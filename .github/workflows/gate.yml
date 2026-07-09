@@ -1,0 +1,158 @@
+# Reusable gate — the single source of truth for pre-merge CI across all repos
+# (lint / jscpd 查重 / dependency-cruiser / tests / Codex review)。
+# 每个 repo 用 ~10 行 caller 调用它(模板在私有 gate-hub 仓 templates/caller-ci.yml),
+# 这里改一次 → 所有仓库立刻生效(caller 引用 @main,故意不钉 SHA)。
+#
+# 为什么放在这个 PUBLIC 的 org 仓:①GitHub 硬限制,公开仓不能 uses: 私有仓的
+# reusable workflow(0-job 启动失败);②org runner group 的 restricted_to_workflows
+# 白名单只接受 org 内仓库的 workflow(实测 2026-07-09,个人账号公开仓也不行)——
+# 这是它从 zj1123581321/ci-templates 再迁到 zlxlabs/gate 的原因(见 README)。
+# 本文件只有通用门禁逻辑、没有秘密;敏感部分留在别处:codex review 的 prompt/策略
+# 在 self-hosted runner 本地磁盘(GATE_HUB_DIR),仓库清单/runner 基建在私有 gate-hub 仓。
+name: gate
+
+on:
+  workflow_call:
+    inputs:
+      tier:       { type: string,  default: "personal" }  # personal | internal | saas
+      runner:     { type: string,  default: "self" }      # self (self-hosted) | hosted (GitHub-hosted, free minutes)
+      has_ui:     { type: boolean, default: false }
+      design_doc: { type: string,  default: "" }          # e.g. docs/DESIGN.md
+    secrets:
+      FEISHU_CI_WEBHOOK:
+        # 可选:公开仓必须用 repo SECRET 传(fork PR 的 run 拿不到 secrets,防 webhook
+        # 泄露被刷群);私有仓可继续用 repo VARIABLE(下面 notify 有 vars 兜底)。
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write   # codex-review.sh posts a comment
+
+# ── fork-PR 防护(公开仓安全的承重墙)────────────────────────────────────────
+# self-hosted 只接「来自本仓分支」的事件:fork PR 的 head.repo != 本仓,一律强制降级
+# GitHub-hosted 一次性沙箱,并跳过 codex review(见下面三处同一条件,改动必须同步,
+# tests/test_gate_contract.py 钉死了这个契约)。
+# 为什么写在这里而不是 caller:pull_request 事件执行的是 PR 作者那份 caller 文件,
+# 外人可以随意改写;本 reusable workflow 永远取 @main 的版本,PR 作者碰不到。
+# 第二道闸在 org runner group:restricted_to_workflows 白名单只放行本文件 @main,
+# 绕过本文件的任意 job 根本派不到 self-hosted runner。
+
+jobs:
+  gate:
+    # cold/hot split: self-hosted for hot repos, GitHub-hosted (free) for cold ones / pilots.
+    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Lint / format
+        run: |
+          if [ -f Makefile ] && grep -qE '^lint:' Makefile; then make lint
+          else echo "no 'lint' make target — skipping"; fi
+
+      - name: Duplicate check (jscpd, advisory)
+        # Advisory during onboarding: reports duplication but does NOT block (legacy repos
+        # carry pre-existing dup). v2: switch to blocking-on-increase via a baseline.
+        continue-on-error: true
+        run: npx --yes jscpd --threshold "${JSCPD_THRESHOLD:-5}" --reporters console .
+
+      - name: Dependency direction (dependency-cruiser)
+        run: |
+          if [ -f .dependency-cruiser.js ] || [ -f .dependency-cruiser.json ]; then
+            npx --yes --package=dependency-cruiser depcruise --config .dependency-cruiser.* --output-type err src
+          else echo "no dependency-cruiser config — skipping (use import-linter for python)"; fi
+
+      - name: Tests
+        run: |
+          if   [ -f Makefile ] && grep -qE '^test:' Makefile; then make test
+          elif [ -f package.json ]; then npm test --if-present
+          elif [ -f pyproject.toml ]; then
+            if   command -v uv >/dev/null;     then uv run --frozen pytest -q || uv run pytest -q
+            elif command -v pytest >/dev/null; then pytest -q
+            else echo "no python test runner on this runner — skipping (runs on self-hosted)"; fi
+          else echo "no tests detected"; fi
+
+      - name: Codex review gate
+        # codex 订阅认证只挂在 self-hosted runner 上;fork PR 已被 runs-on 降级到
+        # hosted,这里再拦一层避免条件漂移时误跑(脚本在 hosted 上也不存在)。
+        if: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          DESIGN_DOC: ${{ inputs.design_doc }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/codex-review.sh" "${{ github.event.pull_request.number }}"
+
+      # ── has_ui 录屏走查:故意不在这个 gate job 里 ─────────────────────────────────
+      # 它是一条*独立* workflow,跑 hosted(免费)、独立触发,关注点与 lint/test/codex 分离
+      # (合进来会强耦合 + 逼所有 has_ui 走 self-hosted)。落地形态 = 模板 + 共享件,
+      # 都在私有 gate-hub 仓:.github/actions/ui-visual-publish + templates/ui-visual/。
+
+  # ── 通知层(registry-routed)─────────────────────────────────────────────────
+  # 门禁失败时发一张飞书卡到 CI ops 群。edit-CI-in-one-file:这里加一次,全 org 生效。
+  # fail-open:continue-on-error + 吞异常,通知挂了绝不改变门禁结论,最坏只是「没收到卡」。
+  # 凭据:secret FEISHU_CI_WEBHOOK 优先(公开仓必须),否则回落 repo 变量同名 var
+  # (关键词模式自定义机器人,无 secret 内容);标题关键词 = vars.FEISHU_CI_TITLE_PREFIX,
+  # 由 onboard-repo.sh 按 registry 分类写入。未配置 prefix 时默认 [zlxlabs·CI]。
+  # 用 python3 stdlib 拼 JSON:日志/标题里的反引号、引号一律安全转义,杜绝坏 payload 破卡。
+  notify:
+    needs: gate
+    if: failure()          # 只在门禁失败时跑;成功 / 取消不发
+    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    steps:
+      - name: Feishu 门禁失败卡 (P2, fail-open)
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE:  ${{ github.event.pull_request.title }}
+          PR_URL:    ${{ github.event.pull_request.html_url }}
+          BRANCH:    ${{ github.head_ref }}
+          SHA:       ${{ github.event.pull_request.head.sha }}
+          TIER:      ${{ inputs.tier }}
+          RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("no FEISHU_CI_WEBHOOK secret/var set — skip notify"); raise SystemExit(0)
+          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
+          repo    = os.environ["REPO"]
+          pr      = os.environ.get("PR_NUMBER", "") or "?"
+          title   = os.environ.get("PR_TITLE", "") or "(无标题)"
+          branch  = os.environ.get("BRANCH", "") or "?"
+          sha     = (os.environ.get("SHA", "") or "")[:12]
+          tier    = os.environ.get("TIER", "") or "?"
+          pr_url  = os.environ.get("PR_URL", "") or ""
+          run_url = os.environ["RUN_URL"]
+          # 关键词模式:机器人关键词由标题前缀保证命中,与 repo 路径解耦。
+          body = (f"**仓库** `{repo}`\n"
+                  f"**PR** #{pr} · {title}\n"
+                  f"**分支** `{branch}`  ·  **commit** `{sha}`  ·  **tier** `{tier}`\n"
+                  f"CI 门禁失败(lint / 测试 / codex-review 其一未过)。点按钮看详情。")
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {"template": "orange",
+                             "title": {"tag": "plain_text", "content": f"🟠 {title_prefix} P2 门禁失败 · {repo}#{pr}"}},
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看 Run"},
+                           "type": "primary", "url": run_url},
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看 PR"},
+                           "type": "default", "url": pr_url},
+                      ]},
+                  ],
+              },
+          }
+          req = urllib.request.Request(
+              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
+          except Exception as e:
+              print("feishu notify failed (swallowed):", e)
+          PY
