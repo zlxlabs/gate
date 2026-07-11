@@ -64,12 +64,22 @@ def test_codex_step_gated_on_same_repo_head():
     raw, _ = _load()
     codex_steps = [
         s for s in raw["jobs"]["gate"]["steps"]
-        if "codex" in str(s.get("name", "")).lower()
+        if s.get("name") == "Codex review gate"
     ]
     assert len(codex_steps) == 1, "gate job 应恰好有一个 Codex review 步骤"
     cond = str(codex_steps[0].get("if", ""))
     assert "inputs.runner == 'self'" in cond
     assert FORK_GUARD in cond, "codex 步骤丢了 fork 防护"
+
+
+def test_codex_waiver_requires_audited_reason_comment():
+    raw, _ = _load()
+    waiver = next(
+        s for s in raw["jobs"]["gate"]["steps"]
+        if s.get("name") == "Validate audited Codex review waiver"
+    )
+    assert "codex-review-waived" in str(waiver.get("if", ""))
+    assert "Codex review waiver:" in waiver["run"]
 
 
 def test_notify_webhook_secret_first_var_fallback():
