@@ -75,11 +75,23 @@ jobs:
       - name: Codex review gate
         # codex 订阅认证只挂在 self-hosted runner 上;fork PR 已被 runs-on 降级到
         # hosted,这里再拦一层避免条件漂移时误跑(脚本在 hosted 上也不存在)。
-        if: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}
+        if: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}
         env:
           DESIGN_DOC: ${{ inputs.design_doc }}
           GH_TOKEN: ${{ github.token }}
         run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/codex-review.sh" "${{ github.event.pull_request.number }}"
+
+      - name: Validate audited Codex review waiver
+        if: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          comments="$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" --jq '.[].body')"
+          if ! grep -Fq 'Codex review waiver:' <<<"$comments"; then
+            echo '::error::codex-review-waived requires a PR comment beginning with Codex review waiver: and a reason'
+            exit 1
+          fi
+          echo 'Codex review explicitly waived; lint/test gates remain required and deployment stays manual.'
 
       # ── has_ui 录屏走查:故意不在这个 gate job 里 ─────────────────────────────────
       # 它是一条*独立* workflow,跑 hosted(免费)、独立触发,关注点与 lint/test/codex 分离
