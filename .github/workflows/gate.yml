@@ -28,6 +28,13 @@ permissions:
   contents: read
   pull-requests: write   # codex-review.sh posts a comment
 
+# A repair agent often pushes code, tests, and docs within minutes. Only the
+# newest head of a PR is worth reviewing; cancel older runs before they consume
+# runner capacity or leave findings for a superseded commit.
+concurrency:
+  group: gate-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 # ── fork-PR 防护(公开仓安全的承重墙)────────────────────────────────────────
 # self-hosted 只接「来自本仓分支」的事件:fork PR 的 head.repo != 本仓,一律强制降级
 # GitHub-hosted 一次性沙箱,并跳过 codex review(见下面三处同一条件,改动必须同步,
