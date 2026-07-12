@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -39,6 +40,8 @@ class CrossHostAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
+STATE_MARKER = "<!-- codex-review-ledger-state -->"
+STATE_RE = re.compile(r"<!-- codex-review-ledger-state:v1:([A-Za-z0-9_-]+={0,2}) -->")
 
 
 def parse_dispositions(comments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -54,6 +57,57 @@ def parse_dispositions(comments: list[dict[str, Any]]) -> dict[str, dict[str, An
                 "url": comment.get("html_url"),
             }
     return result
+
+
+def parse_state_entries(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for comment in comments:
+        user = comment.get("user", {})
+        if user.get("type") != "Bot" or user.get("login") != "github-actions[bot]":
+            continue
+        match = STATE_RE.search(comment.get("body", ""))
+        if not match:
+            continue
+        try:
+            payload = base64.urlsafe_b64decode(match.group(1).encode())
+            entries = json.loads(payload)
+            if isinstance(entries, list) and all(isinstance(entry, dict) for entry in entries):
+                return entries
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    return []
+
+
+def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any]) -> str:
+    relevant = [
+        entry for entry in entries
+        if entry.get("repository") == current.get("repository")
+        and entry.get("pr_number") == current.get("pr_number")
+    ][-20:]
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(relevant, ensure_ascii=False, separators=(",", ":")).encode()
+    ).decode()
+    review = current["review"]
+    comparison = current["comparison"]
+    comparison_line = comparison["kind"]
+    if comparison["kind"] == "new_head":
+        comparison_line += (
+            f"; persistent/resolved/new = {len(comparison['persistent_finding_ids'])}/"
+            f"{len(comparison['resolved_finding_ids'])}/{len(comparison['new_finding_ids'])}"
+        )
+    elif comparison["kind"] == "same_head_rerun":
+        comparison_line += (
+            f"; stable/missing/appeared = {len(comparison['persistent_finding_ids'])}/"
+            f"{len(comparison['missing_finding_ids'])}/{len(comparison['appeared_finding_ids'])}"
+        )
+    return (
+        f"{STATE_MARKER}\n\n### 📒 Review ledger state\n\n"
+        f"- Commit: `{current['head_sha']}`\n"
+        f"- Round: **{current['review_round']}**\n"
+        f"- Status / findings: **{review['status']} / {review['finding_count']}**\n"
+        f"- Comparison: `{comparison_line}`\n\n"
+        "完整数据保存在 `codex-review-ledger` artifact；此 sticky comment 仅保存跨 rerun 的连续游标。\n\n"
+        f"<!-- codex-review-ledger-state:v1:{encoded} -->\n"
+    )
 
 
 def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[str, Any]:
@@ -146,24 +200,31 @@ def build_entry(
 
 
 def write_ledger(path: Path, entries: list[dict[str, Any]], *, max_entries: int) -> None:
-    unique: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for entry in entries:
-        key = (entry.get("repository"), entry.get("run_id"), entry.get("run_attempt"))
-        unique[key] = entry
-    ordered = sorted(unique.values(), key=lambda entry: (entry.get("recorded_at", ""), entry.get("run_id", 0), entry.get("run_attempt", 0)))
-    ordered = ordered[-max_entries:]
+    ordered = dedupe_entries(entries)[-max_entries:]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n" for entry in ordered))
 
 
-def _api_request(token: str, url: str) -> bytes:
+def dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for entry in entries:
+        key = (entry.get("repository"), entry.get("run_id"), entry.get("run_attempt"))
+        unique[key] = entry
+    return sorted(unique.values(), key=lambda entry: (entry.get("recorded_at", ""), entry.get("run_id", 0), entry.get("run_attempt", 0)))
+
+
+def _api_request(token: str, url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
+    data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
         url,
+        data=data,
+        method=method,
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "zlxlabs-gate-review-ledger",
+            "Content-Type": "application/json",
         },
     )
     with URL_OPENER.open(request, timeout=30) as response:
@@ -200,6 +261,28 @@ def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10
 
 def fetch_comments(token: str, repository: str, pr_number: int) -> list[dict[str, Any]]:
     return _api_json(token, f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100")
+
+
+def post_state_comment(
+    token: str,
+    repository: str,
+    pr_number: int,
+    head_sha: str,
+    entries: list[dict[str, Any]],
+    current: dict[str, Any],
+    comments: list[dict[str, Any]],
+) -> None:
+    api = f"https://api.github.com/repos/{repository}"
+    pull = _api_json(token, f"{api}/pulls/{pr_number}")
+    if pull.get("head", {}).get("sha") != head_sha:
+        print("::notice::skip stale review ledger state; PR head advanced")
+        return
+    existing = next((comment for comment in comments if STATE_MARKER in comment.get("body", "")), None)
+    body = render_state_comment(entries, current)
+    if existing:
+        _api_request(token, f"{api}/issues/comments/{existing['id']}", method="PATCH", payload={"body": body})
+    else:
+        _api_request(token, f"{api}/issues/{pr_number}/comments", method="POST", payload={"body": body})
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -264,15 +347,18 @@ def main() -> int:
 
     prior_entries: list[dict[str, Any]] = []
     dispositions: dict[str, dict[str, Any]] = {}
+    comments: list[dict[str, Any]] = []
     if token:
         try:
             prior_entries = fetch_prior_entries(token, args.repository)
         except Exception as error:  # Metrics are fail-open; never change the gate verdict.
             print(f"::warning::could not load prior review ledger: {error}")
         try:
-            dispositions = parse_dispositions(fetch_comments(token, args.repository, args.pr_number))
+            comments = fetch_comments(token, args.repository, args.pr_number)
+            dispositions = parse_dispositions(comments)
+            prior_entries = dedupe_entries([*prior_entries, *parse_state_entries(comments)])
         except Exception as error:
-            print(f"::warning::could not load finding dispositions: {error}")
+            print(f"::warning::could not load finding dispositions or PR ledger state: {error}")
 
     entry = build_entry(
         repository=args.repository,
@@ -286,7 +372,16 @@ def main() -> int:
         dispositions=dispositions,
         fallback_status=fallback,
     )
-    write_ledger(args.output, [*prior_entries, entry], max_entries=args.max_entries)
+    all_entries = dedupe_entries([*prior_entries, entry])
+    write_ledger(args.output, all_entries, max_entries=args.max_entries)
+    if token:
+        try:
+            post_state_comment(
+                token, args.repository, args.pr_number, args.head_sha,
+                all_entries, entry, comments,
+            )
+        except Exception as error:
+            print(f"::warning::could not update PR review ledger state: {error}")
     print(json.dumps(entry, ensure_ascii=False))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         _append_summary(entry, os.environ["GITHUB_STEP_SUMMARY"])

@@ -118,3 +118,22 @@ def test_cross_host_artifact_redirect_strips_github_authorization():
     assert redirected is not None
     assert redirected.get_header("Authorization") is None
     assert redirected.get_header("Accept") == "application/json"
+
+
+def test_bot_sticky_state_survives_reruns_but_user_spoof_is_ignored():
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="same", preflight={}, audit=_audit("same", ["a"]), prior_entries=[], dispositions={},
+    )
+    body = module.render_state_comment([entry], entry)
+    comments = [
+        {"body": body, "user": {"login": "owner", "type": "User"}},
+        {"body": body, "user": {"login": "github-actions[bot]", "type": "Bot"}},
+    ]
+
+    restored = module.parse_state_entries(comments)
+
+    assert restored == [entry]
+    assert "Review ledger state" in body
+    assert "same" in body
