@@ -18,6 +18,8 @@ on:
       runner:     { type: string,  default: "self" }      # self (self-hosted) | hosted (GitHub-hosted, free minutes)
       has_ui:     { type: boolean, default: false }
       design_doc: { type: string,  default: "" }          # e.g. docs/DESIGN.md
+      max_diff_lines:    { type: number, default: 4000 }   # per-Codex-turn diff budget
+      max_review_shards: { type: number, default: 8 }      # total large-PR coverage budget
     secrets:
       FEISHU_CI_WEBHOOK:
         # 可选:公开仓必须用 repo SECRET 传(fork PR 的 run 拿不到 secrets,防 webhook
@@ -48,6 +50,7 @@ jobs:
   gate:
     # cold/hot split: self-hosted for hot repos, GitHub-hosted (free) for cold ones / pilots.
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -85,6 +88,9 @@ jobs:
         if: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}
         env:
           DESIGN_DOC: ${{ inputs.design_doc }}
+          MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
+          MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
+          CODEX_REVIEW_RESULT_PATH: ${{ runner.temp }}/codex-review-result.json
           GH_TOKEN: ${{ github.token }}
         run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/codex-review.sh" "${{ github.event.pull_request.number }}"
 
@@ -99,6 +105,15 @@ jobs:
             exit 1
           fi
           echo 'Codex review explicitly waived; lint/test gates remain required and deployment stays manual.'
+
+      - name: Upload Codex review audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/codex-review-result.json
+          if-no-files-found: ignore
+          retention-days: 30
 
       # ── has_ui 录屏走查:故意不在这个 gate job 里 ─────────────────────────────────
       # 它是一条*独立* workflow,跑 hosted(免费)、独立触发,关注点与 lint/test/codex 分离
