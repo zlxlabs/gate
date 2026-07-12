@@ -27,9 +27,32 @@ jobs:
     with:
       tier: personal          # personal | internal | saas
       runner: self            # self(自建 VM201, 有 codex review) | hosted(免费分钟)
+      # 可选覆盖: max_diff_lines: 4000, max_review_shards: 8, pr_size_warn_lines: 8000
     secrets:
       FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}   # 公开仓必须 secret;私有仓可用同名 variable 兜底
 ```
+
+## PR 体积预检和 review 效果账本
+
+checkout 后、lint/test/Codex 前会先按与 Codex 相同的完整 binary diff 口径测量 PR：
+
+- 不超过 `max_diff_lines`（默认 4,000）：单轮 review。
+- 超过单轮预算但不超过 `pr_size_warn_lines`（默认 8,000）：自动完整分片，并在 sticky comment 提醒下次拆小。
+- 超过强警告线、但仍在 `max_diff_lines × max_review_shards`（默认 32,000）内：继续完整分片 review，同时给出强警告。
+- 超过完整覆盖预算：预检直接失败，要求 small PR / stacked PR；不会消耗 Codex 后再说审不完。
+
+每次 run（包括测试失败、体积拦截、Codex waiver 和 Codex unavailable）都会尽力生成
+`codex-review-ledger` artifact，保留 90 天。最新 artifact 的 `ledger.jsonl` 会累计近期历史，
+并记录每轮耗时、覆盖、finding 数量和 ID，以及同一 PR 相邻两轮的持续/消失/新增项。
+同一 SHA 重跑会单独标为稳定性比较，不会把模型本身的波动误算成代码修复。
+
+确认误报或人工处置时，在 PR 评论中使用一行机器可读记录：
+
+```text
+Codex finding disposition: correctness.example-id = false-positive — 说明证据
+```
+
+处置值支持 `false-positive`、`accepted`、`fixed`、`wont-fix`；作者、理由和评论链接会进入后续账本。
 
 ## 公开仓安全模型（三层）
 

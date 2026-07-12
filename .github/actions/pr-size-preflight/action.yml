@@ -1,0 +1,24 @@
+name: PR size preflight
+description: Measure PR size, warn early, and block changes beyond complete Codex review capacity.
+inputs:
+  base-sha: { required: true }
+  head-sha: { required: true }
+  max-diff-lines: { required: true }
+  warn-lines: { required: true }
+  max-review-shards: { required: true }
+  token: { required: true }
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        python3 "$GITHUB_ACTION_PATH/preflight.py" \
+          --base-sha "${{ inputs.base-sha }}" \
+          --head-sha "${{ inputs.head-sha }}" \
+          --max-diff-lines "${{ inputs.max-diff-lines }}" \
+          --warn-lines "${{ inputs.warn-lines }}" \
+          --max-review-shards "${{ inputs.max-review-shards }}" \
+          --output "$RUNNER_TEMP/pr-size-preflight.json"

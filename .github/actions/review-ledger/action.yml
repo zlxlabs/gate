@@ -1,0 +1,26 @@
+name: Review effectiveness ledger
+description: Build a cumulative JSONL ledger from PR size and Codex review audit artifacts.
+inputs:
+  audit-path: { required: true }
+  preflight-path: { required: true }
+  token: { required: true }
+  codex-expected: { required: true }
+  codex-waived: { required: true }
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        python3 "$GITHUB_ACTION_PATH/build_ledger.py" \
+          --audit-path "${{ inputs.audit-path }}" \
+          --preflight-path "${{ inputs.preflight-path }}" \
+          --output "$RUNNER_TEMP/review-ledger/ledger.jsonl" \
+          --repository "$GITHUB_REPOSITORY" \
+          --pr-number "${{ github.event.pull_request.number }}" \
+          --run-id "$GITHUB_RUN_ID" \
+          --run-attempt "$GITHUB_RUN_ATTEMPT" \
+          --head-sha "${{ github.event.pull_request.head.sha }}" \
+          --codex-expected "${{ inputs.codex-expected }}" \
+          --codex-waived "${{ inputs.codex-waived }}"

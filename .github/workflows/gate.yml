@@ -20,6 +20,7 @@ on:
       design_doc: { type: string,  default: "" }          # e.g. docs/DESIGN.md
       max_diff_lines:    { type: number, default: 4000 }   # per-Codex-turn diff budget
       max_review_shards: { type: number, default: 8 }      # total large-PR coverage budget
+      pr_size_warn_lines: { type: number, default: 8000 }  # strong warning; hard cap derives from the two inputs above
     secrets:
       FEISHU_CI_WEBHOOK:
         # 可选:公开仓必须用 repo SECRET 传(fork PR 的 run 拿不到 secrets,防 webhook
@@ -27,6 +28,7 @@ on:
         required: false
 
 permissions:
+  actions: read       # review ledger reads prior ledger artifacts
   contents: read
   pull-requests: write   # codex-review.sh posts a comment
 
@@ -54,6 +56,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      - name: PR size preflight
+        uses: zlxlabs/gate/.github/actions/pr-size-preflight@main
+        with:
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          max-diff-lines: ${{ inputs.max_diff_lines }}
+          max-review-shards: ${{ inputs.max_review_shards }}
+          warn-lines: ${{ inputs.pr_size_warn_lines }}
+          token: ${{ github.token }}
 
       - name: Lint / format
         run: |
@@ -114,6 +126,26 @@ jobs:
           path: ${{ runner.temp }}/codex-review-result.json
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Build review effectiveness ledger
+        if: always()
+        continue-on-error: true
+        uses: zlxlabs/gate/.github/actions/review-ledger@main
+        with:
+          audit-path: ${{ runner.temp }}/codex-review-result.json
+          preflight-path: ${{ runner.temp }}/pr-size-preflight.json
+          token: ${{ github.token }}
+          codex-expected: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}
+          codex-waived: ${{ contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}
+
+      - name: Upload review effectiveness ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-review-ledger
+          path: ${{ runner.temp }}/review-ledger/ledger.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
 
       # ── has_ui 录屏走查:故意不在这个 gate job 里 ─────────────────────────────────
       # 它是一条*独立* workflow,跑 hosted(免费)、独立触发,关注点与 lint/test/codex 分离
