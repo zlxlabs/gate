@@ -25,6 +25,22 @@ DISPOSITION_RE = re.compile(
 )
 
 
+class CrossHostAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Do not leak the GitHub bearer token to signed artifact storage URLs."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected and urllib.parse.urlsplit(req.full_url).netloc != urllib.parse.urlsplit(newurl).netloc:
+            for header_map in (redirected.headers, redirected.unredirected_hdrs):
+                for key in list(header_map):
+                    if key.lower() == "authorization":
+                        del header_map[key]
+        return redirected
+
+
+URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
+
+
 def parse_dispositions(comments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for comment in comments:
@@ -150,7 +166,7 @@ def _api_request(token: str, url: str) -> bytes:
             "User-Agent": "zlxlabs-gate-review-ledger",
         },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with URL_OPENER.open(request, timeout=30) as response:
         return response.read()
 
 

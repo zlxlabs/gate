@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import urllib.request
 from pathlib import Path
 
 
@@ -95,3 +96,25 @@ def test_ledger_deduplicates_run_attempts_and_writes_jsonl(tmp_path):
     lines = output.read_text().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["review"]["status"] == "pass"
+
+
+def test_cross_host_artifact_redirect_strips_github_authorization():
+    module = _module()
+    handler = module.CrossHostAuthStripRedirectHandler()
+    original = urllib.request.Request(
+        "https://api.github.com/repos/zlxlabs/app/actions/artifacts/1/zip",
+        headers={"Authorization": "Bearer secret", "Accept": "application/json"},
+    )
+
+    redirected = handler.redirect_request(
+        original,
+        None,
+        302,
+        "Found",
+        {"Location": "https://artifactcache.example.test/signed"},
+        "https://artifactcache.example.test/signed",
+    )
+
+    assert redirected is not None
+    assert redirected.get_header("Authorization") is None
+    assert redirected.get_header("Accept") == "application/json"
