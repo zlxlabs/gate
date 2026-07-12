@@ -82,6 +82,16 @@ def test_codex_waiver_requires_audited_reason_comment():
     assert "Codex review waiver:" in waiver["run"]
 
 
+def test_same_pr_runs_cancel_superseded_reviews():
+    raw, _ = _load()
+    concurrency = raw.get("concurrency", {})
+
+    assert concurrency.get("cancel-in-progress") is True
+    group = str(concurrency.get("group", ""))
+    assert "github.repository" in group
+    assert "github.event.pull_request.number" in group
+
+
 def test_notify_webhook_secret_first_var_fallback():
     # 公开仓走 secret(fork run 拿不到),私有仓回落 repo 变量;标题前缀约定同 build-deploy。
     text = WORKFLOW.read_text()
