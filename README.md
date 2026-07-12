@@ -45,6 +45,8 @@ checkout 后、lint/test/Codex 前会先按与 Codex 相同的完整 binary diff
 `codex-review-ledger` artifact，保留 90 天。最新 artifact 的 `ledger.jsonl` 会累计近期历史，
 并记录每轮耗时、覆盖、finding 数量和 ID，以及同一 PR 相邻两轮的持续/消失/新增项。
 同一 SHA 重跑会单独标为稳定性比较，不会把模型本身的波动误算成代码修复。
+GitHub 在点击 Re-run 时会删除同一 run 的旧 artifact，因此每个 PR 另有一条由
+`github-actions[bot]` 维护的精简 sticky state comment，作为跨 rerun 游标；完整数据仍只在 artifact。
 
 确认误报或人工处置时，在 PR 评论中使用一行机器可读记录：
 
