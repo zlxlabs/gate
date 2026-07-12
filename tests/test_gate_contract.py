@@ -112,6 +112,40 @@ def test_codex_review_exports_machine_readable_audit_artifact():
     assert upload["with"]["if-no-files-found"] == "ignore"
 
 
+def test_pr_size_preflight_runs_before_expensive_checks_and_uses_review_capacity():
+    raw, trigger = _load()
+    inputs = trigger["workflow_call"]["inputs"]
+    assert inputs["pr_size_warn_lines"]["default"] == 8000
+
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    preflight_index = names.index("PR size preflight")
+    assert preflight_index < names.index("Lint / format")
+    preflight = steps[preflight_index]
+    assert preflight["uses"].startswith("zlxlabs/gate/.github/actions/pr-size-preflight@")
+    assert preflight["with"]["max-diff-lines"] == "${{ inputs.max_diff_lines }}"
+    assert preflight["with"]["max-review-shards"] == "${{ inputs.max_review_shards }}"
+    assert preflight["with"]["warn-lines"] == "${{ inputs.pr_size_warn_lines }}"
+
+
+def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
+    raw, _ = _load()
+    assert raw["permissions"]["actions"] == "read"
+    steps = raw["jobs"]["gate"]["steps"]
+    build = next(step for step in steps if step.get("name") == "Build review effectiveness ledger")
+    assert build["if"] == "always()"
+    assert build["uses"].startswith("zlxlabs/gate/.github/actions/review-ledger@")
+    assert "codex-review-result.json" in build["with"]["audit-path"]
+    assert "pr-size-preflight.json" in build["with"]["preflight-path"]
+
+    upload = next(step for step in steps if step.get("name") == "Upload review effectiveness ledger")
+    assert upload["if"] == "always()"
+    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["with"]["name"] == "codex-review-ledger"
+    assert "ledger.jsonl" in upload["with"]["path"]
+    assert upload["with"]["retention-days"] == 90
+
+
 def test_notify_webhook_secret_first_var_fallback():
     # 公开仓走 secret(fork run 拿不到),私有仓回落 repo 变量;标题前缀约定同 build-deploy。
     text = WORKFLOW.read_text()
