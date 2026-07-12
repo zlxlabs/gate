@@ -92,6 +92,26 @@ def test_same_pr_runs_cancel_superseded_reviews():
     assert "github.event.pull_request.number" in group
 
 
+def test_codex_review_exports_machine_readable_audit_artifact():
+    raw, trigger = _load()
+    inputs = trigger["workflow_call"]["inputs"]
+    assert inputs["max_diff_lines"]["default"] == 4000
+    assert inputs["max_review_shards"]["default"] == 8
+
+    job = raw["jobs"]["gate"]
+    assert job["timeout-minutes"] == 45
+    codex = next(step for step in job["steps"] if step.get("name") == "Codex review gate")
+    assert "CODEX_REVIEW_RESULT_PATH" in codex["env"]
+    assert "MAX_DIFF_LINES" in codex["env"]
+    assert "MAX_REVIEW_SHARDS" in codex["env"]
+
+    upload = next(step for step in job["steps"] if step.get("name") == "Upload Codex review audit")
+    assert upload["if"] == "always()"
+    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert "codex-review-result.json" in upload["with"]["path"]
+    assert upload["with"]["if-no-files-found"] == "ignore"
+
+
 def test_notify_webhook_secret_first_var_fallback():
     # 公开仓走 secret(fork run 拿不到),私有仓回落 repo 变量;标题前缀约定同 build-deploy。
     text = WORKFLOW.read_text()
