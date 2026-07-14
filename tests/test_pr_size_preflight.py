@@ -59,6 +59,27 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
     assert result["classification"] in {"warning", "blocked"}
 
 
+def test_measurement_fetches_only_missing_pr_endpoints_from_a_shallow_clone(tmp_path):
+    module = _module()
+    source, base, head = _repo(tmp_path, 20)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "clone", "--bare", str(source), str(remote)], check=True)
+
+    shallow = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "--depth", "1", remote.as_uri(), str(shallow)], check=True)
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
+    ).returncode != 0
+
+    result = module.measure(shallow, base, head, max_diff_lines=12, warn_lines=20, max_review_shards=3)
+
+    assert result["base_sha"] == base
+    assert result["head_sha"] == head
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
+    ).returncode == 0
+
+
 def test_warning_comment_tells_agent_to_split_without_claiming_review_failed():
     module = _module()
     result = {

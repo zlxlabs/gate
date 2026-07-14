@@ -22,6 +22,21 @@ def _git(repo: Path, *args: str) -> bytes:
     return subprocess.check_output(["git", *args], cwd=repo)
 
 
+def ensure_review_commits(repo: Path, base_sha: str, head_sha: str) -> None:
+    """Make the exact PR endpoints available without requiring full history.
+
+    `actions/checkout` intentionally fetches only the workflow ref.  A PR diff is
+    nevertheless fully defined by its base and head commits, so fetch just those
+    objects when either is absent instead of making every Gate run clone every
+    branch and tag in the repository.
+    """
+    try:
+        for sha in (base_sha, head_sha):
+            _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
+    except subprocess.CalledProcessError:
+        _git(repo, "fetch", "--no-tags", "origin", base_sha, head_sha)
+
+
 def classify(diff_lines: int, max_diff_lines: int, warn_lines: int, max_review_shards: int) -> tuple[str, bool]:
     hard_lines = max_diff_lines * max_review_shards
     if diff_lines > hard_lines:
@@ -42,6 +57,7 @@ def measure(
     warn_lines: int,
     max_review_shards: int,
 ) -> dict[str, Any]:
+    ensure_review_commits(repo, base_sha, head_sha)
     patch = _git(repo, "diff", "--no-ext-diff", "--binary", base_sha, head_sha)
     numstat = _git(repo, "diff", "--numstat", base_sha, head_sha).decode("utf-8", "replace")
     additions = deletions = changed_files = 0

@@ -55,7 +55,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        # Tests need the current workspace, while PR measurement/review need only
+        # the exact base/head pair. The preflight and review scripts fetch that
+        # pair on demand, avoiding a full-history clone for every Gate run.
+        with: { fetch-depth: 1 }
 
       - name: PR size preflight
         uses: zlxlabs/gate/.github/actions/pr-size-preflight@main

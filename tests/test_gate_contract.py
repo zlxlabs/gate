@@ -128,6 +128,16 @@ def test_pr_size_preflight_runs_before_expensive_checks_and_uses_review_capacity
     assert preflight["with"]["warn-lines"] == "${{ inputs.pr_size_warn_lines }}"
 
 
+def test_checkout_is_shallow_and_preflight_restores_exact_diff_endpoints():
+    raw, _ = _load()
+    checkout = raw["jobs"]["gate"]["steps"][0]
+    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["with"]["fetch-depth"] == 1
+
+    preflight_code = (REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py").read_text()
+    assert '"fetch", "--no-tags", "origin", base_sha, head_sha' in preflight_code
+
+
 def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     raw, _ = _load()
     assert raw["permissions"]["actions"] == "read"
