@@ -87,6 +87,26 @@ jobs:
             npx --yes --package=dependency-cruiser depcruise --config .dependency-cruiser.* --output-type err src
           else echo "no dependency-cruiser config — skipping (use import-linter for python)"; fi
 
+      # ── L1 依赖下载缓存(uv 生态试点)──────────────────────────────────────────
+      # 一次性 runner 每 Job 冷启动,Python 仓的 Tests 步骤主要耗时在 uv 重新下载
+      # 全部依赖(VideoTranscriptAPI 实测冷缓存 ~13min)。按 gate-hub 仓
+      # docs/designs/ci-cache-strategy.md 的 L1 层落地:
+      # - key = 仓库隔离(Actions cache 天然按仓隔离) + OS/arch + uv.lock 哈希;
+      # - restore-keys 允许 lockfile 变更后部分复用(uv cache 内容寻址,残留无害);
+      # - miss 自动回退正常下载,冷缓存不影响正确性;
+      # - 失败 Job 不写缓存(actions/cache 仅在 job 成功后保存);
+      # - fork PR 已被 runs-on 强制降级 hosted,能写本缓存的只有本仓受信分支;
+      # - 容量由 GitHub Actions cache 每仓 10GB + LRU 淘汰兜底。
+      # 非 uv 仓库 hashFiles 为空,两个步骤整体跳过,对现有仓库零影响。
+      - name: Restore uv download cache
+        if: ${{ hashFiles('uv.lock') != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Tests
         run: |
           if   [ -f Makefile ] && grep -qE '^test:' Makefile; then make test
@@ -96,6 +116,12 @@ jobs:
             elif command -v pytest >/dev/null; then pytest -q
             else echo "no python test runner on this runner — skipping (runs on self-hosted)"; fi
           else echo "no tests detected"; fi
+
+      # 保存前收缩缓存体积:去掉已装好后不再需要的构建产物(uv 官方 CI 建议)。
+      # 只在 Tests 成功后执行;真正的缓存上传由 actions/cache 的 post 步骤完成。
+      - name: Prune uv cache before persistence
+        if: ${{ hashFiles('uv.lock') != '' }}
+        run: uv cache prune --ci || true
 
       - name: Codex review gate
         # codex 订阅认证只挂在 self-hosted runner 上;fork PR 已被 runs-on 降级到
