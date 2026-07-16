@@ -77,6 +77,7 @@ def measure(
         "base_sha": base_sha,
         "head_sha": head_sha,
         "diff_lines": diff_lines,
+        "changed_lines": additions + deletions,
         "additions": additions,
         "deletions": deletions,
         "changed_files": changed_files,
@@ -98,33 +99,34 @@ def render_comment(result: dict[str, Any]) -> str:
     if kind == "blocked":
         title = "⛔ PR 体积预检：超过完整审查能力，已拦截"
         explanation = (
-            f"当前 diff 为 **{result['diff_lines']} 行**，超过最多 "
+            f"当前审查 Patch 为 **{result['diff_lines']} 行**，超过最多 "
             f"**{thresholds['hard_lines']} 行 / {thresholds.get('max_review_shards', '?')} 个分片**的完整审查预算。"
         )
         action = "请把改动拆成可独立验收的 small PR 或 stacked PR；未拆分前 Gate 不会把未审完的改动放行。"
     elif kind == "warning":
         title = "⚠️ PR 体积预检：强警告"
         explanation = (
-            f"当前 diff 为 **{result['diff_lines']} 行**，已超过强警告线 "
+            f"当前审查 Patch 为 **{result['diff_lines']} 行**，已超过强警告线 "
             f"**{thresholds['warn_lines']} 行**。本轮仍会完整分片 review，但反馈更慢、修复成本更高。"
         )
         action = "后续请按单一功能拆成 small PR；如果存在依赖关系，使用 stacked PR。"
     elif kind == "sharded":
         title = "ℹ️ PR 体积预检：将自动分片审查"
         explanation = (
-            f"当前 diff 为 **{result['diff_lines']} 行**，超过单轮预算 "
+            f"当前审查 Patch 为 **{result['diff_lines']} 行**，超过单轮预算 "
             f"**{thresholds['single_turn_lines']} 行**，Codex 会覆盖所有分片并做跨模块整合。"
         )
         action = "这次可以继续，但下次优先按单一功能拆成 small PR，以缩短反馈时间。"
     else:
         title = "✅ PR 体积已回到单轮审查范围"
-        explanation = f"当前 diff 为 **{result['diff_lines']} 行**，可由 Codex 单轮完整审查。"
+        explanation = f"当前审查 Patch 为 **{result['diff_lines']} 行**，可由 Codex 单轮完整审查。"
         action = "此前的大 PR 提醒已解除。"
+    changed_lines = result.get("changed_lines", result["additions"] + result["deletions"])
     return (
         f"{MARKER}\n\n### {title}\n\n{explanation}\n\n"
         f"- 文件：{result['changed_files']}\n"
-        f"- 增加：{result['additions']} 行\n"
-        f"- 删除：{result['deletions']} 行\n"
+        f"- 实际增删：{changed_lines} 行（+{result['additions']} / -{result['deletions']}）\n"
+        f"- 审查 Patch：{result['diff_lines']} 行（包含上下文和 diff 元数据）\n"
         f"- Reviewed commit: `{result['head_sha']}`\n\n{action}\n"
     )
 
@@ -170,7 +172,9 @@ def _append_summary(result: dict[str, Any], path: str) -> None:
     with open(path, "a", encoding="utf-8") as summary:
         summary.write(
             "### PR size preflight\n\n"
-            f"- Status: `{status}`\n- Diff: {result['diff_lines']} lines\n"
+            f"- Status: `{status}`\n- Review patch: {result['diff_lines']} lines\n"
+            f"- Changed: {result.get('changed_lines', result['additions'] + result['deletions'])} lines "
+            f"(+{result['additions']} / -{result['deletions']})\n"
             f"- Files: {result['changed_files']}\n- Plan: `{result['review_plan']}`\n"
         )
 

@@ -53,6 +53,7 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
     )
     assert result["diff_lines"] == expected_lines
     assert result["changed_files"] == 1
+    assert result["changed_lines"] == 21
     assert result["additions"] == 20
     assert result["deletions"] == 1
     assert result["thresholds"]["hard_lines"] == 36
@@ -97,4 +98,8 @@ def test_warning_comment_tells_agent_to_split_without_claiming_review_failed():
     assert "强警告" in body
     assert "small PR" in body
     assert "仍会完整分片 review" in body
+    assert "当前审查 Patch 为 **12000 行**" in body
+    assert "实际增删：12000 行（+9000 / -3000）" in body
+    assert "审查 Patch：12000 行（包含上下文和 diff 元数据）" in body
+    assert "当前 diff" not in body
     assert "abcdef1234567890" in body
