@@ -3,6 +3,15 @@ description: Build a cumulative JSONL ledger from PR size and Codex review audit
 inputs:
   audit-path: { required: true }
   preflight-path: { required: true }
+  # D5(ci-cache-strategy.md 阶段 A):Install dependencies 步骤写的 JSON —
+  # { ecosystem, status, duration_s, cache_hit }。required: true 与另外两个
+  # path 输入保持同一风格,但文件*允许不存在*:canary ring 期间 tier != personal
+  # 的 run 里 Install 步骤整体不跑,不会写这个文件 —— build_ledger.py 对缺文件
+  # 容错为 install: null(有测试钉死),不报错。ledger.jsonl 里新增的
+  # "install" 字段对历史条目(没有这个 key)和现有消费者(gate-hub 的
+  # scripts/review-ledger-report.py,按 key 取值、不会因未知/缺失字段报错)
+  # 都是纯新增、向后兼容。
+  install-path: { required: true }
   token: { required: true }
   codex-expected: { required: true }
   codex-waived: { required: true }
@@ -16,6 +25,7 @@ runs:
         python3 "$GITHUB_ACTION_PATH/build_ledger.py" \
           --audit-path "${{ inputs.audit-path }}" \
           --preflight-path "${{ inputs.preflight-path }}" \
+          --install-path "${{ inputs.install-path }}" \
           --output "$RUNNER_TEMP/review-ledger/ledger.jsonl" \
           --repository "$GITHUB_REPOSITORY" \
           --pr-number "${{ github.event.pull_request.number }}" \

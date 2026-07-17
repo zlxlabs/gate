@@ -99,6 +99,7 @@ jobs:
       # - 容量由 GitHub Actions cache 每仓 10GB + LRU 淘汰兜底。
       # 非 uv 仓库 hashFiles 为空,两个步骤整体跳过,对现有仓库零影响。
       - name: Restore uv download cache
+        id: uv-cache
         if: ${{ hashFiles('uv.lock') != '' }}
         uses: actions/cache@v4
         with:
@@ -106,6 +107,88 @@ jobs:
           key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}
           restore-keys: |
             uv-${{ runner.os }}-${{ runner.arch }}-
+
+      # ── D5:装依赖拆分计时(ci-cache-strategy.md「阶段 A:先建立基线」,度量前置
+      # 于缓存本身 —— docs/designs/ci-cache-strategy.md)────────────────────────
+      # 把"装依赖"从 Tests 步骤里独立出来,天然拿到 GitHub 的 step 级计时,让
+      # "装依赖耗时"和"跑测试耗时"不再混一坨。这一步只是把 Tests 步骤反正要做
+      # 一遍的安装提前做一遍,不改 make test 契约、不改任何仓库的 Makefile:
+      #   - uv.lock          → uv sync --frozen(不带 --extra/--group,与下面
+      #                        Tests 回退分支的 `uv run --frozen pytest` 同口径;
+      #                        个别仓库 Makefile 自带 --extra dev 时,预装只覆盖
+      #                        base 依赖,Tests 内部再补 extra 是增量安装而非
+      #                        从零安装,仍然更快,且不会把预装的包冲掉 —— uv
+      #                        sync 只在"本次请求的解析结果比当前环境更少"时才
+      #                        卸载,extra 更多是纯增量)。
+      #   - package-lock.json → npm ci
+      #   - pnpm-lock.yaml    → pnpm install --frozen-lockfile(pnpm 已烤进
+      #                        runner 镜像,见 ci-cache-strategy.md,不需要
+      #                        corepack enable)。
+      #   - go.sum            → 调研结论:先不拆。已注册的唯一 go stack 仓库
+      #                        zlxlabs/key-proxy 的 Makefile test: 目标是
+      #                        `docker run ... golang:1.25-alpine go test ./...`
+      #                        ——测试跑在隔离容器里,不 mount host 的 Go module
+      #                        cache;host 侧 `go mod download` 填的缓存到不了
+      #                        那个容器,预装既不加速也不可见,反而会让
+      #                        duration_s 显得"很快"、误导度量。要让 Go 真正受益
+      #                        需要仓库自己把 host 模块缓存挂进 docker run(改
+      #                        Makefile/契约),超出本次"最小拆分"范围,留给
+      #                        owner 按仓单独决定。
+      #   - 都没有 → 跳过,对现有仓库零影响(实测:当前注册仓库里没有一个在根
+      #                        目录放 package-lock.json;根目录 pnpm-lock.yaml
+      #                        目前也没有 —— 这两个分支目前处于零流量、面向未来
+      #                        新接入 node 仓库的状态,不会改变任何现有仓库行为)。
+      # continue-on-error:失败只影响这一步自身的状态和计时,不阻断 Tests ——
+      # 判定测试是否通过的唯一权威仍是 Tests 步骤本身(它会用同一套命令重新走一遍)。
+      # 这样即使某仓库的真实安装发生在别处(Makefile cd 到子目录、或者整个测试
+      # 跑在另一个 Docker 容器里,预装够不到那个环境),预装失败也不会误伤本来
+      # 会通过的 PR,只是白跑一次、看不到加速 —— 不是新的失败模式。
+      #
+      # ⚠ canary ring(临时条件,2026-07-17 起):门禁自身的一切变更按 tier 分批
+      # 生效(personal → internal → saas,组织纪律,规矩本身正在另一 PR 成文)。
+      # 下面 `if: inputs.tier == 'personal'` 是第 1 批灰度;观察约一周无异常后,
+      # 由后续 PR 放宽到 internal(条件改成 `inputs.tier != 'saas'`),再一周后
+      # 全量(直接删掉这个 if,并同步更新 tests/test_gate_contract.py 里钉住该
+      # 条件的断言)。tier != personal 时本步骤整体不跑,install-result.json
+      # *不存在*(不是 skipped JSON)—— build_ledger.py 对缺文件容错为
+      # install: null,ledger 及其消费者不受影响(有测试钉死)。
+      - name: Install dependencies
+        id: install
+        if: ${{ inputs.tier == 'personal' }}
+        continue-on-error: true
+        env:
+          UV_CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}
+          INSTALL_RESULT_PATH: ${{ runner.temp }}/install-result.json
+        run: |
+          start=$(date +%s)
+          ecosystem="none"
+          status="skipped"
+          if [ -f uv.lock ]; then
+            ecosystem="uv"
+            if uv sync --frozen; then status="ok"; else status="failed"; fi
+          elif [ -f package-lock.json ]; then
+            ecosystem="npm"
+            if npm ci; then status="ok"; else status="failed"; fi
+          elif [ -f pnpm-lock.yaml ]; then
+            ecosystem="pnpm"
+            if pnpm install --frozen-lockfile; then status="ok"; else status="failed"; fi
+          elif [ -f go.sum ]; then
+            ecosystem="go-skipped"
+            echo "go.sum detected but the only registered Go repo runs tests inside an isolated docker container (host module cache unreachable) — skipping host-side predownload, see gate PR description"
+          else
+            echo "no supported lockfile at repo root — skipping predownload"
+          fi
+          end=$(date +%s)
+          cache_hit=null
+          if [ "$ecosystem" = "uv" ]; then
+            case "${UV_CACHE_HIT:-}" in
+              true)  cache_hit=true ;;
+              false) cache_hit=false ;;
+            esac
+          fi
+          printf '{"ecosystem":"%s","status":"%s","duration_s":%s,"cache_hit":%s}\n' \
+            "$ecosystem" "$status" "$((end - start))" "$cache_hit" | tee "$INSTALL_RESULT_PATH"
+          [ "$status" != "failed" ]
 
       - name: Tests
         run: |
@@ -163,6 +246,7 @@ jobs:
         with:
           audit-path: ${{ runner.temp }}/codex-review-result.json
           preflight-path: ${{ runner.temp }}/pr-size-preflight.json
+          install-path: ${{ runner.temp }}/install-result.json
           token: ${{ github.token }}
           codex-expected: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}
           codex-waived: ${{ contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}

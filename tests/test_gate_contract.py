@@ -138,6 +138,32 @@ def test_checkout_is_shallow_and_preflight_restores_exact_diff_endpoints():
     assert '"fetch", "--no-tags", "origin", base_sha, head_sha' in preflight_code
 
 
+def test_install_dependencies_runs_before_tests_and_never_blocks_the_job():
+    # D5(ci-cache-strategy.md 阶段 A):拆分计时的 step 必须在 Tests 之前(否则测不到
+    # 真实的"预装让 Tests 变快"效果),且必须 continue-on-error —— 预装失败不能
+    # 变成一种新的、覆盖不到所有仓库真实安装位置的失败模式(见 gate.yml 步骤注释)。
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    install_index = names.index("Install dependencies")
+    assert install_index < names.index("Tests")
+    assert install_index > names.index("Restore uv download cache")
+
+    install = steps[install_index]
+    assert install["continue-on-error"] is True
+    assert "uv.lock" in install["run"]
+    assert "package-lock.json" in install["run"]
+    assert "pnpm-lock.yaml" in install["run"]
+    # Go 调研结论:先不拆(见步骤内注释),但仍需识别 go.sum 并显式记录跳过原因,
+    # 不能悄悄什么都不做。
+    assert "go.sum" in install["run"]
+    # canary ring 第 1 批(2026-07-17 起,临时):门禁自身变更按 tier 分批生效,
+    # 本步骤先只对 personal 生效。promotion 时(→ internal → 全量)由后续 PR
+    # 修改/删除 gate.yml 的 if 条件,并同步更新这条断言 —— 故意钉死,防止条件
+    # 被顺手删掉而绕过灰度纪律。
+    assert "inputs.tier == 'personal'" in str(install.get("if", ""))
+
+
 def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     raw, _ = _load()
     assert raw["permissions"]["actions"] == "read"
@@ -147,6 +173,7 @@ def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     assert build["uses"].startswith("zlxlabs/gate/.github/actions/review-ledger@")
     assert "codex-review-result.json" in build["with"]["audit-path"]
     assert "pr-size-preflight.json" in build["with"]["preflight-path"]
+    assert "install-result.json" in build["with"]["install-path"]
 
     upload = next(step for step in steps if step.get("name") == "Upload review effectiveness ledger")
     assert upload["if"] == "always()"

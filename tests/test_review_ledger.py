@@ -68,6 +68,49 @@ def test_same_head_rerun_is_recorded_as_stability_not_as_a_fix():
     assert "resolved_finding_ids" not in current["comparison"]
 
 
+def test_install_metrics_flow_through_when_present_and_default_to_none():
+    module = _module()
+    with_install = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        install={"ecosystem": "uv", "status": "ok", "duration_s": 42, "cache_hit": True},
+    )
+    without_install = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+    )
+
+    assert with_install["install"] == {
+        "ecosystem": "uv", "status": "ok", "duration_s": 42, "cache_hit": True,
+    }
+    # Old callers (and old ledger entries with no "install" key) must not break —
+    # the field is purely additive.
+    assert without_install["install"] is None
+
+
+def test_missing_install_result_file_yields_null_install_field(tmp_path):
+    # canary ring:tier != personal 时 gate.yml 的 Install 步骤整体不跑,
+    # install-result.json *不存在*(不是一份 skipped JSON)。_load_json 必须
+    # 对缺文件(以及空文件)容错为 None,进而 ledger 条目 install 字段为 null,
+    # 不能报错 —— 否则非 personal tier 的每次 run 都会在 ledger 步骤炸掉。
+    module = _module()
+
+    missing = tmp_path / "does-not-exist" / "install-result.json"
+    assert module._load_json(missing) is None
+
+    empty = tmp_path / "install-result.json"
+    empty.write_text("")
+    assert module._load_json(empty) is None
+
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        install=module._load_json(missing),
+    )
+    assert entry["install"] is None
+    assert json.loads(json.dumps(entry))["install"] is None
+
+
 def test_disposition_comments_capture_false_positive_reason_and_author():
     module = _module()
     comments = [{
