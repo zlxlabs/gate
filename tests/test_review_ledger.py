@@ -68,6 +68,26 @@ def test_same_head_rerun_is_recorded_as_stability_not_as_a_fix():
     assert "resolved_finding_ids" not in current["comparison"]
 
 
+def test_install_metrics_flow_through_when_present_and_default_to_none():
+    module = _module()
+    with_install = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        install={"ecosystem": "uv", "status": "ok", "duration_s": 42, "cache_hit": True},
+    )
+    without_install = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+    )
+
+    assert with_install["install"] == {
+        "ecosystem": "uv", "status": "ok", "duration_s": 42, "cache_hit": True,
+    }
+    # Old callers (and old ledger entries with no "install" key) must not break —
+    # the field is purely additive.
+    assert without_install["install"] is None
+
+
 def test_disposition_comments_capture_false_positive_reason_and_author():
     module = _module()
     comments = [{

@@ -147,6 +147,7 @@ def build_entry(
     audit: dict[str, Any] | None,
     prior_entries: list[dict[str, Any]],
     dispositions: dict[str, dict[str, Any]],
+    install: dict[str, Any] | None = None,
     fallback_status: str = "not_run",
 ) -> dict[str, Any]:
     relevant = [
@@ -190,6 +191,11 @@ def build_entry(
         "head_sha": head_sha,
         "review_round": len(relevant) + 1,
         "preflight": preflight or None,
+        # D5(ci-cache-strategy.md 阶段 A):Install dependencies 步骤的度量信号 —
+        # {ecosystem, status, duration_s, cache_hit}(见 gate.yml Install 步骤),
+        # 缺失时为 None。纯新增字段,不影响任何读取 "review"/"preflight"/
+        # "comparison" 等既有 key 的消费者。
+        "install": install,
         "review": review,
         "comparison": comparison,
         "finding_dispositions": relevant_dispositions,
@@ -316,12 +322,19 @@ def _append_summary(entry: dict[str, Any], path: str) -> None:
                 f"- Same-head stable / missing / appeared: {len(comparison['persistent_finding_ids'])} / "
                 f"{len(comparison['missing_finding_ids'])} / {len(comparison['appeared_finding_ids'])}\n"
             )
+        install = entry.get("install")
+        if install:
+            summary.write(
+                f"- Install: `{install.get('ecosystem')}` status={install.get('status')} "
+                f"duration={install.get('duration_s')}s cache_hit={install.get('cache_hit')}\n"
+            )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audit-path", required=True, type=Path)
     parser.add_argument("--preflight-path", required=True, type=Path)
+    parser.add_argument("--install-path", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", required=True, type=int)
@@ -336,6 +349,7 @@ def main() -> int:
 
     preflight = _load_json(args.preflight_path) or {}
     audit = _load_json(args.audit_path)
+    install = _load_json(args.install_path)
     if not preflight.get("reviewable", True):
         fallback = "blocked_by_size"
     elif _truthy(args.codex_waived):
@@ -370,6 +384,7 @@ def main() -> int:
         audit=audit,
         prior_entries=prior_entries,
         dispositions=dispositions,
+        install=install,
         fallback_status=fallback,
     )
     all_entries = dedupe_entries([*prior_entries, entry])
