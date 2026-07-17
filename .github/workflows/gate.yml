@@ -87,7 +87,7 @@ jobs:
             npx --yes --package=dependency-cruiser depcruise --config .dependency-cruiser.* --output-type err src
           else echo "no dependency-cruiser config — skipping (use import-linter for python)"; fi
 
-      # ── L1 依赖下载缓存(uv 生态试点)──────────────────────────────────────────
+      # ── L1 依赖下载缓存 —— hosted 专属路径(uv 生态试点)──────────────────────
       # 一次性 runner 每 Job 冷启动,Python 仓的 Tests 步骤主要耗时在 uv 重新下载
       # 全部依赖(VideoTranscriptAPI 实测冷缓存 ~13min)。按 gate-hub 仓
       # docs/designs/ci-cache-strategy.md 的 L1 层落地:
@@ -98,15 +98,56 @@ jobs:
       # - fork PR 已被 runs-on 强制降级 hosted,能写本缓存的只有本仓受信分支;
       # - 容量由 GitHub Actions cache 每仓 10GB + LRU 淘汰兜底。
       # 非 uv 仓库 hashFiles 为空,两个步骤整体跳过,对现有仓库零影响。
+      #
+      # 2026-07-17(ci-cache-strategy.md §0 D2):这条 actions/cache 路径只留给
+      # `runner: hosted`。`runner: self` 仓改走 run-ephemeral-runner.sh 挂载的
+      # VM201 本机卷(见下面新增步骤)——本机卷是同一台宿主上一次性容器间的本地
+      # bind mount,没有网络往返;actions/cache 则要把缓存整个回传到 GitHub 云端
+      # 再下载回来,重依赖仓库缓存体积可达 GB 级,回传本身比冷装还慢,继续走它对
+      # self 仓是负优化。加 `inputs.runner == 'hosted'` 后,self 仓这条 restore/
+      # save 直接跳过,`steps.uv-cache.outputs.cache-hit` 在 self 上是空字符串,
+      # 下面 Install dependencies 步骤的 `case` 分支对空值已容错为 cache_hit: null
+      # (self 上这个字段本来就不该来自 actions/cache,是已知的账本盲区,见 PR 描述)。
       - name: Restore uv download cache
         id: uv-cache
-        if: ${{ hashFiles('uv.lock') != '' }}
+        if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}
           restore-keys: |
             uv-${{ runner.os }}-${{ runner.arch }}-
+
+      # ── L1 依赖下载缓存 —— self 专属路径(VM201 本机卷,canary ring 第 1 批)──────
+      # ci-cache-strategy.md §0 D2:`runner: self` 仓改走 run-ephemeral-runner.sh
+      # (私有 gate-hub 仓)在拉起一次性 runner 容器时挂载的本机读写卷,固定路径
+      # `/opt/gate-hub-cache/{uv,npm,pnpm,go}`,按生态分卷。这里只是把各包管理器
+      # 指过去,不做任何下载/安装动作——真正的装依赖仍在下面「Install dependencies」
+      # 和「Tests」两步,变量通过 $GITHUB_ENV 传递,对本 job 剩余步骤全程生效。
+      #
+      # canary ring(与「Install dependencies」同一批、同一条件,promotion 路径也
+      # 相同):先只对 `inputs.tier == 'personal'` 生效;观察约一周无异常后放宽到
+      # internal(`inputs.tier != 'saas'`),再一周后全量删除这个 if —— 每次放宽都
+      # 要同步更新 tests/test_gate_contract.py 里钉住该条件的断言。
+      #
+      # 优雅降级是硬要求:如果 run-ephemeral-runner.sh 还没滚动升级到挂了这个卷的
+      # release(旧镜像)、或者这条 gate.yml 跑在还没走到这批 canary 的仓库上,这四
+      # 个目录在容器里可能根本不存在。已用真实 uv/npm/pnpm 二进制验证:三者对不存在
+      # 的多级缓存目录都会自己 mkdir -p 后正常工作,不会因为目录缺失而报错——所以
+      # 这里不需要、也不应该在 gate.yml 里额外判断目录是否存在,直接指过去即可,最坏
+      # 情况只是把它当一次性空目录冷装,不产生新的失败模式。Go 的 GOMODCACHE 目前
+      # 没有对应的真实预装动作(见下面 Install dependencies 里 go-skipped 分支的
+      # 调研结论:唯一注册的 Go 仓测试跑在隔离 docker 容器里,host 侧变量到不了那个
+      # 容器),这里仍然设置它是为了 D3「三个生态一并补齐接口」和未来该仓改造后可以
+      # 直接受益,现在设置了但暂时没有真实效果,不是 bug。
+      - name: Point package manager caches at the VM201 local cache volume (self, personal canary)
+        if: ${{ inputs.runner == 'self' && inputs.tier == 'personal' }}
+        run: |
+          cache_root=/opt/gate-hub-cache
+          echo "UV_CACHE_DIR=$cache_root/uv" >> "$GITHUB_ENV"
+          echo "npm_config_cache=$cache_root/npm" >> "$GITHUB_ENV"
+          echo "pnpm_config_store_dir=$cache_root/pnpm" >> "$GITHUB_ENV"
+          echo "GOMODCACHE=$cache_root/go" >> "$GITHUB_ENV"
 
       # ── D5:装依赖拆分计时(ci-cache-strategy.md「阶段 A:先建立基线」,度量前置
       # 于缓存本身 —— docs/designs/ci-cache-strategy.md)────────────────────────
@@ -202,8 +243,15 @@ jobs:
 
       # 保存前收缩缓存体积:去掉已装好后不再需要的构建产物(uv 官方 CI 建议)。
       # 只在 Tests 成功后执行;真正的缓存上传由 actions/cache 的 post 步骤完成。
+      #
+      # 2026-07-17:限定 `runner == 'hosted'`。这一步存在的唯一理由是给 actions/cache
+      # 的 post-save 减重(省云端上传字节和时间);`self` 仓改走 VM201 本机卷后,
+      # 「保存」就是这个卷本身持续累积、供下一个 Job 复用——如果继续无条件 prune,
+      # 会在每个 Job 结束后主动清空刚刚可能帮到下一个 Job 的内容,和「本机卷本机
+      # 复用」的整个目的反着来。self 仓这一步直接跳过,累积量的容量/TTL 治理见
+      # docs/designs/ci-cache-strategy.md D6(GC 接入是独立待办,见该文档补充说明)。
       - name: Prune uv cache before persistence
-        if: ${{ hashFiles('uv.lock') != '' }}
+        if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         run: uv cache prune --ci || true
 
       - name: Codex review gate
