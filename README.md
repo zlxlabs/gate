@@ -74,3 +74,11 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
   验证未合并的改动，临时把分支 ref 加进 runner group 白名单，或先用 `runner: hosted`
   验证四项门禁，codex 步骤合并后再看。
 - 本仓 PR 会自动跑契约测试（hosted，免费）。
+- **L1 本机缓存卷的 env 切换（`runner == 'self' && tier == 'personal'`）依赖私有
+  `zlxlabs/gate-hub` 仓 `run-ephemeral-runner.sh` 挂载的
+  `/opt/gate-hub-cache/{uv,npm,pnpm,go}`（`docs/designs/ci-cache-strategy.md` §0
+  D2）。两边可以独立合并、独立部署，顺序不影响正确性：这里只是把 env 指过去，
+  uv/npm/pnpm 对不存在的目录会自己 `mkdir -p` 后正常工作（已实测），旧版
+  runner 镜像上只是没有加速，不会失败。建议顺序仍是先合 gate-hub 的挂载 →
+  VM201 逐槽滚动上线新 release → 再合本仓这半，方便对照“挂载生效前/后”的
+  命中率差异，细节见两个配套 PR 描述。

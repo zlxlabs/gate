@@ -164,6 +164,62 @@ def test_install_dependencies_runs_before_tests_and_never_blocks_the_job():
     assert "inputs.tier == 'personal'" in str(install.get("if", ""))
 
 
+def test_uv_actions_cache_is_hosted_only():
+    # ci-cache-strategy.md §0 D2: `runner: self` 仓改走 run-ephemeral-runner.sh
+    # 挂载的 VM201 本机卷,不再靠 actions/cache 云端回传(重依赖仓库缓存体积可达
+    # GB 级,回传本身比冷装还慢)。这两步只应该在 `runner == 'hosted'` 时跑;误删
+    # 这个条件会让 self 仓悄悄退回云端回传路径,故意钉死。
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    restore = next(s for s in steps if s.get("name") == "Restore uv download cache")
+    prune = next(s for s in steps if s.get("name") == "Prune uv cache before persistence")
+    assert "inputs.runner == 'hosted'" in str(restore.get("if", ""))
+    assert "inputs.runner == 'hosted'" in str(prune.get("if", ""))
+
+
+def test_self_runner_points_package_managers_at_the_local_cache_volume():
+    # ci-cache-strategy.md §0 D2: self 仓的包管理器缓存指向
+    # run-ephemeral-runner.sh(私有 gate-hub 仓)挂载的本机读写卷,按生态分卷。
+    # canary ring 第 1 批,和 Install dependencies 同一条件、同一批次。
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    step_name = "Point package manager caches at the VM201 local cache volume (self, personal canary)"
+    cache_index = names.index(step_name)
+    assert cache_index > names.index("Restore uv download cache")
+    assert cache_index < names.index("Install dependencies")
+    assert cache_index < names.index("Tests")
+
+    cache_step = steps[cache_index]
+    cond = str(cache_step.get("if", ""))
+    assert "inputs.runner == 'self'" in cond
+    # canary ring: 先只对 personal 生效,promotion 时(→ internal → 全量)由后续
+    # PR 修改并同步更新这条断言 —— 故意钉死,防止条件被顺手删掉而绕过灰度纪律。
+    assert "inputs.tier == 'personal'" in cond
+
+    run = cache_step["run"]
+    assert "cache_root=/opt/gate-hub-cache" in run
+    assert 'UV_CACHE_DIR=$cache_root/uv' in run
+    assert 'npm_config_cache=$cache_root/npm' in run
+    assert 'pnpm_config_store_dir=$cache_root/pnpm' in run
+    assert 'GOMODCACHE=$cache_root/go' in run
+    assert run.count("GITHUB_ENV") == 4
+
+
+def test_self_runner_cache_env_switch_does_not_apply_to_internal_or_saas_yet():
+    # canary ring: internal/saas 仓暂时没有这个 env 切换(D8 上线顺序:
+    # personal → internal → saas)。这条断言不解析表达式真值,只保证条件字符串
+    # 里出现的是 tier == 'personal' 而不是更宽松的写法,防止有人不小心把灰度
+    # 范围放宽了却没有走 promotion 的 PR 流程。
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    step_name = "Point package manager caches at the VM201 local cache volume (self, personal canary)"
+    cache_step = next(s for s in steps if s.get("name") == step_name)
+    cond = str(cache_step.get("if", ""))
+    assert "inputs.tier != 'saas'" not in cond
+    assert cond.count("inputs.tier ==") == 1
+
+
 def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     raw, _ = _load()
     assert raw["permissions"]["actions"] == "read"
