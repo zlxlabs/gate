@@ -143,8 +143,18 @@ jobs:
       # 这样即使某仓库的真实安装发生在别处(Makefile cd 到子目录、或者整个测试
       # 跑在另一个 Docker 容器里,预装够不到那个环境),预装失败也不会误伤本来
       # 会通过的 PR,只是白跑一次、看不到加速 —— 不是新的失败模式。
+      #
+      # ⚠ canary ring(临时条件,2026-07-17 起):门禁自身的一切变更按 tier 分批
+      # 生效(personal → internal → saas,组织纪律,规矩本身正在另一 PR 成文)。
+      # 下面 `if: inputs.tier == 'personal'` 是第 1 批灰度;观察约一周无异常后,
+      # 由后续 PR 放宽到 internal(条件改成 `inputs.tier != 'saas'`),再一周后
+      # 全量(直接删掉这个 if,并同步更新 tests/test_gate_contract.py 里钉住该
+      # 条件的断言)。tier != personal 时本步骤整体不跑,install-result.json
+      # *不存在*(不是 skipped JSON)—— build_ledger.py 对缺文件容错为
+      # install: null,ledger 及其消费者不受影响(有测试钉死)。
       - name: Install dependencies
         id: install
+        if: ${{ inputs.tier == 'personal' }}
         continue-on-error: true
         env:
           UV_CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}

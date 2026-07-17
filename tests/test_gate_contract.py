@@ -157,6 +157,11 @@ def test_install_dependencies_runs_before_tests_and_never_blocks_the_job():
     # Go 调研结论:先不拆(见步骤内注释),但仍需识别 go.sum 并显式记录跳过原因,
     # 不能悄悄什么都不做。
     assert "go.sum" in install["run"]
+    # canary ring 第 1 批(2026-07-17 起,临时):门禁自身变更按 tier 分批生效,
+    # 本步骤先只对 personal 生效。promotion 时(→ internal → 全量)由后续 PR
+    # 修改/删除 gate.yml 的 if 条件,并同步更新这条断言 —— 故意钉死,防止条件
+    # 被顺手删掉而绕过灰度纪律。
+    assert "inputs.tier == 'personal'" in str(install.get("if", ""))
 
 
 def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():

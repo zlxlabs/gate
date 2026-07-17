@@ -5,8 +5,9 @@ inputs:
   preflight-path: { required: true }
   # D5(ci-cache-strategy.md 阶段 A):Install dependencies 步骤写的 JSON —
   # { ecosystem, status, duration_s, cache_hit }。required: true 与另外两个
-  # path 输入保持同一风格;gate.yml 的 Install 步骤总会写这个文件(即便是
-  # skipped/go-skipped 也写一份),不需要条件判断。ledger.jsonl 里新增的
+  # path 输入保持同一风格,但文件*允许不存在*:canary ring 期间 tier != personal
+  # 的 run 里 Install 步骤整体不跑,不会写这个文件 —— build_ledger.py 对缺文件
+  # 容错为 install: null(有测试钉死),不报错。ledger.jsonl 里新增的
   # "install" 字段对历史条目(没有这个 key)和现有消费者(gate-hub 的
   # scripts/review-ledger-report.py,按 key 取值、不会因未知/缺失字段报错)
   # 都是纯新增、向后兼容。
