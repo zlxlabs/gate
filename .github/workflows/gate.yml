@@ -19,6 +19,7 @@ on:
       has_ui:     { type: boolean, default: false }
       design_doc: { type: string,  default: "" }          # e.g. docs/DESIGN.md
       max_diff_lines:    { type: number, default: 4000 }   # per-Codex-turn diff budget
+      timeout_minutes:   { type: number, default: 45 }     # gate job 硬超时；巨型 PR 的分片审查可由 caller 临时调高
       max_review_shards: { type: number, default: 8 }      # total large-PR coverage budget
       pr_size_warn_lines: { type: number, default: 8000 }  # strong warning; hard cap derives from the two inputs above
     secrets:
@@ -52,7 +53,7 @@ jobs:
   gate:
     # cold/hot split: self-hosted for hot repos, GitHub-hosted (free) for cold ones / pilots.
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - uses: actions/checkout@v4
         # Tests need the current workspace, while PR measurement/review need only

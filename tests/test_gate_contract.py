@@ -99,7 +99,9 @@ def test_codex_review_exports_machine_readable_audit_artifact():
     assert inputs["max_review_shards"]["default"] == 8
 
     job = raw["jobs"]["gate"]
-    assert job["timeout-minutes"] == 45
+    # timeout 已参数化：契约锁定"引用 timeout_minutes 输入且默认值为 45"
+    assert job["timeout-minutes"] == "${{ inputs.timeout_minutes }}"
+    assert inputs["timeout_minutes"]["default"] == 45
     codex = next(step for step in job["steps"] if step.get("name") == "Codex review gate")
     assert "CODEX_REVIEW_RESULT_PATH" in codex["env"]
     assert "MAX_DIFF_LINES" in codex["env"]
