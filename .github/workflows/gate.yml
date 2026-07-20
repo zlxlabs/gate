@@ -1,5 +1,5 @@
 # Reusable gate — the single source of truth for pre-merge CI across all repos
-# (lint / jscpd 查重 / dependency-cruiser / tests / Codex review)。
+# (lint / jscpd 查重 / dependency-cruiser / tests / agent review)。
 # 每个 repo 用 ~10 行 caller 调用它(模板在私有 gate-hub 仓 templates/caller-ci.yml),
 # 这里改一次 → 所有仓库立刻生效(caller 引用 @main,故意不钉 SHA)。
 #
@@ -255,9 +255,11 @@ jobs:
         if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         run: uv cache prune --ci || true
 
-      - name: Codex review gate
-        # codex 订阅认证只挂在 self-hosted runner 上;fork PR 已被 runs-on 降级到
-        # hosted,这里再拦一层避免条件漂移时误跑(脚本在 hosted 上也不存在)。
+      - name: Agent review gate
+        # 多 agent review(chain/shadow 由 gate-hub registry.yaml 的 review_policy 决定,
+        # 2026-07-20 起主审为 claude-glm、codex-sub 兜底);认证只挂在 self-hosted runner
+        # 上;fork PR 已被 runs-on 降级到 hosted,这里再拦一层避免条件漂移时误跑
+        # (脚本在 hosted 上也不存在)。
         if: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}
         env:
           DESIGN_DOC: ${{ inputs.design_doc }}
