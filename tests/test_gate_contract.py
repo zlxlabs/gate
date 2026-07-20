@@ -60,13 +60,14 @@ def test_fork_guard_on_every_self_hosted_runs_on():
 
 
 def test_codex_step_gated_on_same_repo_head():
-    # codex 步骤除 runs-on 路由外还要自带同条件,防两处条件漂移时在 hosted 上误跑。
+    # review 步骤(2026-07-20 改名 Agent review gate)除 runs-on 路由外还要自带同条件,
+    # 防两处条件漂移时在 hosted 上误跑。
     raw, _ = _load()
     codex_steps = [
         s for s in raw["jobs"]["gate"]["steps"]
-        if s.get("name") == "Codex review gate"
+        if s.get("name") == "Agent review gate"
     ]
-    assert len(codex_steps) == 1, "gate job 应恰好有一个 Codex review 步骤"
+    assert len(codex_steps) == 1, "gate job 应恰好有一个 agent review 步骤"
     cond = str(codex_steps[0].get("if", ""))
     assert "inputs.runner == 'self'" in cond
     assert FORK_GUARD in cond, "codex 步骤丢了 fork 防护"
@@ -102,7 +103,7 @@ def test_codex_review_exports_machine_readable_audit_artifact():
     # timeout 已参数化：契约锁定"引用 timeout_minutes 输入且默认值为 45"
     assert job["timeout-minutes"] == "${{ inputs.timeout_minutes }}"
     assert inputs["timeout_minutes"]["default"] == 45
-    codex = next(step for step in job["steps"] if step.get("name") == "Codex review gate")
+    codex = next(step for step in job["steps"] if step.get("name") == "Agent review gate")
     assert "CODEX_REVIEW_RESULT_PATH" in codex["env"]
     assert "MAX_DIFF_LINES" in codex["env"]
     assert "MAX_REVIEW_SHARDS" in codex["env"]
