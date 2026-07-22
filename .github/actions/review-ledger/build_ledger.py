@@ -131,6 +131,8 @@ def _compact_attempts(audit: dict[str, Any] | None) -> list[dict[str, Any]]:
             "reason": item.get("reason") or "",
             "duration_s": item.get("duration_s"),
             "cost_usd": item.get("cost_usd"),
+            # Optional short redacted adapter diagnostic (e.g. "api_error_status=529 …访问量过大").
+            "diag_snippet": item.get("diag_snippet"),
         })
     return compact
 
