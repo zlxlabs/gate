@@ -99,15 +99,40 @@ def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any])
             f"; stable/missing/appeared = {len(comparison['persistent_finding_ids'])}/"
             f"{len(comparison['missing_finding_ids'])}/{len(comparison['appeared_finding_ids'])}"
         )
+    reviewer = review.get("reviewer") or "none"
+    failover = bool(review.get("failover"))
+    reviewer_line = f"{reviewer}" + (" (failover)" if failover else "")
     return (
         f"{STATE_MARKER}\n\n### 📒 Review ledger state\n\n"
         f"- Commit: `{current['head_sha']}`\n"
         f"- Round: **{current['review_round']}**\n"
         f"- Status / findings: **{review['status']} / {review['finding_count']}**\n"
+        f"- Reviewer: **{reviewer_line}**\n"
         f"- Comparison: `{comparison_line}`\n\n"
         "完整数据保存在 `codex-review-ledger` artifact；此 sticky comment 仅保存跨 rerun 的连续游标。\n\n"
         f"<!-- codex-review-ledger-state:v1:{encoded} -->\n"
     )
+
+
+def _compact_attempts(audit: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Keep a stable, ledger-friendly hop summary (no tokens blobs)."""
+    if not audit:
+        return []
+    raw = audit.get("attempts") or []
+    if not isinstance(raw, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        compact.append({
+            "reviewer": item.get("reviewer"),
+            "exit_code": item.get("exit_code"),
+            "reason": item.get("reason") or "",
+            "duration_s": item.get("duration_s"),
+            "cost_usd": item.get("cost_usd"),
+        })
+    return compact
 
 
 def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[str, Any]:
@@ -121,9 +146,16 @@ def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[
             "category_counts": {},
             "coverage": None,
             "runtime": None,
+            # P0 observability: who adjudicated + hop path (additive; old readers ignore).
+            "reviewer": None,
+            "attempts": [],
+            "failover": False,
         }
     result = audit.get("result") or {}
     findings = result.get("findings") or []
+    attempts = _compact_attempts(audit)
+    # Failover = more than one hop was tried (a discarded hop precedes the adopted one).
+    failover = len(attempts) > 1
     return {
         "status": audit.get("status", "unknown"),
         "verdict": result.get("verdict"),
@@ -133,6 +165,9 @@ def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[
         "category_counts": dict(sorted(Counter(finding.get("category", "unknown") for finding in findings).items())),
         "coverage": audit.get("coverage"),
         "runtime": audit.get("runtime"),
+        "reviewer": audit.get("reviewer"),
+        "attempts": attempts,
+        "failover": failover,
     }
 
 
@@ -305,13 +340,26 @@ def _append_summary(entry: dict[str, Any], path: str) -> None:
     review = entry["review"]
     comparison = entry["comparison"]
     with open(path, "a", encoding="utf-8") as summary:
+        reviewer = review.get("reviewer") or "none"
+        failover = "yes" if review.get("failover") else "no"
         summary.write(
             "### Review effectiveness ledger\n\n"
             f"- Round: {entry['review_round']} (`{comparison['kind']}`)\n"
             f"- Review status: `{review['status']}`\n"
+            f"- Reviewer: `{reviewer}` (failover={failover})\n"
             f"- Findings: {review['finding_count']}\n"
             f"- False positives recorded: {entry['false_positive_count']}\n"
         )
+        attempts = review.get("attempts") or []
+        if attempts:
+            chain = " -> ".join(
+                f"{a.get('reviewer')}(exit {a.get('exit_code')}"
+                + (f", {a.get('reason')}" if a.get("reason") else "")
+                + (f", {a.get('duration_s')}s" if isinstance(a.get("duration_s"), int) else "")
+                + ")"
+                for a in attempts
+            )
+            summary.write(f"- Chain: `{chain}`\n")
         if comparison["kind"] == "new_head":
             summary.write(
                 f"- Persistent / resolved / new: {len(comparison['persistent_finding_ids'])} / "
