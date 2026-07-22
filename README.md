@@ -41,12 +41,18 @@ checkout 后、lint/test/Codex 前会先按与 Codex 相同的完整 binary diff
 - 超过强警告线、但仍在 `max_diff_lines × max_review_shards`（默认 32,000）内：继续完整分片 review，同时给出强警告。
 - 超过完整覆盖预算：预检直接失败，要求 small PR / stacked PR；不会消耗 Codex 后再说审不完。
 
-每次 run（包括测试失败、体积拦截、Codex waiver 和 Codex unavailable）都会尽力生成
+每次 run（包括测试失败、体积拦截、review waiver 和 review unavailable）都会尽力生成
 `codex-review-ledger` artifact，保留 90 天。最新 artifact 的 `ledger.jsonl` 会累计近期历史，
 并记录每轮耗时、覆盖、finding 数量和 ID，以及同一 PR 相邻两轮的持续/消失/新增项。
+账本还写入 **adopted `review.reviewer`**、**`review.failover`**，以及精简
+**`review.attempts[]`**（`exit_code` / `reason` / `duration_s` / `cost_usd` /
+`diag_snippet`），用于跨仓统计 chain failover（例如 claude-glm HTTP 529 过载 vs 429 额度）。
+完整 hop 细节以 runner 上传的 `codex-review-result.json` 为准；字段说明见私有
+`gate-hub` 的 `docs/review-effectiveness.md`。
 同一 SHA 重跑会单独标为稳定性比较，不会把模型本身的波动误算成代码修复。
 GitHub 在点击 Re-run 时会删除同一 run 的旧 artifact，因此每个 PR 另有一条由
-`github-actions[bot]` 维护的精简 sticky state comment，作为跨 rerun 游标；完整数据仍只在 artifact。
+`github-actions[bot]` 维护的精简 sticky state comment（含 Reviewer / failover 提示），
+作为跨 rerun 游标；完整数据仍只在 artifact。
 
 确认误报或人工处置时，在 PR 评论中使用一行机器可读记录：
 
