@@ -180,3 +180,96 @@ def test_bot_sticky_state_survives_reruns_but_user_spoof_is_ignored():
     assert restored == [entry]
     assert "Review ledger state" in body
     assert "same" in body
+
+
+def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():
+    """P0: ledger review block must carry who ran, hop path, and whether failover happened."""
+    module = _module()
+    audit = _audit("sha", [])
+    audit["reviewer"] = "codex-sub"
+    audit["attempts"] = [
+        {
+            "reviewer": "claude-glm",
+            "exit_code": 20,
+            "reason": "Claude 额度或限流暂不可用",
+            "cost_usd": 0,
+            "tokens": None,
+            "duration_s": 175,
+        },
+        {
+            "reviewer": "codex-sub",
+            "exit_code": 0,
+            "reason": "",
+            "cost_usd": None,
+            "tokens": None,
+            "duration_s": 42,
+        },
+    ]
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    review = entry["review"]
+    assert review["reviewer"] == "codex-sub"
+    assert review["failover"] is True
+    assert review["attempts"] == [
+        {
+            "reviewer": "claude-glm",
+            "exit_code": 20,
+            "reason": "Claude 额度或限流暂不可用",
+            "duration_s": 175,
+            "cost_usd": 0,
+        },
+        {
+            "reviewer": "codex-sub",
+            "exit_code": 0,
+            "reason": "",
+            "duration_s": 42,
+            "cost_usd": None,
+        },
+    ]
+
+
+def test_review_summary_no_failover_when_single_successful_hop():
+    module = _module()
+    audit = _audit("sha", [])
+    audit["reviewer"] = "claude-glm"
+    audit["attempts"] = [
+        {"reviewer": "claude-glm", "exit_code": 0, "reason": "", "duration_s": 12, "cost_usd": 0.9},
+    ]
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    assert entry["review"]["reviewer"] == "claude-glm"
+    assert entry["review"]["failover"] is False
+    assert len(entry["review"]["attempts"]) == 1
+
+
+def test_review_summary_defaults_when_audit_missing():
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=None, prior_entries=[], dispositions={},
+        fallback_status="not_run",
+    )
+    assert entry["review"]["reviewer"] is None
+    assert entry["review"]["failover"] is False
+    assert entry["review"]["attempts"] == []
+
+
+def test_state_comment_and_summary_mention_reviewer_on_failover():
+    module = _module()
+    audit = _audit("sha", [])
+    audit["reviewer"] = "codex-sub"
+    audit["attempts"] = [
+        {"reviewer": "claude-glm", "exit_code": 20, "reason": "限流", "duration_s": 1},
+        {"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2},
+    ]
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    body = module.render_state_comment([entry], entry)
+    assert "codex-sub" in body
+    assert "failover" in body.lower() or "切换" in body
