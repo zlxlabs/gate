@@ -191,10 +191,11 @@ def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():
         {
             "reviewer": "claude-glm",
             "exit_code": 20,
-            "reason": "Claude 额度或限流暂不可用",
+            "reason": "Claude 模型服务过载（529）",
             "cost_usd": 0,
             "tokens": None,
             "duration_s": 175,
+            "diag_snippet": "api_error_status=529 该模型当前访问量过大，请您稍后再试",
         },
         {
             "reviewer": "codex-sub",
@@ -203,6 +204,7 @@ def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():
             "cost_usd": None,
             "tokens": None,
             "duration_s": 42,
+            "diag_snippet": None,
         },
     ]
     entry = module.build_entry(
@@ -216,9 +218,10 @@ def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():
         {
             "reviewer": "claude-glm",
             "exit_code": 20,
-            "reason": "Claude 额度或限流暂不可用",
+            "reason": "Claude 模型服务过载（529）",
             "duration_s": 175,
             "cost_usd": 0,
+            "diag_snippet": "api_error_status=529 该模型当前访问量过大，请您稍后再试",
         },
         {
             "reviewer": "codex-sub",
@@ -226,6 +229,7 @@ def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():
             "reason": "",
             "duration_s": 42,
             "cost_usd": None,
+            "diag_snippet": None,
         },
     ]
 
