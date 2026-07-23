@@ -263,6 +263,7 @@ jobs:
         if: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}
         env:
           DESIGN_DOC: ${{ inputs.design_doc }}
+          GATE_TIER: ${{ inputs.tier }}
           MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
           MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
           CODEX_REVIEW_RESULT_PATH: ${{ runner.temp }}/codex-review-result.json

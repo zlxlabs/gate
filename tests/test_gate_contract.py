@@ -107,6 +107,7 @@ def test_codex_review_exports_machine_readable_audit_artifact():
     assert "CODEX_REVIEW_RESULT_PATH" in codex["env"]
     assert "MAX_DIFF_LINES" in codex["env"]
     assert "MAX_REVIEW_SHARDS" in codex["env"]
+    assert codex["env"]["GATE_TIER"] == "${{ inputs.tier }}"
 
     upload = next(step for step in job["steps"] if step.get("name") == "Upload Codex review audit")
     assert upload["if"] == "always()"
