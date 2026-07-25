@@ -145,36 +145,95 @@ def test_resolve_has_no_checkout_step():
 
 
 # ── resolve -> shadow matrix data flow, including the empty-list boundary ──────
+#
+# P1 fix (2026-07-26, codex review of an earlier draft of this workflow): GitHub Actions
+# hard-errors ("Matrix vector does not contain any values") the instant a
+# `strategy.matrix` dimension evaluates to an empty array `[]` — it does NOT degrade to a
+# clean zero-job-runs skip the way a job-level `if:` false does. The fix is a sentinel
+# value (`__none__`, never a legal reviewer identifier) `resolve` substitutes for an empty
+# shadow list, plus a separate plain-boolean `has_shadows` output the `shadow`/`summary`
+# jobs actually gate their own `if:` on — the tests below replace the old (buggy) `|| '[]'`
+# fallback assertions with sentinel-aware ones.
 
-def test_resolve_outputs_shadow_reviewers_from_resolve_policy_step():
+def test_resolve_outputs_shadow_reviewers_and_has_shadows_from_resolve_policy_step():
     raw, _ = _load_workflow()
     resolve_job = raw["jobs"]["resolve"]
     assert resolve_job["outputs"]["shadow_reviewers"] == "${{ steps.resolve-policy.outputs.shadow_reviewers }}"
+    assert resolve_job["outputs"]["has_shadows"] == "${{ steps.resolve-policy.outputs.has_shadows }}"
     steps = resolve_job["steps"]
     step = next(s for s in steps if s.get("id") == "resolve-policy")
     assert "resolve_policy.py" in step["run"]
-    assert 'echo "shadow_reviewers=$shadow_reviewers" >> "$GITHUB_OUTPUT"' in step["run"]
-    # Fail-closed: no continue-on-error anywhere on this step — a PolicyError must fail
-    # the `resolve` job outright, never silently degrade to an empty shadow list.
+    assert "shadow_reviewers={json.dumps(reviewers)}" in step["run"]
+    assert "has_shadows={str(has_shadows).lower()}" in step["run"]
+    # Fail-closed: no continue-on-error anywhere on this step — a PolicyError (or an
+    # unsafe reviewer name — see the next test) must fail the `resolve` job outright,
+    # never silently degrade to an empty shadow list.
     assert "continue-on-error" not in step
 
 
-def test_shadow_matrix_uses_fallback_to_empty_array_not_raw_needs_output():
+def test_resolve_policy_step_validates_every_reviewer_name_against_safe_identifier_regex():
+    # P2 fix (2026-07-26, codex review): the reviewer names resolve_policy.py returns
+    # cross from gate-hub's trusted-config domain into THIS workflow's own shell/jq/
+    # artifact-name interpolation sites — re-validated here against the SAME
+    # safe-identifier shape gate-hub's resolve_policy.py/review-shadow already enforce,
+    # fail-closed on any violation, before any name reaches those sites.
+    raw, _ = _load_workflow()
+    step = next(s for s in raw["jobs"]["resolve"]["steps"] if s.get("id") == "resolve-policy")
+    run = step["run"]
+    assert 'SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")' in run
+    assert "SAFE_NAME_RE.match(name)" in run
+    assert "sys.exit(1)" in run
+
+
+def test_resolve_policy_step_uses_reserved_sentinel_for_empty_shadow_list():
+    raw, _ = _load_workflow()
+    step = next(s for s in raw["jobs"]["resolve"]["steps"] if s.get("id") == "resolve-policy")
+    run = step["run"]
+    assert 'SENTINEL = "__none__"' in run
+    assert "reviewers = shadow if has_shadows else [SENTINEL]" in run
+
+
+def test_shadow_matrix_fallback_is_sentinel_array_never_empty_array():
     # The safety net for "resolve was skipped -> needs.resolve.outputs.shadow_reviewers
-    # is an empty string" MUST be the `|| '[]'` fallback inside fromJSON, not solely the
-    # job-level `if:` (GitHub Actions' precise evaluation order between a job's `if:` and
-    # its own `strategy.matrix` expression is not something this suite treats as safe to
-    # assume) — assert the fallback literal is actually present.
+    # is an empty string" MUST be a NON-EMPTY-array fallback inside fromJSON (an empty
+    # `[]` fallback is the exact P1 bug — GitHub Actions errors on an empty matrix
+    # dimension regardless of why it's empty), and must not rely on any assumption about
+    # whether a job's `if:` is evaluated before its own `strategy.matrix` expression.
     raw, _ = _load_workflow()
     matrix_expr = str(raw["jobs"]["shadow"]["strategy"]["matrix"]["reviewer"])
-    assert "fromJSON(needs.resolve.outputs.shadow_reviewers || '[]')" in matrix_expr
+    assert "fromJSON(needs.resolve.outputs.shadow_reviewers || '[\"__none__\"]')" in matrix_expr
+    assert "|| '[]'" not in matrix_expr
 
 
-def test_shadow_job_needs_resolve_and_gates_on_its_result():
+def test_shadow_job_needs_resolve_and_gates_on_has_shadows():
     raw, _ = _load_workflow()
     shadow_job = raw["jobs"]["shadow"]
     assert shadow_job["needs"] == "resolve"
-    assert str(shadow_job.get("if", "")) == "needs.resolve.result == 'success'"
+    assert str(shadow_job.get("if", "")) == "needs.resolve.result == 'success' && needs.resolve.outputs.has_shadows == 'true'"
+
+
+def test_shadow_job_steps_each_carry_the_sentinel_guard():
+    # Innermost defense-in-depth layer (see the `shadow` job's own `if:` comment): even a
+    # hypothetical sentinel leg that somehow still started does nothing at all.
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["shadow"]["steps"]
+    guarded_step_names = {
+        "actions/checkout@v4",
+        "Resolve numeric job id for REVIEW_JOB_ID",
+        "Run review-shadow",
+    }
+    seen = set()
+    for step in steps:
+        label = step.get("name") or step.get("uses")
+        if label in guarded_step_names:
+            seen.add(label)
+            assert str(step.get("if", "")) == "matrix.reviewer != '__none__'", (
+                f"step {label!r} must carry the sentinel guard verbatim, got {step.get('if')!r}"
+            )
+    assert seen == guarded_step_names
+
+    upload = next(s for s in steps if s.get("name") == "Upload shadow calibration event")
+    assert str(upload.get("if", "")) == "always() && matrix.reviewer != '__none__'"
 
 
 # ── shadow matrix job: fail-fast/max-parallel/timeout/artifact naming ──────────
@@ -206,7 +265,7 @@ def test_shadow_upload_step_name_pattern_matches_summary_download_pattern():
     raw, _ = _load_workflow()
     shadow_steps = raw["jobs"]["shadow"]["steps"]
     upload = next(s for s in shadow_steps if s.get("name") == "Upload shadow calibration event")
-    assert upload["if"] == "always()"
+    assert upload["if"] == "always() && matrix.reviewer != '__none__'"
     assert upload["uses"] == "actions/upload-artifact@v4"
     upload_name = str(upload["with"]["name"])
     assert upload_name == "shadow-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -226,14 +285,20 @@ def test_shadow_upload_step_name_pattern_matches_summary_download_pattern():
 def test_shadow_job_id_resolution_accounts_for_matrix_leg_naming():
     # Extends gate-v2.yml's own (non-matrix) "Resolve numeric job id" step: a matrix
     # leg's Jobs-API `name` is rendered as "<job id> (<matrix value>)", optionally
-    # prefixed by the calling job's own name — assert the jq selector accounts for the
-    # `(${{ matrix.reviewer }})` suffix gate-v2.yml's own copy never needed.
+    # prefixed by the calling job's own name — assert the jq selector accounts for this
+    # suffix. `matrix.reviewer` is routed through the `REVIEWER` env var and exported as
+    # `JOB_NAME_SUFFIX` for jq's own `env.JOB_NAME_SUFFIX` builtin to read (P2 hygiene
+    # fix, 2026-07-26 codex review) rather than interpolated directly into the jq filter
+    # source string.
     raw, _ = _load_workflow()
     steps = raw["jobs"]["shadow"]["steps"]
     step = next(s for s in steps if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID")
+    assert step["env"]["REVIEWER"] == "${{ matrix.reviewer }}"
     run = step["run"]
-    assert '.name == "${{ github.job }} (${{ matrix.reviewer }})"' in run
-    assert 'endswith("/ ${{ github.job }} (${{ matrix.reviewer }})")' in run
+    assert 'export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
+    assert ".name == env.JOB_NAME_SUFFIX" in run
+    assert 'endswith("/ " + env.JOB_NAME_SUFFIX)' in run
+    assert "${{ matrix.reviewer }}" not in run
 
 
 def test_run_review_shadow_env_has_required_v2_identity_vars():
@@ -244,9 +309,13 @@ def test_run_review_shadow_env_has_required_v2_identity_vars():
     assert env["REVIEW_JOB_ID"] == "${{ steps.resolve-job-id.outputs.job_id }}"
     assert env["REVIEW_CALLER_SHA"] == "${{ github.workflow_sha }}"
     assert env["REVIEW_REUSABLE_WORKFLOW_SHA"] == "${{ job.workflow_sha }}"
+    # P2 hygiene fix (2026-07-26 codex review): matrix.reviewer routed through env:,
+    # referenced in the run: script as "$REVIEWER", never interpolated directly.
+    assert env["REVIEWER"] == "${{ matrix.reviewer }}"
     assert "review-shadow" in run_step["run"]
     assert '"${{ github.event.pull_request.number }}"' in run_step["run"]
-    assert '"${{ matrix.reviewer }}"' in run_step["run"]
+    assert '"$REVIEWER"' in run_step["run"]
+    assert "${{ matrix.reviewer }}" not in run_step["run"]
     # REVIEW_GATE_TIMEOUT_S deliberately NOT overridden — review-shadow's own default
     # (780s) already matches the plan's stated shadow budget.
     assert "REVIEW_GATE_TIMEOUT_S" not in env
@@ -260,18 +329,17 @@ def test_summary_job_needs_resolve_and_shadow():
     assert set(needs if isinstance(needs, list) else [needs]) == {"resolve", "shadow"}
 
 
-def test_summary_if_contains_always_and_explicit_non_empty_guards():
+def test_summary_if_is_always_plus_has_shadows_guard():
     # Tightened, D1-style: `always()` alone is not enough — review-summary itself
     # requires >=1 expected reviewer argv, so this job must ALSO skip cleanly whenever
     # `resolve` produced an empty/absent shadow list (draft/fork/hosted skip, OR a
     # same-repo trusted PR whose resolved policy legitimately has zero shadow
-    # reviewers) — assert `always()` is present AND both explicit guard clauses are
-    # present, rather than accepting a bare `if: always()`.
+    # reviewers). `has_shadows` (same boolean the `shadow` job's own `if:` gates on) is
+    # the single source of truth for both triggers — assert the full string, not just
+    # substring presence, since this is the exact expression GitHub Actions evaluates.
     raw, _ = _load_workflow()
     summary_if = str(raw["jobs"]["summary"].get("if", ""))
-    assert "always()" in summary_if
-    assert "needs.resolve.outputs.shadow_reviewers != ''" in summary_if
-    assert "needs.resolve.outputs.shadow_reviewers != '[]'" in summary_if
+    assert summary_if == "always() && needs.resolve.outputs.has_shadows == 'true'"
 
 
 def test_summary_runs_on_self_hosted_with_no_fork_guard_ternary():
@@ -309,6 +377,25 @@ def test_no_job_grants_pull_request_or_issue_write():
     raw, _ = _load_workflow()
     for job in raw["jobs"].values():
         assert "permissions" not in job
+
+
+def test_no_run_block_directly_interpolates_matrix_reviewer():
+    # P2 hygiene fix (2026-07-26 codex review): GitHub Actions substitutes `${{ ... }}`
+    # expressions into a `run:` step's script text BEFORE bash/jq ever parses it — direct
+    # interpolation of `${{ matrix.reviewer }}` into a `run:` block is the textbook
+    # GitHub-Actions script-injection pattern. Every use of the reviewer name inside a
+    # `run:` script in this file must go through an `env:`-declared variable instead
+    # (`$REVIEWER` in shell, `env.REVIEWER`/`env.JOB_NAME_SUFFIX` in jq) — scan every
+    # step's `run:` field in this workflow (not `if:`/`with:`, which are GitHub Actions'
+    # own expression contexts, not shell/jq script text, and carry no equivalent risk).
+    raw, _ = _load_workflow()
+    offenders = []
+    for job_id, job in raw["jobs"].items():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if run and "${{ matrix.reviewer }}" in run:
+                offenders.append(f"{job_id}::{step.get('name', step.get('id', '<unnamed>'))}")
+    assert not offenders, f"run: block(s) directly interpolate matrix.reviewer: {offenders!r}"
 
 
 # ── caller template ──────────────────────────────────────────────────────────
