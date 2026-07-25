@@ -1,0 +1,67 @@
+# Shadow Calibration v2 — canary caller template.
+#
+# Dropped into a business repo as .github/workflows/gate-shadow.yml (a SEPARATE file
+# from .github/workflows/gate.yml/templates/caller-gate-v2.yml — see gate-shadow-v2.yml's
+# own top comment and the plan's "Workflow concurrency contract") ONLY for repos
+# explicitly opted into the Shadow Calibration canary (personal canary -> internal ->
+# saas, same ring as Required Gate v2 — see the private gate-hub repo's
+# ceo-plans/2026-07-24-shadow-review-independence.md, "Fleet Rollout and Drift Control").
+#
+# This workflow carries NO required-check-bearing job — its `name:` is deliberately NOT
+# `gate` (contrast with templates/caller-gate-v2.yml, where the literal name/job-id
+# `gate` is load-bearing for the `gate / gate` required-status-check context). A repo
+# adds this template alongside (never instead of) its Required Gate caller.
+name: gate-shadow
+
+on:
+  pull_request:
+    # Same four "real" trigger types as templates/caller-gate-v2.yml's own `on:` block,
+    # PLUS `converted_to_draft` is load-bearing HERE in a way it is only symmetric/
+    # observational for Required Gate: a PR converted back to draft fires a NEW
+    # workflow_call run of gate-shadow-v2.yml whose `resolve` job's draft guard
+    # immediately skips it (clean, zero-job-runs outcome) — and because that new run
+    # shares gate-shadow-v2.yml's OWN concurrency group with `cancel-in-progress: true`,
+    # it simultaneously cancels whatever OLD, still-in-flight shadow calibration run was
+    # active for this PR. That is the entire "转 draft 取消在途" mechanism the plan calls
+    # for — implemented purely as (draft-guard skip) + (shared concurrency group,
+    # cancel-in-progress), with no extra code in gate-shadow-v2.yml itself. Without
+    # `converted_to_draft` in this trigger list, a draft-again PR would never fire a new
+    # run at all, and an old shadow run already in flight would simply be left to finish
+    # on its own instead of being cancelled promptly.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    # Byte-identical to templates/caller-gate-v2.yml's own paths-ignore (see that file's
+    # own comment for the full "纯文档改动跳过门禁" rationale this mirrors verbatim) —
+    # this workflow carries no required status check at all, so the "no branch
+    # protection ever marks this as required" precondition that comment documents is
+    # even less of a concern here than it is for the Required Gate caller.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+# Union of what gate-shadow-v2.yml's jobs need (see that file's own top-level
+# `permissions:` comment) — no `pull-requests`/`issues` scope at all: this workflow never
+# posts a PR comment (review-summary only ever writes $GITHUB_STEP_SUMMARY; posting a
+# calibration PR comment is T6 scope — see gate-shadow-v2.yml's `summary` job comment).
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  gate-shadow:
+    # CANARY PIN: same governance as templates/caller-gate-v2.yml's own `gate` job —
+    # during canary this MUST be an immutable commit SHA, never a moving ref like
+    # `@main`. Replace the placeholder below with the exact reviewed commit SHA of
+    # zlxlabs/gate before onboarding any real repo to this template. This is
+    # deliberately the SAME pin discipline as the Required Gate caller, but the two
+    # callers are free to point at DIFFERENT reviewed SHAs of this repo at different
+    # times — there is no requirement that a repo's gate.yml and gate-shadow.yml stay
+    # pinned to the same commit.
+    uses: zlxlabs/gate/.github/workflows/gate-shadow-v2.yml@__PINNED_GATE_SHA__ # TODO(canary): pin to the reviewed gate-shadow-v2.yml commit SHA
+    with:
+      tier: personal   # personal | internal | saas — should match this repo's gate.yml caller
+      runner: self     # self (self-hosted, runs shadow reviewers) | hosted (no shadow jobs run at all)
+      # Optional overrides: design_doc: docs/DESIGN.md, max_diff_lines: 4000, max_review_shards: 8
+      # — should match this repo's gate.yml caller's own values, so primary and shadow
+      # reviewers are judged against the same diff/coverage budget.
+    # No `secrets:` block: gate-shadow-v2.yml declares none (see that file's own
+    # `workflow_call` comment).

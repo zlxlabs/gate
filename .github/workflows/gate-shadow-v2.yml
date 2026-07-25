@@ -1,0 +1,495 @@
+# Shadow Calibration v2 (reusable workflow) — resolve -> shadow matrix -> summary.
+#
+# D2 (private gate-hub repo's ceo-plans/2026-07-24-shadow-review-independence.md) of the
+# shadow-review independence rollout. Implements ONLY the "Shadow Calibration" state
+# machine from that plan. Required Gate (D1, .github/workflows/gate-v2.yml, ALREADY
+# MERGED and UNTOUCHED by this file) is a SEPARATE workflow with its OWN concurrency
+# group — per the plan's "Workflow concurrency contract":
+#
+#   gate-required-v2-{repository_id}-{pr_number}   (gate-v2.yml, unrelated to this file)
+#   gate-shadow-v2-{repository_id}-{pr_number}      (this workflow, below)
+#
+# The two groups are, and must remain, independent: this workflow can never cancel or
+# block a Required Gate run, and vice versa — Required Gate's dependency graph never
+# references anything in this file, and this file never writes anything Required Gate
+# reads. This file also carries NO required-check-bearing job at all (contrast with
+# gate-v2.yml's `gate` job, which is literally named `gate` to preserve the
+# `gate / gate` required status-check context) — the calibration workflow is
+# intentionally not, and must never become, a merge gate.
+#
+# legacy `.github/workflows/gate.yml` and D1's `.github/workflows/gate-v2.yml` are BOTH
+# unchanged by this file. Reachable only via an explicit per-repo caller opt-in (see
+# templates/caller-gate-shadow-v2.yml) — no existing caller references this file.
+#
+# Job layout (see plan's "Shadow Calibration" state machine):
+#   resolve  — resolves this repo's `review_policy.*.shadow` reviewer list (via
+#              gate-hub's resolve_policy.py, the SAME resolver review-shadow itself uses
+#              internally — this job re-runs it standalone purely to get the list BEFORE
+#              any matrix job can exist, since a matrix must be defined from a prior
+#              job's output). Runs on the SAME self-hosted/hosted-fallback pool
+#              expression as gate-v2.yml's `primary` job (not `quality`'s — deliberately
+#              the primary-shaped 3-guard expression: draft/fork/runner, no
+#              non-pull_request carve-out) — draft PR, fork PR, or `runner: hosted` make
+#              THIS job (and therefore every job below, which all depend on it) skip
+#              outright, so shadow calibration never starts for those cases (plan's Fork
+#              semantics: "Shadow Calibration 不启动 reviewer" for hosted/fork).
+#              Outputs a JSON array string (job output `shadow_reviewers`) that is NEVER
+#              the empty array `[]` — GitHub Actions errors ("Matrix vector does not
+#              contain any values") the instant a `strategy.matrix` dimension evaluates
+#              to an empty array, so when this repo's resolved policy has no shadow
+#              reviewers configured, this job substitutes a single reserved SENTINEL
+#              value (`__none__`, deliberately not a legal reviewer identifier) instead
+#              of an empty list, and separately outputs a plain boolean `has_shadows` the
+#              `shadow`/`summary` jobs below actually gate on — see those jobs' own
+#              comments for the full mechanism.
+#   shadow   — matrix fan-out, one leg per resolved reviewer, each running
+#              `review-shadow <pr> <reviewer>` (gate-hub, already merged) and uploading
+#              its own event file as its own uniquely-named artifact. `fail-fast: false`
+#              (one reviewer's failure/timeout must never cancel another — plan's
+#              explicit "单 reviewer timeout/失败不取消其他 matrix members"). See this
+#              job's own `strategy` comment for the canary-scoped `max-parallel: 1` note.
+#   summary  — `if: always()`, downloads every shadow-event artifact this run produced,
+#              runs `review-summary <dir> <reviewers...>` (gate-hub, already merged) and
+#              appends its markdown rendering to $GITHUB_STEP_SUMMARY. Never posts a PR
+#              comment (see review-summary's own module docstring: PR-comment posting —
+#              one of the plan's "Two Receipts" — is T6 scope, not this file). Runs on
+#              the general self-hosted pool with NO fork-guard ternary of its own: unlike
+#              quality/primary/shadow, this job never checks out or executes the
+#              reviewed PR's own (possibly fork-controlled) code — it only reads
+#              structured, schema-validated JSON artifacts this SAME workflow run already
+#              produced and runs gate-hub's own trusted script over them — so the
+#              fork/self-hosted arbitrary-code-execution concern that motivates the
+#              other jobs' runs-on ternaries does not apply here. Its own failure is
+#              fully isolated to this workflow (plan: "shadow-summary 自身失败也绝不影响
+#              required workflow — 它本来就在另一条 workflow 里，天然隔离").
+#
+# Deliberately NO notify job: the plan is explicit that a single shadow failure/timeout/
+# cancel must NEVER trigger a "required gate failed" notification ("Fork, waiver and
+# notification semantics": "单次 shadow red/timeout/cancel 不发'门禁失败'"). Shadow's
+# own SLO-based alerting (consecutive-window availability/completeness violations) is a
+# separate, not-yet-built pipeline (plan: "Shadow 初始 SLO" — T5/T7 scope), not a
+# per-run GitHub Actions job at all — there is nothing for this file to wire up.
+name: gate-shadow
+
+on:
+  workflow_call:
+    inputs:
+      tier:   { type: string, default: "personal" } # personal | internal | saas
+      runner: { type: string, default: "self" }      # self (self-hosted) | hosted (GitHub-hosted, free minutes)
+      design_doc:        { type: string, default: "" }   # e.g. docs/DESIGN.md — same meaning as gate-v2.yml's input
+      max_diff_lines:    { type: number, default: 4000 } # per-review-turn diff budget — same default as gate-v2.yml
+      max_review_shards: { type: number, default: 8 }    # total large-PR coverage budget — same default as gate-v2.yml
+      # Deliberately NOT mirrored from gate-v2.yml: `has_ui`, `timeout_minutes`,
+      # `pr_size_warn_lines`, `primary_timeout_minutes`, `control_runner`. Those are all
+      # quality-job- or aggregator-specific inputs with no Shadow Calibration analogue —
+      # this workflow has no quality job and no required-check aggregator, so importing
+      # them would just be unused surface area.
+    # No `secrets:` block: this workflow never calls an external webhook (no notify job)
+    # and never posts a PR comment (see `summary` job's own comment) — it needs nothing
+    # beyond the standard `github.token` every job already gets implicitly.
+
+# Union of everything any job below needs.
+# actions: read   — Jobs API (each shadow matrix leg resolves its own numeric job id,
+#                    same as gate-v2.yml's `primary` job) + actions/download-artifact in
+#                    the `summary` job.
+# contents: read  — actions/checkout in the `shadow` job only (`resolve`/`summary` never
+#                    check out the reviewed repo at all).
+# Deliberately NO `pull-requests: write` / `issues: write` anywhere in this workflow —
+# per the plan's Security section: "每个 shadow matrix reviewer 仅授予 contents: read,
+# 不得持有 pull-requests: write、issues: write 或可修改 PR 状态的 token"; and
+# review-summary itself never posts a comment (PR-comment posting is T6 scope — see
+# `summary` job's own comment above). A reusable-workflow job can never escalate beyond
+# what is granted here, so omitting write scopes entirely is the strongest available
+# enforcement of that invariant (stronger than a per-job `permissions:` override, which
+# could theoretically be edited back in one job without touching this one authoritative
+# ceiling).
+permissions:
+  actions: read
+  contents: read
+
+# Workflow concurrency contract (plan section of the same name): defined ONCE at this
+# reusable-workflow level, same shape as gate-v2.yml's own group (repository_id + PR
+# number, falling back to run_id for a non-PR trigger) but with the `gate-shadow-v2-`
+# prefix instead of `gate-required-v2-` — the two prefixes must never collide, and
+# NEVER cancel one another (see this file's own top comment). `cancel-in-progress: true`
+# also implements the plan's "转 draft 取消在途" mechanism together with the caller's
+# `converted_to_draft` trigger (see templates/caller-gate-shadow-v2.yml): a PR converted
+# back to draft fires a NEW workflow_call run whose `resolve` job's `if:` immediately
+# skips (draft guard, below) — and because that new run shares this SAME concurrency
+# group, cancel-in-progress terminates whatever OLD, still-running shadow calibration
+# run existed for this PR at the same time. No extra logic is needed in this file for
+# that to work; it falls straight out of the concurrency group + the draft guard.
+concurrency:
+  group: gate-shadow-v2-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # ── resolve ──────────────────────────────────────────────────────────────
+  resolve:
+    # Byte-identical to gate-v2.yml's `primary` job's `if:` (tests/test_gate_shadow_v2_contract.py
+    # pins this equality) — deliberately the PRIMARY-shaped expression (draft/fork/runner
+    # only), not quality's (which additionally allows non-pull_request events): Shadow
+    # Calibration only ever triggers on `pull_request` (see the caller template), so the
+    # non-pull_request carve-out quality's expression needs is not applicable here.
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+    # Byte-identical to gate-v2.yml's `primary` job's `runs-on:` ternary (same defense-in-depth
+    # rationale as that job's own comment: even if the `if:` above were ever weakened, a
+    # fork PR still can never land on the self-hosted pool). resolve_policy.py and
+    # registry.yaml only exist on the self-hosted image's GATE_HUB_DIR checkout today, so
+    # the hosted/fork fallback branch below is a dead branch in practice (the `if:`
+    # above already prevents reaching it) — kept for the same belt-and-suspenders reason
+    # the mirrored job keeps it.
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    outputs:
+      # A JSON array string. NEVER `[]` when this job actually runs to completion (see
+      # the step below, and this job's own top-of-file comment) — either the real
+      # resolved shadow-reviewer list, or the single-element sentinel array
+      # `["__none__"]` when that list is empty. Only an empty STRING (falsy) is possible,
+      # and only when this WHOLE job was skipped (the `if:` above was false) — that is
+      # exactly the signal `has_shadows` below turns into a plain boolean for
+      # `shadow`/`summary` to gate on directly, without either of them needing to
+      # re-parse or string-compare this JSON value themselves.
+      shadow_reviewers: ${{ steps.resolve-policy.outputs.shadow_reviewers }}
+      # 'true'/'false' (GitHub Actions' own boolean-expression string rendering) — 'true'
+      # only when the resolved policy's `shadow` list is genuinely non-empty. This is the
+      # SINGLE signal `shadow`'s job-level `if:` and `summary`'s job-level `if:` both key
+      # off of; when this job itself was skipped (draft/fork/hosted), this output is an
+      # empty string, which never equals 'true' either — one boolean covers both skip
+      # triggers the D2 task's "为空时后续 job 全 skip" calls for.
+      has_shadows: ${{ steps.resolve-policy.outputs.has_shadows }}
+    steps:
+      # No actions/checkout here: resolve_policy.py only needs `github.repository` (a
+      # plain string, from context — no need to check out the reviewed repo's code at
+      # all) plus registry.yaml, which already lives on this self-hosted image's
+      # GATE_HUB_DIR (same convention gate-v2.yml's `primary` job relies on for
+      # review-primary itself).
+      - name: Resolve shadow reviewer list from policy
+        id: resolve-policy
+        # set -euo pipefail + no continue-on-error anywhere in this step: a policy
+        # resolution failure (malformed registry.yaml, unknown reviewer reference, etc.
+        # — see gate-hub's resolve_policy.py PolicyError domain) must fail THIS job
+        # loudly, never silently degrade to an empty shadow list (which would look
+        # identical, from the outside, to "this repo simply has no shadow reviewers
+        # configured" — a real, legitimate, and much more common state this design must
+        # not be confused with). The filter script below (written to a temp file via a
+        # quote-delimited heredoc, so NOTHING inside it is subject to bash
+        # variable/expression expansion — the only interpolation happens once, earlier,
+        # into `resolve_policy.py`'s own argv) independently re-validates every reviewer
+        # name against the SAME safe-identifier shape gate-hub's resolve_policy.py/
+        # review-shadow already enforce (security.reviewer-name-path-traversal): this is
+        # the one place a reviewer name crosses from gate-hub's trusted-config domain
+        # into THIS workflow's own shell/jq/artifact-name interpolation sites (the
+        # `shadow` job's env vars, upload-artifact name, `summary` job's download
+        # pattern), so a future registry.yaml entry that somehow slipped past
+        # resolve_policy.py's own validation — or a bug in it — cannot reach any of those
+        # sites unsanitized. Any unsafe name fails THIS job outright (fail-closed), never
+        # silently drops or renames the offending reviewer.
+        run: |
+          set -euo pipefail
+          gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
+          registry_file="${REVIEW_REGISTRY_FILE:-$gate_hub_dir/registry.yaml}"
+          policy_json="$(python3 "$gate_hub_dir/scripts/review/resolve_policy.py" "$registry_file" "${{ github.repository }}")"
+          filter_script="${RUNNER_TEMP:-/tmp}/resolve-shadow-filter.py"
+          cat > "$filter_script" <<'PYEOF'
+          import json
+          import re
+          import sys
+
+          # Same safe-identifier shape gate-hub's resolve_policy.py (_SAFE_NAME_RE) and
+          # review-shadow's own entry (_SAFE_REVIEWER_NAME_RE) already enforce.
+          SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+          # Deliberately fails SAFE_NAME_RE (a leading "_" is not in [a-z]) so this value
+          # can never collide with a real, policy-validated reviewer name — consumed by
+          # the `shadow` job's own per-leg guard steps below.
+          SENTINEL = "__none__"
+
+          policy = json.loads(sys.argv[1])
+          shadow = policy["shadow"]
+
+          for name in shadow:
+              if not isinstance(name, str) or not SAFE_NAME_RE.match(name):
+                  print(
+                      f"::error::resolve_policy returned an unsafe shadow reviewer name "
+                      f"{name!r} (must match {SAFE_NAME_RE.pattern!r})",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+          has_shadows = bool(shadow)
+          reviewers = shadow if has_shadows else [SENTINEL]
+          print(f"shadow_reviewers={json.dumps(reviewers)}")
+          print(f"has_shadows={str(has_shadows).lower()}")
+          PYEOF
+          python3 "$filter_script" "$policy_json" >> "$GITHUB_OUTPUT"
+
+  # ── shadow (matrix fan-out) ──────────────────────────────────────────────
+  shadow:
+    needs: resolve
+    # `has_shadows` (see `resolve`'s own `outputs`/step comments) is the PRIMARY signal:
+    # when it isn't 'true' (either `resolve` was skipped outright, or it ran and this
+    # repo's resolved policy has zero shadow reviewers), this whole job is skipped —
+    # zero runner allocation, zero leg executions. The `strategy.matrix` sentinel
+    # fallback below is a SEPARATE, independent safety net for the matrix EXPRESSION
+    # itself (GitHub Actions confirmed to hard-error — "Matrix vector does not contain
+    # any values" — the instant a matrix dimension evaluates to an empty array,
+    # independent of whether this job's own `if:` would otherwise have skipped it); the
+    # per-step `matrix.reviewer != '__none__'` guards inside this job's steps are a
+    # THIRD, innermost layer, so even a hypothetical single sentinel leg that somehow
+    # still started (e.g. this `if:` were ever weakened) does nothing and exits clean.
+    if: needs.resolve.result == 'success' && needs.resolve.outputs.has_shadows == 'true'
+    strategy:
+      # Reviewer failures must never affect each other (plan: "单 reviewer timeout/失败
+      # 不取消其他 matrix members") — a substantive `fail` verdict from one reviewer, or
+      # an infra-ish typed failure/timeout, must not cancel any other in-flight leg.
+      fail-fast: false
+      # CANARY-SCOPED WINDOW LIMITER, NOT A FLEET-LEVEL RATE LIMITER. `max-parallel: 1`
+      # is the 1-2 lower-bound choice the D2 task called for: it serializes this repo's
+      # own shadow matrix legs into a single execution window so today's single-VM,
+      # no-broker canary environment cannot have N shadow reviewers all hit a shared
+      # model-provider rate-limit group (e.g. `glm`) at the same instant. It is a STOPGAP
+      # for the canary ring ONLY — once broker-lite (Stage 3, out of scope for this PR;
+      # see the plan's "Resource Scheduling"/"broker-lite" sections) is live, REAL
+      # cross-repo, cross-reviewer admission control lives in the broker's
+      # acquire/heartbeat/release protocol, not in a GitHub Actions `strategy` field.
+      # DO NOT reuse `max-parallel` on any other workflow as a substitute for that —
+      # it only throttles THIS repo's THIS PR's shadow legs against each other; it has
+      # no visibility into, and provides no protection against, any other repository's
+      # or any other workflow's concurrent model-provider usage. Remove this field (or
+      # raise it) only as part of the broker-lite rollout, not as an independent tuning
+      # change. tests/test_gate_shadow_v2_contract.py pins both the value and this
+      # comment's presence.
+      max-parallel: 1
+      # `fromJSON(... || '["__none__"]')` — NEVER an empty array, and NEVER `fromJSON`
+      # called on an empty string. Confirmed (2026-07-26 codex review of an earlier draft
+      # of this file): GitHub Actions hard-errors ("Matrix vector does not contain any
+      # values") the moment a `strategy.matrix` dimension evaluates to `[]` — a bare
+      # `|| '[]'` fallback (this file's own earlier draft) does NOT degrade to a clean
+      # zero-job-runs skip the way an empty matrix from, say, a `jobs.<id>.if:` skip
+      # does; it is a hard workflow-level error. `resolve`'s own step therefore never
+      # emits `[]` for `shadow_reviewers` at all (see that job's own step: an empty
+      # resolved shadow list becomes the single-element sentinel array `["__none__"]`
+      # instead) — and the `|| '["__none__"]'` fallback here covers the ONE remaining
+      # case `resolve`'s own output can't: `resolve` being skipped outright (draft/fork/
+      # hosted), where `needs.resolve.outputs.shadow_reviewers` is an empty STRING. Either
+      # way, `fromJSON` here always receives a valid, non-empty JSON array. Whether this
+      # actually spawns a (harmless, immediately-exiting) sentinel leg or zero legs at all
+      # then depends entirely on this job's OWN `if:` above (`has_shadows == 'true'`) —
+      # this matrix expression's only job is to never be the thing that hard-errors the
+      # whole workflow.
+      matrix:
+        reviewer: ${{ fromJSON(needs.resolve.outputs.shadow_reviewers || '["__none__"]') }}
+    # Same ternary as `resolve`/gate-v2.yml's `primary` job — same defense-in-depth
+    # rationale (this job's own `if:` already prevents a fork/hosted/draft PR from
+    # reaching here via the `resolve` dependency, but the pool selection itself repeats
+    # the guard independently, same as every other job in this file's lineage does).
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # 15 minutes: review-shadow's OWN internal budget (REVIEW_GATE_TIMEOUT_S) defaults to
+    # 780s (13 minutes — sized to the plan's stated "每个 shadow 13 分钟" figure; not
+    # overridden here, see the "Run review-shadow" step's own comment) — this job's GH
+    # Actions timeout-minutes is intentionally a couple of minutes LARGER than that
+    # internal figure (unlike gate-v2.yml's `primary`, which derives an internal budget
+    # SMALLER than its own job timeout via a shell computation), simply reserving
+    # headroom for actions/checkout + the Jobs API job-id lookup BEFORE review-shadow
+    # even starts, and for the upload-artifact step AFTER it exits — none of which count
+    # against review-shadow's own internal deadline.
+    timeout-minutes: 15
+    steps:
+      # `if: matrix.reviewer != '__none__'` on EVERY step from here down (innermost
+      # safety-net layer — see this job's own `if:` comment above): the sentinel leg, if
+      # one ever actually starts, does not check out the reviewed repo, does not resolve
+      # a job id, does not run review-shadow, and does not upload anything — it simply
+      # has no steps run at all, which GitHub Actions reports as job conclusion
+      # `success` (a job with zero executed steps is not the same as a job whose OWN
+      # `if:` was false, which reports `skipped` instead — either outcome is harmless
+      # here, since normal operation never reaches this branch at all).
+      - uses: actions/checkout@v4
+        if: matrix.reviewer != '__none__'
+        with: { fetch-depth: 1 }
+
+      # Extends gate-v2.yml's `primary` job's own "Resolve numeric job id" step to a
+      # matrix context: GitHub's Jobs API renders a matrix leg's job `name` as
+      # "<job id> (<matrix value(s)>)", optionally prefixed by "<calling job name> / "
+      # when (as here) the job runs inside a workflow_call'd reusable workflow — so the
+      # match must include the `(<reviewer>)` suffix gate-v2.yml's own (non-matrix) copy
+      # of this step never needed. Canary should specifically smoke-test that this
+      # resolves correctly (see this PR's own report).
+      #
+      # `matrix.reviewer` is deliberately routed through the `REVIEWER` env var (below)
+      # rather than interpolated directly into this `run:` script's text (2026-07-26
+      # codex review hygiene fix): GitHub Actions substitutes `${{ ... }}` expressions
+      # into the raw script BEFORE bash ever parses it, so interpolating an
+      # attacker-influenceable-shaped value straight into shell/jq source text is the
+      # textbook GitHub Actions script-injection pattern — `resolve`'s own step already
+      # fail-closed validates every reviewer name against a safe-identifier shape before
+      # it ever reaches this job, so there is no LIVE injection vector today, but routing
+      # through `env:` + `$REVIEWER`/jq's `env.REVIEWER` builtin is defense in depth that
+      # costs nothing and matches the same hygiene every other value crossing this
+      # boundary should get.
+      - name: Resolve numeric job id for REVIEW_JOB_ID
+        if: matrix.reviewer != '__none__'
+        id: resolve-job-id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEWER: ${{ matrix.reviewer }}
+        run: |
+          set -euo pipefail
+          # JOB_NAME_SUFFIX is computed from $REVIEWER (env, not a direct ${{ }}
+          # interpolation) and then EXPORTED so the jq filter below can read it via its
+          # own `env.JOB_NAME_SUFFIX` builtin — `gh api --jq` spawns jq inheriting this
+          # process's environment, so no string ever needs to be interpolated into the
+          # jq filter source itself either.
+          export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"
+          job_id="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs" \
+            --paginate --jq '.jobs[] | select(.name == env.JOB_NAME_SUFFIX or (.name | endswith("/ " + env.JOB_NAME_SUFFIX))) | .id' \
+            | head -n1)"
+          if [ -z "$job_id" ]; then
+            echo "::error::could not resolve a numeric job id for job '$JOB_NAME_SUFFIX' via the Jobs API"
+            exit 1
+          fi
+          echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run review-shadow
+        if: matrix.reviewer != '__none__'
+        env:
+          DESIGN_DOC: ${{ inputs.design_doc }}
+          GATE_TIER: ${{ inputs.tier }}
+          MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
+          MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
+          REVIEW_JOB_ID: ${{ steps.resolve-job-id.outputs.job_id }}
+          # Same REVIEW_CALLER_SHA / REVIEW_REUSABLE_WORKFLOW_SHA distinction as
+          # gate-v2.yml's `primary` job — see that job's own comment and
+          # review-shadow's docstring for the full rationale (github.workflow_sha is the
+          # CALLER's commit; job.workflow_sha is THIS reusable workflow file's commit).
+          REVIEW_CALLER_SHA: ${{ github.workflow_sha }}
+          REVIEW_REUSABLE_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          # REVIEW_GATE_TIMEOUT_S is intentionally NOT set here: review-shadow's own
+          # default (780s) already matches the plan's stated "13 分钟" shadow budget
+          # figure verbatim (see review-shadow's own docstring) — unlike primary, no
+          # shell computation is needed to derive it from this job's timeout-minutes.
+          GH_TOKEN: ${{ github.token }}
+          # Routed through env: rather than interpolated into the `run:` string below —
+          # same hygiene fix as the "Resolve numeric job id" step above.
+          REVIEWER: ${{ matrix.reviewer }}
+        run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" "${{ github.event.pull_request.number }}" "$REVIEWER"
+
+      # `if: always()`: review-shadow's own docstring guarantees a legal event file is
+      # ALREADY on disk for every outcome except exit codes 2 (event write itself
+      # failed) and 3 (no legal event could be constructed at all, e.g. a pre-identity
+      # setup error) — this step must still attempt the upload after a non-zero
+      # "Run review-shadow" exit (which already makes this job read as `failure`, e.g.
+      # for an exit-1 typed infra failure) so the event/failure-envelope artifact isn't
+      # lost. `if-no-files-found: warn` (not `error`): the exit-2/3 "legitimately nothing
+      # was ever written" case must not pile a SECOND, misleading failure reason onto a
+      # job that is already red for its own, more specific reason. A genuine
+      # upload-artifact API failure still fails this step (and therefore the job) on its
+      # own terms — matching the D2 task's "上传失败即该成员 job 红（不影响他人）".
+      #
+      # Artifact registration name deliberately DIFFERENT from (shorter than) the local
+      # event file name review-shadow itself computes
+      # (`shadow-review-v1-{repository_id}-{head_sha}-{reviewer}-{run_id}-{run_attempt}.json`,
+      # per shadow_worker.shadow_event_filename — untouched by this file, "事件文件本身
+      # 名字不动"): this run/attempt already scopes every artifact to one specific repo +
+      # run, so `{reviewer}-{run_id}-{run_attempt}` is enough entropy for the GH artifact
+      # NAMESPACE alone, without needing to re-embed repository_id/head_sha a second time
+      # in the artifact name too. Appending the job's own per-matrix-leg dimension
+      # (`{reviewer}`) as an explicit, separate name component — rather than reusing the
+      # plan's literal 5-field filename string verbatim as the artifact's registered name
+      # — is the fix for the exact gap gate-hub PR #62 surfaced: that filename's 5 fields
+      # do not include `job_id`, so a name built by blind string-reuse alone is not
+      # provably collision-safe across every future caller of this same naming
+      # convention, even though it happens to be safe for THIS workflow's own matrix
+      # today (each leg's `reviewer` already differs within one run/attempt).
+      # tests/test_gate_shadow_v2_contract.py pins this name pattern and its consistency
+      # with the `summary` job's own download `pattern:` below.
+      - name: Upload shadow calibration event
+        # `always()` (unaffected by any earlier step's own failure — see this step's own
+        # comment above) ANDed with the same sentinel guard every other step in this job
+        # carries: the phantom sentinel leg uploads nothing at all (there is nothing on
+        # disk for it to upload in the first place — its "Run review-shadow" step never
+        # ran either).
+        if: always() && matrix.reviewer != '__none__'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shadow-events
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── summary ──────────────────────────────────────────────────────────────
+  summary:
+    needs: [resolve, shadow]
+    # `always()` so this job still runs and reports on WHATEVER partial state the
+    # `shadow` matrix ended up in (some legs timed out/cancelled/failed, the whole
+    # matrix was itself cancelled by a newer head, etc. — plan: "整个 workflow cancel
+    # 可以终止 summary，但不影响 required workflow", and review-summary's own contract
+    # explicitly classifies missing/duplicate/ignored events as DATA, not job failure).
+    # Combined with an EXPLICIT `has_shadows` check on `resolve`'s own output (same
+    # boolean the `shadow` job's own `if:` gates on — see `resolve`'s `outputs` comment):
+    # this job must not attempt to run at all when there is nothing to summarize —
+    # review-summary itself requires at least one expected reviewer argv
+    # (`review-summary <events-dir> <reviewer-1> [<reviewer-2> ...]`; zero reviewers is
+    # its own usage error, exit 2) — so "resolve produced an empty/absent shadow list"
+    # must be a clean SKIP of this job too, not a guaranteed-to-usage-error invocation.
+    # `has_shadows` alone correctly covers BOTH of the D2 task's "后续 job 全 skip"
+    # triggers, since this job has no matrix of its own (ordinary `needs.*.outputs.*`
+    # string comparison in a job-level `if:` is ordinary, unambiguous GitHub Actions
+    # behavior — no dependency on the matrix-evaluation-order question `shadow`'s own
+    # `strategy.matrix` has to worry about):
+    #   - draft/fork/hosted PR: `resolve` itself never ran, so `has_shadows` is an empty
+    #     string, which never equals 'true';
+    #   - `resolve` ran successfully but this repo's resolved policy has an empty
+    #     `shadow` list: `has_shadows` is the literal string 'false', which also never
+    #     equals 'true'.
+    # tests/test_gate_shadow_v2_contract.py pins the presence of `always()` plus the
+    # `has_shadows` guard clause (not a bare `if: always()` — see this job's own
+    # docstring bullet in this file's top-of-file comment for why the two "always() only"
+    # and "still needs an explicit guard" ideas are not in tension: `always()` overrides
+    # the DEFAULT success()-implied skip-on-dependency-failure semantics; it is not a
+    # promise that no other explicit condition may ever be ANDed alongside it, and every
+    # other `always()` job in this repo's own workflows pairs it with additional checks
+    # the same way — e.g. gate-v2.yml's `gate` job pairs `if: always()` with its OWN
+    # internal Python-side validation instead of a compound `if:`, same goal, different
+    # mechanism, because that job's decision logic lives in a script rather than in the
+    # `if:` itself).
+    if: always() && needs.resolve.outputs.has_shadows == 'true'
+    # General self-hosted pool, NOT the primary/shadow review-runner-specific pool this
+    # job's own comment at the top of this file explains why a fork-guard ternary is not
+    # needed here (this job never checks out or executes the reviewed PR's own code).
+    # Real pool separation (`gate-shadow-v2` vs `gate-primary-v2` labels, plan's
+    # "Resource Scheduling") is Stage 3/broker-lite scope, not this PR — this job (like
+    # every other job in this file, for now) shares the SAME self-hosted label set the
+    # rest of this canary-stage fleet already uses.
+    runs-on: [self-hosted, linux, codex]
+    timeout-minutes: 5
+    steps:
+      # `pattern:` mirrors the `shadow` job's own upload `name:` shape
+      # (`shadow-event-{reviewer}-{run_id}-{run_attempt}`) with `{reviewer}` wildcarded —
+      # this job doesn't know in advance which matrix legs actually ran (some may be
+      # `not_started`/cancelled with no artifact at all; review-summary's own contract
+      # already treats a missing expected reviewer as data, not an error). `run_id`/
+      # `run_attempt` are pinned to THIS run/attempt so a stale artifact from an older,
+      # cancelled attempt of the same PR is never picked up. `merge-multiple: true`
+      # flattens every matched artifact into ONE flat directory (not one
+      # per-artifact-name subdirectory) — review-summary's own `_load_event_sources`
+      # scans its events-dir NON-recursively for `*.json`, so a flat layout is required
+      # for it to see every event file at all.
+      - name: Download all shadow event artifacts for this run
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/shadow-events-all
+          pattern: shadow-event-*-${{ github.run_id }}-${{ github.run_attempt }}
+          merge-multiple: true
+
+      - name: Summarize shadow calibration results
+        env:
+          REVIEW_SUMMARY_REPOSITORY_ID: ${{ github.repository_id }}
+          REVIEW_SUMMARY_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_SUMMARY_JSON_PATH: ${{ runner.temp }}/shadow-summary.json
+        run: |
+          set -euo pipefail
+          reviewers_json='${{ needs.resolve.outputs.shadow_reviewers }}'
+          mapfile -t reviewers < <(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "$reviewers_json")
+          gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
+          python3 "$gate_hub_dir/scripts/review/review-summary" "${{ runner.temp }}/shadow-events-all" "${reviewers[@]}" >> "$GITHUB_STEP_SUMMARY"

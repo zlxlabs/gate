@@ -7,10 +7,11 @@ ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
 .github/workflows/gate.yml and its own tests/test_gate_contract.py are
 untouched and unaffected by this file.
 """
-import re
 from pathlib import Path
 
 import yaml
+
+from _gha_lint import find_arithmetic_gha_expression_offenders
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
@@ -296,33 +297,15 @@ def test_primary_timeout_minutes_lower_bound_is_validated_and_fails_closed():
     assert "exit 1" in run
 
 
-# Matches an arithmetic operator used AS AN OPERATOR (whitespace on both
-# sides) so it doesn't false-positive on legitimate tight-hyphen identifiers
-# GitHub Actions expressions use all over this file, e.g. step ids
-# (`resolve-job-id`), runner labels inside quoted string literals
-# (`'self-hosted'`), or `control_runner`'s `'self-hosted-control'` value —
-# none of those have whitespace around the `-`.
-_ARITHMETIC_OPERATOR_WITH_SPACES = re.compile(r"\s[-*/%]\s")
-_GHA_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+# Regression guard for the P1 above: GitHub Actions expressions can never contain
+# `+ - * / %` as operators anywhere in this file (not just in the one spot that broke).
+# The scan/regex logic itself now lives in _gha_lint.py (2026-07-26, extracted for the D2
+# gate-shadow-v2 task so the same guard covers that file too, without a second hand-kept
+# copy of this regex) — this test just points the shared helper at THIS workflow file.
 
 
 def test_no_gha_expression_anywhere_uses_arithmetic_operators():
-    # Regression guard for the P1 above: GitHub Actions expressions can never
-    # contain `+ - * / %` as operators anywhere in this file (not just in the
-    # one spot that broke) — scan every `${{ ... }}` span in the raw file.
-    # Comment-only lines are dropped first: this file's own prose explaining
-    # the bug quotes the broken `${{ (x - 5) * 60 }}` example verbatim, which
-    # must not trip this guard against itself.
-    text = "\n".join(ln for ln in WORKFLOW.read_text().splitlines() if not ln.lstrip().startswith("#"))
-    offenders = []
-    for match in _GHA_EXPRESSION.finditer(text):
-        body = match.group(1)
-        # Strip single-quoted string literals (GHA expression string syntax)
-        # before scanning, so quoted content like 'self-hosted' can't trip
-        # the heuristic even if it somehow contained a spaced hyphen.
-        stripped = re.sub(r"'[^']*'", "", body)
-        if _ARITHMETIC_OPERATOR_WITH_SPACES.search(stripped):
-            offenders.append(body.strip())
+    offenders = find_arithmetic_gha_expression_offenders(WORKFLOW)
     assert not offenders, f"found arithmetic-looking operator(s) inside GHA expression(s): {offenders!r}"
 
 
