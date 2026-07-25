@@ -1,0 +1,453 @@
+# Required Gate v2 (reusable workflow) — quality ∥ primary → gate aggregator.
+#
+# Stage 2 (D1 in the private gate-hub repo's
+# ceo-plans/2026-07-24-shadow-review-independence.md) of the shadow-review
+# independence rollout. This file implements ONLY the "Required Gate" state
+# machine from that plan. Shadow Calibration is a SEPARATE workflow (D2, a
+# later task, not in this file) with its OWN concurrency group — per the
+# plan's "Workflow concurrency contract":
+#
+#   gate-required-v2-{repository_id}-{pr_number}   (this workflow, below)
+#   gate-shadow-v2-{repository_id}-{pr_number}      (future Shadow Calibration)
+#
+# The two groups are, and must remain, independent: Shadow Calibration must
+# never be able to cancel or block this Required Gate run, and vice versa.
+#
+# legacy `.github/workflows/gate.yml` is UNCHANGED by this file and continues
+# to serve the existing fleet unmodified. This workflow is additive and only
+# reachable via an explicit per-repo caller opt-in during canary (see
+# templates/caller-gate-v2.yml) — no existing caller references this file.
+#
+# Job layout:
+#   quality  — lint / jscpd / dependency-cruiser / tests / PR-size preflight.
+#              Everything from legacy gate.yml's single job EXCEPT the model
+#              review itself. Runs on the same self-hosted/hosted pool legacy
+#              uses, with the same fork-PR → hosted-fallback guard.
+#   primary  — runs `review-primary` (gate-hub, already merged) when the PR is
+#              non-draft, same-repo (not a fork), and `runner: self`. Skips
+#              the WHOLE job otherwise (draft / fork / hosted-tier) — see the
+#              job's own comment for what's deliberately NOT wired up yet.
+#   gate     — the ONLY required-check-bearing job. Job id MUST stay literally
+#              `gate` (this file's `name:` is also `gate`) — that combination
+#              is what keeps the existing required status check context
+#              `gate / gate` unchanged (see the plan's "Required status check
+#              compatibility"). `if: always()` so a skipped/failed dependency
+#              can never make this job silently skip too. Validates
+#              needs.quality/needs.primary + the canonical primary audit
+#              artifact via the portable aggregator script in
+#              .github/actions/gate-aggregator/aggregate.py, and is the only
+#              job with receipt-writing authority (Step Summary only in this
+#              PR — PR-comment "double receipt" is Stage 4, not this file).
+#   notify   — same fail-only Feishu notification semantics as legacy,
+#              triggered by `gate` (not by quality/primary individually).
+name: gate
+
+on:
+  workflow_call:
+    inputs:
+      tier:       { type: string,  default: "personal" }  # personal | internal | saas
+      runner:     { type: string,  default: "self" }      # self (self-hosted) | hosted (GitHub-hosted, free minutes)
+      has_ui:     { type: boolean, default: false }
+      design_doc: { type: string,  default: "" }          # e.g. docs/DESIGN.md
+      max_diff_lines:    { type: number, default: 4000 }   # per-review-turn diff budget
+      timeout_minutes:   { type: number, default: 45 }     # per-job (quality, primary) hard timeout
+      max_review_shards: { type: number, default: 8 }      # total large-PR coverage budget
+      pr_size_warn_lines: { type: number, default: 8000 }  # strong warning; hard cap derives from the two inputs above
+      # Selects the runner pool for the FINAL `gate` aggregator job only. Per
+      # the plan's "Required Gate" section: the aggregator must be able to run
+      # independently of the review runner pool (PVE self-hosted fleet), so a
+      # `github-hosted` default gives it its own failure domain even if the
+      # self-hosted fleet is entirely down. `self-hosted-control` is reserved
+      # for a LATER migration (shadow double-run first, see the plan) — this
+      # input exists now so that migration is a config flip, not a rewrite;
+      # nothing in this PR sets it to anything but the default.
+      control_runner: { type: string, default: "github-hosted" }  # github-hosted | self-hosted-control
+    secrets:
+      FEISHU_CI_WEBHOOK:
+        # Optional: public repos MUST pass this as a repo SECRET (fork PR runs
+        # cannot read secrets — see the notify job); private repos may rely on
+        # the same-name repo VARIABLE fallback instead (see notify job below).
+        required: false
+
+# Union of everything any job below needs; each caller must grant this whole
+# set (reusable-workflow permission escalation otherwise fails at startup).
+# actions: read   — Jobs API (resolve this run's numeric job id for the
+#                    primary job's REVIEW_JOB_ID) + actions/download-artifact
+#                    in the gate job.
+# pull-requests: write — only the quality job's PR-size preflight action posts
+#                    a sticky comment; primary/gate never comment (Step
+#                    Summary only — see the gate job).
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+# Workflow concurrency contract (plan section of the same name): defined ONCE
+# at this reusable-workflow level so no caller can define a competing group or
+# skip cancellation. Independent from, and never shared with, the (future)
+# Shadow Calibration workflow's `gate-shadow-v2-...` group.
+concurrency:
+  group: gate-required-v2-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # ── quality ──────────────────────────────────────────────────────────────
+  # Every legacy gate.yml step EXCEPT the model review chain (see "primary"
+  # below) and the review-effectiveness ledger (legacy's "Build/Upload review
+  # effectiveness ledger" steps consume BOTH quality-only artifacts
+  # (pr-size-preflight.json/install-result.json) AND the review audit, which
+  # in v2 lives in a *different job's* runner.temp — porting that step
+  # correctly needs its own cross-job artifact plumbing, which the task this
+  # file was written for explicitly scoped OUT of D1 (Required Gate). Not
+  # silently dropped: this is a deliberate, documented omission — see this
+  # PR's report / the follow-up TODO tracked alongside Shadow Calibration
+  # (D2), which will need the same cross-job artifact question for its own
+  # ledger consumers anyway.
+  quality:
+    # Same self-hosted/hosted fork-guard expression legacy's single `gate` job
+    # uses verbatim (see legacy .github/workflows/gate.yml and
+    # tests/test_gate_contract.py's FORK_GUARD): non-pull_request events
+    # (reserved for a future `merge_group` trigger — see
+    # templates/caller-gate-v2.yml) always get the self-hosted pool when
+    # `runner: self`; pull_request events additionally require the head repo
+    # to equal this repo (fork PRs degrade to the hosted, one-shot sandbox).
+    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: PR size preflight
+        uses: zlxlabs/gate/.github/actions/pr-size-preflight@main
+        with:
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          max-diff-lines: ${{ inputs.max_diff_lines }}
+          max-review-shards: ${{ inputs.max_review_shards }}
+          warn-lines: ${{ inputs.pr_size_warn_lines }}
+          token: ${{ github.token }}
+
+      - name: Lint / format
+        run: |
+          if [ -f Makefile ] && grep -qE '^lint:' Makefile; then make lint
+          else echo "no 'lint' make target — skipping"; fi
+
+      - name: Duplicate check (jscpd, advisory)
+        continue-on-error: true
+        run: npx --yes jscpd --threshold "${JSCPD_THRESHOLD:-5}" --reporters console .
+
+      - name: Dependency direction (dependency-cruiser)
+        run: |
+          if [ -f .dependency-cruiser.js ] || [ -f .dependency-cruiser.json ]; then
+            npx --yes --package=dependency-cruiser depcruise --config .dependency-cruiser.* --output-type err src
+          else echo "no dependency-cruiser config — skipping (use import-linter for python)"; fi
+
+      # L1 dependency-download cache — hosted-only path (uv cache mirrors legacy
+      # verbatim; see legacy gate.yml + docs/designs/ci-cache-strategy.md for the
+      # full historical rationale, unchanged here).
+      - name: Restore uv download cache
+        id: uv-cache
+        if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ runner.arch }}-
+
+      # L1 dependency-download cache — self-hosted-only path (VM201 local
+      # volume). Canary ring, personal tier only — same condition and
+      # promotion path as legacy gate.yml (tests/test_gate_contract.py pins
+      # legacy's copy; this v2 copy carries the same restriction forward).
+      - name: Point package manager caches at the VM201 local cache volume (self, personal canary)
+        if: ${{ inputs.runner == 'self' && inputs.tier == 'personal' }}
+        run: |
+          cache_root=/opt/gate-hub-cache
+          echo "UV_CACHE_DIR=$cache_root/uv" >> "$GITHUB_ENV"
+          echo "npm_config_cache=$cache_root/npm" >> "$GITHUB_ENV"
+          echo "pnpm_config_store_dir=$cache_root/pnpm" >> "$GITHUB_ENV"
+          echo "GOMODCACHE=$cache_root/go" >> "$GITHUB_ENV"
+
+      # D5 install-timing split — canary ring, personal tier only, same as
+      # legacy gate.yml (see that file's steps for the full historical
+      # rationale on ecosystem detection / continue-on-error / canary gating).
+      - name: Install dependencies
+        id: install
+        if: ${{ inputs.tier == 'personal' }}
+        continue-on-error: true
+        env:
+          UV_CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}
+          INSTALL_RESULT_PATH: ${{ runner.temp }}/install-result.json
+        run: |
+          start=$(date +%s)
+          ecosystem="none"
+          status="skipped"
+          if [ -f uv.lock ]; then
+            ecosystem="uv"
+            if uv sync --frozen; then status="ok"; else status="failed"; fi
+          elif [ -f package-lock.json ]; then
+            ecosystem="npm"
+            if npm ci; then status="ok"; else status="failed"; fi
+          elif [ -f pnpm-lock.yaml ]; then
+            ecosystem="pnpm"
+            if pnpm install --frozen-lockfile; then status="ok"; else status="failed"; fi
+          elif [ -f go.sum ]; then
+            ecosystem="go-skipped"
+            echo "go.sum detected but the only registered Go repo runs tests inside an isolated docker container (host module cache unreachable) — skipping host-side predownload, see legacy gate.yml"
+          else
+            echo "no supported lockfile at repo root — skipping predownload"
+          fi
+          end=$(date +%s)
+          cache_hit=null
+          if [ "$ecosystem" = "uv" ]; then
+            case "${UV_CACHE_HIT:-}" in
+              true)  cache_hit=true ;;
+              false) cache_hit=false ;;
+            esac
+          fi
+          printf '{"ecosystem":"%s","status":"%s","duration_s":%s,"cache_hit":%s}\n' \
+            "$ecosystem" "$status" "$((end - start))" "$cache_hit" | tee "$INSTALL_RESULT_PATH"
+          [ "$status" != "failed" ]
+
+      - name: Tests
+        run: |
+          if   [ -f Makefile ] && grep -qE '^test:' Makefile; then make test
+          elif [ -f package.json ]; then npm test --if-present
+          elif [ -f pyproject.toml ]; then
+            if   command -v uv >/dev/null;     then uv run --frozen pytest -q || uv run pytest -q
+            elif command -v pytest >/dev/null; then pytest -q
+            else echo "no python test runner on this runner — skipping (runs on self-hosted)"; fi
+          else echo "no tests detected"; fi
+
+      - name: Prune uv cache before persistence
+        if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
+        run: uv cache prune --ci || true
+
+  # ── primary ──────────────────────────────────────────────────────────────
+  # Runs review-primary (gate-hub, already merged) and writes+uploads the ONE
+  # canonical primary audit the `gate` aggregator consumes. Deliberately does
+  # NOT implement (this PR, D1 scope only):
+  #   - the `codex-review-waived` label / waiver-comment validation legacy's
+  #     "Validate audited Codex review waiver" step does — the aggregator DOES
+  #     have defensive not_expected/waived acceptance logic ready (see
+  #     .github/actions/gate-aggregator/aggregate.py, T6 TODO) for whenever a
+  #     later PR wires up a real waiver-writing branch here;
+  #   - a not_expected canonical-audit WRITE for the fork/hosted skip branches
+  #     below (the plan's Required Gate section calls for one; this canary PR
+  #     leaves the whole job skipped instead and relies on the aggregator's
+  #     `review_expected` check to accept the skip — tracked as a TODO, not a
+  #     silent gap: see this PR's report).
+  primary:
+    # Whole-job skip (clean `skipped` conclusion, not a same-verdict "success
+    # with nothing done") whenever review should not run at all: draft PR,
+    # fork PR (head repo != this repo), or `runner: hosted`. The `gate`
+    # aggregator recomputes this SAME expression (as `REVIEW_EXPECTED`, see
+    # the `gate` job below) to decide whether a `skipped` result is an
+    # accepted no-op or a fail-closed anomaly — tests/test_gate_v2_contract.py
+    # pins that both copies stay identical.
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+    # Defense in depth (belt-and-suspenders, same rationale as legacy's
+    # runs-on ternary + per-step `if` pair — see legacy gate.yml's fork-PR
+    # protection comment): even if the `if:` above were ever weakened by a
+    # future edit, a fork PR still can never land on the self-hosted pool.
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Resolve numeric job id for REVIEW_JOB_ID
+        # review-primary requires REVIEW_JOB_ID (a net-new v2 identity field —
+        # GitHub Actions has no standard env var exposing a job's own numeric
+        # id). Query THIS run's exact attempt so a rerun never picks up a
+        # stale job id from an earlier attempt, and match by this job's own
+        # `github.job` id — for a called reusable-workflow job the Jobs API
+        # `name` field is typically "<caller job name> / <this job id>", so
+        # match on a suffix rather than requiring an exact equality.
+        id: resolve-job-id
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          job_id="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs" \
+            --paginate --jq '.jobs[] | select(.name == "${{ github.job }}" or (.name | endswith("/ ${{ github.job }}"))) | .id' \
+            | head -n1)"
+          if [ -z "$job_id" ]; then
+            echo "::error::could not resolve a numeric job id for job '${{ github.job }}' via the Jobs API"
+            exit 1
+          fi
+          echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run review-primary
+        env:
+          DESIGN_DOC: ${{ inputs.design_doc }}
+          GATE_TIER: ${{ inputs.tier }}
+          MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
+          MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
+          REVIEW_PRIMARY_AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
+          REVIEW_JOB_ID: ${{ steps.resolve-job-id.outputs.job_id }}
+          # github.workflow_sha = the commit SHA of the CALLING (top-level,
+          # per-repo caller) workflow file — the `github` context is always
+          # associated with the caller, even inside a called reusable
+          # workflow's jobs. job.workflow_sha (a SEPARATE `job` context, not a
+          # `github.*` property — verified against GitHub's Contexts
+          # reference doc; there is no such thing as `github.job_workflow_sha`)
+          # is the commit SHA of THIS reusable workflow file for this job —
+          # the two differ whenever the caller pins gate-v2.yml to an
+          # older/newer SHA than its own caller file's latest commit. See
+          # review-primary's docstring for the identical REVIEW_CALLER_SHA/
+          # REVIEW_REUSABLE_WORKFLOW_SHA distinction.
+          REVIEW_CALLER_SHA: ${{ github.workflow_sha }}
+          REVIEW_REUSABLE_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
+
+      - name: Upload canonical primary audit
+        # Fail-closed by design: if the audit can't be uploaded, the aggregator
+        # must never see a "success" primary job without a matching artifact
+        # to validate — so this step deliberately has NO `continue-on-error`
+        # and no `if-no-files-found: ignore` (unlike legacy's advisory codex
+        # audit upload). A missing file here fails the job outright.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/primary-review-audit.json
+          retention-days: 30
+
+  # ── gate (final aggregator — required check) ────────────────────────────
+  gate:
+    needs: [quality, primary]
+    # always(): an aggregator gated by the default `success()` would itself be
+    # skipped whenever a dependency fails/is skipped, and GitHub treats a
+    # skipped required job as a passing check — exactly the hole the plan's
+    # Required Gate section calls out. This job must always run and compute
+    # its own verdict from needs.*.result instead of relying on GitHub's
+    # default dependency semantics.
+    if: always()
+    runs-on: ${{ inputs.control_runner == 'self-hosted-control' && fromJSON('["self-hosted","linux","gate-control"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 10
+    steps:
+      # `uses:` cannot itself take an expression, so the only way to pin the
+      # aggregator script to the EXACT commit this reusable workflow file is
+      # currently running from (whatever SHA a canary caller pinned for
+      # gate-v2.yml) is to check that ref out explicitly here and invoke the
+      # checked-out file directly in the next step — see aggregate.py's module
+      # docstring for why there is no `action.yml` composite-action wrapper.
+      # job.workflow_repository/job.workflow_sha (the `job` context, distinct
+      # from `github.*`) are GitHub's own documented mechanism for exactly
+      # this "reusable workflow checks out its own source" case (Contexts
+      # reference, "Example usage of job context workflow identity").
+      - name: Checkout gate-aggregator at this workflow's own commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-aggregator-src
+
+      - name: Download canonical primary audit (best effort — may not exist)
+        if: ${{ needs.primary.result != 'skipped' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/primary-audit
+
+      - name: Aggregate required verdict
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          PRIMARY_RESULT: ${{ needs.primary.result }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          # The SAME expression the `primary` job's own `if:` uses (see that
+          # job's comment) — recomputed here because a skipped job's `if:`
+          # condition is not itself exposed via `needs.*`, only its `result`.
+          # tests/test_gate_v2_contract.py pins these two copies identical.
+          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
+            --quality-result "$QUALITY_RESULT" \
+            --primary-result "$PRIMARY_RESULT" \
+            --is-draft "$IS_DRAFT" \
+            --review-expected "$REVIEW_EXPECTED" \
+            --repository-id "$REPOSITORY_ID" \
+            --head-sha "$HEAD_SHA" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --pr-number "$PR_NUMBER" \
+            --audit-dir "${{ runner.temp }}/primary-audit" \
+            --summary-path "$GITHUB_STEP_SUMMARY"
+
+  # ── notify (registry-routed, required-gate-failure only) ────────────────
+  # Same fail-only semantics as legacy gate.yml's notify job (see that file
+  # for the full webhook/fallback rationale, unchanged here), now triggered by
+  # the `gate` aggregator's own conclusion instead of the single legacy job.
+  # Runs plain `ubuntu-latest` (a P2 webhook POST via python3 stdlib needs no
+  # self-hosted capability) rather than reusing the quality/primary fork-guard
+  # ternary — a deliberate v2 simplification, see this PR's report.
+  notify:
+    needs: gate
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Feishu 门禁失败卡 (P2, fail-open)
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE:  ${{ github.event.pull_request.title }}
+          PR_URL:    ${{ github.event.pull_request.html_url }}
+          BRANCH:    ${{ github.head_ref }}
+          SHA:       ${{ github.event.pull_request.head.sha }}
+          TIER:      ${{ inputs.tier }}
+          RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("no FEISHU_CI_WEBHOOK secret/var set — skip notify"); raise SystemExit(0)
+          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
+          repo    = os.environ["REPO"]
+          pr      = os.environ.get("PR_NUMBER", "") or "?"
+          title   = os.environ.get("PR_TITLE", "") or "(无标题)"
+          branch  = os.environ.get("BRANCH", "") or "?"
+          sha     = (os.environ.get("SHA", "") or "")[:12]
+          tier    = os.environ.get("TIER", "") or "?"
+          pr_url  = os.environ.get("PR_URL", "") or ""
+          run_url = os.environ["RUN_URL"]
+          body = (f"**仓库** `{repo}`\n"
+                  f"**PR** #{pr} · {title}\n"
+                  f"**分支** `{branch}`  ·  **commit** `{sha}`  ·  **tier** `{tier}`\n"
+                  f"Required Gate v2 门禁失败(quality / primary review 其一未过)。点按钮看详情。")
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {"template": "orange",
+                             "title": {"tag": "plain_text", "content": f"🟠 {title_prefix} P2 门禁失败 · {repo}#{pr}"}},
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看 Run"},
+                           "type": "primary", "url": run_url},
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看 PR"},
+                           "type": "default", "url": pr_url},
+                      ]},
+                  ],
+              },
+          }
+          req = urllib.request.Request(
+              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
+          except Exception as e:
+              print("feishu notify failed (swallowed):", e)
+          PY
