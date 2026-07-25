@@ -13,6 +13,19 @@
 # jobs to this file; see the plan's "Workflow concurrency contract".
 name: gate
 
+# merge_group is intentionally NOT an active trigger below (2026-07-26
+# tightening pass): this org does not use a GitHub merge queue today, and a
+# real merge_group event carries no `pull_request` payload at all — every
+# expression in gate-v2.yml and in this template's own `pull_request:` block
+# below assumes `github.event.pull_request` exists, so a live merge_group run
+# would reach the aggregator's `--pr-number`/`--head-sha` argparse arguments
+# with nothing to fill them and abort with a (confirmed by testing) hard
+# argparse failure — a real job failure, not an indefinitely pending check,
+# but still a bad, confusing experience for a trigger nobody asked for. If
+# this org ever adopts a merge queue, re-adding `merge_group:` as a trigger
+# requires ALSO adapting gate-v2.yml's expressions (and the aggregator's CLI
+# contract) to a payload that has no PR number/head SHA — tracked as a
+# follow-up design question, not implemented here.
 on:
   pull_request:
     # ready_for_review and converted_to_draft are P0-explicit here: GitHub's
@@ -25,26 +38,32 @@ on:
     # is harmless — primary just skips again) even though it isn't load-
     # bearing the way ready_for_review is.
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
-    # Reserved, NOT yet wired to any behavior change in gate-v2.yml or this
-    # template: a doc-only-change fast path. No existing gate-hub caller
-    # template had a paths-ignore convention to mirror (checked both this
-    # public repo and the private gate-hub templates/ dir) — this list is a
-    # new, minimal proposal scoped to this PR, not a carry-over from prior
-    # art. Revisit before promoting past personal canary.
+    # Doc-only-change fast path — this is an EXISTING operational convention,
+    # not a new invention: the private gate-hub repo's own live caller
+    # (gate-hub/.github/workflows/gate.yml, which calls this same
+    # zlxlabs/gate reusable workflow) already carries this exact
+    # paths-ignore, with this exact rationale in its own comment — "纯文档改动
+    # 跳过门禁——不为 docs/markdown 烧 codex 订阅用量 + 影子(GLM/MiniMax)token。混合
+    # (文档 + 代码)PR 仍会触发门禁(paths-ignore 只在"全部改动都命中"时跳过)。无分支
+    # 保护,被跳过的 gate check 不会卡住合并。" (paraphrased: skip so docs-only PRs
+    # don't burn Codex subscription / shadow-reviewer token budget; a mixed
+    # docs+code PR still triggers normally since paths-ignore only skips when
+    # EVERY changed path matches; this repo has no branch protection today,
+    # so a skipped check never blocks merging). This template's own patterns
+    # below intentionally match gate-hub's glob syntax verbatim rather than a
+    # "more correct"-looking rewrite, to stay byte-identical with the
+    # convention being mirrored.
+    #
+    # PRECONDITION this relies on (same precondition gate-hub's own caller
+    # already depends on): NO branch-protection rule marks `gate / gate` as a
+    # REQUIRED status check on any repo using this template. If ANY repo
+    # onboarded from this template later adds `gate / gate` to its required
+    # status checks, this paths-ignore MUST be removed first — otherwise a
+    # pure-docs PR would never produce that check run at all and would sit
+    # permanently pending on a required context that can never turn green.
     paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-  # Reserved for merge-queue support — NOT yet wired to a distinct behavior in
-  # gate-v2.yml. `github.event.pull_request` is unset for a merge_group event;
-  # gate-v2.yml's existing draft/fork expressions degrade safely under that
-  # (primary's `if:` evaluates false and the whole job skips; quality's
-  # runs-on ternary already special-cases non-pull_request events the same
-  # way legacy gate.yml does). Whether merge_group runs should be
-  # "quality-only" or a deliberate no-op is an open design question left to a
-  # follow-up PR — this trigger is included now so the caller contract is
-  # future-proof, per this task's explicit instruction; do not assume
-  # merge_group behavior has been validated end-to-end.
-  merge_group: {}
+      - '**.md'
+      - 'docs/**'
 
 # Union of what gate-v2.yml's jobs need — see that file's top-level
 # `permissions:` comment for the per-job breakdown (quality needs
