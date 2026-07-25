@@ -1,0 +1,83 @@
+# Required Gate v2 — canary caller template.
+#
+# Dropped into a business repo as .github/workflows/gate.yml (replacing the
+# legacy caller of .github/workflows/gate.yml@main) ONLY for repos explicitly
+# opted into the Required Gate v2 canary (see the private gate-hub repo's
+# ceo-plans/2026-07-24-shadow-review-independence.md, "Fleet Rollout and Drift
+# Control": personal canary -> internal -> saas). Existing repos NOT in the
+# canary keep using zlxlabs/gate/.github/workflows/gate.yml@main untouched —
+# this template does not replace anything automatically.
+#
+# This is the REQUIRED side only (D1). Shadow Calibration (D2) is a SEPARATE
+# workflow file with its own trigger/job/concurrency group — do not add shadow
+# jobs to this file; see the plan's "Workflow concurrency contract".
+name: gate
+
+on:
+  pull_request:
+    # ready_for_review and converted_to_draft are P0-explicit here: GitHub's
+    # pull_request trigger does NOT include ready_for_review by default, and
+    # the Required Gate's `primary` job treats "draft" as an accepted-skip
+    # condition — without this event type, a PR marked ready-for-review would
+    # never re-trigger Required Gate and would sit on a stale draft-era
+    # skipped-and-accepted primary result forever. converted_to_draft is
+    # listed for symmetry/observability (a draft-again PR re-running the gate
+    # is harmless — primary just skips again) even though it isn't load-
+    # bearing the way ready_for_review is.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    # Reserved, NOT yet wired to any behavior change in gate-v2.yml or this
+    # template: a doc-only-change fast path. No existing gate-hub caller
+    # template had a paths-ignore convention to mirror (checked both this
+    # public repo and the private gate-hub templates/ dir) — this list is a
+    # new, minimal proposal scoped to this PR, not a carry-over from prior
+    # art. Revisit before promoting past personal canary.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  # Reserved for merge-queue support — NOT yet wired to a distinct behavior in
+  # gate-v2.yml. `github.event.pull_request` is unset for a merge_group event;
+  # gate-v2.yml's existing draft/fork expressions degrade safely under that
+  # (primary's `if:` evaluates false and the whole job skips; quality's
+  # runs-on ternary already special-cases non-pull_request events the same
+  # way legacy gate.yml does). Whether merge_group runs should be
+  # "quality-only" or a deliberate no-op is an open design question left to a
+  # follow-up PR — this trigger is included now so the caller contract is
+  # future-proof, per this task's explicit instruction; do not assume
+  # merge_group behavior has been validated end-to-end.
+  merge_group: {}
+
+# Union of what gate-v2.yml's jobs need — see that file's top-level
+# `permissions:` comment for the per-job breakdown (quality needs
+# pull-requests: write for the PR-size sticky comment; primary/gate need
+# actions: read for the Jobs API + artifact download).
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  # Job id MUST stay literally `gate` (workflow `name:` above is also `gate`)
+  # — this exact combination is what keeps the required status check context
+  # `gate / gate` unchanged across the legacy -> v2 switch (see the plan's
+  # "Required status check compatibility"). Do not rename this job.
+  gate:
+    # CANARY PIN: during canary this MUST be an immutable commit SHA, never a
+    # moving ref like `@main` — the whole point of pinning is that a caller's
+    # behavior cannot change out from under it without an explicit, reviewed
+    # sync command (see the plan's "Caller / reusable workflow boundary").
+    # Replace the placeholder below with the exact reviewed commit SHA of
+    # zlxlabs/gate before onboarding any real repo to this template.
+    uses: zlxlabs/gate/.github/workflows/gate-v2.yml@__PINNED_GATE_SHA__ # TODO(canary): pin to the reviewed gate-v2.yml commit SHA
+    with:
+      tier: personal          # personal | internal | saas
+      runner: self            # self (self-hosted, runs primary review) | hosted (GitHub free minutes)
+      # control_runner intentionally omitted here (defaults to github-hosted)
+      # — do not set self-hosted-control until the shadow double-run in the
+      # plan's "Required Gate" section has passed its promotion gate.
+      # Optional overrides: max_diff_lines: 4000, max_review_shards: 8,
+      # pr_size_warn_lines: 8000, timeout_minutes: 45
+    secrets:
+      # Public repos MUST pass this as a repo SECRET (fork PR runs cannot read
+      # secrets); private repos may omit it and rely on the same-name repo
+      # VARIABLE fallback inside gate-v2.yml's notify job instead.
+      FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
