@@ -1,0 +1,102 @@
+# Required Gate v2 — canary caller template.
+#
+# Dropped into a business repo as .github/workflows/gate.yml (replacing the
+# legacy caller of .github/workflows/gate.yml@main) ONLY for repos explicitly
+# opted into the Required Gate v2 canary (see the private gate-hub repo's
+# ceo-plans/2026-07-24-shadow-review-independence.md, "Fleet Rollout and Drift
+# Control": personal canary -> internal -> saas). Existing repos NOT in the
+# canary keep using zlxlabs/gate/.github/workflows/gate.yml@main untouched —
+# this template does not replace anything automatically.
+#
+# This is the REQUIRED side only (D1). Shadow Calibration (D2) is a SEPARATE
+# workflow file with its own trigger/job/concurrency group — do not add shadow
+# jobs to this file; see the plan's "Workflow concurrency contract".
+name: gate
+
+# merge_group is intentionally NOT an active trigger below (2026-07-26
+# tightening pass): this org does not use a GitHub merge queue today, and a
+# real merge_group event carries no `pull_request` payload at all — every
+# expression in gate-v2.yml and in this template's own `pull_request:` block
+# below assumes `github.event.pull_request` exists, so a live merge_group run
+# would reach the aggregator's `--pr-number`/`--head-sha` argparse arguments
+# with nothing to fill them and abort with a (confirmed by testing) hard
+# argparse failure — a real job failure, not an indefinitely pending check,
+# but still a bad, confusing experience for a trigger nobody asked for. If
+# this org ever adopts a merge queue, re-adding `merge_group:` as a trigger
+# requires ALSO adapting gate-v2.yml's expressions (and the aggregator's CLI
+# contract) to a payload that has no PR number/head SHA — tracked as a
+# follow-up design question, not implemented here.
+on:
+  pull_request:
+    # ready_for_review and converted_to_draft are P0-explicit here: GitHub's
+    # pull_request trigger does NOT include ready_for_review by default, and
+    # the Required Gate's `primary` job treats "draft" as an accepted-skip
+    # condition — without this event type, a PR marked ready-for-review would
+    # never re-trigger Required Gate and would sit on a stale draft-era
+    # skipped-and-accepted primary result forever. converted_to_draft is
+    # listed for symmetry/observability (a draft-again PR re-running the gate
+    # is harmless — primary just skips again) even though it isn't load-
+    # bearing the way ready_for_review is.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    # Doc-only-change fast path — this is an EXISTING operational convention,
+    # not a new invention: the private gate-hub repo's own live caller
+    # (gate-hub/.github/workflows/gate.yml, which calls this same
+    # zlxlabs/gate reusable workflow) already carries this exact
+    # paths-ignore, with this exact rationale in its own comment — "纯文档改动
+    # 跳过门禁——不为 docs/markdown 烧 codex 订阅用量 + 影子(GLM/MiniMax)token。混合
+    # (文档 + 代码)PR 仍会触发门禁(paths-ignore 只在"全部改动都命中"时跳过)。无分支
+    # 保护,被跳过的 gate check 不会卡住合并。" (paraphrased: skip so docs-only PRs
+    # don't burn Codex subscription / shadow-reviewer token budget; a mixed
+    # docs+code PR still triggers normally since paths-ignore only skips when
+    # EVERY changed path matches; this repo has no branch protection today,
+    # so a skipped check never blocks merging). This template's own patterns
+    # below intentionally match gate-hub's glob syntax verbatim rather than a
+    # "more correct"-looking rewrite, to stay byte-identical with the
+    # convention being mirrored.
+    #
+    # PRECONDITION this relies on (same precondition gate-hub's own caller
+    # already depends on): NO branch-protection rule marks `gate / gate` as a
+    # REQUIRED status check on any repo using this template. If ANY repo
+    # onboarded from this template later adds `gate / gate` to its required
+    # status checks, this paths-ignore MUST be removed first — otherwise a
+    # pure-docs PR would never produce that check run at all and would sit
+    # permanently pending on a required context that can never turn green.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+# Union of what gate-v2.yml's jobs need — see that file's top-level
+# `permissions:` comment for the per-job breakdown (quality needs
+# pull-requests: write for the PR-size sticky comment; primary/gate need
+# actions: read for the Jobs API + artifact download).
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  # Job id MUST stay literally `gate` (workflow `name:` above is also `gate`)
+  # — this exact combination is what keeps the required status check context
+  # `gate / gate` unchanged across the legacy -> v2 switch (see the plan's
+  # "Required status check compatibility"). Do not rename this job.
+  gate:
+    # CANARY PIN: during canary this MUST be an immutable commit SHA, never a
+    # moving ref like `@main` — the whole point of pinning is that a caller's
+    # behavior cannot change out from under it without an explicit, reviewed
+    # sync command (see the plan's "Caller / reusable workflow boundary").
+    # Replace the placeholder below with the exact reviewed commit SHA of
+    # zlxlabs/gate before onboarding any real repo to this template.
+    uses: zlxlabs/gate/.github/workflows/gate-v2.yml@__PINNED_GATE_SHA__ # TODO(canary): pin to the reviewed gate-v2.yml commit SHA
+    with:
+      tier: personal          # personal | internal | saas
+      runner: self            # self (self-hosted, runs primary review) | hosted (GitHub free minutes)
+      # control_runner intentionally omitted here (defaults to github-hosted)
+      # — do not set self-hosted-control until the shadow double-run in the
+      # plan's "Required Gate" section has passed its promotion gate.
+      # Optional overrides: max_diff_lines: 4000, max_review_shards: 8,
+      # pr_size_warn_lines: 8000, timeout_minutes: 45
+    secrets:
+      # Public repos MUST pass this as a repo SECRET (fork PR runs cannot read
+      # secrets); private repos may omit it and rely on the same-name repo
+      # VARIABLE fallback inside gate-v2.yml's notify job instead.
+      FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
