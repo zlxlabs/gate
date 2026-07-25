@@ -7,6 +7,7 @@ ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
 .github/workflows/gate.yml and its own tests/test_gate_contract.py are
 untouched and unaffected by this file.
 """
+import re
 from pathlib import Path
 
 import yaml
@@ -251,11 +252,78 @@ def test_quality_and_primary_use_decoupled_timeout_inputs():
     assert quality_timeout != primary_timeout
 
 
-def test_review_gate_timeout_s_derives_from_primary_timeout_minutes():
+def test_review_gate_timeout_s_is_computed_in_shell_not_in_a_gha_expression():
+    # P1 fix (2026-07-26, codex re-review): GitHub Actions expression syntax
+    # has NO arithmetic operators (the official Operators reference table is
+    # limited to `() [] . ! < <= > >= == != && ||`) — an earlier draft used
+    # `${{ (inputs.primary_timeout_minutes - 5) * 60 }}`, which fails
+    # workflow parsing outright and would have broken every Required Gate
+    # run. REVIEW_GATE_TIMEOUT_S must instead be computed with real shell
+    # arithmetic in a `run:` step and exported via $GITHUB_ENV.
     raw, _ = _load_workflow()
     steps = raw["jobs"]["primary"]["steps"]
+    compute_step = next(
+        s for s in steps if s.get("name") == "Compute and validate review-primary's internal timeout budget"
+    )
+    run = compute_step["run"]
+    assert "primary_timeout_minutes=${{ inputs.primary_timeout_minutes }}" in run
+    assert "$(( (primary_timeout_minutes - 5) * 60 ))" in run
+    assert "REVIEW_GATE_TIMEOUT_S=" in run
+    assert "GITHUB_ENV" in run
+
+    # The compute step must run BEFORE "Run review-primary" so the exported
+    # env var is already present in the job's process environment.
+    names = [s.get("name") for s in steps]
+    assert names.index(compute_step["name"]) < names.index("Run review-primary")
+
+    # "Run review-primary" must NOT re-declare REVIEW_GATE_TIMEOUT_S itself —
+    # it inherits it from $GITHUB_ENV exported above.
     run_step = next(s for s in steps if s.get("name") == "Run review-primary")
-    assert run_step["env"]["REVIEW_GATE_TIMEOUT_S"] == "${{ (inputs.primary_timeout_minutes - 5) * 60 }}"
+    assert "REVIEW_GATE_TIMEOUT_S" not in run_step.get("env", {})
+
+
+def test_primary_timeout_minutes_lower_bound_is_validated_and_fails_closed():
+    # P2 fix (2026-07-26, codex re-review): a caller passing <= 5 would make
+    # the derived review budget zero or negative. Must fail closed with a
+    # clear error, not silently produce a nonsensical/negative timeout.
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["primary"]["steps"]
+    compute_step = next(
+        s for s in steps if s.get("name") == "Compute and validate review-primary's internal timeout budget"
+    )
+    run = compute_step["run"]
+    assert '[ "$primary_timeout_minutes" -le 5 ]' in run
+    assert "exit 1" in run
+
+
+# Matches an arithmetic operator used AS AN OPERATOR (whitespace on both
+# sides) so it doesn't false-positive on legitimate tight-hyphen identifiers
+# GitHub Actions expressions use all over this file, e.g. step ids
+# (`resolve-job-id`), runner labels inside quoted string literals
+# (`'self-hosted'`), or `control_runner`'s `'self-hosted-control'` value —
+# none of those have whitespace around the `-`.
+_ARITHMETIC_OPERATOR_WITH_SPACES = re.compile(r"\s[-*/%]\s")
+_GHA_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+
+
+def test_no_gha_expression_anywhere_uses_arithmetic_operators():
+    # Regression guard for the P1 above: GitHub Actions expressions can never
+    # contain `+ - * / %` as operators anywhere in this file (not just in the
+    # one spot that broke) — scan every `${{ ... }}` span in the raw file.
+    # Comment-only lines are dropped first: this file's own prose explaining
+    # the bug quotes the broken `${{ (x - 5) * 60 }}` example verbatim, which
+    # must not trip this guard against itself.
+    text = "\n".join(ln for ln in WORKFLOW.read_text().splitlines() if not ln.lstrip().startswith("#"))
+    offenders = []
+    for match in _GHA_EXPRESSION.finditer(text):
+        body = match.group(1)
+        # Strip single-quoted string literals (GHA expression string syntax)
+        # before scanning, so quoted content like 'self-hosted' can't trip
+        # the heuristic even if it somehow contained a spaced hyphen.
+        stripped = re.sub(r"'[^']*'", "", body)
+        if _ARITHMETIC_OPERATOR_WITH_SPACES.search(stripped):
+            offenders.append(body.strip())
+    assert not offenders, f"found arithmetic-looking operator(s) inside GHA expression(s): {offenders!r}"
 
 
 def test_pr_size_preflight_runs_before_expensive_checks_in_quality():

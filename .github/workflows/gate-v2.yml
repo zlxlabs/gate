@@ -58,8 +58,10 @@ on:
       # must leave headroom for review-primary to finalize (write + upload the
       # canonical audit) BEFORE GitHub's hard SIGKILL — 20 minutes of review +
       # 5 minutes of finalize reserve, per the plan's REVIEW_GATE_TIMEOUT_S /
-      # REVIEW_GATE_FINALIZE_RESERVE_S budget shape. See the `primary` job for
-      # how REVIEW_GATE_TIMEOUT_S is derived from this same input.
+      # REVIEW_GATE_FINALIZE_RESERVE_S budget shape. The `primary` job's first
+      # step derives REVIEW_GATE_TIMEOUT_S from this input IN SHELL (GitHub
+      # Actions expressions have no arithmetic operators) and fails closed if
+      # a caller ever passes <= 5.
       primary_timeout_minutes: { type: number, default: 25 }
       # Selects the runner pool for the FINAL `gate` aggregator job only. Per
       # the plan's "Required Gate" section: the aggregator must be able to run
@@ -270,6 +272,35 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 1 }
 
+      - name: Compute and validate review-primary's internal timeout budget
+        # GitHub Actions expression syntax has NO arithmetic operators (the
+        # official Operators table is limited to grouping/index/property/
+        # comparison/logical operators — no `+ - * / %`); a `${{ (x - 5) * 60
+        # }}`-style expression fails workflow parsing outright (confirmed
+        # against GitHub's own Contexts/Expressions reference docs after an
+        # earlier draft of this file wrongly assumed arithmetic was
+        # supported). The only correct way to derive REVIEW_GATE_TIMEOUT_S
+        # from primary_timeout_minutes is a plain shell computation here,
+        # then export it via $GITHUB_ENV for every later step in this job
+        # (including "Run review-primary" below, which no longer needs its
+        # own copy). Interpolating `inputs.primary_timeout_minutes` directly
+        # into the shell script is safe: it is a `number`-typed input the
+        # CALLER sets (not attacker-controlled PR content), so GitHub always
+        # substitutes a bare numeric literal here, never arbitrary text.
+        run: |
+          set -euo pipefail
+          primary_timeout_minutes=${{ inputs.primary_timeout_minutes }}
+          # Fail-closed lower bound: the fixed 5-minute finalize reserve
+          # (write + upload the canonical audit) must leave a POSITIVE
+          # review budget — primary_timeout_minutes <= 5 would make
+          # REVIEW_GATE_TIMEOUT_S zero or negative, which is nonsensical.
+          if [ "$primary_timeout_minutes" -le 5 ]; then
+            echo "::error::primary_timeout_minutes must be > 5 (5 minutes are reserved for review-primary to finalize before GitHub's hard job timeout); got $primary_timeout_minutes"
+            exit 1
+          fi
+          review_gate_timeout_s=$(( (primary_timeout_minutes - 5) * 60 ))
+          echo "REVIEW_GATE_TIMEOUT_S=$review_gate_timeout_s" >> "$GITHUB_ENV"
+
       - name: Resolve numeric job id for REVIEW_JOB_ID
         # review-primary requires REVIEW_JOB_ID (a net-new v2 identity field —
         # GitHub Actions has no standard env var exposing a job's own numeric
@@ -313,13 +344,11 @@ jobs:
           # REVIEW_REUSABLE_WORKFLOW_SHA distinction.
           REVIEW_CALLER_SHA: ${{ github.workflow_sha }}
           REVIEW_REUSABLE_WORKFLOW_SHA: ${{ job.workflow_sha }}
-          # Derived from primary_timeout_minutes so review-primary's own
-          # internal deadline (after which it stops mid-chain and writes
-          # whatever audit it can) always elapses BEFORE GitHub's hard
-          # SIGKILL at the job's timeout-minutes — leaving the fixed 5-minute
-          # reserve for finalize (write + upload the canonical audit) to
-          # actually run. GitHub Actions expressions support `-`/`*` directly.
-          REVIEW_GATE_TIMEOUT_S: ${{ (inputs.primary_timeout_minutes - 5) * 60 }}
+          # REVIEW_GATE_TIMEOUT_S is intentionally NOT set here — the
+          # "Compute and validate review-primary's internal timeout budget"
+          # step above already exported it via $GITHUB_ENV, which makes it
+          # part of this job's process environment for every subsequent step
+          # automatically (no per-step `env:` re-declaration needed).
           GH_TOKEN: ${{ github.token }}
         run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
 
