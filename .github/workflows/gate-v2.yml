@@ -50,9 +50,17 @@ on:
       has_ui:     { type: boolean, default: false }
       design_doc: { type: string,  default: "" }          # e.g. docs/DESIGN.md
       max_diff_lines:    { type: number, default: 4000 }   # per-review-turn diff budget
-      timeout_minutes:   { type: number, default: 45 }     # per-job (quality, primary) hard timeout
+      timeout_minutes:   { type: number, default: 45 }     # `quality` job's hard timeout only (see primary_timeout_minutes)
       max_review_shards: { type: number, default: 8 }      # total large-PR coverage budget
       pr_size_warn_lines: { type: number, default: 8000 }  # strong warning; hard cap derives from the two inputs above
+      # Decoupled from `timeout_minutes` (2026-07-26 tightening pass): the
+      # `primary` job's own budget is unrelated to quality's lint/test time and
+      # must leave headroom for review-primary to finalize (write + upload the
+      # canonical audit) BEFORE GitHub's hard SIGKILL — 20 minutes of review +
+      # 5 minutes of finalize reserve, per the plan's REVIEW_GATE_TIMEOUT_S /
+      # REVIEW_GATE_FINALIZE_RESERVE_S budget shape. See the `primary` job for
+      # how REVIEW_GATE_TIMEOUT_S is derived from this same input.
+      primary_timeout_minutes: { type: number, default: 25 }
       # Selects the runner pool for the FINAL `gate` aggregator job only. Per
       # the plan's "Required Gate" section: the aggregator must be able to run
       # independently of the review runner pool (PVE self-hosted fleet), so a
@@ -228,15 +236,20 @@ jobs:
   # canonical primary audit the `gate` aggregator consumes. Deliberately does
   # NOT implement (this PR, D1 scope only):
   #   - the `codex-review-waived` label / waiver-comment validation legacy's
-  #     "Validate audited Codex review waiver" step does — the aggregator DOES
-  #     have defensive not_expected/waived acceptance logic ready (see
-  #     .github/actions/gate-aggregator/aggregate.py, T6 TODO) for whenever a
-  #     later PR wires up a real waiver-writing branch here;
+  #     "Validate audited Codex review waiver" step does. As of the
+  #     2026-07-26 security tightening pass, the aggregator UNCONDITIONALLY
+  #     REJECTS any not_expected/waived audit verdict it ever sees (see
+  #     .github/actions/gate-aggregator/aggregate.py's module docstring, "T6")
+  #     — a later PR that wires up a real waiver-writing branch here MUST
+  #     also implement gate-hub contracts.py-equivalent companion-field
+  #     policy validation in the aggregator (enum-domain / ISO-8601 checks,
+  #     not merely "field is present") before flipping that rejection to an
+  #     acceptance;
   #   - a not_expected canonical-audit WRITE for the fork/hosted skip branches
   #     below (the plan's Required Gate section calls for one; this canary PR
   #     leaves the whole job skipped instead and relies on the aggregator's
   #     `review_expected` check to accept the skip — tracked as a TODO, not a
-  #     silent gap: see this PR's report).
+  #     silent gap: see this PR's report; T3 in the fleet-promotion checklist).
   primary:
     # Whole-job skip (clean `skipped` conclusion, not a same-verdict "success
     # with nothing done") whenever review should not run at all: draft PR,
@@ -251,7 +264,8 @@ jobs:
     # protection comment): even if the `if:` above were ever weakened by a
     # future edit, a fork PR still can never land on the self-hosted pool.
     runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
+    # Decoupled from quality's `timeout_minutes` — see that input's comment.
+    timeout-minutes: ${{ inputs.primary_timeout_minutes }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 1 }
@@ -299,6 +313,13 @@ jobs:
           # REVIEW_REUSABLE_WORKFLOW_SHA distinction.
           REVIEW_CALLER_SHA: ${{ github.workflow_sha }}
           REVIEW_REUSABLE_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          # Derived from primary_timeout_minutes so review-primary's own
+          # internal deadline (after which it stops mid-chain and writes
+          # whatever audit it can) always elapses BEFORE GitHub's hard
+          # SIGKILL at the job's timeout-minutes — leaving the fixed 5-minute
+          # reserve for finalize (write + upload the canonical audit) to
+          # actually run. GitHub Actions expressions support `-`/`*` directly.
+          REVIEW_GATE_TIMEOUT_S: ${{ (inputs.primary_timeout_minutes - 5) * 60 }}
           GH_TOKEN: ${{ github.token }}
         run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
 
@@ -326,7 +347,10 @@ jobs:
     # default dependency semantics.
     if: always()
     runs-on: ${{ inputs.control_runner == 'self-hosted-control' && fromJSON('["self-hosted","linux","gate-control"]') || fromJSON('["ubuntu-latest"]') }}
-    timeout-minutes: 10
+    # 5 minutes (plan value): the aggregator only checks out its own small
+    # source tree, downloads one artifact, and runs a stdlib-only script — it
+    # must never need anywhere near quality/primary's budgets.
+    timeout-minutes: 5
     steps:
       # `uses:` cannot itself take an expression, so the only way to pin the
       # aggregator script to the EXACT commit this reusable workflow file is
@@ -357,6 +381,10 @@ jobs:
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           PRIMARY_RESULT: ${{ needs.primary.result }}
+          # Forwarded so the aggregator can strictly validate it itself
+          # (self|hosted only) — a typo here must fail closed, not silently
+          # fall through whichever branch it happens to resemble.
+          RUNNER_MODE: ${{ inputs.runner }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           # The SAME expression the `primary` job's own `if:` uses (see that
           # job's comment) — recomputed here because a skipped job's `if:`
@@ -372,6 +400,7 @@ jobs:
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
             --primary-result "$PRIMARY_RESULT" \
+            --runner "$RUNNER_MODE" \
             --is-draft "$IS_DRAFT" \
             --review-expected "$REVIEW_EXPECTED" \
             --repository-id "$REPOSITORY_ID" \

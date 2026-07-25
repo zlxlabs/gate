@@ -142,6 +142,13 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
 
 
 def test_gate_job_review_expected_matches_primary_jobs_own_condition():
+    # Tightened (2026-07-26): these two strings are meant to be byte-for-byte
+    # the SAME expression (recomputed in a different job only because a
+    # skipped job's `if:` isn't itself exposed via `needs.*`) — assert full
+    # equality, not just "all three guard substrings happen to be present",
+    # which would tolerate the two copies silently drifting apart in other
+    # ways (extra clauses, different operators, reordering with different
+    # short-circuit semantics).
     raw, _ = _load_workflow()
     primary_if = str(raw["jobs"]["primary"].get("if", ""))
     for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD):
@@ -149,8 +156,11 @@ def test_gate_job_review_expected_matches_primary_jobs_own_condition():
 
     aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
     review_expected = str(aggregate_step["env"]["REVIEW_EXPECTED"])
-    for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD):
-        assert guard in review_expected, f"gate job's REVIEW_EXPECTED is missing {guard!r}"
+    assert review_expected == primary_if, (
+        "gate job's REVIEW_EXPECTED must be byte-for-byte identical to primary job's `if:`\n"
+        f"primary if:        {primary_if!r}\n"
+        f"REVIEW_EXPECTED:   {review_expected!r}"
+    )
 
 
 def test_gate_job_passes_the_identity_quintuple_to_the_aggregator():
@@ -164,11 +174,26 @@ def test_gate_job_passes_the_identity_quintuple_to_the_aggregator():
     assert env["PR_NUMBER"] == "${{ github.event.pull_request.number }}"
     run = aggregate_step["run"]
     for flag in (
-        "--quality-result", "--primary-result", "--is-draft", "--review-expected",
+        "--quality-result", "--primary-result", "--runner", "--is-draft", "--review-expected",
         "--repository-id", "--head-sha", "--run-id", "--run-attempt", "--pr-number",
         "--audit-dir", "--summary-path",
     ):
         assert flag in run
+
+
+def test_gate_job_forwards_the_raw_runner_input_for_strict_validation():
+    # The aggregator itself must strictly validate `runner` (self|hosted) —
+    # see aggregate.py's RUNNER_DOMAIN — rather than trusting a workflow-side
+    # expression to have already screened out typos.
+    raw, _ = _load_workflow()
+    aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
+    assert aggregate_step["env"]["RUNNER_MODE"] == "${{ inputs.runner }}"
+    assert '--runner "$RUNNER_MODE"' in aggregate_step["run"]
+
+
+def test_gate_job_timeout_is_five_minutes():
+    raw, _ = _load_workflow()
+    assert raw["jobs"]["gate"]["timeout-minutes"] == 5
 
 
 # ── primary job: draft/fork/hosted skip + fail-closed upload ─────────────────
@@ -209,12 +234,28 @@ def test_primary_run_review_primary_env_has_required_v2_identity_vars():
     assert "${{ github.event.pull_request.number }}" in run_step["run"]
 
 
-def test_quality_timeout_is_parameterized():
+def test_quality_and_primary_use_decoupled_timeout_inputs():
+    # Tightened (2026-07-26): quality and primary must NOT share one timeout
+    # input — primary needs a smaller, independently-tunable budget that
+    # leaves headroom for review-primary to finalize before GitHub's hard
+    # SIGKILL. Assert they are DIFFERENT input names, not just "both
+    # parameterized somehow".
     raw, trigger = _load_workflow()
     inputs = trigger["workflow_call"]["inputs"]
     assert inputs["timeout_minutes"]["default"] == 45
-    assert raw["jobs"]["quality"]["timeout-minutes"] == "${{ inputs.timeout_minutes }}"
-    assert raw["jobs"]["primary"]["timeout-minutes"] == "${{ inputs.timeout_minutes }}"
+    assert inputs["primary_timeout_minutes"]["default"] == 25
+    quality_timeout = raw["jobs"]["quality"]["timeout-minutes"]
+    primary_timeout = raw["jobs"]["primary"]["timeout-minutes"]
+    assert quality_timeout == "${{ inputs.timeout_minutes }}"
+    assert primary_timeout == "${{ inputs.primary_timeout_minutes }}"
+    assert quality_timeout != primary_timeout
+
+
+def test_review_gate_timeout_s_derives_from_primary_timeout_minutes():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["primary"]["steps"]
+    run_step = next(s for s in steps if s.get("name") == "Run review-primary")
+    assert run_step["env"]["REVIEW_GATE_TIMEOUT_S"] == "${{ (inputs.primary_timeout_minutes - 5) * 60 }}"
 
 
 def test_pr_size_preflight_runs_before_expensive_checks_in_quality():
@@ -253,9 +294,25 @@ def test_caller_declares_ready_for_review_and_converted_to_draft():
     assert set(types) == {"opened", "synchronize", "reopened", "ready_for_review", "converted_to_draft"}
 
 
-def test_caller_reserves_merge_group_trigger():
+def test_caller_merge_group_is_not_an_active_trigger():
+    # Tightened (2026-07-26): a real merge_group event carries no
+    # `pull_request` payload, and gate-v2.yml's expressions (plus the
+    # aggregator's argparse contract) all assume one exists — a live
+    # merge_group run was confirmed to abort with a hard argparse failure.
+    # merge_group must NOT be an active trigger; it stays reserved only as a
+    # comment (see the file's top-of-file explanation) until a follow-up PR
+    # actually adapts the expressions/CLI contract for a PR-less payload.
     _, trigger = _load_caller()
-    assert "merge_group" in trigger
+    assert "merge_group" not in trigger
+    assert set(trigger.keys()) == {"pull_request"}
+    text = CALLER_TEMPLATE.read_text()
+    assert "merge_group" in text  # still documented as a reserved non-trigger, in a comment
+
+
+def test_caller_paths_ignore_mirrors_gate_hubs_existing_caller_convention():
+    _, trigger = _load_caller()
+    paths_ignore = trigger["pull_request"]["paths-ignore"]
+    assert paths_ignore == ["**.md", "docs/**"]
 
 
 def test_caller_job_id_and_workflow_name_are_gate():
