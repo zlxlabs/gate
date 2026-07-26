@@ -385,7 +385,13 @@ jobs:
           # Routed through env: rather than interpolated into the `run:` string below —
           # same hygiene fix as the "Resolve numeric job id" step above.
           REVIEWER: ${{ matrix.reviewer }}
-        run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" "${{ github.event.pull_request.number }}" "$REVIEWER"
+        # P0 fix (2026-07-26, canary probe #2) — same class of bug, and same fix, as
+        # gate-v2.yml's "Run review-primary" step (see that step's own comment for the
+        # full story): review-shadow is a Python entry point, not a bash script — an
+        # earlier draft's `bash "$GATE_HUB_DIR/..."` invocation fed its Python source to
+        # bash instead of python3, confirmed in canary logs as `review-shadow: line 101:
+        # import: command not found`. Explicit `python3` fixes it.
+        run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" "${{ github.event.pull_request.number }}" "$REVIEWER"
 
       # `if: always()`: review-shadow's own docstring guarantees a legal event file is
       # ALREADY on disk for every outcome except exit codes 2 (event write itself
@@ -393,11 +399,18 @@ jobs:
       # setup error) — this step must still attempt the upload after a non-zero
       # "Run review-shadow" exit (which already makes this job read as `failure`, e.g.
       # for an exit-1 typed infra failure) so the event/failure-envelope artifact isn't
-      # lost. `if-no-files-found: warn` (not `error`): the exit-2/3 "legitimately nothing
-      # was ever written" case must not pile a SECOND, misleading failure reason onto a
-      # job that is already red for its own, more specific reason. A genuine
-      # upload-artifact API failure still fails this step (and therefore the job) on its
-      # own terms — matching the D2 task's "上传失败即该成员 job 红（不影响他人）".
+      # lost.
+      #
+      # P1 fix (2026-07-26, canary probe #2): `if-no-files-found: warn` (this file's
+      # earlier draft) is NOT fail-closed — a `warn` only annotates the step, it still
+      # concludes `success`, which would let a leg silently report green with no event on
+      # disk at all. Changed to `if-no-files-found: error` to match the D2 plan's actual
+      # invariant: "成功 leg 必有事件" (a leg that reads as `success` must have produced a
+      # real, uploaded event — never merely "review-shadow exited without crashing").
+      # This DOES mean an exit-2/3 leg (legitimately no event was ever written) now fails
+      # this upload step too, on top of "Run review-shadow" already having failed it —
+      # two failure annotations on the same already-red job, not a new failure mode, and
+      # consistent with the D2 task's original "上传失败即该成员 job 红（不影响他人）".
       #
       # Artifact registration name deliberately DIFFERENT from (shorter than) the local
       # event file name review-shadow itself computes
@@ -427,7 +440,7 @@ jobs:
         with:
           name: shadow-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shadow-events
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
   # ── summary ──────────────────────────────────────────────────────────────
@@ -495,6 +508,12 @@ jobs:
           pattern: shadow-event-*-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
 
+      # Third of the three review-* entry-point invocations audited for the 2026-07-26
+      # canary-probe-#2 P0 fix (alongside gate-v2.yml's "Run review-primary" and this
+      # file's own "Run review-shadow", both of which had to change bash -> python3):
+      # review-summary is ALSO a Python entry point, but this invocation was already
+      # correct — `python3 "$gate_hub_dir/scripts/review/review-summary" ...` below, not
+      # `bash`. Confirmed clean, not touched by that fix.
       - name: Summarize shadow calibration results
         env:
           REVIEW_SUMMARY_REPOSITORY_ID: ${{ github.repository_id }}

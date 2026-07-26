@@ -350,19 +350,42 @@ jobs:
           # part of this job's process environment for every subsequent step
           # automatically (no per-step `env:` re-declaration needed).
           GH_TOKEN: ${{ github.token }}
-        run: bash "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
+        # P0 fix (2026-07-26, canary probe #2): review-primary is a Python entry point
+        # (`#!/usr/bin/env python3` shebang, gate-hub's own scripts/review/review-primary)
+        # — NOT a bash script the way legacy's scripts/codex-review.sh is. An earlier
+        # draft of this line copied legacy's `bash "$GATE_HUB_DIR/..."` invocation
+        # pattern verbatim, which fed review-primary's Python source to bash instead of
+        # python3: confirmed in canary logs as `review-primary: line 78: syntax error
+        # near unexpected token ')'` (bash choking on Python syntax) — and, as a direct
+        # downstream consequence, `fatal: cannot change to 'GATE_HUB_DIR': No such file
+        # or directory` (bash's command-substitution backticks trigger on
+        # review-primary's OWN module docstring prose — e.g. "default `git -C
+        # GATE_HUB_DIR rev-parse HEAD`", markdown-style example text inside gate-hub's
+        # script, never meant to execute — the instant bash parses that whole Python
+        # file as script text, since bash has no concept of a Python triple-quoted
+        # string). Explicit `python3`
+        # (rather than relying on the shebang + the file's executable bit, which this
+        # invocation should not have to gamble on) is the fix; it also makes the
+        # `git -C GATE_HUB_DIR` artifact disappear on its own, since python3 correctly
+        # treats that text as an inert string literal instead of shell source.
+        run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
 
       - name: Upload canonical primary audit
         # Fail-closed by design: if the audit can't be uploaded, the aggregator
         # must never see a "success" primary job without a matching artifact
-        # to validate — so this step deliberately has NO `continue-on-error`
-        # and no `if-no-files-found: ignore` (unlike legacy's advisory codex
-        # audit upload). A missing file here fails the job outright.
+        # to validate — so this step deliberately has NO `continue-on-error`.
+        # P1 fix (2026-07-26, canary probe #2): an earlier draft of this step relied on
+        # `actions/upload-artifact@v4`'s DEFAULT `if-no-files-found` behavior, which is
+        # `warn` — NOT `ignore`, but also NOT `error`: canary observed primary fail to
+        # write an audit at all, yet this step still concluded `success` (a warning
+        # annotation, not a job failure). `if-no-files-found: error` below is the actual
+        # fail-closed setting; "no if-no-files-found: ignore" alone was never sufficient.
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/primary-review-audit.json
+          if-no-files-found: error
           retention-days: 30
 
   # ── gate (final aggregator — required check) ────────────────────────────
