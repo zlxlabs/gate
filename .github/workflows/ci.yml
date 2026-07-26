@@ -62,6 +62,29 @@ jobs:
       # `templates/*.yml` is passed explicitly since actionlint does not look there on
       # its own (these are caller TEMPLATES, not live workflows under `.github/workflows/`,
       # but they are exactly as syntax-sensitive and worth linting the same way).
+      #
+      # SHELLCHECK_OPTS=--severity=warning (2026-07-26 fix, first real CI run): this
+      # runner has `shellcheck` on PATH, so actionlint auto-enables its bundled
+      # shellcheck integration against every `run:` script body — a DIFFERENT source of
+      # findings than actionlint's own native checks, governed by its own severity
+      # levels (style < info < warning < error), not by `.github/actionlint.yaml`'s
+      # `paths.ignore` (that mechanism filters actionlint's OWN error messages by regex,
+      # after the fact; shellcheck's own `--severity` flag controls what it reports in
+      # the first place). Without this, the first real run surfaced ONE style-level
+      # finding (SC2129, "Consider using { cmd1; cmd2; } >> file instead of individual
+      # redirects") in EACH of gate-v2.yml:174 and legacy gate.yml:146 — both files emit
+      # the exact same idiom (repeated `>> "$GITHUB_STEP_SUMMARY"`/similar individual
+      # redirects). Neither is fixable here: legacy gate.yml is frozen (no non-emergency
+      # edits — see this repo's own convention) and gate-v2.yml's occurrence is
+      # pre-existing, unrelated D1 code this task does not otherwise touch; and SC2129 is
+      # a pure style suggestion, not a correctness issue, so blocking CI on it either way
+      # would not be proportionate. `--severity=warning` keeps shellcheck's warning/error
+      # findings fully active (a REAL warning+ issue anywhere must still fail this job —
+      # see this PR's own report for the confirmed-clean re-run at this threshold) and
+      # only silences style/info-level noise; it does not touch actionlint's own native
+      # rules (context/label/syntax checks) at all.
       - name: Lint workflow files and caller templates
+        env:
+          SHELLCHECK_OPTS: --severity=warning
         run: ${{ steps.get_actionlint.outputs.executable }} -color .github/workflows/*.yml templates/*.yml
         shell: bash
