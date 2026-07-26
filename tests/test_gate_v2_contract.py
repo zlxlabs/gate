@@ -131,10 +131,14 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert upload["if"] == "always()"
     assert upload["uses"] == "actions/upload-artifact@v4"
     assert upload["with"]["name"] == ARTIFACT_NAME_EXPR
-    # fail-closed: unlike legacy's advisory codex-audit upload, this upload has
-    # no continue-on-error and no if-no-files-found: ignore.
+    # fail-closed: unlike legacy's advisory codex-audit upload, this upload has no
+    # continue-on-error. P1 fix (2026-07-26, canary probe #2): if-no-files-found MUST be
+    # explicit `error` — actions/upload-artifact@v4's own default is `warn` (a step
+    # annotation, not a failure), which is what let canary's primary job conclude
+    # `success` despite writing no audit at all; relying on "we didn't set `ignore`"
+    # alone was never sufficient fail-closed enforcement.
     assert "continue-on-error" not in upload
-    assert "if-no-files-found" not in upload["with"]
+    assert upload["with"]["if-no-files-found"] == "error"
 
     gate_steps = raw["jobs"]["gate"]["steps"]
     download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
@@ -234,6 +238,21 @@ def test_primary_run_review_primary_env_has_required_v2_identity_vars():
     assert env["REVIEW_REUSABLE_WORKFLOW_SHA"] == "${{ job.workflow_sha }}"
     assert "review-primary" in run_step["run"]
     assert "${{ github.event.pull_request.number }}" in run_step["run"]
+
+
+def test_run_review_primary_invokes_python3_not_bash():
+    # P0 fix (2026-07-26, canary probe #2): review-primary is a Python entry point
+    # (`#!/usr/bin/env python3` shebang) — an earlier draft invoked it via `bash
+    # "$GATE_HUB_DIR/..."` (copied from legacy's own bash-script invocation pattern),
+    # which fed Python source to bash and failed with a bash syntax error. Must be
+    # invoked with an explicit `python3` interpreter, never relying on the shebang +
+    # the file's own executable bit.
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["primary"]["steps"]
+    run_step = next(s for s in steps if s.get("name") == "Run review-primary")
+    run = run_step["run"].strip()
+    assert run.startswith("python3 "), f"expected an explicit python3 invocation, got: {run!r}"
+    assert not run.startswith("bash ")
 
 
 def test_quality_and_primary_use_decoupled_timeout_inputs():

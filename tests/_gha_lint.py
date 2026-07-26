@@ -35,6 +35,12 @@ _GHA_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 # sub-expression. Empty/whitespace-only, or anything else (e.g. literal `...` prose),
 # can never be a real expression — see find_empty_or_malformed_gha_expression_offenders.
 _PLAUSIBLE_EXPRESSION_START = re.compile(r"^\s*[A-Za-z_!('\"0-9(]")
+# A bareword `GATE_HUB_DIR` NOT immediately preceded by `$` or `${` — i.e. NOT part of a
+# real shell variable reference (`$GATE_HUB_DIR`, `${GATE_HUB_DIR}`,
+# `${GATE_HUB_DIR:-/opt/gate-hub}`). Fixed-width lookbehinds (both required: `(?<!\$)`
+# alone would still accept `${GATE_HUB_DIR` since the single character immediately
+# before is `{`, not `$`).
+_BARE_GATE_HUB_DIR_RE = re.compile(r"(?<!\$)(?<!\$\{)GATE_HUB_DIR")
 
 
 def find_arithmetic_gha_expression_offenders(workflow_path: Path) -> list[str]:
@@ -97,4 +103,47 @@ def find_empty_or_malformed_gha_expression_offenders_in_run_blocks(workflow_path
                 if not _PLAUSIBLE_EXPRESSION_START.match(body):
                     label = step.get("name") or step.get("id") or "<unnamed step>"
                     offenders.append(f"{job_id}::{label}: {body!r}")
+    return offenders
+
+
+def find_bare_gate_hub_dir_offenders_in_run_blocks(workflow_path: Path) -> list[str]:
+    """P0 regression guard (2026-07-26, canary probe #2): a `GATE_HUB_DIR` reference
+    inside a `run:` block that is NOT actually a shell variable expansion (missing its
+    `$`/`${...}` sigil, e.g. a stray `git -C GATE_HUB_DIR ...` or `cd GATE_HUB_DIR`)
+    resolves to the literal 12-character string "GATE_HUB_DIR" instead of the resolved
+    directory path, which fails loudly and confusingly at runtime (e.g. git's own
+    `fatal: cannot change to 'GATE_HUB_DIR': No such file or directory`) — canary
+    observed exactly this, downstream of a separate bug (review-primary/review-shadow
+    being executed by bash instead of python3, which caused bash to treat those
+    scripts' own PROSE/docstring text — including markdown-style ``git -C GATE_HUB_DIR
+    rev-parse HEAD`` example text inside backticks — as literal, executable shell
+    command substitution). No bare reference was found in this repo's own workflow
+    files even before that root cause was fixed (this scan confirmed it), but the
+    pattern is cheap and permanent to guard against directly, independent of whatever
+    caused this specific canary incident.
+
+    Real bash `#`-comment lines are EXCLUDED from this scan (unlike
+    find_empty_or_malformed_gha_expression_offenders_in_run_blocks above, where comments
+    ARE dangerous because GitHub Actions' expression templating does not respect bash
+    comment syntax at all): a bash comment mentioning "GATE_HUB_DIR" in prose is
+    genuinely inert to bash, so flagging it here would only be noise, not a real bug.
+
+    Returns a list of `"<job_id>::<step name or id>: <matched line, stripped>"`
+    diagnostic strings; an empty list means the file is clean.
+    """
+    doc = yaml.safe_load(workflow_path.read_text())
+    if not doc or "jobs" not in doc:
+        return []
+    offenders: list[str] = []
+    for job_id, job in doc["jobs"].items():
+        for step in job.get("steps", []) or []:
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            for line in run.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                if _BARE_GATE_HUB_DIR_RE.search(line):
+                    label = step.get("name") or step.get("id") or "<unnamed step>"
+                    offenders.append(f"{job_id}::{label}: {line.strip()!r}")
     return offenders

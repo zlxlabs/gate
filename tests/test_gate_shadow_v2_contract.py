@@ -269,7 +269,11 @@ def test_shadow_upload_step_name_pattern_matches_summary_download_pattern():
     assert upload["uses"] == "actions/upload-artifact@v4"
     upload_name = str(upload["with"]["name"])
     assert upload_name == "shadow-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}"
-    assert upload["with"]["if-no-files-found"] == "warn"
+    # P1 fix (2026-07-26, canary probe #2): must be explicit `error`, not the earlier
+    # draft's `warn` — the D2 plan's actual invariant is "成功 leg 必有事件" (a leg that
+    # reads as `success` must have a real uploaded event), which `warn` (an annotation,
+    # not a failure) does not enforce.
+    assert upload["with"]["if-no-files-found"] == "error"
 
     summary_steps = raw["jobs"]["summary"]["steps"]
     download = next(s for s in summary_steps if s.get("name") == "Download all shadow event artifacts for this run")
@@ -321,6 +325,20 @@ def test_run_review_shadow_env_has_required_v2_identity_vars():
     assert "REVIEW_GATE_TIMEOUT_S" not in env
 
 
+def test_run_review_shadow_invokes_python3_not_bash():
+    # P0 fix (2026-07-26, canary probe #2) — same bug class and fix as
+    # test_gate_v2_contract.py's test_run_review_primary_invokes_python3_not_bash: an
+    # earlier draft invoked review-shadow (a Python entry point) via `bash
+    # "$GATE_HUB_DIR/..."`, which fed Python source to bash and failed with
+    # `import: command not found`.
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["shadow"]["steps"]
+    run_step = next(s for s in steps if s.get("name") == "Run review-shadow")
+    run = run_step["run"].strip()
+    assert run.startswith("python3 "), f"expected an explicit python3 invocation, got: {run!r}"
+    assert not run.startswith("bash ")
+
+
 # ── summary job: always() + explicit non-empty guard, no PR-write permission ───
 
 def test_summary_job_needs_resolve_and_shadow():
@@ -369,6 +387,11 @@ def test_summary_invokes_review_summary_with_events_dir_and_reviewer_args():
     env = run_step["env"]
     assert env["REVIEW_SUMMARY_REPOSITORY_ID"] == "${{ github.repository_id }}"
     assert env["REVIEW_SUMMARY_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+    # Third of the three review-* entry points audited for the P0 bash-vs-python3 fix
+    # (2026-07-26, canary probe #2) — review-summary is also a Python entry point;
+    # confirmed this invocation was already correct (never touched by that fix).
+    assert 'python3 "$gate_hub_dir/scripts/review/review-summary"' in run
+    assert not any(ln.strip().startswith("bash ") for ln in run.splitlines())
 
 
 def test_no_job_grants_pull_request_or_issue_write():
