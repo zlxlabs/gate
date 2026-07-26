@@ -18,3 +18,50 @@ jobs:
         run: pip install pytest pyyaml
       - name: Run tests
         run: python -m pytest -q
+
+  # actionlint (https://github.com/rhysd/actionlint) — an independent, complementary
+  # static check on TOP of tests/test_gate*_contract.py. It catches a different class of
+  # bug than the Python contract tests do: undefined context properties (typos like
+  # `github.repositry`), unknown/undeclared runner labels, invalid `uses:`/`if:`/cron
+  # syntax, and (via its bundled shellcheck/pyflakes integration) issues inside `run:`
+  # script bodies. It would NOT have caught the 2026-07-26 P0 bug (a literal, empty
+  # double-brace expression-interpolation token embedded in a `run:` comment, which
+  # compiles to an invalid EXPRESSION rather than an invalid schema/context reference —
+  # actionlint only flags malformed/unknown REFERENCES inside a well-formed `${{ ... }}`,
+  # not an empty one; tests/test_no_literal_gha_expression_in_run_blocks.py is the
+  # repo-wide regression guard for THAT specific bug class) — the two checks are
+  # deliberately complementary, not redundant.
+  #
+  # Config: .github/actionlint.yaml (self-hosted runner labels this fleet actually uses —
+  # `codex`/`gate-control` — plus two precisely-scoped, documented `-ignore`-equivalent
+  # entries for `job.workflow_sha`/`job.workflow_repository`, which ARE genuine
+  # GitHub-documented `job`-context properties (Contexts reference, "job context") that
+  # actionlint's own type model does not yet know about as of v1.7.12, the latest release
+  # as of this fix — see that config file's own comments for the full story). Every OTHER
+  # rule stays at actionlint's own default strictness; nothing else is relaxed.
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Official download-script method (actionlint's own docs/usage.md, "Use actionlint
+      # on GitHub Actions") — pinned to an exact released version (not "latest") for the
+      # same reproducibility reason this repo pins zlxlabs/gate caller SHAs during canary:
+      # a silent version bump could add new checks or a new type model that behaves
+      # differently without a reviewed, deliberate bump. `steps.*.outputs.executable`
+      # (this script's own contract) is used instead of assuming a fixed `./actionlint`
+      # path, matching the script's own documented usage exactly.
+      - name: Download actionlint (pinned v1.7.12)
+        id: get_actionlint
+        run: bash <(curl -sS https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
+        shell: bash
+
+      # `.github/actionlint.yaml` is auto-discovered by actionlint itself (no
+      # `-config-file` flag needed) whenever it is run from the repository root.
+      # `.github/workflows/*.yml` is actionlint's own default auto-discovered path;
+      # `templates/*.yml` is passed explicitly since actionlint does not look there on
+      # its own (these are caller TEMPLATES, not live workflows under `.github/workflows/`,
+      # but they are exactly as syntax-sensitive and worth linting the same way).
+      - name: Lint workflow files and caller templates
+        run: ${{ steps.get_actionlint.outputs.executable }} -color .github/workflows/*.yml templates/*.yml
+        shell: bash

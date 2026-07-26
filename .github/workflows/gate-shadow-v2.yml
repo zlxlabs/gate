@@ -335,11 +335,24 @@ jobs:
           REVIEWER: ${{ matrix.reviewer }}
         run: |
           set -euo pipefail
-          # JOB_NAME_SUFFIX is computed from $REVIEWER (env, not a direct ${{ }}
+          # JOB_NAME_SUFFIX is computed from $REVIEWER (env, not a direct GHA expression
           # interpolation) and then EXPORTED so the jq filter below can read it via its
           # own `env.JOB_NAME_SUFFIX` builtin — `gh api --jq` spawns jq inheriting this
           # process's environment, so no string ever needs to be interpolated into the
           # jq filter source itself either.
+          #
+          # P0 FIX (2026-07-26, canary first-run failure): the double-brace expression
+          # interpolation syntax (dollar sign, two open braces, ..., two close braces)
+          # must NEVER be spelled out literally inside a `run:` block's text, not even
+          # inside a `#` shell comment — GitHub Actions' expression templating scans the
+          # ENTIRE run-block string (comments included) for that syntax and substitutes
+          # every match BEFORE bash ever parses any of it. An earlier draft of this exact
+          # comment reproduced that literal syntax (empty inside the braces) to illustrate
+          # what NOT to do, and GitHub tried to evaluate it as an empty expression, which
+          # fails to compile at all — confirmed by the canary run failing at creation
+          # (empty `referenced_workflows`, immediate `failure` conclusion, no job ever
+          # dispatched). This paragraph deliberately describes the syntax in prose instead
+          # of reproducing it, precisely so it can explain the bug without retriggering it.
           export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"
           job_id="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs" \
             --paginate --jq '.jobs[] | select(.name == env.JOB_NAME_SUFFIX or (.name | endswith("/ " + env.JOB_NAME_SUFFIX))) | .id' \
