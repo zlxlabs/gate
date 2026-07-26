@@ -1,0 +1,50 @@
+# actionlint configuration (docs: https://github.com/rhysd/actionlint/tree/main/docs/config.md).
+#
+# Added 2026-07-26 alongside the gate-shadow-v2.yml P0 fix (a literal double-brace
+# expression-interpolation token inside a `run:` comment compiled to an empty GitHub
+# Actions expression and hard-failed the whole workflow at creation time — actionlint
+# would NOT have caught that specific class of bug either, since it only lints
+# well-formed `${{ ... }}` expressions, not empty ones embedded in prose; this config
+# wires actionlint into ci.yml as an independent, complementary check for the OTHER
+# classes of static workflow bugs it does catch — undefined context properties, unknown
+# runner labels, shellcheck/expression-syntax issues, etc.).
+self-hosted-runner:
+  # Every custom self-hosted runner label used anywhere in this repo's own workflow
+  # files (`self-hosted`/`linux` are actionlint built-ins already; these are the
+  # repo-specific labels layered on top — see gate.yml/gate-v2.yml/gate-shadow-v2.yml's
+  # own `runs-on:` ternaries and templates/caller-*.yml for where each is used):
+  labels:
+    - codex         # the shared self-hosted review-runner pool (quality/primary/shadow)
+    - gate-control   # gate-v2.yml's `gate` aggregator job's reserved control-runner pool
+                     # (control_runner: self-hosted-control) — not yet used by any live
+                     # caller (control_runner defaults to github-hosted today), but a
+                     # legal runs-on value gate-v2.yml already ships, so it must be
+                     # declared here too or actionlint would flag it as unknown.
+
+# null (not an empty array) leaves configuration-variable ("vars.*") checking
+# disabled — this repo does not maintain an explicit `vars.*` allowlist anywhere, and an
+# empty array here would make actionlint reject EVERY `vars.*` reference (e.g.
+# gate-v2.yml's `vars.FEISHU_CI_WEBHOOK`/`vars.FEISHU_CI_TITLE_PREFIX` fallback) as
+# undefined.
+config-variables: null
+
+# Precise, path-scoped, per-message ignores — NOT a blanket rule relaxation anywhere
+# else. Both entries below are confirmed-genuine actionlint false positives, not real
+# bugs: `job.workflow_sha` / `job.workflow_repository` are documented GitHub Actions
+# `job`-context properties (GitHub's own Contexts reference, "job context" ->
+# "Example usage of job context workflow identity" — the exact "reusable workflow
+# checks out its own source" pattern gate-v2.yml's `gate` job and gate-shadow-v2.yml's
+# `shadow` job both use), confirmed still missing from actionlint's own job-context type
+# model as of v1.7.12 (2026-03-30, the latest release as of this fix — upgrading from
+# the previously-installed v1.7.7 did NOT add support; re-check this file's own ignore
+# list against actionlint's changelog next time it's upgraded, in case a future release
+# finally models these fields and the ignores below become dead weight). Each pattern
+# additionally anchors on the job-context object's own shape (`status: string}` is the
+# tail of every error actionlint emits for this exact object type) so a same-named
+# property on some OTHER, unrelated object type would NOT be silently swallowed by
+# these two lines.
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type \{.*status: string\}'
+      - 'property "workflow_repository" is not defined in object type \{.*status: string\}'
