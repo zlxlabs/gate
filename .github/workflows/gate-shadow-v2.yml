@@ -185,6 +185,35 @@ jobs:
         # resolve_policy.py's own validation — or a bug in it — cannot reach any of those
         # sites unsanitized. Any unsafe name fails THIS job outright (fail-closed), never
         # silently drops or renames the offending reviewer.
+        #
+        # reliability.shadow-resolve-missing-gate-tier (gate-hub canary PR #73,
+        # 2026-07-27): this step was calling resolve_policy.py with NO `GATE_TIER` in its
+        # process environment at all — unlike the `shadow` job below, which threads
+        # `GATE_TIER: ${{ inputs.tier }}` into its own "Run review-shadow" step (see that
+        # step's `env:` a bit further down this file). resolve_policy.py's `resolve()`
+        # reads GATE_TIER as plain ambient env (`os.environ.get("GATE_TIER", "")`) to
+        # apply `review_policy.rollout.shadow_tier_gates` — a per-reviewer allowlist of
+        # which GATE_TIERs it's allowed to run under (gate-hub's canary-ring rollout
+        # mechanism for a brand-new shadow-only reviewer, e.g. personal-only before
+        # internal/saas). With no GATE_TIER set here, `effective_gate_tier` was always the
+        # empty string, so ANY reviewer gated by `shadow_tier_gates` (regardless of the
+        # calling repo's real configured tier) was unconditionally dropped from the
+        # resolved `shadow` list BEFORE the matrix below is even built — the job for that
+        # reviewer never appears at all, which reads identically to "not configured",
+        # making this failure mode easy to miss. This had never fired before because no
+        # `shadow_tier_gates` entry existed until gate-hub PR #72 (`ocr-minimax-m3`,
+        # first-ever shadow reviewer gated to `personal` only); PR #73's canary is the
+        # real-world reproduction that caught it (gate-shadow ran green with 2 legs,
+        # silently missing the 3rd). `gate-v2.yml`'s Required-side `primary` job never
+        # calls resolve_policy.py as a separate CLI step at all (chain failover doesn't
+        # need to precompute a job matrix the way shadow calibration does), and legacy
+        # `gate.yml` invokes resolve_policy.py only indirectly, as a library import inside
+        # `scripts/codex-review.sh`'s single review-gate step — a step whose own `env:`
+        # already sets `GATE_TIER: ${{ inputs.tier }}` — so neither of those needed this
+        # same fix; this `resolve` job's separate matrix-building step was the only call
+        # site missing it.
+        env:
+          GATE_TIER: ${{ inputs.tier }}
         run: |
           set -euo pipefail
           gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"

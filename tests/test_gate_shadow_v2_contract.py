@@ -193,6 +193,26 @@ def test_resolve_policy_step_uses_reserved_sentinel_for_empty_shadow_list():
     assert "reviewers = shadow if has_shadows else [SENTINEL]" in run
 
 
+def test_resolve_policy_step_has_gate_tier_env_for_shadow_tier_gates():
+    # reliability.shadow-resolve-missing-gate-tier (gate-hub canary PR #73, 2026-07-27):
+    # this step used to call resolve_policy.py with NO `GATE_TIER` in its process
+    # environment at all, while the `shadow` job's own "Run review-shadow" step (a few
+    # jobs down in the same file) DID thread `GATE_TIER: ${{ inputs.tier }}` into its
+    # env. resolve_policy.py's resolve() reads GATE_TIER as plain ambient env to apply
+    # `review_policy.rollout.shadow_tier_gates` (a per-reviewer tier allowlist); with no
+    # GATE_TIER set here, effective_gate_tier was always the empty string, so ANY
+    # reviewer gated by shadow_tier_gates was unconditionally dropped from the resolved
+    # shadow list before the matrix below is even built — the job for that reviewer
+    # never appears at all (indistinguishable from "not configured" from the outside).
+    # This had never fired before gate-hub PR #72 added the first-ever shadow_tier_gates
+    # entry (`ocr-minimax-m3`, personal-tier-only); PR #73's canary is the real-world
+    # reproduction that caught it (gate-shadow ran green with 2 legs, silently missing
+    # the 3rd). Locks the fix so a future edit of this step can't silently regress it.
+    raw, _ = _load_workflow()
+    step = next(s for s in raw["jobs"]["resolve"]["steps"] if s.get("id") == "resolve-policy")
+    assert step.get("env", {}).get("GATE_TIER") == "${{ inputs.tier }}"
+
+
 def test_shadow_matrix_fallback_is_sentinel_array_never_empty_array():
     # The safety net for "resolve was skipped -> needs.resolve.outputs.shadow_reviewers
     # is an empty string" MUST be a NON-EMPTY-array fallback inside fromJSON (an empty
