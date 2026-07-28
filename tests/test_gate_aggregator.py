@@ -180,6 +180,28 @@ def test_audit_identity_mismatch_on_any_quintuple_field_fails_and_generates_synt
     assert any("identity mismatch" in p for p in outcome.problems)
 
 
+def test_cross_attempt_audit_from_earlier_run_attempt_is_accepted_and_traced():
+    identity = AGG.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=2, pr=42)
+    audit = {
+        **_valid_primary_record(),
+        "run_attempt": 1,
+    }
+    outcome = AGG.evaluate(**_base_kwargs(identity=identity, audit=audit))
+    assert outcome.ok is True
+    assert any("source run_attempt=1" in note for note in outcome.notes)
+
+
+def test_audit_from_future_run_attempt_is_rejected():
+    identity = AGG.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=2, pr=42)
+    audit = {
+        **_valid_primary_record(),
+        "run_attempt": 3,
+    }
+    outcome = AGG.evaluate(**_base_kwargs(identity=identity, audit=audit))
+    assert outcome.ok is False
+    assert any("exceeds current run_attempt" in problem for problem in outcome.problems)
+
+
 def test_audit_wrong_kind_is_rejected():
     bad_audit = _valid_primary_record(kind="synthetic_primary")
     outcome = AGG.evaluate(**_base_kwargs(audit=bad_audit))
@@ -417,7 +439,7 @@ def _cli_args(audit_dir, summary_path, **overrides):
         pr_number=str(IDENTITY.pr),
     )
     values.update(overrides)
-    return [
+    args = [
         "--quality-result", values["quality_result"],
         "--primary-result", values["primary_result"],
         "--runner", values["runner"],
@@ -431,6 +453,9 @@ def _cli_args(audit_dir, summary_path, **overrides):
         "--audit-dir", str(audit_dir),
         "--summary-path", str(summary_path),
     ]
+    if "audit_source_attempt" in values:
+        args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
+    return args
 
 
 def test_main_exit_code_zero_on_pass(tmp_path):
@@ -441,6 +466,19 @@ def test_main_exit_code_zero_on_pass(tmp_path):
     rc = AGG.main(_cli_args(audit_dir, summary_path))
     assert rc == 0
     assert "pass" in summary_path.read_text()
+
+
+def test_main_summary_and_notice_include_cross_attempt_source(capsys, tmp_path):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    audit = _valid_primary_record(run_attempt=1)
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit))
+    summary_path = tmp_path / "summary.md"
+    args = _cli_args(audit_dir, summary_path, run_attempt="2", audit_source_attempt="1")
+    rc = AGG.main(args)
+    assert rc == 0
+    assert "source run_attempt=1" in summary_path.read_text()
+    assert "source run_attempt=1" in capsys.readouterr().out
 
 
 def test_main_exit_code_nonzero_on_missing_audit(tmp_path):

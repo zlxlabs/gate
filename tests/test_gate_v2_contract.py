@@ -25,6 +25,10 @@ ARTIFACT_NAME_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
 )
+ARTIFACT_PREFIX_EXPR = (
+    "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+    "-${{ github.run_id }}-"
+)
 
 
 def _load_workflow():
@@ -141,10 +145,40 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert upload["with"]["if-no-files-found"] == "error"
 
     gate_steps = raw["jobs"]["gate"]["steps"]
+    resolver = next(s for s in gate_steps if s.get("name") == "Resolve canonical primary audit artifact")
+    assert resolver["id"] == "resolve-audit-artifact"
+    assert resolver["if"] == "${{ needs.primary.result != 'skipped' }}"
+    assert resolver["continue-on-error"] is True
+    assert resolver["env"]["AUDIT_PREFIX"] == ARTIFACT_PREFIX_EXPR
+    resolver_run = resolver["run"]
+    assert "gh api" in resolver_run
+    assert "actions/runs/${{ github.run_id }}/artifacts" in resolver_run
+    assert "--paginate" in resolver_run
+    assert "expired" in resolver_run
+    assert "<= current_attempt" in resolver_run
+    assert "max(" in resolver_run
+    assert 'artifact_id=' in resolver_run
+    assert 'source_attempt=' in resolver_run
+    assert 'echo "artifact_id="' in resolver_run
+    assert 'No matching canonical primary audit artifact found' in resolver_run
+
     download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
-    assert download["with"]["name"] == ARTIFACT_NAME_EXPR
+    assert download["with"]["artifact-ids"] == "${{ steps.resolve-audit-artifact.outputs.artifact_id }}"
+    assert "name" not in download["with"]
     assert download["continue-on-error"] is True
-    assert download["if"] == "${{ needs.primary.result != 'skipped' }}"
+    assert download["if"] == (
+        "${{ needs.primary.result != 'skipped' && "
+        "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
+    )
+
+
+def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
+    raw, _ = _load_workflow()
+    aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
+    assert aggregate_step["env"]["AUDIT_SOURCE_ATTEMPT"] == (
+        "${{ steps.resolve-audit-artifact.outputs.source_attempt }}"
+    )
+    assert '--audit-source-attempt "$AUDIT_SOURCE_ATTEMPT"' in aggregate_step["run"]
 
 
 def test_gate_job_review_expected_matches_primary_jobs_own_condition():

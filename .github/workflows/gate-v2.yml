@@ -421,12 +421,77 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: _gate-aggregator-src
 
-      - name: Download canonical primary audit (best effort — may not exist)
+      - name: Resolve canonical primary audit artifact
+        id: resolve-audit-artifact
         if: ${{ needs.primary.result != 'skipped' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          CURRENT_ATTEMPT: ${{ github.run_attempt }}
+          AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
+        run: |
+          set -euo pipefail
+          # Empty outputs keep the best-effort path fail-closed when the REST lookup fails or finds no candidate.
+          echo "artifact_id=" >> "$GITHUB_OUTPUT"
+          echo "source_attempt=" >> "$GITHUB_OUTPUT"
+          artifact_listing="$(mktemp)"
+          trap 'rm -f "$artifact_listing"' EXIT
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$artifact_listing"
+          selected="$(python3 - "$artifact_listing" "$AUDIT_PREFIX" "$CURRENT_ATTEMPT" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          listing_path, prefix, current_attempt_text = sys.argv[1:]
+          current_attempt = int(current_attempt_text)
+          payload = json.loads(Path(listing_path).read_text(encoding="utf-8"))
+          pages = payload if isinstance(payload, list) else [payload]
+          candidates = []
+          for page in pages:
+              if isinstance(page, dict):
+                  artifacts = page.get("artifacts", [])
+              elif isinstance(page, list):
+                  artifacts = page
+              else:
+                  artifacts = []
+              for artifact in artifacts:
+                  if not isinstance(artifact, dict) or artifact.get("expired") is True:
+                      continue
+                  name = artifact.get("name")
+                  if not isinstance(name, str) or not name.startswith(prefix):
+                      continue
+                  suffix = name[len(prefix):]
+                  if not re.fullmatch(r"[0-9]+", suffix):
+                      continue
+                  attempt = int(suffix)
+                  if attempt <= current_attempt:
+                      artifact_id = artifact.get("id")
+                      if isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
+                          candidates.append((attempt, artifact_id))
+          if not candidates:
+              print("No matching canonical primary audit artifact found", file=sys.stderr)
+              raise SystemExit(0)
+          attempt, artifact_id = max(candidates, key=lambda candidate: candidate[0])
+          print(f"{artifact_id}\t{attempt}")
+          PY
+          )"
+          if [ -z "$selected" ]; then
+            exit 0
+          fi
+          artifact_id="${selected%%$'\t'*}"
+          source_attempt="${selected#*$'\t'}"
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+          echo "source_attempt=$source_attempt" >> "$GITHUB_OUTPUT"
+
+      - name: Download canonical primary audit (best effort — may not exist)
+        if: ${{ needs.primary.result != 'skipped' && steps.resolve-audit-artifact.outputs.artifact_id != '' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.resolve-audit-artifact.outputs.artifact_id }}
           path: ${{ runner.temp }}/primary-audit
 
       - name: Aggregate required verdict
@@ -448,6 +513,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
@@ -460,6 +526,7 @@ jobs:
             --run-id "$RUN_ID" \
             --run-attempt "$RUN_ATTEMPT" \
             --pr-number "$PR_NUMBER" \
+            --audit-source-attempt "$AUDIT_SOURCE_ATTEMPT" \
             --audit-dir "${{ runner.temp }}/primary-audit" \
             --summary-path "$GITHUB_STEP_SUMMARY"
 
