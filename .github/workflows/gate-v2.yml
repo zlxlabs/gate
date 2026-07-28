@@ -492,6 +492,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ steps.resolve-audit-artifact.outputs.artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/primary-audit
 
       - name: Aggregate required verdict
