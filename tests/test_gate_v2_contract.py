@@ -164,6 +164,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
 
     download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
     assert download["with"]["artifact-ids"] == "${{ steps.resolve-audit-artifact.outputs.artifact_id }}"
+    assert download["with"]["merge-multiple"] is True
     assert "name" not in download["with"]
     assert download["continue-on-error"] is True
     assert download["if"] == (
