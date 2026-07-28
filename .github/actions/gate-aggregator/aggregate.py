@@ -138,7 +138,9 @@ def _is_strict_int(value: Any) -> bool:
 @dataclass(frozen=True)
 class Identity:
     """The identity quintuple the plan requires the aggregator to cross-check
-    a downloaded primary audit against, before trusting its verdict."""
+    a downloaded primary audit against, before trusting its verdict. The
+    run_attempt member is the current attempt ceiling: an earlier source
+    attempt is valid, while a future source attempt is rejected."""
 
     repository_id: int
     head_sha: str
@@ -175,7 +177,8 @@ def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
     downloaded synthetic_primary would mean something upstream is badly
     confused), the verdict is a known value, the identity quintuple matches
     the current run/PR/head with EXACT types (rejecting e.g. a bool where an
-    int is required), and — for verdicts that name a reviewer — that the
+    int is required; an earlier source run_attempt is valid but a future one
+    is rejected), and — for verdicts that name a reviewer — that the
     reviewer field is actually populated.
     """
     if not isinstance(record, dict):
@@ -206,6 +209,13 @@ def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
             if not (isinstance(value, str) and value):
                 errors.append(f"{key} must be a non-empty string, got {value!r} ({type(value).__name__})")
                 continue
+        if key == "run_attempt":
+            if value > expected[key]:
+                errors.append(
+                    f"identity mismatch on 'run_attempt': audit={value!r} "
+                    f"exceeds current run_attempt={expected[key]!r}"
+                )
+            continue
         if value != expected[key]:
             errors.append(f"identity mismatch on {key!r}: audit={value!r} expected={expected[key]!r}")
 
@@ -258,6 +268,7 @@ def evaluate(
     audit: Any,
     audit_error: Optional[str],
     identity: Identity,
+    audit_source_attempt: Optional[int] = None,
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -334,6 +345,28 @@ def evaluate(
                 problems.append("primary audit failed validation: " + "; ".join(errors))
             else:
                 verdict = audit["verdict"]
+                source_attempt = audit["run_attempt"]
+                if audit_source_attempt is not None:
+                    if audit_source_attempt != source_attempt:
+                        ok = False
+                        synthetic = build_synthetic_audit(
+                            identity=identity,
+                            status=SYNTHETIC_STATUS_ARTIFACT_MISSING,
+                            reason=(
+                                "downloaded primary audit source attempt does not match "
+                                f"the selected artifact output: audit={source_attempt!r} "
+                                f"selected={audit_source_attempt!r}"
+                            ),
+                        )
+                        problems.append(
+                            "primary audit source run_attempt mismatch: "
+                            f"audit={source_attempt!r} selected={audit_source_attempt!r}"
+                        )
+                        return Outcome(ok=ok, notes=notes, problems=problems, synthetic_audit=synthetic)
+                notes.append(
+                    "primary audit source run_attempt="
+                    f"{source_attempt} (current run_attempt={identity.run_attempt})"
+                )
                 if verdict == "pass":
                     # An audit claiming pass is trusted ONLY when the job's own result
                     # agrees — the job's conclusion is never overridden by the audit's
@@ -448,9 +481,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--pr-number", required=True, type=int)
+    parser.add_argument(
+        "--audit-source-attempt",
+        default=None,
+        help="selected canonical artifact source attempt (the audit remains authoritative)",
+    )
     parser.add_argument("--audit-dir", type=Path, default=None)
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
     args = parser.parse_args(argv)
+
+    audit_source_attempt: Optional[int] = None
+    if args.audit_source_attempt:
+        try:
+            audit_source_attempt = int(args.audit_source_attempt)
+        except (TypeError, ValueError):
+            return _finish(
+                Outcome(
+                    ok=False,
+                    problems=[
+                        "malformed audit source attempt — fail-closed: "
+                        f"expected a decimal integer, got {args.audit_source_attempt!r}"
+                    ],
+                ),
+                args.summary_path,
+            )
 
     identity = Identity(
         repository_id=args.repository_id,
@@ -480,6 +534,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit=audit,
         audit_error=audit_error,
         identity=identity,
+        audit_source_attempt=audit_source_attempt,
     )
 
     return _finish(outcome, args.summary_path)
