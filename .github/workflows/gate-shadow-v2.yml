@@ -400,6 +400,7 @@ jobs:
           MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
           MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
           REVIEW_JOB_ID: ${{ steps.resolve-job-id.outputs.job_id }}
+          REVIEW_RUN_MODE: PAYLOAD_ONLY
           # Same REVIEW_CALLER_SHA / REVIEW_REUSABLE_WORKFLOW_SHA distinction as
           # gate-v2.yml's `primary` job — see that job's own comment and
           # review-shadow's docstring for the full rationale (github.workflow_sha is the

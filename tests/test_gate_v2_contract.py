@@ -271,6 +271,7 @@ def test_primary_run_review_primary_env_has_required_v2_identity_vars():
     assert env["REVIEW_JOB_ID"] == "${{ steps.resolve-job-id.outputs.job_id }}"
     assert env["REVIEW_CALLER_SHA"] == "${{ github.workflow_sha }}"
     assert env["REVIEW_REUSABLE_WORKFLOW_SHA"] == "${{ job.workflow_sha }}"
+    assert env["REVIEW_RUN_MODE"] == "PAYLOAD_ONLY"
     assert "review-primary" in run_step["run"]
     assert "${{ github.event.pull_request.number }}" in run_step["run"]
 

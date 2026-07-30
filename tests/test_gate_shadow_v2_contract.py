@@ -333,6 +333,7 @@ def test_run_review_shadow_env_has_required_v2_identity_vars():
     assert env["REVIEW_JOB_ID"] == "${{ steps.resolve-job-id.outputs.job_id }}"
     assert env["REVIEW_CALLER_SHA"] == "${{ github.workflow_sha }}"
     assert env["REVIEW_REUSABLE_WORKFLOW_SHA"] == "${{ job.workflow_sha }}"
+    assert env["REVIEW_RUN_MODE"] == "PAYLOAD_ONLY"
     # P2 hygiene fix (2026-07-26 codex review): matrix.reviewer routed through env:,
     # referenced in the run: script as "$REVIEWER", never interpolated directly.
     assert env["REVIEWER"] == "${{ matrix.reviewer }}"
