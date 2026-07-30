@@ -331,6 +331,7 @@ jobs:
           MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
           REVIEW_PRIMARY_AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
           REVIEW_JOB_ID: ${{ steps.resolve-job-id.outputs.job_id }}
+          REVIEW_RUN_MODE: PAYLOAD_ONLY
           # github.workflow_sha = the commit SHA of the CALLING (top-level,
           # per-repo caller) workflow file — the `github` context is always
           # associated with the caller, even inside a called reusable
