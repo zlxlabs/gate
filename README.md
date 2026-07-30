@@ -47,6 +47,10 @@ workflow，**目前只有 `zlxlabs/gate-hub` 自己（personal canary）接入**
 | `.github/workflows/gate-v2.yml`(`gate`) | `quality` ∥ `primary` → `gate`(`needs: [quality, primary]`,`if: always()`) | Required Gate。`gate` job id 与 `name:` 都字面等于 `gate`，与 legacy 一致——required status check context 保持 `gate / gate` 不变，branch protection 零迁移。 |
 | `.github/workflows/gate-shadow-v2.yml`(`gate-shadow`) | `resolve` → `shadow`(matrix，每 reviewer 一个 job)→ `summary` | Shadow Calibration。**不产生任何 required status check**，只用于校准；失败/取消/超时不影响 Required Gate。 |
 
+PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式固定为
+`PAYLOAD_ONLY`，不是 `workflow_call` input；这是当前唯一合法模式，待真正启用
+`FULL_SOURCE` 时再引入 caller-level 契约。
+
 ### `gate-v2.yml` inputs(`workflow_call`)
 
 | input | 默认值 | 说明 |
