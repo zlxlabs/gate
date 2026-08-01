@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+USES_LINE_PREFIX = re.compile(r"^(?:uses:|-\s+uses:)(?P<value>.*)$")
 
 
 @dataclass(frozen=True)
@@ -47,10 +48,14 @@ def parse_internal_use_value(line: str) -> tuple[str, str] | None:
     """Extract an internal `uses:` value and its ref from one YAML line."""
 
     stripped = line.strip()
-    if not stripped or stripped.startswith("#") or not stripped.startswith("uses:"):
+    if not stripped or stripped.startswith("#"):
         return None
 
-    value = stripped[len("uses:") :].split("#", 1)[0].strip().strip("'\"")
+    match = USES_LINE_PREFIX.match(stripped)
+    if match is None:
+        return None
+
+    value = match.group("value").split("#", 1)[0].strip().strip("'\"")
     if not value.startswith("zlxlabs/gate/"):
         return None
     if "@" not in value:

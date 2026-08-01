@@ -49,6 +49,33 @@ def test_relative_internal_action_is_allowed(tmp_path):
     assert find_pinned_use_violations(tmp_path) == []
 
 
+def test_dash_uses_in_composite_metadata_reports_line_ref_and_cli_failure(tmp_path):
+    metadata = tmp_path / ".github" / "actions" / "local" / "action.yml"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: zlxlabs/gate/.github/actions/review-ledger@main\n"
+        "    - uses: actions/checkout@v4\n",
+        encoding="utf-8",
+    )
+
+    violations = find_pinned_use_violations(tmp_path)
+
+    assert [(item.file_path, item.line_number, item.ref) for item in violations] == [
+        (".github/actions/local/action.yml", 4, "main")
+    ]
+    checked = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--root", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 1
+    assert ".github/actions/local/action.yml:4:main" in checked.stdout
+
+
 def test_cli_passes_head_and_fails_injected_main(tmp_path):
     workflow = tmp_path / ".github" / "workflows" / "sample.yml"
     workflow.parent.mkdir(parents=True)
