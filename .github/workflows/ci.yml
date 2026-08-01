@@ -19,6 +19,9 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      - name: Check internal uses pins
+        run: python3 scripts/check_pinned_uses.py
+
   # actionlint (https://github.com/rhysd/actionlint) — an independent, complementary
   # static check on TOP of tests/test_gate*_contract.py. It catches a different class of
   # bug than the Python contract tests do: undefined context properties (typos like
