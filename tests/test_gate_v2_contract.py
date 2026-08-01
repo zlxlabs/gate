@@ -66,9 +66,33 @@ def test_control_runner_input_defaults_to_hosted():
     assert inputs["control_runner"]["default"] == "github-hosted"
 
 
-def test_all_four_jobs_present():
+def test_all_required_jobs_present():
     raw, _ = _load_workflow()
-    assert set(raw["jobs"].keys()) == {"quality", "primary", "gate", "notify"}
+    assert set(raw["jobs"].keys()) == {
+        "quality", "primary", "resolve_advisory", "ocr", "gate", "notify",
+    }
+
+
+def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
+    raw, _ = _load_workflow()
+    ocr = raw["jobs"]["ocr"]
+    assert ocr["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "pull-requests": "write",
+    }
+
+    review_step = next(s for s in ocr["steps"] if s.get("name") == "Run OCR advisory review")
+    assert review_step["env"]["REVIEW_SHADOW_EVENT_DIR"] == "${{ runner.temp }}/shadow-events"
+    assert "REVIEW_SHADOW_ADVISORY_EVENT_DIR" not in review_step["env"]
+
+    comment_step = next(s for s in ocr["steps"] if s.get("name") == "Post advisory PR comment")
+    assert "REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md" in comment_step["run"]
+    assert 'gh pr comment "$PR_NUMBER" --body-file "$comment_path"' in comment_step["run"]
+
+    upload_step = next(s for s in ocr["steps"] if s.get("name") == "Upload advisory review event")
+    assert upload_step["with"]["path"] == "${{ runner.temp }}/shadow-events/advisory"
+    assert raw["jobs"]["gate"]["needs"] == ["quality", "primary"]
 
 
 # ── concurrency contract ─────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-# Required Gate v2 (reusable workflow) — quality ∥ primary → gate aggregator.
+# Required Gate v2 (reusable workflow) — quality ∥ primary ∥ ocr → gate aggregator.
 #
 # Stage 2 (D1 in the private gate-hub repo's
 # ceo-plans/2026-07-24-shadow-review-independence.md) of the shadow-review
@@ -27,6 +27,12 @@
 #              non-draft, same-repo (not a fork), and `runner: self`. Skips
 #              the WHOLE job otherwise (draft / fork / hosted-tier) — see the
 #              job's own comment for what's deliberately NOT wired up yet.
+#   resolve_advisory — resolves the registry's policy.advisory reviewer list
+#              before the OCR matrix is expanded. Skips with the same draft /
+#              fork / hosted guard as primary.
+#   ocr      — runs one `review-shadow` advisory matrix leg per resolved
+#              policy.advisory reviewer and posts its non-empty comment artifact
+#              to the PR. It is never a dependency of the required gate.
 #   gate     — the ONLY required-check-bearing job. Job id MUST stay literally
 #              `gate` (this file's `name:` is also `gate`) — that combination
 #              is what keeps the existing required status check context
@@ -82,11 +88,11 @@ on:
 # Union of everything any job below needs; each caller must grant this whole
 # set (reusable-workflow permission escalation otherwise fails at startup).
 # actions: read   — Jobs API (resolve this run's numeric job id for the
-#                    primary job's REVIEW_JOB_ID) + actions/download-artifact
+#                    primary/OCR jobs' REVIEW_JOB_ID) + actions/download-artifact
 #                    in the gate job.
-# pull-requests: write — only the quality job's PR-size preflight action posts
-#                    a sticky comment; primary/gate never comment (Step
-#                    Summary only — see the gate job).
+# pull-requests: write — the quality job's PR-size preflight action and the OCR
+#                    advisory job may post PR comments; primary/gate never
+#                    comment (Step Summary only — see the gate job).
 permissions:
   actions: read
   contents: read
@@ -386,6 +392,150 @@ jobs:
         with:
           name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/primary-review-audit.json
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
+  resolve_advisory:
+    # Same primary-shaped guard as `primary`: draft/fork/hosted callers must
+    # skip the advisory path before any reviewer job can be created.
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+    # Same self-hosted/fork guard as `primary`. The hosted fallback is kept for
+    # defense in depth, although this job-level `if:` prevents it in normal
+    # execution and the registry is supplied by the self-hosted image.
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    outputs:
+      # Never emit [] while this job runs: GitHub Actions rejects an empty
+      # matrix vector before the downstream job-level if can skip it.
+      advisory_reviewers: ${{ steps.resolve-policy.outputs.advisory_reviewers }}
+      has_advisory: ${{ steps.resolve-policy.outputs.has_advisory }}
+    steps:
+      # No checkout: policy resolution uses the trusted registry baked into
+      # GATE_HUB_DIR, matching gate-shadow-v2.yml's resolver contract.
+      - name: Resolve advisory reviewer list from policy
+        id: resolve-policy
+        env:
+          GATE_TIER: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+          gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
+          registry_file="${REVIEW_REGISTRY_FILE:-$gate_hub_dir/registry.yaml}"
+          policy_json="$(python3 "$gate_hub_dir/scripts/review/resolve_policy.py" "$registry_file" "${{ github.repository }}")"
+          filter_script="${RUNNER_TEMP:-/tmp}/resolve-advisory-filter.py"
+          cat > "$filter_script" <<'PYEOF'
+          import json
+          import re
+          import sys
+
+          SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+          SENTINEL = "__none__"
+
+          policy = json.loads(sys.argv[1])
+          advisory = policy["advisory"]
+          for name in advisory:
+              if not isinstance(name, str) or not SAFE_NAME_RE.match(name):
+                  print(
+                      f"::error::resolve_policy returned an unsafe advisory reviewer name "
+                      f"{name!r} (must match {SAFE_NAME_RE.pattern!r})",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+          has_advisory = bool(advisory)
+          reviewers = advisory if has_advisory else [SENTINEL]
+          print(f"advisory_reviewers={json.dumps(reviewers)}")
+          print(f"has_advisory={str(has_advisory).lower()}")
+          PYEOF
+          python3 "$filter_script" "$policy_json" >> "$GITHUB_OUTPUT"
+
+  # ── ocr (advisory matrix; never gates `gate`) ────────────────────────────
+  ocr:
+    needs: resolve_advisory
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    # The resolved policy list is the only reviewer source. When it is empty,
+    # this job is skipped before runs-on is evaluated, so no self-hosted OCR
+    # runner is allocated. The sentinel only keeps matrix expansion valid.
+    if: needs.resolve_advisory.result == 'success' && needs.resolve_advisory.outputs.has_advisory == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        reviewer: ${{ fromJSON(needs.resolve_advisory.outputs.advisory_reviewers || '["__none__"]') }}
+    # Same self-hosted/fork guard as `primary` and `resolve_advisory`.
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # review-shadow's own default internal budget is 780s; this leaves headroom
+    # for checkout, Jobs API lookup, event upload, and PR comment persistence.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        if: matrix.reviewer != '__none__'
+        with: { fetch-depth: 1 }
+
+      - name: Resolve numeric job id for REVIEW_JOB_ID
+        if: matrix.reviewer != '__none__'
+        id: resolve-job-id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEWER: ${{ matrix.reviewer }}
+        run: |
+          set -euo pipefail
+          export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"
+          job_id="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs" \
+            --paginate --jq '.jobs[] | select(.name == env.JOB_NAME_SUFFIX or (.name | endswith("/ " + env.JOB_NAME_SUFFIX))) | .id' \
+            | head -n1)"
+          if [ -z "$job_id" ]; then
+            echo "::error::could not resolve a numeric job id for job '$JOB_NAME_SUFFIX' via the Jobs API"
+            exit 1
+          fi
+          echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run OCR advisory review
+        if: matrix.reviewer != '__none__'
+        env:
+          DESIGN_DOC: ${{ inputs.design_doc }}
+          GATE_TIER: ${{ inputs.tier }}
+          MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
+          MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
+          REVIEW_JOB_ID: ${{ steps.resolve-job-id.outputs.job_id }}
+          REVIEW_RUN_MODE: PAYLOAD_ONLY
+          REVIEW_CALLER_SHA: ${{ github.workflow_sha }}
+          REVIEW_REUSABLE_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          REVIEW_SHADOW_ROLE: advisory
+          REVIEW_SHADOW_EVENT_DIR: ${{ runner.temp }}/shadow-events
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEWER: ${{ matrix.reviewer }}
+        run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" "$PR_NUMBER" "$REVIEWER"
+
+      - name: Post advisory PR comment
+        if: always() && matrix.reviewer != '__none__'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEWER: ${{ matrix.reviewer }}
+          REVIEW_SHADOW_EVENT_DIR: ${{ runner.temp }}/shadow-events
+        run: |
+          set -euo pipefail
+          comment_path="$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md"
+          if [ ! -f "$comment_path" ]; then
+            echo "::error::advisory comment file missing: $comment_path"
+            exit 1
+          fi
+          if [ ! -s "$comment_path" ]; then
+            echo "advisory comment is empty; skipping PR comment"
+            exit 0
+          fi
+          gh pr comment "$PR_NUMBER" --body-file "$comment_path"
+
+      - name: Upload advisory review event
+        if: always() && matrix.reviewer != '__none__'
+        uses: actions/upload-artifact@v4
+        with:
+          name: advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shadow-events/advisory
           if-no-files-found: error
           retention-days: 30
 
