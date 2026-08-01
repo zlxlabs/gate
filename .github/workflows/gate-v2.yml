@@ -134,7 +134,7 @@ jobs:
         with: { fetch-depth: 1 }
 
       - name: PR size preflight
-        uses: zlxlabs/gate/.github/actions/pr-size-preflight@main
+        uses: zlxlabs/gate/.github/actions/pr-size-preflight@9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc
         with:
           base-sha: ${{ github.event.pull_request.base.sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
