@@ -69,15 +69,9 @@ on:
       # Actions expressions have no arithmetic operators) and fails closed if
       # a caller ever passes <= 5.
       primary_timeout_minutes: { type: number, default: 25 }
-      # Selects the runner pool for the FINAL `gate` aggregator job only. Per
-      # the plan's "Required Gate" section: the aggregator must be able to run
-      # independently of the review runner pool (PVE self-hosted fleet), so a
-      # `github-hosted` default gives it its own failure domain even if the
-      # self-hosted fleet is entirely down. `self-hosted-control` is reserved
-      # for a LATER migration (shadow double-run first, see the plan) — this
-      # input exists now so that migration is a config flip, not a rewrite;
-      # nothing in this PR sets it to anything but the default.
-      control_runner: { type: string, default: "github-hosted" }  # github-hosted | self-hosted-control
+      # 控制面 runner：留空（默认）跟随 runner；github-hosted 强制控制面留在
+      # GitHub-hosted，作为单仓回滚逃生舱；保留遗留 self-hosted-control 取值兼容。
+      control_runner: { type: string, default: "" }  # 留空跟随 runner；github-hosted 回滚逃生舱；兼容 self-hosted-control
     secrets:
       FEISHU_CI_WEBHOOK:
         # Optional: public repos MUST pass this as a repo SECRET (fork PR runs
@@ -549,7 +543,10 @@ jobs:
     # its own verdict from needs.*.result instead of relying on GitHub's
     # default dependency semantics.
     if: always()
-    runs-on: ${{ inputs.control_runner == 'self-hosted-control' && fromJSON('["self-hosted","linux","gate-control"]') || fromJSON('["ubuntu-latest"]') }}
+    # 控制面默认跟随 runner 走自建：hosted 因账单预算硬断不可用的实测概率高于
+    # 自建机群整体不可用概率，2026-07-27 已造成全组织停摆；v1 已经如此路由，
+    # 本次只是补齐未完成灰度。取整税数据：2026-08-01 单日 145 计费分钟 / 12.8 实际分钟。
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     # 5 minutes (plan value): the aggregator only checks out its own small
     # source tree, downloads one artifact, and runs a stdlib-only script — it
     # must never need anywhere near quality/primary's budgets.
@@ -686,13 +683,13 @@ jobs:
   # Same fail-only semantics as legacy gate.yml's notify job (see that file
   # for the full webhook/fallback rationale, unchanged here), now triggered by
   # the `gate` aggregator's own conclusion instead of the single legacy job.
-  # Runs plain `ubuntu-latest` (a P2 webhook POST via python3 stdlib needs no
-  # self-hosted capability) rather than reusing the quality/primary fork-guard
-  # ternary — a deliberate v2 simplification, see this PR's report.
+  # Uses the same control-plane route as `gate`: default self-hosted, with the
+  # fork guard and hosted fallback kept in the expression; the webhook POST is
+  # still fail-open and needs no special capability.
   notify:
     needs: gate
     if: failure()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Feishu 门禁失败卡 (P2, fail-open)
         continue-on-error: true

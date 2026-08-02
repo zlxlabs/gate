@@ -60,10 +60,10 @@ def test_secrets_explicit_and_feishu_optional():
     assert secrets["FEISHU_CI_WEBHOOK"].get("required") is False
 
 
-def test_control_runner_input_defaults_to_hosted():
+def test_control_runner_input_defaults_to_follow_runner():
     _, trigger = _load_workflow()
     inputs = trigger["workflow_call"]["inputs"]
-    assert inputs["control_runner"]["default"] == "github-hosted"
+    assert inputs["control_runner"]["default"] == ""
 
 
 def test_all_required_jobs_present():
@@ -125,11 +125,23 @@ def test_gate_job_id_is_literally_gate_and_runs_always():
     assert set(needs if isinstance(needs, list) else [needs]) == {"quality", "primary"}
 
 
-def test_gate_job_runs_on_control_runner_selector_defaulting_hosted():
+def test_gate_and_notify_runs_on_use_the_same_guarded_control_plane_route():
     raw, _ = _load_workflow()
-    runs_on = str(raw["jobs"]["gate"]["runs-on"])
-    assert "inputs.control_runner == 'self-hosted-control'" in runs_on
-    assert "ubuntu-latest" in runs_on
+    expected = (
+        "${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && "
+        "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) "
+        "&& fromJSON('[\"self-hosted\",\"linux\",\"codex\"]') || fromJSON('[\"ubuntu-latest\"]') }}"
+    )
+    workflow_text = WORKFLOW.read_text()
+    assert "gate-control" not in workflow_text
+    for job_name in ("gate", "notify"):
+        runs_on = str(raw["jobs"][job_name]["runs-on"])
+        assert runs_on == expected
+        assert FORK_GUARD in runs_on
+        assert RUNNER_GUARD in runs_on
+        assert "github.event_name != 'pull_request'" in runs_on
+        assert "ubuntu-latest" in runs_on
+        assert all(label in runs_on for label in ("self-hosted", "linux", "codex"))
 
 
 def test_gate_job_never_invokes_aggregator_via_a_moving_uses_ref():
