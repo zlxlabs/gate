@@ -7,6 +7,8 @@ ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
 .github/workflows/gate.yml and its own tests/test_gate_contract.py are
 untouched and unaffected by this file.
 """
+import json
+import re
 from pathlib import Path
 
 import yaml
@@ -29,6 +31,8 @@ ARTIFACT_PREFIX_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-"
 )
+# fromJSON('["self-hosted","linux","ci"]') — capture each array literal in runs-on.
+_FROMJSON_LABELS_RE = re.compile(r"fromJSON\('(\[[^\]]*\])'\)")
 
 
 def _load_workflow():
@@ -41,6 +45,23 @@ def _load_caller():
     raw = yaml.safe_load(CALLER_TEMPLATE.read_text())
     trigger = raw.get("on", raw.get(True))
     return raw, trigger
+
+
+def _fromjson_label_sets(runs_on: str) -> list[set[str]]:
+    """Parse each fromJSON('[...]') label array in a runs-on expression into a set."""
+    out: list[set[str]] = []
+    for match in _FROMJSON_LABELS_RE.finditer(runs_on):
+        labels = json.loads(match.group(1))
+        out.append(set(labels))
+    return out
+
+
+def _self_hosted_label_set(runs_on: str) -> set[str]:
+    """Return the self-hosted pool label set (the fromJSON array that is not ubuntu-latest)."""
+    for labels in _fromjson_label_sets(runs_on):
+        if labels != {"ubuntu-latest"}:
+            return labels
+    raise AssertionError(f"no self-hosted fromJSON label set found in: {runs_on!r}")
 
 
 # ── reusable workflow shape ──────────────────────────────────────────────────
@@ -297,6 +318,29 @@ def test_quality_runs_on_matches_legacy_fork_guard_pattern():
     assert FORK_GUARD in runs_on
     assert "github.event_name != 'pull_request'" in runs_on
     assert "ubuntu-latest" in runs_on
+
+
+def test_quality_self_branch_routes_to_uncredentialed_ci_pool():
+    # D7 (gate-hub docs/designs/runner-ci-pool-split.md): quality's self-hosted
+    # branch must land on the uncredentialed CI pool label set, never the
+    # review-credential codex pool.
+    raw, _ = _load_workflow()
+    runs_on = str(raw["jobs"]["quality"]["runs-on"])
+    assert _self_hosted_label_set(runs_on) == {"self-hosted", "linux", "ci"}
+    assert "codex" not in runs_on
+
+
+def test_non_quality_jobs_do_not_use_ci_pool_label():
+    # Guard against accidental migration of review/control-plane jobs onto the
+    # uncredentialed CI pool. Assert on parsed fromJSON labels, not bare
+    # substring match (would false-positive on words containing "ci").
+    raw, _ = _load_workflow()
+    for job_name in ("gate", "notify", "primary", "resolve_advisory", "ocr"):
+        runs_on = str(raw["jobs"][job_name]["runs-on"])
+        for labels in _fromjson_label_sets(runs_on):
+            assert "ci" not in labels, (
+                f"{job_name} runs-on label set must not include 'ci': {labels!r}"
+            )
 
 
 def test_primary_run_review_primary_env_has_required_v2_identity_vars():
