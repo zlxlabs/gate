@@ -26,7 +26,7 @@ jobs:
     uses: zlxlabs/gate/.github/workflows/gate.yml@main   # @main 故意不钉:改一处全仓库生效
     with:
       tier: personal          # personal | internal | saas
-      runner: self            # self(自建 VM201, 有 codex review) | hosted(免费分钟)
+      runner: self            # self(自建两台, 有 codex review) | hosted(免费分钟)
       # 可选覆盖: max_diff_lines: 4000, max_review_shards: 8, pr_size_warn_lines: 8000
     secrets:
       FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}   # 公开仓必须 secret;私有仓可用同名 variable 兜底
@@ -64,7 +64,7 @@ PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式�
 | `pr_size_warn_lines` | `8000` | 强警告线 |
 | `timeout_minutes` | `45` | 仅 `quality` job 的硬超时 |
 | `primary_timeout_minutes` | `25` | `primary` job 自己的超时预算，与 `timeout_minutes` 解耦——需要给 `review-primary` 留出「GitHub 硬 SIGKILL 前写完并上传 canonical audit」的收尾余量 |
-| `control_runner` | `github-hosted` | 最终 `gate` 聚合器的 runner 池；`self-hosted-control` 是预留的未来迁移位，双跑验证通过 promotion gate 前不要手动设置成这个值 |
+| `control_runner` | `""` | `gate` 聚合器与 `notify` 的 runner 池：留空（默认）跟随 `runner` 走自建（gate#27 起，取整税修复）；`github-hosted` 把控制面钉回 hosted，是单仓回滚逃生舱；遗留值 `self-hosted-control` 等价于留空 |
 
 ### `gate-shadow-v2.yml` inputs(`workflow_call`)
 
@@ -110,6 +110,10 @@ sha>` 是不够的，org runner group 的白名单是另一道独立的闸，不
 2026-07-26 canary 切换时这一步漏做过一次，导致 self-hosted job **无限排队且没有任何
 告警**（现有容量告警都不覆盖「job 排队卡在白名单外」这种失效模式），排了约 4 小时才被
 人工发现。
+
+（2026-08 起 org 有两个 runner group：白名单只存在于**评审池** Default（id=1）；
+CI 池 `ci`（id=4）`restricted_to_workflows=false`，bump 不涉及它——PATCH 别打错组。
+首选入口是 gate-hub `scripts/bump_caller_pins.py`，它固定先同步白名单再改 caller。）
 
 正确顺序（三步缺一不可）：
 
@@ -193,9 +197,13 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
    GitHub-hosted 一次性沙箱并跳过 codex review；只有本仓分支的 PR 才上 self-hosted。
    pull_request 事件下 caller 文件是 PR 作者的版本（拦不住人），本文件永远取 @main
    （拦得住）。三处防护由 `tests/test_gate_contract.py` 钉死。
-2. **org runner group 白名单**：`restricted_to_workflows` 只放行本文件
-   `@refs/heads/main` —— 绕过本文件的任意 job（包括 fork PR 里改写 caller 硬点名
-   self-hosted）根本派不到自建 runner。
+2. **org runner group 白名单（仅评审池）**：自建 runner 分两个 group（2026-08 起，
+   spec 见 gate-hub `docs/designs/runner-ci-pool-split.md`）——**评审池**（Default，
+   id=1，挂 LLM 凭据，`restricted_to_workflows` 只放行本仓 workflow 的钉定 SHA /
+   `@refs/heads/main`）与**无凭据 CI 池**（`ci`，id=4，不限制 workflow，
+   `allows_public_repositories=false`）。绕过本文件的任意 job（包括 fork PR 里改写
+   caller 硬点名 self-hosted）派不进评审池；`quality` 与各仓自有测试 CI 走
+   `[self-hosted, linux, ci]` 落 CI 池，那里本来就没有凭据可偷。
 3. **fork PR 审批**：两个公开仓的 Actions 设置为 all external contributors 必须
    人工批准才能跑任何 workflow。
 
