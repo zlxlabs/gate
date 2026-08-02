@@ -90,7 +90,8 @@ jobs:
     with:
       tier: personal          # personal | internal | saas
       runner: self            # self (self-hosted, runs primary review) | hosted (GitHub free minutes)
-      # control_runner intentionally omitted here (defaults to github-hosted)
+      # control_runner intentionally omitted here (empty default = follow
+      # runner; github-hosted = single-repo rollback escape hatch).
       # — do not set self-hosted-control until the shadow double-run in the
       # plan's "Required Gate" section has passed its promotion gate.
       # Optional overrides: max_diff_lines: 4000, max_review_shards: 8,
