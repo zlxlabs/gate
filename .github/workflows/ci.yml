@@ -35,8 +35,9 @@ jobs:
   # repo-wide regression guard for THAT specific bug class) — the two checks are
   # deliberately complementary, not redundant.
   #
-  # Config: .github/actionlint.yaml (self-hosted runner labels this fleet actually uses —
-  # `codex`/`gate-control` — plus two precisely-scoped, documented `-ignore`-equivalent
+  # Config: .github/actionlint.yaml (the self-hosted runner label this fleet actually uses —
+  # `codex`, the only custom label any workflow here emits — plus two precisely-scoped,
+  # documented `-ignore`-equivalent
   # entries for `job.workflow_sha`/`job.workflow_repository`, which ARE genuine
   # GitHub-documented `job`-context properties (Contexts reference, "job context") that
   # actionlint's own type model does not yet know about as of v1.7.12, the latest release

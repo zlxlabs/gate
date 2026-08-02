@@ -14,12 +14,15 @@ self-hosted-runner:
   # repo-specific labels layered on top — see gate.yml/gate-v2.yml/gate-shadow-v2.yml's
   # own `runs-on:` ternaries and templates/caller-*.yml for where each is used):
   labels:
-    - codex         # the shared self-hosted review-runner pool (quality/primary/shadow)
-    - gate-control   # gate-v2.yml's `gate` aggregator job's reserved control-runner pool
-                     # (control_runner: self-hosted-control) — not yet used by any live
-                     # caller (control_runner defaults to github-hosted today), but a
-                     # legal runs-on value gate-v2.yml already ships, so it must be
-                     # declared here too or actionlint would flag it as unknown.
+    - codex         # the shared self-hosted review-runner pool — since the control plane
+                    # migration (gate-v2.yml's `gate` aggregator + `notify` now route here
+                    # too) this is the ONLY custom label any workflow in this repo emits.
+                    # `gate-control` used to be declared alongside it for the never-promoted
+                    # `control_runner: self-hosted-control` route; that route now reuses
+                    # `codex` (no runner in the fleet ever carried a `gate-control` label),
+                    # so the declaration was dropped rather than left as a label nothing
+                    # references. Re-add it here if dedicated control-plane runners are ever
+                    # provisioned — actionlint would otherwise flag the label as unknown.
 
 # null (not an empty array) leaves configuration-variable ("vars.*") checking
 # disabled — this repo does not maintain an explicit `vars.*` allowlist anywhere, and an
