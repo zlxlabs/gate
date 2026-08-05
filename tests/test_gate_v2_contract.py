@@ -23,6 +23,10 @@ AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "agg
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
 RUNNER_GUARD = "inputs.runner == 'self'"
+# ci 池 (org runner group `ci`) 拒绝公开仓,quality 的 self-hosted 分支必须额外
+# 判 base 仓私有,否则公开仓 caller 无限 queued —— 见
+# test_quality_public_repo_never_routes_to_ci_pool。
+PRIVATE_REPO_GUARD = "github.event.repository.private"
 ARTIFACT_NAME_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -328,6 +332,22 @@ def test_quality_self_branch_routes_to_uncredentialed_ci_pool():
     runs_on = str(raw["jobs"]["quality"]["runs-on"])
     assert _self_hosted_label_set(runs_on) == {"self-hosted", "linux", "ci"}
     assert "codex" not in runs_on
+
+
+def test_quality_public_repo_never_routes_to_ci_pool():
+    # org runner group `ci` 设了 allows_public_repositories=false(spec
+    # gate-hub docs/designs/runner-ci-pool-split.md D7),所以公开仓的 quality
+    # 一旦被路由到 [self-hosted,linux,ci] 就永远匹配不到 runner —— 无限 queued
+    # 且 GitHub 侧零报错(2026-08-04 zlxlabs/llm-compat PR #10 实测排队 10h)。
+    # self-hosted 分支必须额外要求 base 仓私有,公开仓走 ubuntu-latest。
+    # 断言写成「与 ci 标签集同一表达式里」而不是「文件里出现过」,
+    # 防止判据被挪到别的 job 或注释里还判过。
+    raw, _ = _load_workflow()
+    runs_on = str(raw["jobs"]["quality"]["runs-on"])
+    assert _self_hosted_label_set(runs_on) == {"self-hosted", "linux", "ci"}
+    assert PRIVATE_REPO_GUARD in runs_on, (
+        f"quality.runs-on 丢了 public 仓防护 {PRIVATE_REPO_GUARD!r}: {runs_on!r}"
+    )
 
 
 def test_non_quality_jobs_do_not_use_ci_pool_label():

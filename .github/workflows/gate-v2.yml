@@ -122,7 +122,17 @@ jobs:
     # `runner: self`; pull_request events additionally require the head repo
     # to equal this repo (fork PRs degrade to the hosted, one-shot sandbox).
     # quality 走无凭据 ci 池（spec：gate-hub docs/designs/runner-ci-pool-split.md）。
-    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
+    #
+    # `github.event.repository.private` 是 ci 池独有的第三个条件,codex 池那三个
+    # job 没有:org runner group `ci` 设了 `allows_public_repositories=false`
+    # (spec runner-ci-pool-split.md D7「公有仓 hosted 免费,无需自建,顺带排除陌生
+    # fork」),公开仓的 job 一旦被路由到 `[self-hosted,linux,ci]` 就永远匹配不到
+    # runner —— 表现是无限 queued 且 GitHub 侧零报错(2026-08-04 zlxlabs/llm-compat
+    # PR #10 实测排队 10h)。这一条把 spec 的「公有仓不迁 ci 池」从运维约定变成
+    # workflow 层的硬路由,由 test_quality_public_repo_never_routes_to_ci_pool 锁死。
+    # 顶层 webhook payload 的 `repository` 恒为接收事件的 base 仓(fork PR 也不例外),
+    # 因此这个判据读到的始终是 caller 仓自身的可见性。
+    runs-on: ${{ (inputs.runner == 'self' && github.event.repository.private && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - uses: actions/checkout@v4
