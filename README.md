@@ -191,21 +191,34 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
 
 处置值支持 `false-positive`、`accepted`、`fixed`、`wont-fix`；作者、理由和评论链接会进入后续账本。
 
-## 公开仓安全模型（三层）
+## 公开仓安全模型（四层）
 
-1. **fork-PR 防护写死在 gate.yml 本体**：fork PR（head.repo ≠ 本仓）一律强制降级
-   GitHub-hosted 一次性沙箱并跳过 codex review；只有本仓分支的 PR 才上 self-hosted。
-   pull_request 事件下 caller 文件是 PR 作者的版本（拦不住人），本文件永远取 @main
-   （拦得住）。三处防护由 `tests/test_gate_contract.py` 钉死。
-2. **org runner group 白名单（仅评审池）**：自建 runner 分两个 group（2026-08 起，
-   spec 见 gate-hub `docs/designs/runner-ci-pool-split.md`）——**评审池**（Default，
-   id=1，挂 LLM 凭据，`restricted_to_workflows` 只放行本仓 workflow 的钉定 SHA /
-   `@refs/heads/main`）与**无凭据 CI 池**（`ci`，id=4，不限制 workflow，
-   `allows_public_repositories=false`）。绕过本文件的任意 job（包括 fork PR 里改写
-   caller 硬点名 self-hosted）派不进评审池；`quality` 与各仓自有测试 CI 走
-   `[self-hosted, linux, ci]` 落 CI 池，那里本来就没有凭据可偷。
-3. **fork PR 审批**：两个公开仓的 Actions 设置为 all external contributors 必须
-   人工批准才能跑任何 workflow。
+1. **fork-PR 防护写死在 reusable workflow 本体**：fork PR（`head.repo` ≠ 本仓）一律
+   强制降级 GitHub-hosted 一次性沙箱并跳过 codex review；只有本仓分支的 PR 才上
+   self-hosted。`pull_request` 事件下 caller 文件是 PR 作者的版本（拦不住人），本文件
+   永远取 pin 的 SHA（拦得住）。三处防护由 `tests/test_gate_contract.py` /
+   `tests/test_gate_v2_contract.py` 钉死。
+2. **GitHub 外部贡献者人工批准**：5 个公开仓——`llm-compat`、`MediaResolverAPI`、
+   `obsidian-clip-api`、`VideoTranscriptAPI`、`youtube_download_api`——全部设为
+   `approval_policy: all_external_contributors`（最严一档；org 默认只是
+   `first_time_contributors`）。任何外部贡献者的 workflow 运行都需人工点同意。查法：
+   `gh api repos/zlxlabs/<repo>/actions/permissions/fork-pr-contributor-approval`
+3. **org runner group 分池 + 白名单（白名单仅评审池）**：自建 runner 分两个 group
+   （spec 见 gate-hub `docs/designs/runner-ci-pool-split.md`）——**评审池**（Default，
+   id=1，挂 LLM 凭据，`restricted_to_workflows=true`，只放行本仓 workflow 的钉定 SHA /
+   `@refs/heads/main`）与**无凭据 CI 池**（`ci`，id=4，`restricted_to_workflows=false`，
+   `allows_public_repositories=true`；2026-08-05 翻转，分池理由见上述 spec）。因此公开
+   仓的自有测试 CI 可以上 self-hosted 的 ci 池；绕过本文件的任意 job（包括 fork PR 里
+   改写 caller 硬点名 self-hosted）仍派不进评审池。
+
+   评审池白名单是隔离承重墙，任何时候不放开。ci 池刻意不设 workflow 白名单，不是遗漏：
+   它只承载各仓自己的 CI，池内没有凭据；白名单是资源边界而非安全边界，救不了 fork
+   guard 失效，而且每次 bump SHA 多维护一处，漏同步就会无限排队且零告警。
+4. **ephemeral 容器**：runner 容器跑完即销毁，不在 self-hosted 机器上留下可被下一个
+   job 读到的状态。
+
+已知残余风险：L1 依赖缓存卷在两池之间共享（gate-hub spec D3 明写「两池共享是有意的」）。
+这是唯一一条从 ci 池通往评审池的路径；触发它需先穿过上面四层，故当前接受该风险，暂不处理。
 
 ## 改 gate.yml 注意
 
