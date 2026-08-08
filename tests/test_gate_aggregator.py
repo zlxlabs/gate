@@ -436,7 +436,7 @@ def _cli_args(audit_dir, summary_path, **overrides):
         head_sha=IDENTITY.head_sha,
         run_id=str(IDENTITY.run_id),
         run_attempt=str(IDENTITY.run_attempt),
-        pr_number=str(IDENTITY.pr),
+        pr_number=str(IDENTITY.pr), repository="zlxlabs/gate",
     )
     values.update(overrides)
     args = [
@@ -445,7 +445,7 @@ def _cli_args(audit_dir, summary_path, **overrides):
         "--runner", values["runner"],
         "--is-draft", values["is_draft"],
         "--review-expected", values["review_expected"],
-        "--repository-id", values["repository_id"],
+        "--repository-id", values["repository_id"], "--repository", values["repository"],
         "--head-sha", values["head_sha"],
         "--run-id", values["run_id"],
         "--run-attempt", values["run_attempt"],
@@ -455,12 +455,12 @@ def _cli_args(audit_dir, summary_path, **overrides):
     ]
     if "audit_source_attempt" in values:
         args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
+    if "audit_artifact_name" in values: args.extend(["--audit-artifact-name", values["audit_artifact_name"]])
+    if "terminal_path" in values: args.extend(["--terminal-path", values["terminal_path"]])
     return args
 
-
 def test_main_exit_code_zero_on_pass(tmp_path):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
+    audit_dir = tmp_path / "audit"; audit_dir.mkdir()
     (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
     summary_path = tmp_path / "summary.md"
     rc = AGG.main(_cli_args(audit_dir, summary_path))
@@ -504,3 +504,43 @@ def test_main_exit_code_nonzero_on_unknown_runner(tmp_path):
     rc = AGG.main(_cli_args(audit_dir, summary_path, runner="slef"))
     assert rc == 1
     assert "runner input" in summary_path.read_text()
+
+
+@pytest.mark.parametrize("kwargs,classification,reason_code,gate_result",
+    [
+        ({"quality_result": "failure"}, "ci_failure", "quality_failure", "fail"),
+        ({"quality_result": "cancelled"}, "ci_failure", "quality_cancelled", "fail"),
+        ({"quality_result": "skipped"}, "ci_failure", "quality_skipped", "fail"),
+        ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None}, "expected_skip", "review_not_expected", "skipped"),
+        ({}, "code_pass", "primary_pass", "pass"),
+        ({"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")}, "code_fail", "primary_findings", "fail"),
+        ({"primary_result": "failure", "audit": _valid_primary_record(verdict="unavailable")}, "review_unavailable", "primary_unavailable", "unavailable"),
+        ({"primary_result": "cancelled", "audit": None}, "review_unavailable", "primary_cancelled", "unavailable"),
+        ({"primary_result": "skipped", "audit": None}, "integration_error", "unexpected_primary_skip", "unavailable"),
+        ({"audit": None, "audit_error": "missing"}, "integration_error", "audit_missing", "unavailable"),
+        ({"audit": _valid_primary_record(kind="synthetic_primary")}, "integration_error", "audit_invalid", "unavailable"),
+        ({"audit_source_attempt": 2}, "integration_error", "audit_source_mismatch", "unavailable"),
+        ({"primary_result": "failure", "audit": _valid_primary_record(verdict="pass")}, "integration_error", "job_audit_mismatch", "unavailable"),
+        ({"quality_result": "failure", "audit": None, "audit_error": "missing"}, "integration_error", "audit_missing", "unavailable"),
+    ],
+)
+def test_evaluate_emits_structured_terminal_classification(kwargs, classification, reason_code, gate_result):
+    outcome = AGG.evaluate(**_base_kwargs(**kwargs))
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (classification, reason_code, gate_result)
+
+
+def test_main_writes_versioned_terminal_for_pass_and_failure(tmp_path):
+    audit_dir = tmp_path / "audit"; audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
+    terminal_path = tmp_path / "gate-terminal.json"; summary_path = tmp_path / "summary.md"
+    args = _cli_args(audit_dir, summary_path, terminal_path=str(terminal_path), audit_artifact_name="primary-audit-v2-1")
+    assert AGG.main(args) == 0
+    terminal = json.loads(terminal_path.read_text())
+    assert set(terminal) == {"schema_version", "kind", "repository", "repository_id", "pr_number", "run_id", "run_attempt", "head_sha", "quality_result", "primary_result", "review_expected", "is_draft", "runner", "gate_result", "classification", "reason_code", "audit"}
+    assert terminal["schema_version"] == 1 and terminal["kind"] == "gate_terminal" and terminal["gate_result"] == "pass"
+    assert terminal["audit"] == {"available": True, "source_attempt": 1, "artifact_name": "primary-audit-v2-1"}
+
+    assert AGG.main(_cli_args(tmp_path / "missing", summary_path, terminal_path=str(terminal_path))) == 1
+    failure = json.loads(terminal_path.read_text())
+    assert failure["gate_result"] == "unavailable" and failure["classification"] == "integration_error" and failure["reason_code"] == "audit_missing"
+    assert failure["audit"] == {"available": False, "source_attempt": None, "artifact_name": None}
