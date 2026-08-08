@@ -217,6 +217,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert 'artifact_id=' in resolver_run
     assert 'source_attempt=' in resolver_run
     assert 'echo "artifact_id="' in resolver_run
+    assert 'echo "artifact_name="' in resolver_run and 'echo "artifact_name=$artifact_name"' in resolver_run
     assert 'No matching canonical primary audit artifact found' in resolver_run
 
     download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
@@ -228,6 +229,8 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
         "${{ needs.primary.result != 'skipped' && "
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
+    terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
+    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == "actions/upload-artifact@v4" and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error"} and "continue-on-error" not in terminal_upload
 
 
 def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
@@ -237,6 +240,8 @@ def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
         "${{ steps.resolve-audit-artifact.outputs.source_attempt }}"
     )
     assert '--audit-source-attempt "$AUDIT_SOURCE_ATTEMPT"' in aggregate_step["run"]
+    assert aggregate_step["env"]["AUDIT_ARTIFACT_NAME"] == "${{ steps.resolve-audit-artifact.outputs.artifact_name }}"
+    assert '--audit-artifact-name "$AUDIT_ARTIFACT_NAME"' in aggregate_step["run"]
 
 
 def test_gate_job_review_expected_matches_primary_jobs_own_condition():
@@ -270,11 +275,12 @@ def test_gate_job_passes_the_identity_quintuple_to_the_aggregator():
     assert env["RUN_ID"] == "${{ github.run_id }}"
     assert env["RUN_ATTEMPT"] == "${{ github.run_attempt }}"
     assert env["PR_NUMBER"] == "${{ github.event.pull_request.number }}"
+    assert env["REPOSITORY"] == "${{ github.repository }}"
     run = aggregate_step["run"]
     for flag in (
         "--quality-result", "--primary-result", "--runner", "--is-draft", "--review-expected",
         "--repository-id", "--head-sha", "--run-id", "--run-attempt", "--pr-number",
-        "--audit-dir", "--summary-path",
+        "--audit-dir", "--summary-path", "--repository", "--terminal-path", "--audit-artifact-name",
     ):
         assert flag in run
 

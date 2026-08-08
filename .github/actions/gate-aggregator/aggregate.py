@@ -87,6 +87,10 @@ _IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
 # immediately rather than being funneled into whichever branch it happens to
 # fall through to.
 PRIMARY_RESULT_DOMAIN = ("success", "failure", "cancelled", "skipped")
+QUALITY_RESULT_DOMAIN = PRIMARY_RESULT_DOMAIN
+TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
+TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip")
+GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
 
 # The `runner` reusable-workflow input's only two legal values (see
 # gate-v2.yml's `inputs.runner`). A typo (e.g. "slef") must never be silently
@@ -164,6 +168,35 @@ class Outcome:
     notes: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
     synthetic_audit: Optional[dict[str, Any]] = None
+    classification: Optional[str] = None
+    reason_code: Optional[str] = None
+    gate_result: Optional[str] = None
+    audit_available: bool = False
+    audit_source_attempt: Optional[int] = None
+    audit_artifact_name: Optional[str] = None
+
+
+def build_terminal_envelope(
+    *, repository: str, identity: Identity, quality_result: str, primary_result: str, review_expected: bool,
+    is_draft: bool, runner: str, outcome: Outcome,
+) -> dict[str, Any]:
+    """Build the versioned machine-readable gate terminal envelope."""
+    if outcome.classification not in TERMINAL_CLASSIFICATION_DOMAIN or outcome.reason_code not in TERMINAL_REASON_DOMAIN or outcome.gate_result not in GATE_RESULT_DOMAIN:
+        raise ValueError("terminal field is outside the finite domain")
+    return {
+        "schema_version": 1, "kind": "gate_terminal", "repository": repository,
+        "repository_id": identity.repository_id, "pr_number": identity.pr, "run_id": identity.run_id,
+        "run_attempt": identity.run_attempt, "head_sha": identity.head_sha,
+        "quality_result": quality_result,
+        "primary_result": primary_result,
+        "review_expected": review_expected,
+        "is_draft": is_draft,
+        "runner": runner,
+        "gate_result": outcome.gate_result,
+        "classification": outcome.classification,
+        "reason_code": outcome.reason_code,
+        "audit": {"available": outcome.audit_available, "source_attempt": outcome.audit_source_attempt if outcome.audit_available else None, "artifact_name": outcome.audit_artifact_name if outcome.audit_available else None},
+    }
 
 
 def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
@@ -269,6 +302,7 @@ def evaluate(
     audit_error: Optional[str],
     identity: Identity,
     audit_source_attempt: Optional[int] = None,
+    audit_artifact_name: Optional[str] = None,
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -282,118 +316,109 @@ def evaluate(
     notes: list[str] = []
     problems: list[str] = []
     synthetic: Optional[dict[str, Any]] = None
-    ok = True
-
+    invalid_inputs = []
     if runner not in RUNNER_DOMAIN:
-        ok = False
-        problems.append(
-            f"runner input {runner!r} is not a recognized value (expected one of {RUNNER_DOMAIN!r}) — "
-            "fail-closed rather than silently falling through to a hosted-like skip-accepted path"
-        )
+        invalid_inputs.append(f"runner input {runner!r} is not a recognized value (expected one of {RUNNER_DOMAIN!r}) — fail-closed")
+    if quality_result not in QUALITY_RESULT_DOMAIN:
+        invalid_inputs.append(f"quality job result {quality_result!r} is not a recognized value — fail-closed")
+    if primary_result not in PRIMARY_RESULT_DOMAIN:
+        invalid_inputs.append(f"primary job result {primary_result!r} is not a recognized value (expected one of {PRIMARY_RESULT_DOMAIN!r}) — fail-closed")
+    if type(is_draft) is not bool or type(review_expected) is not bool:
+        invalid_inputs.append("draft/review_expected must be genuine booleans — fail-closed")
+    if invalid_inputs:
+        return Outcome(ok=False, problems=invalid_inputs)
+
+    quality_reason = None if quality_result == "success" else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
+    primary_classification = primary_reason = None
+    audit_available = False
+    audit_source = artifact_name = None
 
     if quality_result == "success":
         notes.append("quality: success")
     else:
-        ok = False
         problems.append(f"quality job result is {quality_result!r} (required: success)")
 
-    if primary_result not in PRIMARY_RESULT_DOMAIN:
-        ok = False
-        problems.append(
-            f"primary job result {primary_result!r} is not a recognized value "
-            f"(expected one of {PRIMARY_RESULT_DOMAIN!r}) — fail-closed"
-        )
-    elif primary_result == "skipped":
+    if primary_result == "skipped":
         if is_draft or not review_expected:
             notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
+            primary_classification, primary_reason = "expected_skip", "review_not_expected"
         else:
-            ok = False
             problems.append(
                 "primary job was skipped but review was expected (non-draft PR, same-repo head, "
                 "runner: self) — an unexplained skip is never accepted as a passing primary review"
             )
+            primary_classification, primary_reason = "integration_error", "unexpected_primary_skip"
     elif primary_result == "cancelled":
-        ok = False
-        synthetic = build_synthetic_audit(
-            identity=identity,
-            status=SYNTHETIC_STATUS_TIMED_OUT,
-            reason="primary job concluded 'cancelled' before a canonical audit could be finalized",
-        )
+        synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_TIMED_OUT, reason="primary job concluded 'cancelled' before a canonical audit could be finalized")
         problems.append("primary job was cancelled before completion — fail-closed, synthetic audit generated")
+        primary_classification, primary_reason = "review_unavailable", "primary_cancelled"
+    elif audit is None:
+        synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_ARTIFACT_MISSING, reason=audit_error or "primary audit artifact was not found")
+        problems.append(f"primary audit artifact missing ({audit_error or 'not found'}) — fail-closed")
+        primary_classification, primary_reason = "integration_error", "audit_missing"
     else:
-        # success or failure: review-primary writes a canonical audit on exit codes 0
-        # (pass) and 1 (fail/unavailable — a legitimate audited outcome); exit codes 2
-        # (audit write failed) and 3 (setup error) may leave no audit file at all — see
-        # review-primary's exit-code contract docstring.
-        if audit is None:
-            ok = False
-            synthetic = build_synthetic_audit(
-                identity=identity,
-                status=SYNTHETIC_STATUS_ARTIFACT_MISSING,
-                reason=audit_error or "primary audit artifact was not found",
-            )
-            problems.append(f"primary audit artifact missing ({audit_error or 'not found'}) — fail-closed")
+        errors = validate_audit_identity(audit, identity)
+        if errors:
+            synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_ARTIFACT_MISSING, reason="downloaded primary audit failed validation: " + "; ".join(errors))
+            problems.append("primary audit failed validation: " + "; ".join(errors))
+            primary_classification, primary_reason = "integration_error", "audit_invalid"
         else:
-            errors = validate_audit_identity(audit, identity)
-            if errors:
-                ok = False
-                synthetic = build_synthetic_audit(
-                    identity=identity,
-                    status=SYNTHETIC_STATUS_ARTIFACT_MISSING,
-                    reason="downloaded primary audit failed validation: " + "; ".join(errors),
+            verdict = audit["verdict"]
+            audit_source = audit["run_attempt"]
+            if audit_source_attempt != audit_source or not (isinstance(audit_artifact_name, str) and audit_artifact_name):
+                synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_ARTIFACT_MISSING, reason=("downloaded primary audit source attempt does not match the selected artifact output: " f"audit={audit_source!r} selected={audit_source_attempt!r}"))
+                problems.append(
+                    "primary audit source run_attempt mismatch: "
+                    f"audit={audit_source!r} selected={audit_source_attempt!r}"
                 )
-                problems.append("primary audit failed validation: " + "; ".join(errors))
+                audit_source = None
+                primary_classification, primary_reason = "integration_error", "audit_source_mismatch"
             else:
-                verdict = audit["verdict"]
-                source_attempt = audit["run_attempt"]
-                if audit_source_attempt is not None:
-                    if audit_source_attempt != source_attempt:
-                        ok = False
-                        synthetic = build_synthetic_audit(
-                            identity=identity,
-                            status=SYNTHETIC_STATUS_ARTIFACT_MISSING,
-                            reason=(
-                                "downloaded primary audit source attempt does not match "
-                                f"the selected artifact output: audit={source_attempt!r} "
-                                f"selected={audit_source_attempt!r}"
-                            ),
-                        )
-                        problems.append(
-                            "primary audit source run_attempt mismatch: "
-                            f"audit={source_attempt!r} selected={audit_source_attempt!r}"
-                        )
-                        return Outcome(ok=ok, notes=notes, problems=problems, synthetic_audit=synthetic)
-                notes.append(
-                    "primary audit source run_attempt="
-                    f"{source_attempt} (current run_attempt={identity.run_attempt})"
-                )
+                audit_available = verdict in ("pass", "fail", "unavailable")
+                artifact_name = audit_artifact_name if isinstance(audit_artifact_name, str) and audit_artifact_name else None
+                notes.append(f"primary audit source run_attempt={audit_source} (current run_attempt={identity.run_attempt})")
                 if verdict == "pass":
-                    # An audit claiming pass is trusted ONLY when the job's own result
-                    # agrees — the job's conclusion is never overridden by the audit's
-                    # self-reported verdict (see the module docstring).
                     if primary_result != "success":
-                        ok = False
+                        audit_available = False
+                        audit_source = artifact_name = None
                         problems.append(
-                            f"primary audit verdict is 'pass' but the job result is {primary_result!r} — "
-                            "inconsistent, fail-closed"
+                            f"primary audit verdict is 'pass' but the job result is {primary_result!r} — inconsistent, fail-closed"
                         )
+                        primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
                     else:
                         notes.append("primary: pass")
-                elif verdict in ("fail", "unavailable"):
-                    ok = False
-                    problems.append(f"primary review verdict is {verdict!r}")
-                else:  # not_expected / waived — ALWAYS rejected, see module docstring's T6 note
-                    ok = False
+                        primary_classification, primary_reason = "code_pass", "primary_pass"
+                elif verdict == "fail":
+                    problems.append("primary review verdict is 'fail'")
+                    primary_classification, primary_reason = "code_fail", "primary_findings"
+                elif verdict == "unavailable":
+                    problems.append("primary review verdict is 'unavailable'")
+                    primary_classification, primary_reason = "review_unavailable", "primary_unavailable"
+                else:
+                    audit_available = False
+                    audit_source = artifact_name = None
                     problems.append(
-                        f"primary audit verdict {verdict!r} is not accepted: canary-stage primary never "
-                        "legitimately writes not_expected/waived (fork/hosted PRs skip the whole `primary` "
-                        "job instead — see gate-v2.yml). T6: a follow-up PR wiring up a real "
-                        "not_expected/waived writer must implement gate-hub contracts.py-equivalent "
-                        "companion-field validation (not_expected_reason enum domain, waiver.approved_at "
-                        "ISO-8601 time component) before either verdict may be accepted here."
+                        f"primary audit verdict {verdict!r} is not accepted: canary-stage primary never legitimately writes "
+                        "not_expected/waived; companion-field validation is not wired yet"
                     )
+                    primary_classification, primary_reason = "integration_error", "audit_invalid"
+                if primary_result == "success" and verdict in ("fail", "unavailable"):
+                    audit_available = False
+                    audit_source = artifact_name = None
+                    primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
 
-    return Outcome(ok=ok, notes=notes, problems=problems, synthetic_audit=synthetic)
+    if primary_classification == "integration_error":
+        classification, reason_code = primary_classification, primary_reason
+    elif quality_reason is not None:
+        classification, reason_code = "ci_failure", quality_reason
+    else:
+        classification, reason_code = primary_classification, primary_reason
+    gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[classification]
+    return Outcome(
+        ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,
+        classification=classification, reason_code=reason_code, gate_result=gate_result,
+        audit_available=audit_available, audit_source_attempt=audit_source, audit_artifact_name=artifact_name,
+    )
 
 
 def find_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str]]:
@@ -448,7 +473,11 @@ def render_summary(outcome: Outcome) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _finish(outcome: Outcome, summary_path: Optional[str]) -> int:
+def _finish(
+    outcome: Outcome, summary_path: Optional[str], *, terminal_path: Optional[str] = None, repository: Optional[str] = None,
+    identity: Optional[Identity] = None, quality_result: Optional[str] = None, primary_result: Optional[str] = None,
+    review_expected: Optional[bool] = None, is_draft: Optional[bool] = None, runner: Optional[str] = None,
+) -> int:
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
     ::notice::/::error:: annotations, and map ok -> exit code."""
@@ -461,6 +490,12 @@ def _finish(outcome: Outcome, summary_path: Optional[str]) -> int:
         print(f"::notice::{note}")
     for problem in outcome.problems:
         print(f"::error::{problem}")
+    if terminal_path and outcome.classification is not None:
+        terminal = build_terminal_envelope(repository=repository or "", identity=identity, quality_result=quality_result, primary_result=primary_result, review_expected=review_expected, is_draft=is_draft, runner=runner, outcome=outcome)
+        terminal_path = Path(terminal_path)
+        temporary_path = terminal_path.with_name(f".{terminal_path.name}.tmp")
+        temporary_path.write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary_path.replace(terminal_path)
     return 0 if outcome.ok else 1
 
 
@@ -477,6 +512,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "`if:` uses — see gate-v2.yml and tests/test_gate_v2_contract.py",
     )
     parser.add_argument("--repository-id", required=True, type=int)
+    parser.add_argument("--repository", required=True)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
@@ -487,6 +523,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="selected canonical artifact source attempt (the audit remains authoritative)",
     )
     parser.add_argument("--audit-dir", type=Path, default=None)
+    parser.add_argument("--audit-artifact-name", default=None)
+    parser.add_argument("--terminal-path", default=None, help="gate-terminal.json output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
     args = parser.parse_args(argv)
 
@@ -494,6 +532,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.audit_source_attempt:
         try:
             audit_source_attempt = int(args.audit_source_attempt)
+            if audit_source_attempt <= 0:
+                raise ValueError
         except (TypeError, ValueError):
             return _finish(
                 Outcome(
@@ -505,6 +545,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 ),
                 args.summary_path,
             )
+
+    if not args.repository or not args.head_sha:
+        return _finish(
+            Outcome(ok=False, problems=["malformed repository/head_sha identity input — fail-closed"]),
+            args.summary_path,
+        )
 
     identity = Identity(
         repository_id=args.repository_id,
@@ -535,9 +581,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit_error=audit_error,
         identity=identity,
         audit_source_attempt=audit_source_attempt,
+        audit_artifact_name=args.audit_artifact_name or None,
     )
 
-    return _finish(outcome, args.summary_path)
+    return _finish(
+        outcome,
+        args.summary_path,
+        terminal_path=args.terminal_path,
+        repository=args.repository,
+        identity=identity,
+        quality_result=args.quality_result,
+        primary_result=args.primary_result,
+        review_expected=review_expected,
+        is_draft=is_draft,
+        runner=args.runner,
+    )
 
 
 if __name__ == "__main__":

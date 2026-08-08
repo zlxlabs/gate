@@ -585,6 +585,7 @@ jobs:
           # Empty outputs keep the best-effort path fail-closed when the REST lookup fails or finds no candidate.
           echo "artifact_id=" >> "$GITHUB_OUTPUT"
           echo "source_attempt=" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=" >> "$GITHUB_OUTPUT"
           artifact_listing="$(mktemp)"
           trap 'rm -f "$artifact_listing"' EXIT
           gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$artifact_listing"
@@ -619,21 +620,21 @@ jobs:
                   if attempt <= current_attempt:
                       artifact_id = artifact.get("id")
                       if isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
-                          candidates.append((attempt, artifact_id))
+                          candidates.append((attempt, artifact_id, name))
           if not candidates:
               print("No matching canonical primary audit artifact found", file=sys.stderr)
               raise SystemExit(0)
-          attempt, artifact_id = max(candidates, key=lambda candidate: candidate[0])
-          print(f"{artifact_id}\t{attempt}")
+          attempt, artifact_id, name = max(candidates, key=lambda candidate: candidate[0])
+          print(f"{artifact_id}\t{attempt}\t{name}")
           PY
           )"
           if [ -z "$selected" ]; then
             exit 0
           fi
-          artifact_id="${selected%%$'\t'*}"
-          source_attempt="${selected#*$'\t'}"
+          IFS=$'\t' read -r artifact_id source_attempt artifact_name <<< "$selected"
           echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
           echo "source_attempt=$source_attempt" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
       - name: Download canonical primary audit (best effort — may not exist)
         if: ${{ needs.primary.result != 'skipped' && steps.resolve-audit-artifact.outputs.artifact_id != '' }}
@@ -659,11 +660,14 @@ jobs:
           # tests/test_gate_v2_contract.py pins these two copies identical.
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
           REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
+          AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
+          TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
@@ -672,13 +676,24 @@ jobs:
             --is-draft "$IS_DRAFT" \
             --review-expected "$REVIEW_EXPECTED" \
             --repository-id "$REPOSITORY_ID" \
+            --repository "$REPOSITORY" \
             --head-sha "$HEAD_SHA" \
             --run-id "$RUN_ID" \
             --run-attempt "$RUN_ATTEMPT" \
             --pr-number "$PR_NUMBER" \
             --audit-source-attempt "$AUDIT_SOURCE_ATTEMPT" \
+            --audit-artifact-name "$AUDIT_ARTIFACT_NAME" \
             --audit-dir "${{ runner.temp }}/primary-audit" \
-            --summary-path "$GITHUB_STEP_SUMMARY"
+            --summary-path "$GITHUB_STEP_SUMMARY" \
+            --terminal-path "$TERMINAL_PATH"
+
+      - name: Upload gate terminal envelope
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gate-terminal.json
+          if-no-files-found: error
 
   # ── notify (registry-routed, required-gate-failure only) ────────────────
   # Same fail-only semantics as legacy gate.yml's notify job (see that file
