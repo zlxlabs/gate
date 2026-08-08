@@ -216,6 +216,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert 'artifact_id=' in resolver_run
     assert 'source_attempt=' in resolver_run
     assert 'echo "artifact_id="' in resolver_run
+    assert 'echo "artifact_name="' in resolver_run and 'echo "artifact_name=$artifact_name"' in resolver_run
     assert 'No matching canonical primary audit artifact found' in resolver_run
 
     download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
@@ -227,6 +228,11 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
         "${{ needs.primary.result != 'skipped' && "
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
+    terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
+    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == "actions/upload-artifact@v4"
+    assert terminal_upload["with"]["name"] == "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}"
+    assert terminal_upload["with"]["path"] == "${{ runner.temp }}/gate-terminal.json" and terminal_upload["with"]["if-no-files-found"] == "error"
+    assert "continue-on-error" not in terminal_upload
 
 
 def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
@@ -272,6 +278,7 @@ def test_gate_job_passes_the_identity_quintuple_to_the_aggregator():
     assert env["RUN_ATTEMPT"] == "${{ github.run_attempt }}"
     assert env["PR_NUMBER"] == "${{ github.event.pull_request.number }}"
     assert env["REPOSITORY"] == "${{ github.repository }}"
+    assert env["TERMINAL_PATH"] == "${{ runner.temp }}/gate-terminal.json"
     run = aggregate_step["run"]
     for flag in (
         "--quality-result", "--primary-result", "--runner", "--is-draft", "--review-expected",
@@ -418,22 +425,6 @@ def test_review_gate_timeout_s_is_computed_in_shell_not_in_a_gha_expression():
     # it inherits it from $GITHUB_ENV exported above.
     run_step = next(s for s in steps if s.get("name") == "Run review-primary")
     assert "REVIEW_GATE_TIMEOUT_S" not in run_step.get("env", {})
-
-
-def test_gate_terminal_upload_and_aggregator_path_contract():
-    raw, _ = _load_workflow()
-    gate_steps = raw["jobs"]["gate"]["steps"]
-    resolver = next(s for s in gate_steps if s.get("name") == "Resolve canonical primary audit artifact")
-    assert 'echo "artifact_name="' in resolver["run"]
-    assert 'echo "artifact_name=$artifact_name"' in resolver["run"]
-
-    upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
-    assert upload["if"] == "always()"
-    assert upload["uses"] == "actions/upload-artifact@v4"
-    assert upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error"}
-    assert "continue-on-error" not in upload
-    aggregate = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
-    assert aggregate["env"]["TERMINAL_PATH"] == "${{ runner.temp }}/gate-terminal.json" and "classification" not in aggregate["run"] and "reason_code" not in aggregate["run"]
 
 
 def test_primary_timeout_minutes_lower_bound_is_validated_and_fails_closed():

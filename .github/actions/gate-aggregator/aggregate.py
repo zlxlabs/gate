@@ -330,7 +330,8 @@ def evaluate(
 
     quality_reason = None if quality_result == "success" else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
     primary_classification = primary_reason = None
-    audit_available = False; audit_source = artifact_name = None
+    audit_available = False
+    audit_source = artifact_name = None
 
     if quality_result == "success":
         notes.append("quality: success")
@@ -364,7 +365,7 @@ def evaluate(
         else:
             verdict = audit["verdict"]
             audit_source = audit["run_attempt"]
-            if audit_source_attempt is not None and audit_source_attempt != audit_source:
+            if audit_source_attempt != audit_source or not (isinstance(audit_artifact_name, str) and audit_artifact_name):
                 synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_ARTIFACT_MISSING, reason=("downloaded primary audit source attempt does not match the selected artifact output: " f"audit={audit_source!r} selected={audit_source_attempt!r}"))
                 problems.append(
                     "primary audit source run_attempt mismatch: "
@@ -378,7 +379,9 @@ def evaluate(
                 notes.append(f"primary audit source run_attempt={audit_source} (current run_attempt={identity.run_attempt})")
                 if verdict == "pass":
                     if primary_result != "success":
-                        audit_available = False; problems.append(
+                        audit_available = False
+                        audit_source = artifact_name = None
+                        problems.append(
                             f"primary audit verdict is 'pass' but the job result is {primary_result!r} — inconsistent, fail-closed"
                         )
                         primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
@@ -393,11 +396,16 @@ def evaluate(
                     primary_classification, primary_reason = "review_unavailable", "primary_unavailable"
                 else:
                     audit_available = False
+                    audit_source = artifact_name = None
                     problems.append(
                         f"primary audit verdict {verdict!r} is not accepted: canary-stage primary never legitimately writes "
                         "not_expected/waived; companion-field validation is not wired yet"
                     )
                     primary_classification, primary_reason = "integration_error", "audit_invalid"
+                if primary_result == "success" and verdict in ("fail", "unavailable"):
+                    audit_available = False
+                    audit_source = artifact_name = None
+                    primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
 
     if primary_classification == "integration_error":
         classification, reason_code = primary_classification, primary_reason
@@ -475,7 +483,10 @@ def _finish(
     ::notice::/::error:: annotations, and map ok -> exit code."""
     if terminal_path and outcome.classification is not None:
         terminal = build_terminal_envelope(repository=repository or "", identity=identity, quality_result=quality_result, primary_result=primary_result, review_expected=review_expected, is_draft=is_draft, runner=runner, outcome=outcome)
-        Path(terminal_path).write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        terminal_path = Path(terminal_path)
+        temporary_path = terminal_path.with_name(f".{terminal_path.name}.tmp")
+        temporary_path.write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary_path.replace(terminal_path)
     summary = render_summary(outcome)
     print(summary)
     if summary_path:
