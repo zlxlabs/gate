@@ -437,7 +437,7 @@ def _cli_args(audit_dir, summary_path, **overrides):
         run_id=str(IDENTITY.run_id),
         run_attempt=str(IDENTITY.run_attempt),
         pr_number=str(IDENTITY.pr), repository="zlxlabs/gate",
-        audit_source_attempt=str(IDENTITY.run_attempt), audit_artifact_name="primary-audit-v2-1", terminal_path="",
+        audit_source_attempt=str(IDENTITY.run_attempt), audit_artifact_name="primary-audit-v2-1", terminal_path=str(Path(summary_path).with_name("gate-terminal.json")),
     )
     values.update(overrides)
     args = [
@@ -464,10 +464,9 @@ def test_main_exit_code_zero_on_pass(tmp_path):
     audit_dir.mkdir()
     (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
     summary_path = tmp_path / "summary.md"
-    terminal_path = tmp_path / "gate-terminal.json"
-    rc = AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path)))
+    rc = AGG.main(_cli_args(audit_dir, summary_path))
     assert rc == 0
-    assert "pass" in summary_path.read_text() and json.loads(terminal_path.read_text())["kind"] == "gate_terminal"
+    assert "pass" in summary_path.read_text() and json.loads(summary_path.with_name("gate-terminal.json").read_text())["kind"] == "gate_terminal"
 
 
 def test_main_summary_and_notice_include_cross_attempt_source(capsys, tmp_path):
@@ -485,11 +484,10 @@ def test_main_summary_and_notice_include_cross_attempt_source(capsys, tmp_path):
 
 def test_main_exit_code_nonzero_on_missing_audit(tmp_path):
     summary_path = tmp_path / "summary.md"
-    terminal_path = tmp_path / "gate-terminal.json"
-    rc = AGG.main(_cli_args(tmp_path / "nope", summary_path, terminal_path=str(terminal_path)))
+    rc = AGG.main(_cli_args(tmp_path / "nope", summary_path))
     assert rc == 1
     assert "Synthetic audit generated" in summary_path.read_text()
-    assert json.loads(terminal_path.read_text())["audit"] == {"available": False, "source_attempt": None, "artifact_name": None}
+    assert json.loads(summary_path.with_name("gate-terminal.json").read_text())["audit"] == {"available": False, "source_attempt": None, "artifact_name": None}
 
 
 def test_main_exit_code_nonzero_on_malformed_boolean_input(tmp_path):
@@ -529,11 +527,16 @@ def _assert_terminal_classification(outcome, expected):
 def test_terminal_classification_matrix(kwargs, expected):
     _assert_terminal_classification(AGG.evaluate(**_base_kwargs(**kwargs)), expected)
 
-def test_terminal_write_failure_leaves_final_path_absent(tmp_path, monkeypatch):
+def test_terminal_publish_barrier_failures(tmp_path, monkeypatch):
     audit_dir = tmp_path / "audit"
     audit_dir.mkdir()
     (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
     terminal_path = tmp_path / "gate-terminal.json"
+    summary_path = tmp_path / "summary.md"
+    summary_path.mkdir()
+    with pytest.raises(OSError):
+        AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path)))
+    assert not terminal_path.exists()
     original_write_text = Path.write_text
     def partial_write_then_fail(path, data, **kwargs):
         if path.name == ".gate-terminal.json.tmp":
@@ -542,5 +545,5 @@ def test_terminal_write_failure_leaves_final_path_absent(tmp_path, monkeypatch):
         return original_write_text(path, data, **kwargs)
     monkeypatch.setattr(Path, "write_text", partial_write_then_fail)
     with pytest.raises(OSError, match="simulated partial terminal write"):
-        AGG.main(_cli_args(audit_dir, tmp_path / "summary.md", terminal_path=str(terminal_path)))
+        AGG.main(_cli_args(audit_dir, tmp_path / "summary.txt", terminal_path=str(terminal_path)))
     assert not terminal_path.exists()

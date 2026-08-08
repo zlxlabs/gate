@@ -481,12 +481,6 @@ def _finish(
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
     ::notice::/::error:: annotations, and map ok -> exit code."""
-    if terminal_path and outcome.classification is not None:
-        terminal = build_terminal_envelope(repository=repository or "", identity=identity, quality_result=quality_result, primary_result=primary_result, review_expected=review_expected, is_draft=is_draft, runner=runner, outcome=outcome)
-        terminal_path = Path(terminal_path)
-        temporary_path = terminal_path.with_name(f".{terminal_path.name}.tmp")
-        temporary_path.write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary_path.replace(terminal_path)
     summary = render_summary(outcome)
     print(summary)
     if summary_path:
@@ -496,6 +490,12 @@ def _finish(
         print(f"::notice::{note}")
     for problem in outcome.problems:
         print(f"::error::{problem}")
+    if terminal_path and outcome.classification is not None:
+        terminal = build_terminal_envelope(repository=repository or "", identity=identity, quality_result=quality_result, primary_result=primary_result, review_expected=review_expected, is_draft=is_draft, runner=runner, outcome=outcome)
+        terminal_path = Path(terminal_path)
+        temporary_path = terminal_path.with_name(f".{terminal_path.name}.tmp")
+        temporary_path.write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary_path.replace(terminal_path)
     return 0 if outcome.ok else 1
 
 
