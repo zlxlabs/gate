@@ -510,19 +510,24 @@ def test_main_exit_code_nonzero_on_unknown_runner(tmp_path):
     assert "runner input" in summary_path.read_text()
 
 
-@pytest.mark.parametrize("verdict", ["fail", "unavailable"])
-def test_successful_primary_job_cannot_claim_nonpass_audit(verdict):
-    outcome = AGG.evaluate(**_base_kwargs(audit=_valid_primary_record(verdict=verdict)))
-    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("integration_error", "job_audit_mismatch", "unavailable")
-    assert (outcome.audit_available, outcome.audit_source_attempt, outcome.audit_artifact_name) == (False, None, None)
+def _assert_terminal_classification(outcome, expected):
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == expected
+    if expected[0] == "integration_error":
+        assert (outcome.audit_available, outcome.audit_source_attempt, outcome.audit_artifact_name) == (False, None, None)
 
-
-@pytest.mark.parametrize("source_attempt,artifact_name", [(None, "primary-audit-v2-1"), (1, ""), (1, None)])
-def test_canonical_audit_requires_selected_source_and_artifact_name(source_attempt, artifact_name):
-    outcome = AGG.evaluate(**_base_kwargs(audit_source_attempt=source_attempt, audit_artifact_name=artifact_name))
-    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("integration_error", "audit_source_mismatch", "unavailable")
-    assert (outcome.audit_available, outcome.audit_source_attempt, outcome.audit_artifact_name) == (False, None, None)
-
+@pytest.mark.parametrize("kwargs,expected", [
+    ({"quality_result": "failure"}, ("ci_failure", "quality_failure", "fail")), ({"quality_result": "cancelled"}, ("ci_failure", "quality_cancelled", "fail")),
+    ({"quality_result": "skipped"}, ("ci_failure", "quality_skipped", "fail")), ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None}, ("expected_skip", "review_not_expected", "skipped")),
+    ({}, ("code_pass", "primary_pass", "pass")), ({"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")}, ("code_fail", "primary_findings", "fail")),
+    ({"primary_result": "failure", "audit": _valid_primary_record(verdict="unavailable")}, ("review_unavailable", "primary_unavailable", "unavailable")), ({"primary_result": "cancelled", "audit": None}, ("review_unavailable", "primary_cancelled", "unavailable")),
+    ({"primary_result": "skipped", "audit": None}, ("integration_error", "unexpected_primary_skip", "unavailable")), ({"audit": None, "audit_error": "missing"}, ("integration_error", "audit_missing", "unavailable")),
+    ({"audit": _valid_primary_record(kind="synthetic_primary")}, ("integration_error", "audit_invalid", "unavailable")), ({"audit_source_attempt": 2}, ("integration_error", "audit_source_mismatch", "unavailable")),
+    ({"primary_result": "failure", "audit": _valid_primary_record(verdict="pass")}, ("integration_error", "job_audit_mismatch", "unavailable")), ({"quality_result": "failure", "audit": None, "audit_error": "missing"}, ("integration_error", "audit_missing", "unavailable")),
+    ({"primary_result": "success", "audit": _valid_primary_record(verdict="fail")}, ("integration_error", "job_audit_mismatch", "unavailable")), ({"primary_result": "success", "audit": _valid_primary_record(verdict="unavailable")}, ("integration_error", "job_audit_mismatch", "unavailable")),
+    ({"audit_source_attempt": None}, ("integration_error", "audit_source_mismatch", "unavailable")), ({"audit_artifact_name": ""}, ("integration_error", "audit_source_mismatch", "unavailable")), ({"audit_artifact_name": None}, ("integration_error", "audit_source_mismatch", "unavailable")),
+])
+def test_terminal_classification_matrix(kwargs, expected):
+    _assert_terminal_classification(AGG.evaluate(**_base_kwargs(**kwargs)), expected)
 
 def test_terminal_write_failure_leaves_final_path_absent(tmp_path, monkeypatch):
     audit_dir = tmp_path / "audit"

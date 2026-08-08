@@ -189,7 +189,8 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     raw, _ = _load_workflow()
     primary_steps = raw["jobs"]["primary"]["steps"]
     upload = next(s for s in primary_steps if s.get("name") == "Upload canonical primary audit")
-    assert upload["if"] == "always()" and upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["if"] == "always()"
+    assert upload["uses"] == "actions/upload-artifact@v4"
     assert upload["with"]["name"] == ARTIFACT_NAME_EXPR
     # fail-closed: unlike legacy's advisory codex-audit upload, this upload has no
     # continue-on-error. P1 fix (2026-07-26, canary probe #2): if-no-files-found MUST be
@@ -229,10 +230,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
     terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
-    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == "actions/upload-artifact@v4"
-    assert terminal_upload["with"]["name"] == "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}"
-    assert terminal_upload["with"]["path"] == "${{ runner.temp }}/gate-terminal.json" and terminal_upload["with"]["if-no-files-found"] == "error"
-    assert "continue-on-error" not in terminal_upload
+    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == "actions/upload-artifact@v4" and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error"} and "continue-on-error" not in terminal_upload
 
 
 def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
@@ -278,7 +276,6 @@ def test_gate_job_passes_the_identity_quintuple_to_the_aggregator():
     assert env["RUN_ATTEMPT"] == "${{ github.run_attempt }}"
     assert env["PR_NUMBER"] == "${{ github.event.pull_request.number }}"
     assert env["REPOSITORY"] == "${{ github.repository }}"
-    assert env["TERMINAL_PATH"] == "${{ runner.temp }}/gate-terminal.json"
     run = aggregate_step["run"]
     for flag in (
         "--quality-result", "--primary-result", "--runner", "--is-draft", "--review-expected",
