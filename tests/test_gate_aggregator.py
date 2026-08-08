@@ -507,7 +507,6 @@ def test_main_exit_code_nonzero_on_unknown_runner(tmp_path):
     assert rc == 1
     assert "runner input" in summary_path.read_text()
 
-
 def _assert_terminal_classification(outcome, expected):
     assert (outcome.classification, outcome.reason_code, outcome.gate_result) == expected
     if expected[0] == "integration_error":
