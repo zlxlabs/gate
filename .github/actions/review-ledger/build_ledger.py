@@ -297,16 +297,21 @@ def write_ledger(path: Path, entries: list[dict[str, Any]], *, max_entries: int)
 
 def dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
+    known_conflict_counts: dict[tuple[Any, ...], int] = {}
     for entry in entries:
         key = (entry.get("repository"), entry.get("run_id"), entry.get("run_attempt"))
+        conflict = entry.get("ledger_conflict")
+        if isinstance(conflict, dict) and type(conflict.get("variant_count")) is int:
+            known_conflict_counts[key] = max(known_conflict_counts.get(key, 0), conflict["variant_count"])
         canonical = {field: value for field, value in entry.items() if field != "ledger_conflict"}
         signature = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         grouped.setdefault(key, {})[signature] = canonical
     unique: list[dict[str, Any]] = []
     for key, variants in grouped.items():
-        marker = {"key": list(key), "variant_count": len(variants)}
+        variant_count = max(len(variants), known_conflict_counts.get(key, 0))
+        marker = {"key": list(key), "variant_count": variant_count, "present_variant_count": len(variants)}
         for entry in variants.values():
-            if len(variants) > 1:
+            if variant_count > 1:
                 entry = {**entry, "ledger_conflict": marker}
             unique.append(entry)
     return sorted(unique, key=lambda entry: (

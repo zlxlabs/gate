@@ -210,11 +210,13 @@ def test_ledger_preserves_conflicting_run_attempt_variants():
 
     assert len(variants) == 2
     assert all(item["ledger_conflict"]["variant_count"] == 2 for item in variants)
+    survivor = module.dedupe_entries([variants[0]])
+    assert survivor[0]["ledger_conflict"]["present_variant_count"] == 1
 
     current = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
         head_sha="next", preflight={}, audit=_audit("next", []),
-        prior_entries=variants, dispositions={},
+        prior_entries=survivor, dispositions={},
     )
     assert current["comparison"]["kind"] == "prior_conflict"
     assert current["review_round"] == 2
