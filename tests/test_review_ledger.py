@@ -236,6 +236,23 @@ def test_v2_primary_audit_rejects_malformed_canonical_shape(field, value):
         )
 
 
+@pytest.mark.parametrize(
+    "verdict,field",
+    [(verdict, field) for verdict in ["pass", "fail", "unavailable"] for field in ["waiver", "not_expected_reason"]]
+    + [("not_expected", "waiver"), ("waived", "not_expected_reason")],
+)
+def test_v2_primary_audit_rejects_companion_fields_for_wrong_verdict(verdict, field):
+    module = _module()
+    audit = _v2_audit(verdict)
+    audit[field] = {} if field == "waiver" else "hosted_runner"
+
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        )
+
+
 def test_fetch_prior_entries_fails_on_corrupt_artifact(monkeypatch):
     module = _module()
     monkeypatch.setattr(module, "_api_json", lambda token, url: {

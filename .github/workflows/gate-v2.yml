@@ -545,9 +545,6 @@ jobs:
     # its own verdict from needs.*.result instead of relying on GitHub's
     # default dependency semantics.
     if: always()
-    concurrency:
-      group: gate-required-v2-ledger-${{ github.repository_id }}
-      cancel-in-progress: false
     # 控制面默认跟随 runner 走自建：hosted 因账单预算硬断不可用的实测概率高于
     # 自建机群整体不可用概率，2026-07-27 已造成全组织停摆；v1 已经如此路由，
     # 本次只是补齐未完成灰度。取整税数据：2026-08-01 单日 145 计费分钟 / 12.8 实际分钟。
@@ -649,14 +646,6 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/primary-audit
 
-      - name: Download v2 review ledger inputs
-        if: always()
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/review-ledger-input
-
       - name: Aggregate required verdict
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
@@ -699,9 +688,110 @@ jobs:
             --summary-path "$GITHUB_STEP_SUMMARY" \
             --terminal-path "$TERMINAL_PATH"
 
-      - name: Build v2 review effectiveness ledger
+      - name: Upload gate terminal envelope
         if: always()
-        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gate-terminal.json
+          if-no-files-found: error
+
+  # ── ledger (independent persistence health check) ───────────────────────
+  ledger:
+    needs: [quality, primary, gate]
+    if: always()
+    concurrency:
+      group: gate-required-v2-ledger-${{ github.repository_id }}
+      cancel-in-progress: false
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout ledger action at this workflow's own commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-aggregator-src
+
+      - name: Resolve v2 ledger artifacts
+        id: resolve-ledger-artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PREFIX: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
+          AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
+          CURRENT_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+        run: |
+          set -euo pipefail
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$listing"
+          python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          listing_path, input_prefix, audit_prefix, current_text, expected_text, output_path = sys.argv[1:]
+          current = int(current_text)
+          if expected_text not in {"true", "false"}:
+              raise SystemExit("REVIEW_EXPECTED must be true or false")
+          payload = json.loads(Path(listing_path).read_text(encoding="utf-8"))
+          pages = payload if isinstance(payload, list) else [payload]
+          artifacts = []
+          for page in pages:
+              if not isinstance(page, dict) or not isinstance(page.get("artifacts"), list):
+                  raise SystemExit("current run artifact listing has invalid JSON shape")
+              artifacts.extend(page["artifacts"])
+
+          def select_artifact(prefix, missing_message, required):
+              candidates = []
+              for artifact in artifacts:
+                  if not isinstance(artifact, dict) or artifact.get("expired") is True:
+                      continue
+                  name = artifact.get("name", "")
+                  if not isinstance(name, str) or not name.startswith(prefix):
+                      continue
+                  suffix = name[len(prefix):]
+                  if not re.fullmatch(r"[0-9]+", suffix):
+                      continue
+                  attempt = int(suffix)
+                  # Only attempts <= current are eligible; never select a future artifact.
+                  artifact_id = artifact.get("id")
+                  if attempt <= current and isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
+                      candidates.append((attempt, artifact_id, name))
+              if not candidates:
+                  if required:
+                      raise SystemExit(missing_message)
+                  return None
+              return max(candidates, key=lambda item: (item[0], item[1]))
+
+          input_artifact = select_artifact(input_prefix, "No matching required ledger input artifact found", True)
+          audit_artifact = select_artifact(audit_prefix, "No matching canonical primary audit artifact found", expected_text == "true")
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"input_artifact_id={input_artifact[1]}\n")
+              output.write(f"input_source_attempt={input_artifact[0]}\n")
+              output.write(f"audit_artifact_id={audit_artifact[1] if audit_artifact else ''}\n")
+              output.write(f"audit_source_attempt={audit_artifact[0] if audit_artifact else ''}\n")
+          PY
+
+      - name: Download v2 review ledger inputs
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/review-ledger-input
+
+      - name: Download canonical primary audit for ledger
+        if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/primary-audit
+
+      - name: Build v2 review effectiveness ledger
         uses: ./_gate-aggregator-src/.github/actions/review-ledger
         with:
           audit-path: ${{ runner.temp }}/primary-audit/primary-review-audit.json
@@ -716,22 +806,12 @@ jobs:
           expected-reusable-workflow-sha: ${{ job.workflow_sha }}
 
       - name: Upload v2 review effectiveness ledger
-        if: always()
-        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: codex-review-ledger
           path: ${{ runner.temp }}/review-ledger/ledger.jsonl
           if-no-files-found: error
           retention-days: 90
-
-      - name: Upload gate terminal envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gate-terminal.json
-          if-no-files-found: error
 
   # ── notify (registry-routed, required-gate-failure only) ────────────────
   # Same fail-only semantics as legacy gate.yml's notify job (see that file

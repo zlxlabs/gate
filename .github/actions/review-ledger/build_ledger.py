@@ -260,6 +260,10 @@ def _primary_identity(
         mismatches.append("run_attempt")
     if mismatches:
         raise ValueError(f"primary audit identity mismatch: {sorted(set(mismatches))}")
+    if verdict != "not_expected" and "not_expected_reason" in audit:
+        raise ValueError("canonical primary not_expected_reason is only valid for not_expected")
+    if verdict != "waived" and "waiver" in audit:
+        raise ValueError("canonical primary waiver is only valid for waived")
     reviewer = audit["reviewer"]
     if verdict in PRIMARY_REVIEWER_VERDICTS and (not isinstance(reviewer, str) or not reviewer):
         raise ValueError("canonical primary reviewer must be a non-empty string")
@@ -282,7 +286,7 @@ def _primary_identity(
         if (attempts != [] or result is not None or audit.get("cost") is not None or audit.get("tokens") is not None
                 or (verdict == "not_expected" and "waiver" in audit)
                 or (verdict == "waived" and "not_expected_reason" in audit)):
-            raise ValueError("no-review primary audit cannot carry review content")
+            raise ValueError("canonical primary no-review audit cannot carry review content")
         if verdict == "not_expected" and (not isinstance(audit.get("not_expected_reason"), str) or audit.get("not_expected_reason") not in {
             "fork", "hosted_runner", "no_review_policy"
         }):
