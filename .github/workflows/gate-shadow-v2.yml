@@ -3,16 +3,16 @@
 # D2 (private gate-hub repo's ceo-plans/2026-07-24-shadow-review-independence.md) of the
 # shadow-review independence rollout. Implements ONLY the "Shadow Calibration" state
 # machine from that plan. Required Gate (D1, .github/workflows/gate-v2.yml, ALREADY
-# MERGED and UNTOUCHED by this file) is a SEPARATE workflow with its OWN concurrency
-# group — per the plan's "Workflow concurrency contract":
+# MERGED and UNTOUCHED by this file) is a SEPARATE workflow. Required Gate deliberately
+# has no workflow-level concurrency so every run can reach its independent ledger writer;
+# this workflow retains its own concurrency group for the shadow/draft lifecycle:
 #
-#   gate-required-v2-{repository_id}-{pr_number}   (gate-v2.yml, unrelated to this file)
 #   gate-shadow-v2-{repository_id}-{pr_number}      (this workflow, below)
 #
-# The two groups are, and must remain, independent: this workflow can never cancel or
-# block a Required Gate run, and vice versa — Required Gate's dependency graph never
-# references anything in this file, and this file never writes anything Required Gate
-# reads. This file also carries NO required-check-bearing job at all (contrast with
+# This workflow's group can never cancel or block a Required Gate run, and vice versa —
+# Required Gate's dependency graph never references anything in this file, and this file
+# never writes anything Required Gate reads. This file also carries NO required-check-bearing
+# job at all (contrast with
 # gate-v2.yml's `gate` job, which is literally named `gate` to preserve the
 # `gate / gate` required status-check context) — the calibration workflow is
 # intentionally not, and must never become, a merge gate.
@@ -107,11 +107,10 @@ permissions:
   actions: read
   contents: read
 
-# Workflow concurrency contract (plan section of the same name): defined ONCE at this
-# reusable-workflow level, same shape as gate-v2.yml's own group (repository_id + PR
-# number, falling back to run_id for a non-PR trigger) but with the `gate-shadow-v2-`
-# prefix instead of `gate-required-v2-` — the two prefixes must never collide, and
-# NEVER cancel one another (see this file's own top comment). `cancel-in-progress: true`
+# Workflow concurrency contract: Shadow Calibration keeps one workflow-level
+# `gate-shadow-v2-...` cancel group for its shadow/draft lifecycle. Required Gate
+# intentionally has no workflow-level concurrency; its `ledger` job owns the repository
+# writer queue. `cancel-in-progress: true`
 # also implements the plan's "转 draft 取消在途" mechanism together with the caller's
 # `converted_to_draft` trigger (see templates/caller-gate-shadow-v2.yml): a PR converted
 # back to draft fires a NEW workflow_call run whose `resolve` job's `if:` immediately

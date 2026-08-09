@@ -120,10 +120,7 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
 
 def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     raw, _ = _load_workflow()
-    concurrency = raw["concurrency"]
-    assert concurrency.get("cancel-in-progress") is True
-    assert str(concurrency.get("group", "")).startswith("gate-required-v2-")
-    assert "github.event.pull_request.number" in str(concurrency["group"])
+    assert "concurrency" not in raw
     assert not raw["jobs"]["gate"].get("concurrency", {})
     ledger_concurrency = raw["jobs"]["ledger"].get("concurrency", {})
     assert ledger_concurrency.get("cancel-in-progress") is False
