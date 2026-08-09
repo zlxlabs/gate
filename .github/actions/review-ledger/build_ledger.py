@@ -7,6 +7,7 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -62,7 +63,7 @@ PRIMARY_SCOPE_FIELDS = ("merge_base_sha", "candidate_commit_sha", "candidate_tre
 PRIMARY_SPEC_FIELDS = ("spec_source", "pr_body_digest")
 PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
     "kind", "schema_version", "verdict", "attempts", "shadow_mode", "expected_shadows",
-    "result", "cost", "tokens", "not_expected_reason", "waiver",
+    "result", "cost", "tokens", "runtime", "not_expected_reason", "waiver",
 }
 PRIMARY_VERDICTS = {"pass", "fail", "unavailable", "not_expected", "waived"}
 PRIMARY_REVIEWER_VERDICTS = {"pass", "fail", "unavailable"}
@@ -162,38 +163,88 @@ def _compact_attempts(audit: dict[str, Any] | None) -> list[dict[str, Any]]:
     return compact
 
 
-def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[str, Any]:
+def _require_finite_nonnegative(value: Any, field: str) -> None:
+    if value is None:
+        return
+    try:
+        valid = not isinstance(value, bool) and isinstance(value, (int, float))
+        valid = valid and math.isfinite(float(value)) and value >= 0
+    except (OverflowError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError(f"canonical primary {field} must be finite and non-negative or null")
+
+
+def _review_summary(
+    audit: dict[str, Any] | None, fallback_status: str, preflight: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not audit:
         return {
             "status": fallback_status,
             "verdict": None,
+            "result": None,
+            "cost_usd": None,
+            "tokens": None,
             "finding_count": 0,
             "finding_ids": [],
             "severity_counts": {},
             "category_counts": {},
             "coverage": None,
             "runtime": None,
+            "shadows": {},
             # P0 observability: who adjudicated + hop path (additive; old readers ignore).
             "reviewer": None,
             "attempts": [],
             "failover": False,
         }
-    result = audit.get("result") or {}
-    findings = result.get("findings") or []
-    attempts = _compact_attempts(audit)
+    result = audit.get("result")
     is_primary_v2 = audit.get("kind") == "primary_review"
+    if is_primary_v2:
+        if not isinstance(preflight, dict):
+            raise ValueError("canonical primary preflight must be an object")
+        thresholds = preflight.get("thresholds")
+        diff_lines = preflight.get("diff_lines")
+        if (
+            isinstance(diff_lines, bool) or not isinstance(diff_lines, int) or diff_lines < 0
+            or not isinstance(preflight.get("classification"), str)
+            or not isinstance(preflight.get("review_plan"), str)
+            or not isinstance(thresholds, dict)
+            or isinstance(thresholds.get("single_turn_lines"), bool)
+            or not isinstance(thresholds.get("single_turn_lines"), int)
+            or thresholds["single_turn_lines"] <= 0
+        ):
+            raise ValueError("canonical primary preflight has invalid coverage shape")
+        coverage_complete = diff_lines <= thresholds["single_turn_lines"]
+        coverage = {
+            "mode": "single" if coverage_complete else "sharded+cross-module integration",
+            "complete": coverage_complete,
+            "diff_lines": diff_lines,
+            "shards": 1 if coverage_complete else None,
+        }
+        findings = result["findings"] if isinstance(result, dict) else []
+        cost_usd, tokens, shadows = audit.get("cost"), audit.get("tokens"), {}
+    else:
+        result = result or {}
+        findings = result.get("findings") or []
+        coverage = audit.get("coverage")
+        cost_usd, tokens, shadows = audit.get("cost_usd"), audit.get("tokens"), audit.get("shadows", {})
+    attempts = _compact_attempts(audit)
     status = PRIMARY_STATUS_BY_VERDICT[audit["verdict"]] if is_primary_v2 else audit.get("status", "unknown")
     # Failover = more than one hop was tried (a discarded hop precedes the adopted one).
     failover = len(attempts) > 1
     return {
         "status": status,
         "verdict": status if is_primary_v2 else result.get("verdict"),
+        "result": audit.get("result"),
+        "cost_usd": cost_usd,
+        "tokens": tokens,
         "finding_count": len(findings),
         "finding_ids": sorted({finding.get("id", "") for finding in findings if finding.get("id")}),
         "severity_counts": dict(sorted(Counter(finding.get("severity", "unknown") for finding in findings).items())),
         "category_counts": dict(sorted(Counter(finding.get("category", "unknown") for finding in findings).items())),
-        "coverage": audit.get("coverage"),
+        "coverage": coverage,
         "runtime": audit.get("runtime"),
+        "shadows": shadows,
         "reviewer": audit.get("reviewer"),
         "attempts": attempts,
         "failover": failover,
@@ -205,7 +256,11 @@ def _primary_identity(
     run_id: int, run_attempt: int, head_sha: str,
     expected_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if not audit or audit.get("kind") != "primary_review":
+    if audit is None:
+        return None
+    if not isinstance(audit, dict):
+        raise ValueError("review audit must be a JSON object")
+    if audit.get("kind") != "primary_review":
         return None
     verdict = audit.get("verdict")
     if audit.get("schema_version") != 1 or verdict not in PRIMARY_VERDICTS:
@@ -275,15 +330,67 @@ def _primary_identity(
         isinstance(name, str) and name for name in audit["expected_shadows"]
     ):
         raise ValueError("canonical primary expected_shadows must be an array of names")
+    if audit["expected_shadows"]:
+        raise ValueError("canonical primary expected_shadows outcomes are unavailable")
     attempts = audit["attempts"]
-    if not isinstance(attempts, list) or not all(isinstance(item, dict) for item in attempts):
+    if not isinstance(attempts, list):
         raise ValueError("canonical primary attempts must be an array of objects")
+    required_attempt_fields = ("reviewer", "exit_code", "reason", "duration_s", "cost_usd")
+    attempt_durations = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or any(field not in attempt for field in required_attempt_fields):
+            raise ValueError("canonical primary attempts have an invalid consumed shape")
+        if not isinstance(attempt["reviewer"], str) or not attempt["reviewer"]:
+            raise ValueError("canonical primary attempt reviewer must be a non-empty string")
+        if isinstance(attempt["exit_code"], bool) or not isinstance(attempt["exit_code"], int):
+            raise ValueError("canonical primary attempt exit_code must be an integer")
+        if not isinstance(attempt["reason"], str):
+            raise ValueError("canonical primary attempt reason must be a string")
+        if attempt["duration_s"] is None: raise ValueError("canonical primary attempt duration_s must be a number")
+        _require_finite_nonnegative(attempt["duration_s"], "attempt duration_s")
+        _require_finite_nonnegative(attempt["cost_usd"], "attempt cost_usd")
+        attempt_durations.append(attempt["duration_s"])
+        if "diag_snippet" in attempt and attempt["diag_snippet"] is not None and not isinstance(attempt["diag_snippet"], str):
+            raise ValueError("canonical primary attempt diag_snippet must be a string or null")
+    if verdict in PRIMARY_REVIEWER_VERDICTS:
+        missing = {field for field in ("result", "cost", "tokens", "runtime") if field not in audit}
+        if missing:
+            raise ValueError(f"canonical primary telemetry fields are missing: {sorted(missing)}")
+    _require_finite_nonnegative(audit.get("cost"), "cost")
+    tokens = audit.get("tokens")
+    if tokens is not None and not isinstance(tokens, list):
+        raise ValueError("canonical primary tokens must be an array or null")
+    runtime = audit.get("runtime")
+    if runtime is not None:
+        if not isinstance(runtime, dict) or set(runtime) != {"duration_s"}:
+            raise ValueError("canonical primary runtime must be null or {duration_s}")
+        if runtime["duration_s"] is None: raise ValueError("canonical primary runtime duration_s must be a number")
+        _require_finite_nonnegative(runtime["duration_s"], "runtime duration_s")
+    if not attempts and runtime is not None:
+        raise ValueError("canonical primary runtime must be null when attempts are empty")
+    if attempts and (runtime is None or runtime["duration_s"] != sum(attempt_durations)):
+        raise ValueError("canonical primary runtime must equal attempt duration sum")
     result = audit.get("result")
-    if verdict in {"pass", "fail"}:
-        if not isinstance(result, dict) or result.get("verdict") != verdict:
-            raise ValueError("primary audit result.verdict must match terminal verdict")
-    elif verdict in {"not_expected", "waived"}:
+    if result is None:
+        if verdict in {"pass", "fail"}:
+            raise ValueError("canonical primary result is required for pass/fail")
+    elif not isinstance(result, dict) or result.get("verdict") != verdict:
+        raise ValueError("canonical primary result.verdict must match terminal verdict")
+    elif not isinstance(result.get("summary"), str) or not result["summary"]:
+        raise ValueError("canonical primary result.summary must be a non-empty string")
+    if isinstance(result, dict):
+        findings = result.get("findings")
+        if not isinstance(findings, list):
+            raise ValueError("canonical primary result.findings must be an array")
+        for finding in findings:
+            if not isinstance(finding, dict):
+                raise ValueError("canonical primary finding must be an object")
+            for field in ("id", "severity", "category"):
+                if not isinstance(finding.get(field), str) or not finding[field]:
+                    raise ValueError(f"canonical primary finding {field} must be a non-empty string")
+    if verdict in {"not_expected", "waived"}:
         if (attempts != [] or result is not None or audit.get("cost") is not None or audit.get("tokens") is not None
+                or audit.get("runtime") is not None
                 or (verdict == "not_expected" and "waiver" in audit)
                 or (verdict == "waived" and "not_expected_reason" in audit)):
             raise ValueError("canonical primary no-review audit cannot carry review content")
@@ -328,7 +435,7 @@ def build_entry(
         audit, repository=repository, pr_number=pr_number, run_id=run_id,
         run_attempt=run_attempt, head_sha=head_sha, expected_identity=expected_identity,
     )
-    review = _review_summary(audit, fallback_status)
+    review = _review_summary(audit, fallback_status, preflight)
     current_ids = set(review["finding_ids"])
     comparison: dict[str, Any] = {"kind": "prior_conflict" if prior_conflict else "first_review"}
     if previous:

@@ -36,7 +36,11 @@ def _audit(sha: str, ids: list[str], duration: int = 30) -> dict:
     }
 
 
-def _v2_audit(verdict: str) -> dict:
+def _preflight(diff_lines: int = 100, *, plan: str = "single") -> dict:
+    return {"diff_lines": diff_lines, "classification": plan, "review_plan": plan, "thresholds": {"single_turn_lines": 4000}}
+
+
+def _v2_audit(verdict: str, *, cost=None, tokens=None, runtime=None, expected_shadows=None) -> dict:
     result = None if verdict not in {"pass", "fail"} else {
         "verdict": verdict,
         "summary": "result",
@@ -53,7 +57,8 @@ def _v2_audit(verdict: str) -> dict:
         "reusable_workflow_sha": "c" * 40, "run_id": 10, "run_attempt": 1,
         "job_id": 99, "reviewer": None if verdict in {"not_expected", "waived"} else "codex-sub",
         "verdict": verdict, "attempts": [], "shadow_mode": "detached",
-        "expected_shadows": [], "result": result, "cost": None, "tokens": None,
+        "expected_shadows": [] if expected_shadows is None else expected_shadows,
+        "result": result, "cost": cost, "tokens": tokens, "runtime": runtime,
         "merge_base_sha": "merge-base", "candidate_commit_sha": "candidate-commit",
         "candidate_tree_sha": "candidate-tree", "run_mode": "PAYLOAD_ONLY",
     }
@@ -185,13 +190,60 @@ def test_v2_primary_audit_projects_verdict_and_identity(verdict):
     audit = _v2_audit(verdict)
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=audit,
+        head_sha="head", preflight=_preflight(), audit=audit,
         prior_entries=[], dispositions={},
     )
 
     assert entry["review"]["status"] == verdict
     assert entry["review"]["verdict"] == verdict
     assert entry["primary_identity"] == {key: audit[key] for key in module.PRIMARY_IDENTITY_FIELDS if key in audit}
+    if verdict in {"not_expected", "waived"}: assert entry["review"]["result"] is None and entry["review"]["finding_count"] == 0
+
+
+@pytest.mark.parametrize("diff_lines,plan,mode,complete,shards", [(100, "single", "single", True, 1), (5000, "sharded", "sharded+cross-module integration", False, None)])
+def test_v2_review_preserves_result_and_recomputes_legacy_coverage(
+    diff_lines, plan, mode, complete, shards,
+):
+    module = _module()
+    audit = _v2_audit("fail", cost=1.25, tokens=[{"input": 3}], runtime={"duration_s": 12.5})
+    audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 12.5, "cost_usd": 1.25}]
+    entry = module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(diff_lines, plan=plan), audit=audit, prior_entries=[], dispositions={})
+
+    review = entry["review"]
+    assert review["result"] == audit["result"]
+    assert review["cost_usd"] == 1.25
+    assert review["tokens"] == [{"input": 3}]
+    assert review["runtime"] == {"duration_s": 12.5}
+    assert review["coverage"] == {
+        "mode": mode, "complete": complete, "diff_lines": diff_lines, "shards": shards,
+    }
+    assert review["shadows"] == {}
+    assert review["finding_count"] == 1
+
+
+def test_v2_runtime_rejects_attempt_duration_sum_mismatch():
+    module = _module()
+    audit = _v2_audit("pass", runtime={"duration_s": 1})
+    audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2, "cost_usd": None}]
+    with pytest.raises(ValueError, match="runtime"):
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+
+
+@pytest.mark.parametrize("field,value", [("cost", -1), ("cost", float("inf")), ("tokens", {}), ("runtime", {"duration_s": -1}), ("runtime", {"duration_s": float("nan")}), ("expected_shadows", ["claude-glm"])])
+def test_v2_review_rejects_invalid_telemetry(field, value):
+    module = _module()
+    audit = _v2_audit("pass", **{field: value})
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+
+
+@pytest.mark.parametrize("mutation", [lambda audit: audit["result"].pop("findings"), lambda audit: audit["result"]["findings"].append({"id": "broken"}), lambda audit: audit["attempts"].append({"reviewer": 3})])
+def test_v2_review_rejects_malformed_consumed_payload(mutation):
+    module = _module()
+    audit = _v2_audit("pass")
+    mutation(audit)
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
 
 
 def test_v2_primary_audit_rejects_mismatched_parent_identity():
@@ -202,7 +254,7 @@ def test_v2_primary_audit_rejects_mismatched_parent_identity():
     with pytest.raises(ValueError, match="primary audit identity mismatch"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
         )
 
 
@@ -215,7 +267,7 @@ def test_v2_primary_audit_binds_every_workflow_identity_field(field):
     with pytest.raises(ValueError, match="primary audit identity mismatch"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
             expected_identity=EXPECTED_IDENTITY,
         )
 
@@ -232,7 +284,7 @@ def test_v2_primary_audit_rejects_malformed_canonical_shape(field, value):
     with pytest.raises(ValueError, match="canonical primary"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
         )
 
 
@@ -249,7 +301,7 @@ def test_v2_primary_audit_rejects_companion_fields_for_wrong_verdict(verdict, fi
     with pytest.raises(ValueError, match="canonical primary"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
         )
 
 
@@ -295,7 +347,7 @@ def test_ledger_preserves_conflicting_run_attempt_variants():
     module = _module()
     first = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_v2_audit("pass"),
+        head_sha="head", preflight=_preflight(), audit=_v2_audit("pass"),
         prior_entries=[], dispositions={},
     )
     second = json.loads(json.dumps(first))
