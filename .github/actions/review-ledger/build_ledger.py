@@ -53,6 +53,20 @@ PRIMARY_IDENTITY_FIELDS = (
     "merge_base_sha", "candidate_commit_sha", "candidate_tree_sha", "run_mode",
     "spec_source", "pr_body_digest",
 )
+PRIMARY_REQUIRED_IDENTITY_FIELDS = (
+    "repository_id", "repository", "pr", "base_sha", "head_sha", "diff_digest",
+    "policy_version", "policy_digest", "registry_commit", "caller_sha",
+    "reusable_workflow_sha", "run_id", "run_attempt", "job_id", "reviewer",
+)
+PRIMARY_SCOPE_FIELDS = ("merge_base_sha", "candidate_commit_sha", "candidate_tree_sha", "run_mode")
+PRIMARY_SPEC_FIELDS = ("spec_source", "pr_body_digest")
+PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
+    "kind", "schema_version", "verdict", "attempts", "shadow_mode", "expected_shadows",
+    "result", "cost", "tokens", "not_expected_reason", "waiver",
+}
+PRIMARY_VERDICTS = {"pass", "fail", "unavailable", "not_expected", "waived"}
+PRIMARY_REVIEWER_VERDICTS = {"pass", "fail", "unavailable"}
+PRIMARY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def parse_dispositions(comments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -189,27 +203,98 @@ def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[
 def _primary_identity(
     audit: dict[str, Any] | None, *, repository: str, pr_number: int,
     run_id: int, run_attempt: int, head_sha: str,
+    expected_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not audit or audit.get("kind") != "primary_review":
         return None
-    if audit.get("schema_version") != 1 or audit.get("verdict") not in PRIMARY_STATUS_BY_VERDICT:
-        raise ValueError("invalid primary_review schema/version or verdict")
+    verdict = audit.get("verdict")
+    if audit.get("schema_version") != 1 or verdict not in PRIMARY_VERDICTS:
+        raise ValueError("invalid canonical primary_review schema/version or verdict")
+    extra = set(audit) - PRIMARY_ALLOWED_FIELDS
+    missing = set(PRIMARY_REQUIRED_IDENTITY_FIELDS) - set(audit)
+    if extra or missing:
+        raise ValueError(
+            f"invalid canonical primary envelope: extra={sorted(extra)}, missing={sorted(missing)}"
+        )
+    if (
+        isinstance(audit["repository_id"], bool) or not isinstance(audit["repository_id"], int)
+        or audit["repository_id"] <= 0
+    ):
+        raise ValueError("canonical primary repository_id must be a positive integer")
+    for field in ("repository", "base_sha", "head_sha", "policy_version", "registry_commit",
+                  "caller_sha", "reusable_workflow_sha"):
+        if not isinstance(audit[field], str) or not audit[field]:
+            raise ValueError(f"canonical primary {field} must be a non-empty string")
+    for field in ("pr", "run_id", "run_attempt", "job_id"):
+        if isinstance(audit[field], bool) or not isinstance(audit[field], int) or audit[field] <= 0:
+            raise ValueError(f"canonical primary {field} must be a positive integer")
+    for field in ("diff_digest", "policy_digest"):
+        if not isinstance(audit[field], str) or not PRIMARY_SHA256_RE.fullmatch(audit[field]):
+            raise ValueError(f"canonical primary {field} must be a lowercase SHA-256 digest")
+    present_scope = [field for field in PRIMARY_SCOPE_FIELDS if field in audit]
+    if present_scope and set(present_scope) != set(PRIMARY_SCOPE_FIELDS):
+        raise ValueError("canonical primary scope provenance must be complete")
+    if present_scope:
+        for field in PRIMARY_SCOPE_FIELDS[:3]:
+            if not isinstance(audit[field], str) or not audit[field]:
+                raise ValueError(f"canonical primary {field} must be a non-empty string")
+        if not isinstance(audit["run_mode"], str) or audit["run_mode"] not in {"PAYLOAD_ONLY", "FULL_SOURCE"}:
+            raise ValueError("canonical primary run_mode is invalid")
+    present_spec = [field for field in PRIMARY_SPEC_FIELDS if field in audit]
+    if present_spec and set(present_spec) != set(PRIMARY_SPEC_FIELDS):
+        raise ValueError("canonical primary spec provenance must be complete")
+    if present_spec:
+        if not isinstance(audit["spec_source"], str) or audit["spec_source"] not in {"live", "event_payload"}:
+            raise ValueError("canonical primary spec_source is invalid")
+        digest = audit["pr_body_digest"]
+        if digest != "empty" and (
+            not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{12}", digest)
+        ):
+            raise ValueError("canonical primary pr_body_digest is invalid")
     expected = {"repository": repository, "pr": pr_number, "run_id": run_id, "head_sha": head_sha}
+    expected.update(expected_identity or {})
     mismatches = [field for field, value in expected.items() if audit.get(field) != value]
     source_attempt = audit.get("run_attempt")
-    if not isinstance(source_attempt, int) or isinstance(source_attempt, bool) or not 1 <= source_attempt <= run_attempt:
+    current_attempt = expected.get("run_attempt", run_attempt)
+    if not isinstance(source_attempt, int) or isinstance(source_attempt, bool) or not 1 <= source_attempt <= current_attempt:
         mismatches.append("run_attempt")
     if mismatches:
         raise ValueError(f"primary audit identity mismatch: {sorted(set(mismatches))}")
+    reviewer = audit["reviewer"]
+    if verdict in PRIMARY_REVIEWER_VERDICTS and (not isinstance(reviewer, str) or not reviewer):
+        raise ValueError("canonical primary reviewer must be a non-empty string")
+    if verdict in {"not_expected", "waived"} and reviewer is not None:
+        raise ValueError("canonical primary reviewer must be None when no reviewer ran")
+    if audit["shadow_mode"] != "detached":
+        raise ValueError("canonical primary shadow_mode must be 'detached'")
+    if not isinstance(audit["expected_shadows"], list) or not all(
+        isinstance(name, str) and name for name in audit["expected_shadows"]
+    ):
+        raise ValueError("canonical primary expected_shadows must be an array of names")
+    attempts = audit["attempts"]
+    if not isinstance(attempts, list) or not all(isinstance(item, dict) for item in attempts):
+        raise ValueError("canonical primary attempts must be an array of objects")
     result = audit.get("result")
-    if audit["verdict"] in {"pass", "fail"} and (
-        not isinstance(result, dict) or result.get("verdict") != audit["verdict"]
-    ):
-        raise ValueError("primary audit result.verdict must match terminal verdict")
-    if audit["verdict"] in {"not_expected", "waived"} and (
-        audit.get("reviewer") is not None or result is not None
-    ):
-        raise ValueError("no-review primary audit cannot carry reviewer or result")
+    if verdict in {"pass", "fail"}:
+        if not isinstance(result, dict) or result.get("verdict") != verdict:
+            raise ValueError("primary audit result.verdict must match terminal verdict")
+    elif verdict in {"not_expected", "waived"}:
+        if (attempts != [] or result is not None or audit.get("cost") is not None or audit.get("tokens") is not None
+                or (verdict == "not_expected" and "waiver" in audit)
+                or (verdict == "waived" and "not_expected_reason" in audit)):
+            raise ValueError("no-review primary audit cannot carry review content")
+        if verdict == "not_expected" and (not isinstance(audit.get("not_expected_reason"), str) or audit.get("not_expected_reason") not in {
+            "fork", "hosted_runner", "no_review_policy"
+        }):
+            raise ValueError("canonical primary not_expected_reason is invalid")
+        if verdict == "waived":
+            waiver = audit.get("waiver")
+            if (
+                not isinstance(waiver, dict) or set(waiver) != {"approver", "approved_at", "reason"}
+                or any(not isinstance(waiver[field], str) or not waiver[field] for field in waiver)
+                or "T" not in waiver["approved_at"]
+            ):
+                raise ValueError("canonical primary waiver has invalid shape")
     return {field: audit[field] for field in PRIMARY_IDENTITY_FIELDS if field in audit}
 
 
@@ -224,6 +309,7 @@ def build_entry(
     audit: dict[str, Any] | None,
     prior_entries: list[dict[str, Any]],
     dispositions: dict[str, dict[str, Any]],
+    expected_identity: dict[str, Any] | None = None,
     install: dict[str, Any] | None = None,
     fallback_status: str = "not_run",
 ) -> dict[str, Any]:
@@ -236,7 +322,7 @@ def build_entry(
     previous = None if prior_conflict else previous
     primary_identity = _primary_identity(
         audit, repository=repository, pr_number=pr_number, run_id=run_id,
-        run_attempt=run_attempt, head_sha=head_sha,
+        run_attempt=run_attempt, head_sha=head_sha, expected_identity=expected_identity,
     )
     review = _review_summary(audit, fallback_status)
     current_ids = set(review["finding_ids"])
@@ -290,7 +376,11 @@ def build_entry(
 
 
 def write_ledger(path: Path, entries: list[dict[str, Any]], *, max_entries: int) -> None:
-    ordered = dedupe_entries(entries)[-max_entries:]
+    if type(max_entries) is not int or max_entries <= 0:
+        raise ValueError("max_entries must be a positive integer")
+    ordered = dedupe_entries(entries)
+    if len(ordered) > max_entries:
+        raise ValueError(f"max_entries exceeded: {len(ordered)} entries > {max_entries}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n" for entry in ordered))
 
@@ -345,21 +435,23 @@ def _api_json(token: str, url: str) -> Any:
 def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10) -> list[dict[str, Any]]:
     query = urllib.parse.urlencode({"name": "codex-review-ledger", "per_page": artifact_limit})
     payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
+        raise ValueError("prior ledger artifact list has invalid JSON shape")
     entries: list[dict[str, Any]] = []
     for artifact in payload.get("artifacts", [])[:artifact_limit]:
         if artifact.get("expired"):
             continue
-        try:
-            archive = _api_request(token, artifact["archive_download_url"])
-            with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-                name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
-                if not name:
-                    continue
-                for line in bundle.read(name).decode("utf-8").splitlines():
-                    if line.strip():
-                        entries.append(json.loads(line))
-        except (KeyError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
-            print(f"::warning::skip unreadable prior ledger artifact {artifact.get('id')}: {error}")
+        archive = _api_request(token, artifact["archive_download_url"])
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
+            if not name:
+                raise ValueError(f"prior ledger artifact {artifact.get('id')} has no ledger.jsonl")
+            for line in bundle.read(name).decode("utf-8").splitlines():
+                if line.strip():
+                    entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        raise ValueError("prior ledger entry must be a JSON object")
+                    entries.append(entry)
     return dedupe_entries(entries)
 
 
@@ -452,11 +544,17 @@ def main() -> int:
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--expected-repository-id", required=True, type=int)
+    parser.add_argument("--expected-base-sha", required=True)
+    parser.add_argument("--expected-caller-sha", required=True)
+    parser.add_argument("--expected-reusable-workflow-sha", required=True)
     parser.add_argument("--codex-expected", default="false")
     parser.add_argument("--codex-waived", default="false")
     parser.add_argument("--max-entries", default=2000, type=int)
     args = parser.parse_args()
     token = os.environ.get("GH_TOKEN", "")
+    if not token:
+        raise RuntimeError("GH_TOKEN is required to publish review ledger")
 
     preflight = _load_json(args.preflight_path) or {}
     audit = _load_json(args.audit_path)
@@ -473,11 +571,8 @@ def main() -> int:
     prior_entries: list[dict[str, Any]] = []
     dispositions: dict[str, dict[str, Any]] = {}
     comments: list[dict[str, Any]] = []
+    prior_entries = fetch_prior_entries(token, args.repository)
     if token:
-        try:
-            prior_entries = fetch_prior_entries(token, args.repository)
-        except Exception as error:  # Metrics are fail-open; never change the gate verdict.
-            print(f"::warning::could not load prior review ledger: {error}")
         try:
             comments = fetch_comments(token, args.repository, args.pr_number)
             dispositions = parse_dispositions(comments)
@@ -495,6 +590,12 @@ def main() -> int:
         audit=audit,
         prior_entries=prior_entries,
         dispositions=dispositions,
+        expected_identity={
+            "repository_id": args.expected_repository_id,
+            "base_sha": args.expected_base_sha,
+            "caller_sha": args.expected_caller_sha,
+            "reusable_workflow_sha": args.expected_reusable_workflow_sha,
+        },
         install=install,
         fallback_status=fallback,
     )

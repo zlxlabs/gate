@@ -92,10 +92,6 @@ permissions:
   contents: read
   pull-requests: write
 
-# Workflow concurrency contract (plan section of the same name): defined ONCE
-# at this reusable-workflow level so no caller can define a competing group or
-# skip cancellation. Independent from, and never shared with, the (future)
-# Shadow Calibration workflow's `gate-shadow-v2-...` group.
 concurrency:
   group: gate-required-v2-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
@@ -549,6 +545,9 @@ jobs:
     # its own verdict from needs.*.result instead of relying on GitHub's
     # default dependency semantics.
     if: always()
+    concurrency:
+      group: gate-required-v2-ledger-${{ github.repository_id }}
+      cancel-in-progress: false
     # 控制面默认跟随 runner 走自建：hosted 因账单预算硬断不可用的实测概率高于
     # 自建机群整体不可用概率，2026-07-27 已造成全组织停摆；v1 已经如此路由，
     # 本次只是补齐未完成灰度。取整税数据：2026-08-01 单日 145 计费分钟 / 12.8 实际分钟。
@@ -711,6 +710,10 @@ jobs:
           token: ${{ github.token }}
           codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
           codex-waived: false
+          expected-repository-id: ${{ github.repository_id }}
+          expected-base-sha: ${{ github.event.pull_request.base.sha }}
+          expected-caller-sha: ${{ github.workflow_sha }}
+          expected-reusable-workflow-sha: ${{ job.workflow_sha }}
 
       - name: Upload v2 review effectiveness ledger
         if: always()

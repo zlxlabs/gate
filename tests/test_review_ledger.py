@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,8 @@ def _v2_audit(verdict: str) -> dict:
         "job_id": 99, "reviewer": None if verdict in {"not_expected", "waived"} else "codex-sub",
         "verdict": verdict, "attempts": [], "shadow_mode": "detached",
         "expected_shadows": [], "result": result, "cost": None, "tokens": None,
+        "merge_base_sha": "merge-base", "candidate_commit_sha": "candidate-commit",
+        "candidate_tree_sha": "candidate-tree", "run_mode": "PAYLOAD_ONLY",
     }
     if verdict == "not_expected":
         audit["not_expected_reason"] = "hosted_runner"
@@ -60,6 +63,13 @@ def _v2_audit(verdict: str) -> dict:
         audit["waiver"] = {"approver": "owner", "approved_at": "2026-08-09T00:00:00Z", "reason": "test"}
     return audit
 
+
+EXPECTED_IDENTITY = {
+    "repository_id": 123,
+    "base_sha": "base",
+    "caller_sha": "b" * 40,
+    "reusable_workflow_sha": "c" * 40,
+}
 
 def test_new_head_comparison_tracks_persistent_resolved_and_new_findings():
     module = _module()
@@ -194,6 +204,74 @@ def test_v2_primary_audit_rejects_mismatched_parent_identity():
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
             head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
         )
+
+
+@pytest.mark.parametrize("field", list(EXPECTED_IDENTITY))
+def test_v2_primary_audit_binds_every_workflow_identity_field(field):
+    module = _module()
+    audit = _v2_audit("pass")
+    audit[field] = 999 if isinstance(EXPECTED_IDENTITY[field], int) else "stale"
+
+    with pytest.raises(ValueError, match="primary audit identity mismatch"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+            expected_identity=EXPECTED_IDENTITY,
+        )
+
+
+@pytest.mark.parametrize("field,value", [("diff_digest", "D" * 64), ("policy_digest", "D" * 64), ("candidate_tree_sha", None)])
+def test_v2_primary_audit_rejects_malformed_canonical_shape(field, value):
+    module = _module()
+    audit = _v2_audit("pass")
+    if value is None:
+        del audit[field]
+    else:
+        audit[field] = value
+
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        )
+
+
+def test_fetch_prior_entries_fails_on_corrupt_artifact(monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "_api_json", lambda token, url: {
+        "artifacts": [{"id": 1, "expired": False, "archive_download_url": "https://example.test/1"}]
+    })
+    monkeypatch.setattr(module, "_api_request", lambda token, url: b"not a zip")
+
+    with pytest.raises(zipfile.BadZipFile):
+        module.fetch_prior_entries("token", "zlxlabs/app")
+
+
+@pytest.mark.parametrize("max_entries", [0, -1])
+def test_write_ledger_rejects_nonpositive_capacity(tmp_path, max_entries):
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+    )
+
+    with pytest.raises(ValueError, match="max_entries"):
+        module.write_ledger(tmp_path / "ledger.jsonl", [entry], max_entries=max_entries)
+
+
+@pytest.mark.parametrize("count,capacity", [(2000, 2000), (2001, 2000)])
+def test_write_ledger_capacity_boundary(tmp_path, count, capacity):
+    module = _module()
+    entries = [{"repository": "zlxlabs/app", "run_id": index, "run_attempt": 1,
+                "recorded_at": str(index)} for index in range(count)]
+    output = tmp_path / "ledger.jsonl"
+    if count == capacity:
+        module.write_ledger(output, entries, max_entries=capacity)
+        assert len(output.read_text().splitlines()) == capacity
+    else:
+        with pytest.raises(ValueError, match="max_entries"):
+            module.write_ledger(output, entries, max_entries=capacity)
+        assert not output.exists()
 
 
 def test_ledger_preserves_conflicting_run_attempt_variants():

@@ -120,20 +120,25 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
 
 def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     raw, _ = _load_workflow()
-    concurrency = raw.get("concurrency", {})
+    concurrency = raw["concurrency"]
     assert concurrency.get("cancel-in-progress") is True
-    group = str(concurrency.get("group", ""))
-    assert group.startswith("gate-required-v2-")
+    assert str(concurrency.get("group", "")).startswith("gate-required-v2-")
+    assert "github.event.pull_request.number" in str(concurrency["group"])
+    gate_concurrency = raw["jobs"]["gate"].get("concurrency", {})
+    assert gate_concurrency.get("cancel-in-progress") is False
+    group = str(gate_concurrency.get("group", ""))
+    assert group.startswith("gate-required-v2-ledger-")
     assert "github.repository_id" in group
-    assert "github.event.pull_request.number" in group
+    assert "github.event.pull_request.number" not in group
     # Independence from the (future) Shadow Calibration group is a naming
     # contract, not something this file alone can prove — but the literal
     # prefix must never collide with `gate-shadow-v2-`.
     assert "shadow" not in group
-    # Must be a single top-level definition, not one per job (a caller must
-    # never be able to define a competing group).
-    for job in raw["jobs"].values():
-        assert "concurrency" not in job
+    # Review jobs retain only workflow-level PR cancellation; gate owns the
+    # additional repository-level writer lock.
+    for job_name, job in raw["jobs"].items():
+        if job_name != "gate":
+            assert "concurrency" not in job
 
 
 # ── gate aggregator job: required-check identity + always() ─────────────────
@@ -270,6 +275,10 @@ def test_gate_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
     assert build["with"]["codex-expected"] == raw["jobs"]["primary"]["if"]
     assert build["with"]["codex-waived"] is False
+    assert build["with"]["expected-repository-id"] == "${{ github.repository_id }}"
+    assert build["with"]["expected-base-sha"] == "${{ github.event.pull_request.base.sha }}"
+    assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
+    assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
 
     upload = steps[upload_index]
     assert upload["if"] == "always()"
