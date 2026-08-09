@@ -237,13 +237,16 @@ def test_str_masquerading_as_int_identity_field_is_rejected(field):
     assert any("genuine int" in p for p in outcome.problems)
 
 
-def test_schema_version_must_be_exactly_int_one():
-    for bogus in (True, "1", 1.0, 2, None):
+def test_schema_version_accepts_primary_v1_and_v2_but_rejects_unknown_or_untyped():
+    for bogus in (True, "1", 1.0, 99, None):
         bad_audit = _valid_primary_record(schema_version=bogus)
         outcome = AGG.evaluate(**_base_kwargs(audit=bad_audit))
         assert outcome.ok is False, f"schema_version={bogus!r} should have been rejected"
         assert any("schema_version" in p for p in outcome.problems)
-
+    for version in (1, 2):
+        audit = _valid_primary_record(schema_version=version)
+        outcome = AGG.evaluate(**_base_kwargs(audit=audit))
+        assert outcome.ok is True
 
 @pytest.mark.parametrize("bogus_top_level", [[1, 2, 3], "hello", 42, True, None])
 def test_non_dict_top_level_audit_payload_is_rejected(bogus_top_level):

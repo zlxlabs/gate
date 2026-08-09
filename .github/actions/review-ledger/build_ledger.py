@@ -263,7 +263,8 @@ def _primary_identity(
     if audit.get("kind") != "primary_review":
         return None
     verdict = audit.get("verdict")
-    if audit.get("schema_version") != 1 or verdict not in PRIMARY_VERDICTS:
+    schema_version = audit.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2} or verdict not in PRIMARY_VERDICTS:
         raise ValueError("invalid canonical primary_review schema/version or verdict")
     extra = set(audit) - PRIMARY_ALLOWED_FIELDS
     missing = set(PRIMARY_REQUIRED_IDENTITY_FIELDS) - set(audit)
@@ -352,14 +353,17 @@ def _primary_identity(
         attempt_durations.append(attempt["duration_s"])
         if "diag_snippet" in attempt and attempt["diag_snippet"] is not None and not isinstance(attempt["diag_snippet"], str):
             raise ValueError("canonical primary attempt diag_snippet must be a string or null")
+    if schema_version == 2 and "runtime" not in audit:
+        raise ValueError("canonical primary telemetry fields are missing: ['runtime']")
     if verdict in PRIMARY_REVIEWER_VERDICTS:
-        missing = {field for field in ("result", "cost", "tokens", "runtime") if field not in audit}
+        missing = {field for field in ("result", "cost", "tokens") if field not in audit}
         if missing:
             raise ValueError(f"canonical primary telemetry fields are missing: {sorted(missing)}")
     _require_finite_nonnegative(audit.get("cost"), "cost")
     tokens = audit.get("tokens")
     if tokens is not None and not isinstance(tokens, list):
         raise ValueError("canonical primary tokens must be an array or null")
+    runtime_present = "runtime" in audit
     runtime = audit.get("runtime")
     if runtime is not None:
         if not isinstance(runtime, dict) or set(runtime) != {"duration_s"}:
@@ -368,7 +372,9 @@ def _primary_identity(
         _require_finite_nonnegative(runtime["duration_s"], "runtime duration_s")
     if not attempts and runtime is not None:
         raise ValueError("canonical primary runtime must be null when attempts are empty")
-    if attempts and (runtime is None or runtime["duration_s"] != sum(attempt_durations)):
+    if attempts and (schema_version == 2 or runtime_present) and (
+        runtime is None or runtime["duration_s"] != sum(attempt_durations)
+    ):
         raise ValueError("canonical primary runtime must equal attempt duration sum")
     result = audit.get("result")
     if result is None:

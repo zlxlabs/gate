@@ -222,8 +222,8 @@ def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
         errors.append(f"unexpected audit kind {record.get('kind')!r} (expected 'primary_review')")
 
     schema_version = record.get("schema_version")
-    if type(schema_version) is not int or schema_version != 1:
-        errors.append(f"schema_version must be exactly int 1, got {schema_version!r}")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        errors.append(f"schema_version must be exactly int 1 or 2, got {schema_version!r}")
 
     verdict = record.get("verdict")
     if verdict not in PRIMARY_VERDICT_DOMAIN:

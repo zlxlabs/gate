@@ -229,6 +229,55 @@ def test_v2_runtime_rejects_attempt_duration_sum_mismatch():
         module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
 
 
+def _ledger_runtime_case(schema_version, verdict, runtime_case):
+    reviewer_verdict = verdict not in {"not_expected", "waived"}
+    audit = _v2_audit(verdict, runtime=None)
+    audit["schema_version"] = schema_version
+    if reviewer_verdict and runtime_case in {"valid", "mismatch"}:
+        audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 1.0, "cost_usd": None}]
+    if runtime_case == "missing":
+        audit.pop("runtime", None)
+    else:
+        audit["runtime"] = {"null": None, "valid": {"duration_s": 1.0},
+                              "mismatch": {"duration_s": 2.0}, "invalid": {"duration_s": "bad"}}[runtime_case]
+    return audit
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 99])
+@pytest.mark.parametrize("runtime_case", ["missing", "null", "valid", "mismatch", "invalid"])
+@pytest.mark.parametrize("verdict", ["pass", "fail", "unavailable", "not_expected", "waived"])
+def test_ledger_runtime_schema_upgrade_matrix(schema_version, runtime_case, verdict):
+    module = _module()
+    reviewer_verdict = verdict not in {"not_expected", "waived"}
+    expected = (
+        schema_version in {1, 2}
+        and (runtime_case == "null" or (runtime_case == "valid" and reviewer_verdict)
+             or (runtime_case == "missing" and schema_version == 1))
+    )
+    audit = _ledger_runtime_case(schema_version, verdict, runtime_case)
+    call = lambda: module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+    )
+    if expected:
+        entry = call()
+        assert entry["review"]["runtime"] is None if runtime_case == "missing" else True
+    else:
+        with pytest.raises(ValueError, match="canonical primary|runtime|schema"):
+            call()
+
+
+def test_ledger_consumes_historical_v1_fixture_without_runtime():
+    module = _module()
+    fixture = json.loads((ROOT / "tests/data/primary_review_v1_missing_runtime.json").read_text())
+    entry = module.build_entry(
+        repository=fixture["repository"], pr_number=fixture["pr"], run_id=fixture["run_id"],
+        run_attempt=fixture["run_attempt"], head_sha=fixture["head_sha"], preflight=_preflight(),
+        audit=fixture, prior_entries=[], dispositions={},
+    )
+    assert entry["review"]["runtime"] is None
+
+
 @pytest.mark.parametrize("field,value", [("cost", -1), ("cost", float("inf")), ("tokens", {}), ("runtime", {"duration_s": -1}), ("runtime", {"duration_s": float("nan")}), ("expected_shadows", ["claude-glm"])])
 def test_v2_review_rejects_invalid_telemetry(field, value):
     module = _module()
