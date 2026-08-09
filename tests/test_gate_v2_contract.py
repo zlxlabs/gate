@@ -127,6 +127,7 @@ def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     assert not raw["jobs"]["gate"].get("concurrency", {})
     ledger_concurrency = raw["jobs"]["ledger"].get("concurrency", {})
     assert ledger_concurrency.get("cancel-in-progress") is False
+    assert ledger_concurrency.get("queue") == "max"
     group = str(ledger_concurrency.get("group", ""))
     assert group.startswith("gate-required-v2-ledger-")
     assert "github.repository_id" in group
