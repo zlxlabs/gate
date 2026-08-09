@@ -103,16 +103,9 @@ concurrency:
 jobs:
   # ── quality ──────────────────────────────────────────────────────────────
   # Every legacy gate.yml step EXCEPT the model review chain (see "primary"
-  # below) and the review-effectiveness ledger (legacy's "Build/Upload review
-  # effectiveness ledger" steps consume BOTH quality-only artifacts
-  # (pr-size-preflight.json/install-result.json) AND the review audit, which
-  # in v2 lives in a *different job's* runner.temp — porting that step
-  # correctly needs its own cross-job artifact plumbing, which the task this
-  # file was written for explicitly scoped OUT of D1 (Required Gate). Not
-  # silently dropped: this is a deliberate, documented omission — see this
-  # PR's report / the follow-up TODO tracked alongside Shadow Calibration
-  # (D2), which will need the same cross-job artifact question for its own
-  # ledger consumers anyway.
+  # below). Its ledger inputs are uploaded at the end of this job so the
+  # separate gate job can combine them with the primary audit without relying
+  # on job-local runner.temp state.
   quality:
     # Same self-hosted/hosted fork-guard expression legacy's single `gate` job
     # uses verbatim (see legacy .github/workflows/gate.yml and
@@ -233,6 +226,18 @@ jobs:
       - name: Prune uv cache before persistence
         if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         run: uv cache prune --ci || true
+
+      - name: Upload v2 review ledger inputs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pr-size-preflight.json
+            ${{ runner.temp }}/install-result.json
+          if-no-files-found: error
+          retention-days: 30
 
   # ── primary ──────────────────────────────────────────────────────────────
   # Runs review-primary (gate-hub, already merged) and writes+uploads the ONE
@@ -644,6 +649,14 @@ jobs:
           artifact-ids: ${{ steps.resolve-audit-artifact.outputs.artifact_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/primary-audit
+
+      - name: Download v2 review ledger inputs
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-ledger-input
 
       - name: Aggregate required verdict
         env:

@@ -246,12 +246,23 @@ def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
 
 def test_gate_job_builds_and_uploads_v2_review_ledger_without_gating():
     raw, _ = _load_workflow()
+    quality_steps = raw["jobs"]["quality"]["steps"]
     steps = raw["jobs"]["gate"]["steps"]
+    input_upload = next(step for step in quality_steps if step.get("name") == "Upload v2 review ledger inputs")
+    input_download = next(step for step in steps if step.get("name") == "Download v2 review ledger inputs")
     aggregate_index = next(i for i, step in enumerate(steps) if step.get("name") == "Aggregate required verdict")
     build_index = next(i for i, step in enumerate(steps) if step.get("name") == "Build v2 review effectiveness ledger")
     upload_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload v2 review effectiveness ledger")
 
     assert aggregate_index < build_index < upload_index
+    assert input_upload["if"] == "always()"
+    assert input_upload["continue-on-error"] is True
+    assert input_upload["with"]["name"] == input_download["with"]["name"]
+    assert "pr-size-preflight.json" in input_upload["with"]["path"]
+    assert "install-result.json" in input_upload["with"]["path"]
+    assert input_download["if"] == "always()"
+    assert input_download["continue-on-error"] is True
+    assert input_download["with"]["path"] == "${{ runner.temp }}/review-ledger-input"
     build = steps[build_index]
     assert build["if"] == "always()"
     assert build["continue-on-error"] is True
