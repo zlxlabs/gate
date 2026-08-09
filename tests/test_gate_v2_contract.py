@@ -244,6 +244,34 @@ def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
     assert '--audit-artifact-name "$AUDIT_ARTIFACT_NAME"' in aggregate_step["run"]
 
 
+def test_gate_job_builds_and_uploads_v2_review_ledger_without_gating():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["gate"]["steps"]
+    aggregate_index = next(i for i, step in enumerate(steps) if step.get("name") == "Aggregate required verdict")
+    build_index = next(i for i, step in enumerate(steps) if step.get("name") == "Build v2 review effectiveness ledger")
+    upload_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload v2 review effectiveness ledger")
+
+    assert aggregate_index < build_index < upload_index
+    build = steps[build_index]
+    assert build["if"] == "always()"
+    assert build["continue-on-error"] is True
+    assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
+    assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
+    assert build["with"]["codex-expected"] == raw["jobs"]["primary"]["if"]
+    assert build["with"]["codex-waived"] is False
+
+    upload = steps[upload_index]
+    assert upload["if"] == "always()"
+    assert upload["continue-on-error"] is True
+    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["with"] == {
+        "name": "codex-review-ledger",
+        "path": "${{ runner.temp }}/review-ledger/ledger.jsonl",
+        "if-no-files-found": "error",
+        "retention-days": 90,
+    }
+
+
 def test_gate_job_review_expected_matches_primary_jobs_own_condition():
     # Tightened (2026-07-26): these two strings are meant to be byte-for-byte
     # the SAME expression (recomputed in a different job only because a

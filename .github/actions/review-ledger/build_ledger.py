@@ -42,6 +42,20 @@ class CrossHostAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
 URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
 STATE_MARKER = "<!-- codex-review-ledger-state -->"
 STATE_RE = re.compile(r"<!-- codex-review-ledger-state:v1:([A-Za-z0-9_-]+={0,2}) -->")
+PRIMARY_STATUS_BY_VERDICT = {
+    "pass": "pass",
+    "fail": "fail",
+    "unavailable": "unavailable",
+    "not_expected": "not_expected",
+    "waived": "waived",
+}
+PRIMARY_IDENTITY_FIELDS = (
+    "repository_id", "repository", "pr", "base_sha", "head_sha", "diff_digest",
+    "policy_version", "policy_digest", "registry_commit", "caller_sha",
+    "reusable_workflow_sha", "run_id", "run_attempt", "job_id", "reviewer",
+    "merge_base_sha", "candidate_commit_sha", "candidate_tree_sha", "run_mode",
+    "spec_source", "pr_body_digest",
+)
 
 
 def parse_dispositions(comments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -156,11 +170,13 @@ def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[
     result = audit.get("result") or {}
     findings = result.get("findings") or []
     attempts = _compact_attempts(audit)
+    is_primary_v2 = audit.get("kind") == "primary_review"
+    status = PRIMARY_STATUS_BY_VERDICT.get(audit.get("verdict"), "unknown") if is_primary_v2 else audit.get("status", "unknown")
     # Failover = more than one hop was tried (a discarded hop precedes the adopted one).
     failover = len(attempts) > 1
     return {
-        "status": audit.get("status", "unknown"),
-        "verdict": result.get("verdict"),
+        "status": status,
+        "verdict": status if is_primary_v2 else result.get("verdict"),
         "finding_count": len(findings),
         "finding_ids": sorted({finding.get("id", "") for finding in findings if finding.get("id")}),
         "severity_counts": dict(sorted(Counter(finding.get("severity", "unknown") for finding in findings).items())),
@@ -171,6 +187,33 @@ def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[
         "attempts": attempts,
         "failover": failover,
     }
+
+
+def _primary_identity(
+    audit: dict[str, Any] | None, *, repository: str, pr_number: int,
+    run_id: int, run_attempt: int, head_sha: str,
+) -> dict[str, Any] | None:
+    if not audit or audit.get("kind") != "primary_review":
+        return None
+    if audit.get("schema_version") != 1 or audit.get("verdict") not in PRIMARY_STATUS_BY_VERDICT:
+        raise ValueError("invalid primary_review schema/version or verdict")
+    expected = {"repository": repository, "pr": pr_number, "run_id": run_id, "head_sha": head_sha}
+    mismatches = [field for field, value in expected.items() if audit.get(field) != value]
+    source_attempt = audit.get("run_attempt")
+    if not isinstance(source_attempt, int) or isinstance(source_attempt, bool) or not 1 <= source_attempt <= run_attempt:
+        mismatches.append("run_attempt")
+    if mismatches:
+        raise ValueError(f"primary audit identity mismatch: {sorted(set(mismatches))}")
+    result = audit.get("result")
+    if audit["verdict"] in {"pass", "fail"} and (
+        not isinstance(result, dict) or result.get("verdict") != audit["verdict"]
+    ):
+        raise ValueError("primary audit result.verdict must match terminal verdict")
+    if audit["verdict"] in {"not_expected", "waived"} and (
+        audit.get("reviewer") is not None or result is not None
+    ):
+        raise ValueError("no-review primary audit cannot carry reviewer or result")
+    return {field: audit[field] for field in PRIMARY_IDENTITY_FIELDS if field in audit}
 
 
 def build_entry(
@@ -191,10 +234,15 @@ def build_entry(
         entry for entry in prior_entries
         if entry.get("repository") == repository and entry.get("pr_number") == pr_number
     ]
-    previous = relevant[-1] if relevant else None
+    prior_conflict = any(entry.get("ledger_conflict") for entry in relevant)
+    previous = relevant[-1] if relevant and not prior_conflict else None
+    primary_identity = _primary_identity(
+        audit, repository=repository, pr_number=pr_number, run_id=run_id,
+        run_attempt=run_attempt, head_sha=head_sha,
+    )
     review = _review_summary(audit, fallback_status)
     current_ids = set(review["finding_ids"])
-    comparison: dict[str, Any] = {"kind": "first_review"}
+    comparison: dict[str, Any] = {"kind": "prior_conflict" if prior_conflict else "first_review"}
     if previous:
         previous_ids = set(previous.get("review", {}).get("finding_ids", []))
         same_head = previous.get("head_sha") == head_sha
@@ -226,13 +274,14 @@ def build_entry(
         "run_id": run_id,
         "run_attempt": run_attempt,
         "head_sha": head_sha,
-        "review_round": len(relevant) + 1,
+        "review_round": len({(entry.get("run_id"), entry.get("run_attempt")) for entry in relevant}) + 1,
         "preflight": preflight or None,
         # D5(ci-cache-strategy.md 阶段 A):Install dependencies 步骤的度量信号 —
         # {ecosystem, status, duration_s, cache_hit}(见 gate.yml Install 步骤),
         # 缺失时为 None。纯新增字段,不影响任何读取 "review"/"preflight"/
         # "comparison" 等既有 key 的消费者。
         "install": install,
+        "primary_identity": primary_identity,
         "review": review,
         "comparison": comparison,
         "finding_dispositions": relevant_dispositions,
@@ -249,11 +298,23 @@ def write_ledger(path: Path, entries: list[dict[str, Any]], *, max_entries: int)
 
 
 def dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+    grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
     for entry in entries:
         key = (entry.get("repository"), entry.get("run_id"), entry.get("run_attempt"))
-        unique[key] = entry
-    return sorted(unique.values(), key=lambda entry: (entry.get("recorded_at", ""), entry.get("run_id", 0), entry.get("run_attempt", 0)))
+        canonical = {field: value for field, value in entry.items() if field != "ledger_conflict"}
+        signature = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        grouped.setdefault(key, {})[signature] = canonical
+    unique: list[dict[str, Any]] = []
+    for key, variants in grouped.items():
+        marker = {"key": list(key), "variant_count": len(variants)}
+        for entry in variants.values():
+            if len(variants) > 1:
+                entry = {**entry, "ledger_conflict": marker}
+            unique.append(entry)
+    return sorted(unique, key=lambda entry: (
+        entry.get("recorded_at", ""), entry.get("run_id", 0), entry.get("run_attempt", 0),
+        json.dumps(entry, ensure_ascii=False, sort_keys=True),
+    ))
 
 
 def _api_request(token: str, url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
@@ -296,10 +357,7 @@ def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10
                         entries.append(json.loads(line))
         except (KeyError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
             print(f"::warning::skip unreadable prior ledger artifact {artifact.get('id')}: {error}")
-    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for entry in entries:
-        deduped[(entry.get("repository"), entry.get("run_id"), entry.get("run_attempt"))] = entry
-    return sorted(deduped.values(), key=lambda entry: (entry.get("recorded_at", ""), entry.get("run_id", 0), entry.get("run_attempt", 0)))
+    return dedupe_entries(entries)
 
 
 def fetch_comments(token: str, repository: str, pr_number: int) -> list[dict[str, Any]]:

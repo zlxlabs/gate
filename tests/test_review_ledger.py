@@ -3,6 +3,8 @@ import json
 import urllib.request
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "review-ledger" / "build_ledger.py"
@@ -31,6 +33,32 @@ def _audit(sha: str, ids: list[str], duration: int = 30) -> dict:
             ],
         },
     }
+
+
+def _v2_audit(verdict: str) -> dict:
+    result = None if verdict not in {"pass", "fail"} else {
+        "verdict": verdict,
+        "summary": "result",
+        "findings": [] if verdict == "pass" else [
+            {"id": "correctness.bad-state", "severity": "major", "category": "correctness"}
+        ],
+    }
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "repository": "zlxlabs/app", "pr": 7,
+        "base_sha": "base", "head_sha": "head", "diff_digest": "d" * 64,
+        "policy_version": "v1", "policy_digest": "e" * 64,
+        "registry_commit": "a" * 40, "caller_sha": "b" * 40,
+        "reusable_workflow_sha": "c" * 40, "run_id": 10, "run_attempt": 1,
+        "job_id": 99, "reviewer": None if verdict in {"not_expected", "waived"} else "codex-sub",
+        "verdict": verdict, "attempts": [], "shadow_mode": "detached",
+        "expected_shadows": [], "result": result, "cost": None, "tokens": None,
+    }
+    if verdict == "not_expected":
+        audit["not_expected_reason"] = "hosted_runner"
+    elif verdict == "waived":
+        audit["waiver"] = {"approver": "owner", "approved_at": "2026-08-09T00:00:00Z", "reason": "test"}
+    return audit
 
 
 def test_new_head_comparison_tracks_persistent_resolved_and_new_findings():
@@ -139,6 +167,57 @@ def test_ledger_deduplicates_run_attempts_and_writes_jsonl(tmp_path):
     lines = output.read_text().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["review"]["status"] == "pass"
+
+
+@pytest.mark.parametrize("verdict", ["pass", "fail", "unavailable", "not_expected", "waived"])
+def test_v2_primary_audit_projects_verdict_and_identity(verdict):
+    module = _module()
+    audit = _v2_audit(verdict)
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=audit,
+        prior_entries=[], dispositions={},
+    )
+
+    assert entry["review"]["status"] == verdict
+    assert entry["review"]["verdict"] == verdict
+    assert entry["primary_identity"] == {key: audit[key] for key in module.PRIMARY_IDENTITY_FIELDS if key in audit}
+
+
+def test_v2_primary_audit_rejects_mismatched_parent_identity():
+    module = _module()
+    audit = _v2_audit("pass")
+    audit["head_sha"] = "stale"
+
+    with pytest.raises(ValueError, match="primary audit identity mismatch"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        )
+
+
+def test_ledger_preserves_conflicting_run_attempt_variants():
+    module = _module()
+    first = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=_v2_audit("pass"),
+        prior_entries=[], dispositions={},
+    )
+    second = json.loads(json.dumps(first))
+    second["review"]["status"] = "fail"
+
+    variants = module.dedupe_entries([first, second])
+
+    assert len(variants) == 2
+    assert all(item["ledger_conflict"]["variant_count"] == 2 for item in variants)
+
+    current = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+        head_sha="next", preflight={}, audit=_audit("next", []),
+        prior_entries=variants, dispositions={},
+    )
+    assert current["comparison"]["kind"] == "prior_conflict"
+    assert current["review_round"] == 2
 
 
 def test_cross_host_artifact_redirect_strips_github_authorization():

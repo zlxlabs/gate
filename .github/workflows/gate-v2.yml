@@ -687,6 +687,28 @@ jobs:
             --summary-path "$GITHUB_STEP_SUMMARY" \
             --terminal-path "$TERMINAL_PATH"
 
+      - name: Build v2 review effectiveness ledger
+        if: always()
+        continue-on-error: true
+        uses: ./_gate-aggregator-src/.github/actions/review-ledger
+        with:
+          audit-path: ${{ runner.temp }}/primary-audit/primary-review-audit.json
+          preflight-path: ${{ runner.temp }}/review-ledger-input/pr-size-preflight.json
+          install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
+          token: ${{ github.token }}
+          codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          codex-waived: false
+
+      - name: Upload v2 review effectiveness ledger
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-review-ledger
+          path: ${{ runner.temp }}/review-ledger/ledger.jsonl
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Upload gate terminal envelope
         if: always()
         uses: actions/upload-artifact@v4
