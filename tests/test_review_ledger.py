@@ -218,6 +218,10 @@ def test_ledger_preserves_conflicting_run_attempt_variants():
     )
     assert current["comparison"]["kind"] == "prior_conflict"
     assert current["review_round"] == 2
+    recovered = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=12, run_attempt=1, head_sha="later", preflight={}, audit=_audit("later", []), prior_entries=[*variants, current], dispositions={},
+    )
+    assert recovered["comparison"]["kind"] == "new_head"
 
 
 def test_cross_host_artifact_redirect_strips_github_authorization():

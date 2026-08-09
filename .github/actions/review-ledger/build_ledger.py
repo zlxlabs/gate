@@ -43,11 +43,8 @@ URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
 STATE_MARKER = "<!-- codex-review-ledger-state -->"
 STATE_RE = re.compile(r"<!-- codex-review-ledger-state:v1:([A-Za-z0-9_-]+={0,2}) -->")
 PRIMARY_STATUS_BY_VERDICT = {
-    "pass": "pass",
-    "fail": "fail",
-    "unavailable": "unavailable",
-    "not_expected": "not_expected",
-    "waived": "waived",
+    "pass": "pass", "fail": "fail", "unavailable": "unavailable",
+    "not_expected": "not_expected", "waived": "waived",
 }
 PRIMARY_IDENTITY_FIELDS = (
     "repository_id", "repository", "pr", "base_sha", "head_sha", "diff_digest",
@@ -171,7 +168,7 @@ def _review_summary(audit: dict[str, Any] | None, fallback_status: str) -> dict[
     findings = result.get("findings") or []
     attempts = _compact_attempts(audit)
     is_primary_v2 = audit.get("kind") == "primary_review"
-    status = PRIMARY_STATUS_BY_VERDICT.get(audit.get("verdict"), "unknown") if is_primary_v2 else audit.get("status", "unknown")
+    status = PRIMARY_STATUS_BY_VERDICT[audit["verdict"]] if is_primary_v2 else audit.get("status", "unknown")
     # Failover = more than one hop was tried (a discarded hop precedes the adopted one).
     failover = len(attempts) > 1
     return {
@@ -234,8 +231,9 @@ def build_entry(
         entry for entry in prior_entries
         if entry.get("repository") == repository and entry.get("pr_number") == pr_number
     ]
-    prior_conflict = any(entry.get("ledger_conflict") for entry in relevant)
-    previous = relevant[-1] if relevant and not prior_conflict else None
+    previous = relevant[-1] if relevant else None
+    prior_conflict = bool(previous and previous.get("ledger_conflict"))
+    previous = None if prior_conflict else previous
     primary_identity = _primary_identity(
         audit, repository=repository, pr_number=pr_number, run_id=run_id,
         run_attempt=run_attempt, head_sha=head_sha,
