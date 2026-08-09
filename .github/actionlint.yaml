@@ -50,8 +50,11 @@ config-variables: null
 # tail of every error actionlint emits for this exact object type) so a same-named
 # property on some OTHER, unrelated object type would NOT be silently swallowed by
 # these two lines.
+# GitHub officially supports `concurrency.queue: max`; v1.7.12 does not model it yet.
+# Remove this path-scoped compatibility ignore when actionlint ships queue support.
 paths:
   .github/workflows/**/*.yml:
     ignore:
       - 'property "workflow_sha" is not defined in object type \{.*status: string\}'
       - 'property "workflow_repository" is not defined in object type \{.*status: string\}'
+      - 'unexpected key "queue" for "concurrency" section'

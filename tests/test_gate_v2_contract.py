@@ -90,7 +90,7 @@ def test_control_runner_input_defaults_to_follow_runner():
 def test_all_required_jobs_present():
     raw, _ = _load_workflow()
     assert set(raw["jobs"].keys()) == {
-        "quality", "primary", "resolve_advisory", "ocr", "gate", "notify",
+        "quality", "primary", "resolve_advisory", "ocr", "gate", "ledger", "notify",
     }
 
 
@@ -120,20 +120,24 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
 
 def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     raw, _ = _load_workflow()
-    concurrency = raw.get("concurrency", {})
-    assert concurrency.get("cancel-in-progress") is True
-    group = str(concurrency.get("group", ""))
-    assert group.startswith("gate-required-v2-")
+    assert "concurrency" not in raw
+    assert not raw["jobs"]["gate"].get("concurrency", {})
+    ledger_concurrency = raw["jobs"]["ledger"].get("concurrency", {})
+    assert ledger_concurrency.get("cancel-in-progress") is False
+    assert ledger_concurrency.get("queue") == "max"
+    group = str(ledger_concurrency.get("group", ""))
+    assert group.startswith("gate-required-v2-ledger-")
     assert "github.repository_id" in group
-    assert "github.event.pull_request.number" in group
+    assert "github.event.pull_request.number" not in group
     # Independence from the (future) Shadow Calibration group is a naming
     # contract, not something this file alone can prove — but the literal
     # prefix must never collide with `gate-shadow-v2-`.
     assert "shadow" not in group
-    # Must be a single top-level definition, not one per job (a caller must
-    # never be able to define a competing group).
-    for job in raw["jobs"].values():
-        assert "concurrency" not in job
+    # Review jobs retain only workflow-level PR cancellation; ledger owns the
+    # additional repository-level writer lock.
+    for job_name, job in raw["jobs"].items():
+        if job_name != "ledger":
+            assert "concurrency" not in job
 
 
 # ── gate aggregator job: required-check identity + always() ─────────────────
@@ -244,6 +248,75 @@ def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
     assert '--audit-artifact-name "$AUDIT_ARTIFACT_NAME"' in aggregate_step["run"]
 
 
+def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
+    raw, _ = _load_workflow()
+    quality_steps = raw["jobs"]["quality"]["steps"]
+    gate_steps = raw["jobs"]["gate"]["steps"]
+    ledger = raw["jobs"]["ledger"]
+    steps = ledger["steps"]
+    input_upload = next(step for step in quality_steps if step.get("name") == "Upload v2 review ledger inputs")
+    input_download = next(step for step in steps if step.get("name") == "Download v2 review ledger inputs")
+    build_index = next(i for i, step in enumerate(steps) if step.get("name") == "Build v2 review effectiveness ledger")
+    upload_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload v2 review effectiveness ledger")
+
+    assert ledger["needs"] == ["quality", "primary", "gate"]
+    assert ledger["if"] == "always()"
+    assert not any(step.get("name") == "Build v2 review effectiveness ledger" for step in gate_steps)
+    assert not any(step.get("name") == "Upload v2 review effectiveness ledger" for step in gate_steps)
+    assert input_upload["if"] == "always()"
+    assert input_upload["continue-on-error"] is True
+    assert input_download["with"]["artifact-ids"] == "${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}"
+    assert "pr-size-preflight.json" in input_upload["with"]["path"]
+    assert "install-result.json" in input_upload["with"]["path"]
+    assert input_download["with"]["path"] == "${{ runner.temp }}/review-ledger-input"
+    build = steps[build_index]
+    assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
+    assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
+    assert build["with"]["codex-expected"] == raw["jobs"]["primary"]["if"]
+    assert build["with"]["codex-waived"] is False
+    assert build["with"]["expected-repository-id"] == "${{ github.repository_id }}"
+    assert build["with"]["expected-base-sha"] == "${{ github.event.pull_request.base.sha }}"
+    assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
+    assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
+
+    upload = steps[upload_index]
+    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["with"] == {
+        "name": "codex-review-ledger",
+        "path": "${{ runner.temp }}/review-ledger/ledger.jsonl",
+        "if-no-files-found": "error",
+        "retention-days": 90,
+    }
+
+
+def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
+    raw, _ = _load_workflow()
+    resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
+    assert resolver["if"] == "always()"
+    assert resolver["env"]["CURRENT_ATTEMPT"] == "${{ github.run_attempt }}"
+    assert resolver["env"]["REVIEW_EXPECTED"] == (
+        "${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}"
+    )
+    run = resolver["run"]
+    for marker in ("--paginate", "expired", "<= current", "input_artifact_id", "audit_artifact_id"):
+        assert marker in run
+    assert "No matching required ledger input artifact found" in run
+    assert "No matching canonical primary audit artifact found" in run
+
+
+def test_ledger_persistence_steps_are_fail_closed():
+    raw, _ = _load_workflow()
+    ledger_steps = raw["jobs"]["ledger"]["steps"]
+    for name in (
+        "Download v2 review ledger inputs",
+        "Download canonical primary audit for ledger",
+        "Build v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger",
+    ):
+        step = next(s for s in ledger_steps if s.get("name") == name)
+        assert "continue-on-error" not in step
+
+
 def test_gate_job_review_expected_matches_primary_jobs_own_condition():
     # Tightened (2026-07-26): these two strings are meant to be byte-for-byte
     # the SAME expression (recomputed in a different job only because a
@@ -341,7 +414,7 @@ def test_non_quality_jobs_do_not_use_ci_pool_label():
     # uncredentialed CI pool. Assert on parsed fromJSON labels, not bare
     # substring match (would false-positive on words containing "ci").
     raw, _ = _load_workflow()
-    for job_name in ("gate", "notify", "primary", "resolve_advisory", "ocr"):
+    for job_name in ("gate", "ledger", "notify", "primary", "resolve_advisory", "ocr"):
         runs_on = str(raw["jobs"][job_name]["runs-on"])
         for labels in _fromjson_label_sets(runs_on):
             assert "ci" not in labels, (

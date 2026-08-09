@@ -4,9 +4,10 @@ templates/caller-gate-shadow-v2.yml).
 Scope: this is the D2 "Shadow Calibration" half of the shadow-review-independence
 rollout (see the private gate-hub repo's ceo-plans/2026-07-24-shadow-review-independence.md).
 D1's Required Gate v2 (.github/workflows/gate-v2.yml, templates/caller-gate-v2.yml,
-tests/test_gate_v2_contract.py) is untouched and unaffected by this file — several tests
-below load gate-v2.yml too, READ-ONLY, purely to assert this file's guards stay
-byte-identical to (or, for the concurrency group, deliberately DIFFERENT from) D1's own.
+tests/test_gate_v2_contract.py) remains independently testable — several tests below
+load gate-v2.yml too, READ-ONLY, to assert this file's guards stay byte-identical while
+Required Gate leaves workflow-level concurrency unset and Shadow retains its own
+shadow/draft lifecycle group.
 """
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def test_permissions_have_no_pr_or_issue_write_scope():
     assert raw["permissions"] == {"actions": "read", "contents": "read"}
 
 
-# ── concurrency contract: independent from, and never equal to, Required Gate's ────
+# ── concurrency contract: Shadow lifecycle group, isolated from Required Gate ─────
 
 def test_concurrency_group_is_shadow_v2_and_defined_once_at_workflow_level():
     raw, _ = _load_workflow()
@@ -87,15 +88,13 @@ def test_concurrency_group_is_shadow_v2_and_defined_once_at_workflow_level():
 
 
 def test_concurrency_group_expression_differs_from_required_gates():
-    # The plan's "required 与 shadow 的 group 永不相同" — assert the two FULL group
-    # expression strings are literally unequal (not just "one contains 'shadow' and the
-    # other doesn't" — a stronger, D1-style full-string check).
+    # Required Gate leaves top-level concurrency unset so independent runs can
+    # reach the ledger writer; Shadow Calibration keeps its own workflow lock.
     raw, _ = _load_workflow()
     shadow_group = str(raw["concurrency"]["group"])
     required_raw = _load_required_workflow()
-    required_group = str(required_raw["concurrency"]["group"])
-    assert shadow_group != required_group
-    assert shadow_group.replace("gate-shadow-v2-", "") == required_group.replace("gate-required-v2-", "")
+    assert "concurrency" not in required_raw
+    assert shadow_group.startswith("gate-shadow-v2-")
 
 
 # ── resolve job: draft/fork/hosted guard byte-identical to gate-v2.yml's `primary` ──

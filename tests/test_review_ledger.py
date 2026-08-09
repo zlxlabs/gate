@@ -1,7 +1,10 @@
 import importlib.util
 import json
 import urllib.request
+import zipfile
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +35,46 @@ def _audit(sha: str, ids: list[str], duration: int = 30) -> dict:
         },
     }
 
+
+def _preflight(diff_lines: int = 100, *, plan: str = "single") -> dict:
+    return {"diff_lines": diff_lines, "classification": plan, "review_plan": plan, "thresholds": {"single_turn_lines": 4000}}
+
+
+def _v2_audit(verdict: str, *, cost=None, tokens=None, runtime=None, expected_shadows=None) -> dict:
+    result = None if verdict not in {"pass", "fail"} else {
+        "verdict": verdict,
+        "summary": "result",
+        "findings": [] if verdict == "pass" else [
+            {"id": "correctness.bad-state", "severity": "major", "category": "correctness"}
+        ],
+    }
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "repository": "zlxlabs/app", "pr": 7,
+        "base_sha": "base", "head_sha": "head", "diff_digest": "d" * 64,
+        "policy_version": "v1", "policy_digest": "e" * 64,
+        "registry_commit": "a" * 40, "caller_sha": "b" * 40,
+        "reusable_workflow_sha": "c" * 40, "run_id": 10, "run_attempt": 1,
+        "job_id": 99, "reviewer": None if verdict in {"not_expected", "waived"} else "codex-sub",
+        "verdict": verdict, "attempts": [], "shadow_mode": "detached",
+        "expected_shadows": [] if expected_shadows is None else expected_shadows,
+        "result": result, "cost": cost, "tokens": tokens, "runtime": runtime,
+        "merge_base_sha": "merge-base", "candidate_commit_sha": "candidate-commit",
+        "candidate_tree_sha": "candidate-tree", "run_mode": "PAYLOAD_ONLY",
+    }
+    if verdict == "not_expected":
+        audit["not_expected_reason"] = "hosted_runner"
+    elif verdict == "waived":
+        audit["waiver"] = {"approver": "owner", "approved_at": "2026-08-09T00:00:00Z", "reason": "test"}
+    return audit
+
+
+EXPECTED_IDENTITY = {
+    "repository_id": 123,
+    "base_sha": "base",
+    "caller_sha": "b" * 40,
+    "reusable_workflow_sha": "c" * 40,
+}
 
 def test_new_head_comparison_tracks_persistent_resolved_and_new_findings():
     module = _module()
@@ -139,6 +182,244 @@ def test_ledger_deduplicates_run_attempts_and_writes_jsonl(tmp_path):
     lines = output.read_text().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["review"]["status"] == "pass"
+
+
+@pytest.mark.parametrize("verdict", ["pass", "fail", "unavailable", "not_expected", "waived"])
+def test_v2_primary_audit_projects_verdict_and_identity(verdict):
+    module = _module()
+    audit = _v2_audit(verdict)
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=_preflight(), audit=audit,
+        prior_entries=[], dispositions={},
+    )
+
+    assert entry["review"]["status"] == verdict
+    assert entry["review"]["verdict"] == verdict
+    assert entry["primary_identity"] == {key: audit[key] for key in module.PRIMARY_IDENTITY_FIELDS if key in audit}
+    if verdict in {"not_expected", "waived"}: assert entry["review"]["result"] is None and entry["review"]["finding_count"] == 0
+
+
+@pytest.mark.parametrize("diff_lines,plan,mode,complete,shards", [(100, "single", "single", True, 1), (5000, "sharded", "sharded+cross-module integration", False, None)])
+def test_v2_review_preserves_result_and_recomputes_legacy_coverage(
+    diff_lines, plan, mode, complete, shards,
+):
+    module = _module()
+    audit = _v2_audit("fail", cost=1.25, tokens=[{"input": 3}], runtime={"duration_s": 12.5})
+    audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 12.5, "cost_usd": 1.25}]
+    entry = module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(diff_lines, plan=plan), audit=audit, prior_entries=[], dispositions={})
+
+    review = entry["review"]
+    assert review["result"] == audit["result"]
+    assert review["cost_usd"] == 1.25
+    assert review["tokens"] == [{"input": 3}]
+    assert review["runtime"] == {"duration_s": 12.5}
+    assert review["coverage"] == {
+        "mode": mode, "complete": complete, "diff_lines": diff_lines, "shards": shards,
+    }
+    assert review["shadows"] == {}
+    assert review["finding_count"] == 1
+
+
+def test_v2_runtime_rejects_attempt_duration_sum_mismatch():
+    module = _module()
+    audit = _v2_audit("pass", runtime={"duration_s": 1})
+    audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2, "cost_usd": None}]
+    with pytest.raises(ValueError, match="runtime"):
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+
+
+def _ledger_runtime_case(schema_version, verdict, runtime_case):
+    reviewer_verdict = verdict not in {"not_expected", "waived"}
+    audit = _v2_audit(verdict, runtime=None)
+    audit["schema_version"] = schema_version
+    if reviewer_verdict and runtime_case in {"valid", "mismatch"}:
+        audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 1.0, "cost_usd": None}]
+    if runtime_case == "missing":
+        audit.pop("runtime", None)
+    else:
+        audit["runtime"] = {"null": None, "valid": {"duration_s": 1.0},
+                              "mismatch": {"duration_s": 2.0}, "invalid": {"duration_s": "bad"}}[runtime_case]
+    return audit
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 99])
+@pytest.mark.parametrize("runtime_case", ["missing", "null", "valid", "mismatch", "invalid"])
+@pytest.mark.parametrize("verdict", ["pass", "fail", "unavailable", "not_expected", "waived"])
+def test_ledger_runtime_schema_upgrade_matrix(schema_version, runtime_case, verdict):
+    module = _module()
+    reviewer_verdict = verdict not in {"not_expected", "waived"}
+    expected = (
+        schema_version in {1, 2}
+        and (runtime_case == "null" or (runtime_case == "valid" and reviewer_verdict)
+             or (runtime_case == "missing" and schema_version == 1))
+    )
+    audit = _ledger_runtime_case(schema_version, verdict, runtime_case)
+    call = lambda: module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+    )
+    if expected:
+        entry = call()
+        assert entry["review"]["runtime"] is None if runtime_case == "missing" else True
+    else:
+        with pytest.raises(ValueError, match="canonical primary|runtime|schema"):
+            call()
+
+
+def test_ledger_consumes_historical_v1_fixture_without_runtime():
+    module = _module()
+    fixture = json.loads((ROOT / "tests/data/primary_review_v1_missing_runtime.json").read_text())
+    entry = module.build_entry(
+        repository=fixture["repository"], pr_number=fixture["pr"], run_id=fixture["run_id"],
+        run_attempt=fixture["run_attempt"], head_sha=fixture["head_sha"], preflight=_preflight(),
+        audit=fixture, prior_entries=[], dispositions={},
+    )
+    assert entry["review"]["runtime"] is None
+
+
+@pytest.mark.parametrize("field,value", [("cost", -1), ("cost", float("inf")), ("tokens", {}), ("runtime", {"duration_s": -1}), ("runtime", {"duration_s": float("nan")}), ("expected_shadows", ["claude-glm"])])
+def test_v2_review_rejects_invalid_telemetry(field, value):
+    module = _module()
+    audit = _v2_audit("pass", **{field: value})
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+
+
+@pytest.mark.parametrize("mutation", [lambda audit: audit["result"].pop("findings"), lambda audit: audit["result"]["findings"].append({"id": "broken"}), lambda audit: audit["attempts"].append({"reviewer": 3})])
+def test_v2_review_rejects_malformed_consumed_payload(mutation):
+    module = _module()
+    audit = _v2_audit("pass")
+    mutation(audit)
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+
+
+def test_v2_primary_audit_rejects_mismatched_parent_identity():
+    module = _module()
+    audit = _v2_audit("pass")
+    audit["head_sha"] = "stale"
+
+    with pytest.raises(ValueError, match="primary audit identity mismatch"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+        )
+
+
+@pytest.mark.parametrize("field", list(EXPECTED_IDENTITY))
+def test_v2_primary_audit_binds_every_workflow_identity_field(field):
+    module = _module()
+    audit = _v2_audit("pass")
+    audit[field] = 999 if isinstance(EXPECTED_IDENTITY[field], int) else "stale"
+
+    with pytest.raises(ValueError, match="primary audit identity mismatch"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+            expected_identity=EXPECTED_IDENTITY,
+        )
+
+
+@pytest.mark.parametrize("field,value", [("diff_digest", "D" * 64), ("policy_digest", "D" * 64), ("candidate_tree_sha", None)])
+def test_v2_primary_audit_rejects_malformed_canonical_shape(field, value):
+    module = _module()
+    audit = _v2_audit("pass")
+    if value is None:
+        del audit[field]
+    else:
+        audit[field] = value
+
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+        )
+
+
+@pytest.mark.parametrize(
+    "verdict,field",
+    [(verdict, field) for verdict in ["pass", "fail", "unavailable"] for field in ["waiver", "not_expected_reason"]]
+    + [("not_expected", "waiver"), ("waived", "not_expected_reason")],
+)
+def test_v2_primary_audit_rejects_companion_fields_for_wrong_verdict(verdict, field):
+    module = _module()
+    audit = _v2_audit(verdict)
+    audit[field] = {} if field == "waiver" else "hosted_runner"
+
+    with pytest.raises(ValueError, match="canonical primary"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+        )
+
+
+def test_fetch_prior_entries_fails_on_corrupt_artifact(monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "_api_json", lambda token, url: {
+        "artifacts": [{"id": 1, "expired": False, "archive_download_url": "https://example.test/1"}]
+    })
+    monkeypatch.setattr(module, "_api_request", lambda token, url: b"not a zip")
+
+    with pytest.raises(zipfile.BadZipFile):
+        module.fetch_prior_entries("token", "zlxlabs/app")
+
+
+@pytest.mark.parametrize("max_entries", [0, -1])
+def test_write_ledger_rejects_nonpositive_capacity(tmp_path, max_entries):
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+    )
+
+    with pytest.raises(ValueError, match="max_entries"):
+        module.write_ledger(tmp_path / "ledger.jsonl", [entry], max_entries=max_entries)
+
+
+@pytest.mark.parametrize("count,capacity", [(2000, 2000), (2001, 2000)])
+def test_write_ledger_capacity_boundary(tmp_path, count, capacity):
+    module = _module()
+    entries = [{"repository": "zlxlabs/app", "run_id": index, "run_attempt": 1,
+                "recorded_at": str(index)} for index in range(count)]
+    output = tmp_path / "ledger.jsonl"
+    if count == capacity:
+        module.write_ledger(output, entries, max_entries=capacity)
+        assert len(output.read_text().splitlines()) == capacity
+    else:
+        with pytest.raises(ValueError, match="max_entries"):
+            module.write_ledger(output, entries, max_entries=capacity)
+        assert not output.exists()
+
+
+def test_ledger_preserves_conflicting_run_attempt_variants():
+    module = _module()
+    first = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=_preflight(), audit=_v2_audit("pass"),
+        prior_entries=[], dispositions={},
+    )
+    second = json.loads(json.dumps(first))
+    second["review"]["status"] = "fail"
+
+    variants = module.dedupe_entries([first, second])
+
+    assert len(variants) == 2
+    assert all(item["ledger_conflict"]["variant_count"] == 2 for item in variants)
+    survivor = module.dedupe_entries([variants[0]])
+    assert survivor[0]["ledger_conflict"]["present_variant_count"] == 1
+
+    current = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+        head_sha="next", preflight={}, audit=_audit("next", []),
+        prior_entries=survivor, dispositions={},
+    )
+    assert current["comparison"]["kind"] == "prior_conflict"
+    assert current["review_round"] == 2
+    recovered = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=12, run_attempt=1, head_sha="later", preflight={}, audit=_audit("later", []), prior_entries=[*variants, current], dispositions={},
+    )
+    assert recovered["comparison"]["kind"] == "new_head"
 
 
 def test_cross_host_artifact_redirect_strips_github_authorization():

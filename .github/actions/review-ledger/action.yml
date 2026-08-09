@@ -15,6 +15,10 @@ inputs:
   token: { required: true }
   codex-expected: { required: true }
   codex-waived: { required: true }
+  expected-repository-id: { required: true }
+  expected-base-sha: { required: true }
+  expected-caller-sha: { required: true }
+  expected-reusable-workflow-sha: { required: true }
 runs:
   using: composite
   steps:
@@ -32,5 +36,9 @@ runs:
           --run-id "$GITHUB_RUN_ID" \
           --run-attempt "$GITHUB_RUN_ATTEMPT" \
           --head-sha "${{ github.event.pull_request.head.sha }}" \
+          --expected-repository-id "${{ inputs.expected-repository-id }}" \
+          --expected-base-sha "${{ inputs.expected-base-sha }}" \
+          --expected-caller-sha "${{ inputs.expected-caller-sha }}" \
+          --expected-reusable-workflow-sha "${{ inputs.expected-reusable-workflow-sha }}" \
           --codex-expected "${{ inputs.codex-expected }}" \
           --codex-waived "${{ inputs.codex-waived }}"
