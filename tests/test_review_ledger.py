@@ -365,6 +365,21 @@ def test_fetch_prior_entries_fails_on_corrupt_artifact(monkeypatch):
         module.fetch_prior_entries("token", "zlxlabs/app")
 
 
+def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
+    module = _module()
+    requested = []
+    monkeypatch.setattr(
+        module,
+        "_api_json",
+        lambda token, url: requested.append(url) or {"artifacts": []},
+    )
+
+    assert module.fetch_prior_entries("token", "zlxlabs/app") == []
+    assert len(requested) == 1
+    assert "name=codex-review-ledger-v2" in requested[0]
+    assert "name=codex-review-ledger&" not in requested[0]
+
+
 @pytest.mark.parametrize("max_entries", [0, -1])
 def test_write_ledger_rejects_nonpositive_capacity(tmp_path, max_entries):
     module = _module()
@@ -461,6 +476,25 @@ def test_bot_sticky_state_survives_reruns_but_user_spoof_is_ignored():
     assert restored == [entry]
     assert "Review ledger state" in body
     assert "same" in body
+
+
+def test_v2_state_marker_does_not_restore_the_legacy_epoch():
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="same", preflight={}, audit=_audit("same", ["a"]), prior_entries=[], dispositions={},
+    )
+    body = module.render_state_comment([entry], entry)
+
+    assert module.parse_state_entries([
+        {
+            "body": "<!-- codex-review-ledger-state:v1:W10= -->",
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+        }
+    ]) == []
+    assert "codex-review-ledger-state:v2:" in body
+    assert "codex-review-ledger-state:v1:" not in body
+    assert "codex-review-ledger-v2" in body
 
 
 def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():

@@ -12,6 +12,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate.yml"
+LEGACY_REVIEW_LEDGER_SHA = "9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 
@@ -241,6 +242,16 @@ def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     assert upload["with"]["name"] == "codex-review-ledger"
     assert "ledger.jsonl" in upload["with"]["path"]
     assert upload["with"]["retention-days"] == 90
+
+
+def test_legacy_gate_keeps_v1_ledger_pin_and_artifact_epoch():
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    build = next(step for step in steps if step.get("name") == "Build review effectiveness ledger")
+    upload = next(step for step in steps if step.get("name") == "Upload review effectiveness ledger")
+
+    assert build["uses"] == f"zlxlabs/gate/.github/actions/review-ledger@{LEGACY_REVIEW_LEDGER_SHA}"
+    assert upload["with"]["name"] == "codex-review-ledger"
 
 
 def test_notify_webhook_secret_first_var_fallback():

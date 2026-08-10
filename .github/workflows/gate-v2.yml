@@ -798,7 +798,7 @@ jobs:
       - name: Upload v2 review effectiveness ledger
         uses: actions/upload-artifact@v4
         with:
-          name: codex-review-ledger
+          name: codex-review-ledger-v2
           path: ${{ runner.temp }}/review-ledger/ledger.jsonl
           if-no-files-found: error
           retention-days: 90
