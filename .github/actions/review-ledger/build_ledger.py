@@ -129,13 +129,18 @@ def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any])
     failover = bool(review.get("failover"))
     reviewer_line = f"{reviewer}" + (" (failover)" if failover else "")
     return (
-        f"{STATE_MARKER}\n\n### 📒 Review ledger state\n\n"
+        f"{STATE_MARKER}\n\n"
+        "### ⚙️ Review ledger state（机器状态记录，非评审结论）\n\n"
+        "> 这是 review ledger 的**机器状态记录**，不代表评审结论，通常无需任何操作。\n"
+        "> 要看当前 PR 能否合并，请看本 PR 的「### Gate 当前状态」评论。\n\n"
+        "<details><summary>机器状态明细</summary>\n\n"
         f"- Commit: `{current['head_sha']}`\n"
         f"- Round: **{current['review_round']}**\n"
         f"- Status / findings: **{review['status']} / {review['finding_count']}**\n"
         f"- Reviewer: **{reviewer_line}**\n"
         f"- Comparison: `{comparison_line}`\n\n"
         "完整数据保存在 `codex-review-ledger-v2` artifact；此 sticky comment 仅保存 v2 epoch 的跨 rerun 连续游标。\n\n"
+        "</details>\n\n"
         f"<!-- codex-review-ledger-state:v2:{encoded} -->\n"
     )
 

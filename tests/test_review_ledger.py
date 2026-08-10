@@ -541,6 +541,71 @@ def test_parse_state_entries_recovers_cursor_from_pre_humanize_comment():
     assert restored == [previous, current]
 
 
+def _details_block(body: str) -> str:
+    return body[body.index("<details>"):body.index("</details>")]
+
+
+@pytest.mark.parametrize(
+    "kind,fragment",
+    [
+        ("new_head", "persistent/resolved/new = 1/1/1"),
+        ("same_head_rerun", "stable/missing/appeared = 1/1/1"),
+    ],
+)
+def test_state_comment_folds_machine_details_behind_human_navigation(kind, fragment):
+    module = _module()
+    same_head = kind == "same_head_rerun"
+    previous = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=_audit("head", ["a", "b"]), prior_entries=[], dispositions={},
+    )
+    current = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10 if same_head else 11,
+        run_attempt=2 if same_head else 1, head_sha="head" if same_head else "new",
+        preflight={}, audit=_audit("head" if same_head else "new", ["b", "c"]),
+        prior_entries=[previous], dispositions={},
+    )
+    body = module.render_state_comment([previous, current], current)
+
+    # First line stays the machine anchor — human navigation must not displace it.
+    assert body.splitlines()[0] == module.STATE_MARKER
+    # Human first screen: heading keeps the referenced name but cannot read as a verdict.
+    assert "### ⚙️ Review ledger state（机器状态记录，非评审结论）" in body
+    navigation = body[: body.index("<details>")]
+    assert "不代表评审结论" in navigation
+    assert "Gate 当前状态" in navigation
+    # Machine details are folded but still complete.
+    assert "<details><summary>机器状态明细</summary>" in body
+    details = _details_block(body)
+    for item in ("- Commit:", "- Round:", "- Status / findings:", "- Reviewer:", "- Comparison:"):
+        assert item in details
+    assert fragment in details
+    # Cursor comment stays last, byte-stable, and decodes back to the entry list.
+    match = module.STATE_RE.search(body)
+    assert match is not None
+    assert body.endswith(match.group(0) + "\n")
+    payload = base64.urlsafe_b64decode(match.group(1).encode())
+    assert json.loads(payload) == [previous, current]
+
+
+def test_state_comment_renders_failover_reviewer_inside_details():
+    module = _module()
+    audit = _audit("sha", [])
+    audit["reviewer"] = "codex-sub"
+    audit["attempts"] = [
+        {"reviewer": "claude-glm", "exit_code": 20, "reason": "限流", "duration_s": 1},
+        {"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2},
+    ]
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    body = module.render_state_comment([entry], entry)
+
+    details = _details_block(body)
+    assert "- Reviewer: **codex-sub (failover)**" in details
+
+
 def test_v2_state_marker_does_not_restore_the_legacy_epoch():
     module = _module()
     entry = module.build_entry(
