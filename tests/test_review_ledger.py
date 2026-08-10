@@ -488,7 +488,7 @@ def test_v2_state_marker_does_not_restore_the_legacy_epoch():
 
     assert module.parse_state_entries([
         {
-            "body": "<!-- codex-review-ledger-state:v1:W10= -->",
+            "body": "<!-- codex-review-ledger-state:v1:W3sicmVwb3NpdG9yeSI6InpseGxhYnMvYXBwIiwicHJfbnVtYmVyIjo3LCJydW5faWQiOjEwfV0= -->",
             "user": {"login": "github-actions[bot]", "type": "Bot"},
         }
     ]) == []
