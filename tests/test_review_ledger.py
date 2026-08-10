@@ -555,12 +555,15 @@ def _details_block(body: str) -> str:
 def test_state_comment_folds_machine_details_behind_human_navigation(kind, fragment):
     module = _module()
     same_head = kind == "same_head_rerun"
+    # Non-default fixture values so checks URL is proven to come from render inputs.
+    repository = "acme/widget"
+    pr_number = 99
     previous = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        repository=repository, pr_number=pr_number, run_id=10, run_attempt=1,
         head_sha="head", preflight={}, audit=_audit("head", ["a", "b"]), prior_entries=[], dispositions={},
     )
     current = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10 if same_head else 11,
+        repository=repository, pr_number=pr_number, run_id=10 if same_head else 11,
         run_attempt=2 if same_head else 1, head_sha="head" if same_head else "new",
         preflight={}, audit=_audit("head" if same_head else "new", ["b", "c"]),
         prior_entries=[previous], dispositions={},
@@ -572,14 +575,19 @@ def test_state_comment_folds_machine_details_behind_human_navigation(kind, fragm
     # Human first screen: heading keeps the referenced name but cannot read as a verdict.
     assert "### ⚙️ Review ledger state（机器状态记录，非评审结论）" in body
     navigation = body[: body.index("<details>")]
+    assert "机器状态记录" in navigation
     assert "不代表评审结论" in navigation
-    assert "Gate 当前状态" in navigation
-    # Machine details are folded but still complete.
+    # Must not name gate-hub-only advisory comment titles (fleet-wide dangling pointer).
+    assert "Gate 当前状态" not in navigation
+    checks_url = f"https://github.com/{repository}/pull/{pr_number}/checks"
+    assert checks_url in navigation
+    # Machine details are folded but still complete (six items incl. artifact note).
     assert "<details><summary>机器状态明细</summary>" in body
     details = _details_block(body)
     for item in ("- Commit:", "- Round:", "- Status / findings:", "- Reviewer:", "- Comparison:"):
         assert item in details
     assert fragment in details
+    assert "完整数据保存在 `codex-review-ledger-v2` artifact" in details
     # Cursor comment stays last, byte-stable, and decodes back to the entry list.
     match = module.STATE_RE.search(body)
     assert match is not None
