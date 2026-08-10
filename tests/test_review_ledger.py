@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import urllib.request
@@ -476,6 +477,142 @@ def test_bot_sticky_state_survives_reruns_but_user_spoof_is_ignored():
     assert restored == [entry]
     assert "Review ledger state" in body
     assert "same" in body
+
+
+def _legacy_state_comment_body(module, entries, current):
+    """Frozen copy of the pre-humanize render_state_comment layout.
+
+    The sticky comment doubles as machine-readable cursor storage, and live PRs
+    already carry comments in this exact layout. This fixture pins that layout so
+    a renderer change can never silently break cursor recovery from old comments.
+    """
+    relevant = [
+        entry for entry in entries
+        if entry.get("repository") == current.get("repository")
+        and entry.get("pr_number") == current.get("pr_number")
+    ][-20:]
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(relevant, ensure_ascii=False, separators=(",", ":")).encode()
+    ).decode()
+    review = current["review"]
+    comparison = current["comparison"]
+    comparison_line = comparison["kind"]
+    if comparison["kind"] == "new_head":
+        comparison_line += (
+            f"; persistent/resolved/new = {len(comparison['persistent_finding_ids'])}/"
+            f"{len(comparison['resolved_finding_ids'])}/{len(comparison['new_finding_ids'])}"
+        )
+    elif comparison["kind"] == "same_head_rerun":
+        comparison_line += (
+            f"; stable/missing/appeared = {len(comparison['persistent_finding_ids'])}/"
+            f"{len(comparison['missing_finding_ids'])}/{len(comparison['appeared_finding_ids'])}"
+        )
+    reviewer = review.get("reviewer") or "none"
+    failover = bool(review.get("failover"))
+    reviewer_line = f"{reviewer}" + (" (failover)" if failover else "")
+    return (
+        f"{module.STATE_MARKER}\n\n### 📒 Review ledger state\n\n"
+        f"- Commit: `{current['head_sha']}`\n"
+        f"- Round: **{current['review_round']}**\n"
+        f"- Status / findings: **{review['status']} / {review['finding_count']}**\n"
+        f"- Reviewer: **{reviewer_line}**\n"
+        f"- Comparison: `{comparison_line}`\n\n"
+        "完整数据保存在 `codex-review-ledger-v2` artifact；此 sticky comment 仅保存 v2 epoch 的跨 rerun 连续游标。\n\n"
+        f"<!-- codex-review-ledger-state:v2:{encoded} -->\n"
+    )
+
+
+def test_parse_state_entries_recovers_cursor_from_pre_humanize_comment():
+    """Backward compat: comments already posted in the old layout must still parse."""
+    module = _module()
+    previous = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="old", preflight={}, audit=_audit("old", ["a", "b"]), prior_entries=[], dispositions={},
+    )
+    current = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+        head_sha="new", preflight={}, audit=_audit("new", ["b", "c"]), prior_entries=[previous], dispositions={},
+    )
+    body = _legacy_state_comment_body(module, [previous, current], current)
+    comments = [{"body": body, "user": {"login": "github-actions[bot]", "type": "Bot"}}]
+
+    restored = module.parse_state_entries(comments)
+
+    assert restored == [previous, current]
+
+
+def _details_block(body: str) -> str:
+    return body[body.index("<details>"):body.index("</details>")]
+
+
+@pytest.mark.parametrize(
+    "kind,fragment",
+    [
+        ("new_head", "persistent/resolved/new = 1/1/1"),
+        ("same_head_rerun", "stable/missing/appeared = 1/1/1"),
+    ],
+)
+def test_state_comment_folds_machine_details_behind_human_navigation(kind, fragment):
+    module = _module()
+    same_head = kind == "same_head_rerun"
+    # Non-default fixture values so rendered content is proven to come from render inputs.
+    repository = "acme/widget"
+    pr_number = 99
+    previous = module.build_entry(
+        repository=repository, pr_number=pr_number, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=_audit("head", ["a", "b"]), prior_entries=[], dispositions={},
+    )
+    current = module.build_entry(
+        repository=repository, pr_number=pr_number, run_id=10 if same_head else 11,
+        run_attempt=2 if same_head else 1, head_sha="head" if same_head else "new",
+        preflight={}, audit=_audit("head" if same_head else "new", ["b", "c"]),
+        prior_entries=[previous], dispositions={},
+    )
+    body = module.render_state_comment([previous, current], current)
+
+    # First line stays the machine anchor — human navigation must not displace it.
+    assert body.splitlines()[0] == module.STATE_MARKER
+    # Human first screen: heading keeps the referenced name but cannot read as a verdict.
+    assert "### ⚙️ Review ledger state（机器状态记录，非评审结论）" in body
+    navigation = body[: body.index("<details>")]
+    assert "机器状态记录" in navigation
+    assert "不代表评审结论" in navigation
+    # Must not name gate-hub-only advisory comment titles (fleet-wide dangling pointer).
+    assert "Gate 当前状态" not in navigation
+    # Navigation must not point anywhere: no single surface can reliably answer
+    # "can this merge" across fleet deployment shapes — lock it with no-URL.
+    assert "http" not in navigation
+    # Machine details are folded but still complete (six items incl. artifact note).
+    assert "<details><summary>机器状态明细</summary>" in body
+    details = _details_block(body)
+    for item in ("- Commit:", "- Round:", "- Status / findings:", "- Reviewer:", "- Comparison:"):
+        assert item in details
+    assert fragment in details
+    assert "完整数据保存在 `codex-review-ledger-v2` artifact" in details
+    # Cursor comment stays last, byte-stable, and decodes back to the entry list.
+    match = module.STATE_RE.search(body)
+    assert match is not None
+    assert body.endswith(match.group(0) + "\n")
+    payload = base64.urlsafe_b64decode(match.group(1).encode())
+    assert json.loads(payload) == [previous, current]
+
+
+def test_state_comment_renders_failover_reviewer_inside_details():
+    module = _module()
+    audit = _audit("sha", [])
+    audit["reviewer"] = "codex-sub"
+    audit["attempts"] = [
+        {"reviewer": "claude-glm", "exit_code": 20, "reason": "限流", "duration_s": 1},
+        {"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2},
+    ]
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    body = module.render_state_comment([entry], entry)
+
+    details = _details_block(body)
+    assert "- Reviewer: **codex-sub (failover)**" in details
 
 
 def test_v2_state_marker_does_not_restore_the_legacy_epoch():
