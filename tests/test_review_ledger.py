@@ -555,7 +555,7 @@ def _details_block(body: str) -> str:
 def test_state_comment_folds_machine_details_behind_human_navigation(kind, fragment):
     module = _module()
     same_head = kind == "same_head_rerun"
-    # Non-default fixture values so checks URL is proven to come from render inputs.
+    # Non-default fixture values so rendered content is proven to come from render inputs.
     repository = "acme/widget"
     pr_number = 99
     previous = module.build_entry(
@@ -579,8 +579,9 @@ def test_state_comment_folds_machine_details_behind_human_navigation(kind, fragm
     assert "不代表评审结论" in navigation
     # Must not name gate-hub-only advisory comment titles (fleet-wide dangling pointer).
     assert "Gate 当前状态" not in navigation
-    checks_url = f"https://github.com/{repository}/pull/{pr_number}/checks"
-    assert checks_url in navigation
+    # Navigation must not point anywhere: no single surface can reliably answer
+    # "can this merge" across fleet deployment shapes — lock it with no-URL.
+    assert "http" not in navigation
     # Machine details are folded but still complete (six items incl. artifact note).
     assert "<details><summary>机器状态明细</summary>" in body
     details = _details_block(body)

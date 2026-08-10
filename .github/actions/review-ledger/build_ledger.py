@@ -131,9 +131,7 @@ def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any])
     return (
         f"{STATE_MARKER}\n\n"
         "### ⚙️ Review ledger state（机器状态记录，非评审结论）\n\n"
-        "> 这是 review ledger 的**机器状态记录**，不代表评审结论，通常无需任何操作。\n"
-        f"> 要看当前 PR 能否合并，请看 required check `gate` 的结果："
-        f" https://github.com/{current['repository']}/pull/{current['pr_number']}/checks\n\n"
+        "> 这是 review ledger 的**机器状态记录**，不代表评审结论，通常无需任何操作。\n\n"
         "<details><summary>机器状态明细</summary>\n\n"
         f"- Commit: `{current['head_sha']}`\n"
         f"- Round: **{current['review_round']}**\n"
