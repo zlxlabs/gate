@@ -282,7 +282,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     upload = steps[upload_index]
     assert upload["uses"] == "actions/upload-artifact@v4"
     assert upload["with"] == {
-        "name": "codex-review-ledger",
+        "name": "codex-review-ledger-v2",
         "path": "${{ runner.temp }}/review-ledger/ledger.jsonl",
         "if-no-files-found": "error",
         "retention-days": 90,

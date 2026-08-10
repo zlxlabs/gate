@@ -41,8 +41,8 @@ class CrossHostAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
-STATE_MARKER = "<!-- codex-review-ledger-state -->"
-STATE_RE = re.compile(r"<!-- codex-review-ledger-state:v1:([A-Za-z0-9_-]+={0,2}) -->")
+STATE_MARKER = "<!-- codex-review-ledger-state:v2 -->"
+STATE_RE = re.compile(r"<!-- codex-review-ledger-state:v2:([A-Za-z0-9_-]+={0,2}) -->")
 PRIMARY_STATUS_BY_VERDICT = {
     "pass": "pass", "fail": "fail", "unavailable": "unavailable",
     "not_expected": "not_expected", "waived": "waived",
@@ -135,8 +135,8 @@ def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any])
         f"- Status / findings: **{review['status']} / {review['finding_count']}**\n"
         f"- Reviewer: **{reviewer_line}**\n"
         f"- Comparison: `{comparison_line}`\n\n"
-        "完整数据保存在 `codex-review-ledger` artifact；此 sticky comment 仅保存跨 rerun 的连续游标。\n\n"
-        f"<!-- codex-review-ledger-state:v1:{encoded} -->\n"
+        "完整数据保存在 `codex-review-ledger-v2` artifact；此 sticky comment 仅保存 v2 epoch 的跨 rerun 连续游标。\n\n"
+        f"<!-- codex-review-ledger-state:v2:{encoded} -->\n"
     )
 
 
@@ -550,7 +550,7 @@ def _api_json(token: str, url: str) -> Any:
 
 
 def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode({"name": "codex-review-ledger", "per_page": artifact_limit})
+    query = urllib.parse.urlencode({"name": "codex-review-ledger-v2", "per_page": artifact_limit})
     payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
     if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
         raise ValueError("prior ledger artifact list has invalid JSON shape")
