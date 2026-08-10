@@ -447,9 +447,58 @@ def find_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str]]:
         return None, f"could not parse {candidates[0].name}: {exc}"
 
 
+# Human-readable, per-reason_code explanations rendered into the Step Summary
+# (issues #32/#43): the caller must be able to tell "the primary reviewer
+# rejected the change" apart from "the aggregator could not read the primary
+# reviewer's conclusion" without opening job logs. Phrasing is load-bearing —
+# the "could not be read" entries must never read as a reviewer rejection, and
+# unexpected_primary_skip must never read as the normal draft/fork skip.
+REASON_CODE_EXPLANATIONS = {
+    "primary_findings": (
+        "The primary reviewer REJECTED this change — see the findings listed under Problems."
+    ),
+    "audit_missing": (
+        "The primary reviewer's conclusion could NOT be read for this run (no audit artifact was "
+        "produced) — check the primary job logs. This is not a reviewer rejection."
+    ),
+    "audit_invalid": (
+        "The primary reviewer's conclusion could NOT be read for this run (the audit artifact failed "
+        "validation) — check the primary job logs. This is not a reviewer rejection."
+    ),
+    "audit_source_mismatch": (
+        "The primary reviewer's conclusion could NOT be read for this run (the audit's source attempt "
+        "did not match the selected artifact) — check the primary job logs. This is not a reviewer rejection."
+    ),
+    "job_audit_mismatch": (
+        "The primary reviewer's recorded conclusion contradicts the primary job's own status — "
+        "the gate fails closed. Check the primary job logs."
+    ),
+    "unexpected_primary_skip": (
+        "The primary review should have run but was skipped — this is NOT the normal draft/fork "
+        "skip. Check the primary job configuration."
+    ),
+}
+
+
 def render_summary(outcome: Outcome) -> str:
     lines = ["### Required Gate v2 — aggregate verdict", ""]
-    lines.append(f"**Result: {'pass' if outcome.ok else 'fail'}**")
+    # Top line shows the four-state gate_result (pass/fail/skipped/unavailable)
+    # instead of collapsing to ok -> pass|fail, so an accepted skip (draft/fork)
+    # is visibly distinct from a real pass, and an unreadable primary review is
+    # visibly distinct from a reviewer rejection (issues #32/#43). Outcomes from
+    # the malformed-input paths carry no terminal fields — keep the legacy
+    # binary rendering there.
+    gate_result = outcome.gate_result or ("pass" if outcome.ok else "fail")
+    lines.append(f"**Result: {gate_result}**")
+    if outcome.classification is not None:
+        lines.append(
+            f"Terminal state: classification=`{outcome.classification}`, "
+            f"reason_code=`{outcome.reason_code}`, gate_result=`{outcome.gate_result}`"
+        )
+    explanation = REASON_CODE_EXPLANATIONS.get(outcome.reason_code or "")
+    if explanation:
+        lines.append("")
+        lines.append(explanation)
     lines.append("")
     if outcome.notes:
         lines.append("Accepted:")
@@ -464,6 +513,11 @@ def render_summary(outcome: Outcome) -> str:
     if outcome.synthetic_audit is not None:
         lines.append(
             "**Synthetic audit generated** (no valid canonical primary audit was available for this run):"
+        )
+        lines.append("")
+        lines.append(
+            '`"verdict": null` below means the primary conclusion could not be read — '
+            "it is NOT a reviewer rejection. Check the primary job logs for the real cause."
         )
         lines.append("")
         lines.append("```json")
@@ -490,6 +544,17 @@ def _finish(
         print(f"::notice::{note}")
     for problem in outcome.problems:
         print(f"::error::{problem}")
+    # Terminal-state annotation carrying the machine codes, so the checks list
+    # page can tell skipped/unavailable/fail apart (and name the reason_code)
+    # without expanding the run (issues #32/#43). notice for pass/skipped,
+    # error otherwise — this mirrors the exit-code mapping, it does not feed
+    # back into any decision.
+    if outcome.classification is not None:
+        tag = "notice" if outcome.ok else "error"
+        print(
+            f"::{tag}::gate terminal state: classification={outcome.classification}, "
+            f"reason_code={outcome.reason_code}, gate_result={outcome.gate_result}"
+        )
     if terminal_path and outcome.classification is not None:
         terminal = build_terminal_envelope(repository=repository or "", identity=identity, quality_result=quality_result, primary_result=primary_result, review_expected=review_expected, is_draft=is_draft, runner=runner, outcome=outcome)
         terminal_path = Path(terminal_path)
