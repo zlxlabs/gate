@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import urllib.request
@@ -476,6 +477,68 @@ def test_bot_sticky_state_survives_reruns_but_user_spoof_is_ignored():
     assert restored == [entry]
     assert "Review ledger state" in body
     assert "same" in body
+
+
+def _legacy_state_comment_body(module, entries, current):
+    """Frozen copy of the pre-humanize render_state_comment layout.
+
+    The sticky comment doubles as machine-readable cursor storage, and live PRs
+    already carry comments in this exact layout. This fixture pins that layout so
+    a renderer change can never silently break cursor recovery from old comments.
+    """
+    relevant = [
+        entry for entry in entries
+        if entry.get("repository") == current.get("repository")
+        and entry.get("pr_number") == current.get("pr_number")
+    ][-20:]
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(relevant, ensure_ascii=False, separators=(",", ":")).encode()
+    ).decode()
+    review = current["review"]
+    comparison = current["comparison"]
+    comparison_line = comparison["kind"]
+    if comparison["kind"] == "new_head":
+        comparison_line += (
+            f"; persistent/resolved/new = {len(comparison['persistent_finding_ids'])}/"
+            f"{len(comparison['resolved_finding_ids'])}/{len(comparison['new_finding_ids'])}"
+        )
+    elif comparison["kind"] == "same_head_rerun":
+        comparison_line += (
+            f"; stable/missing/appeared = {len(comparison['persistent_finding_ids'])}/"
+            f"{len(comparison['missing_finding_ids'])}/{len(comparison['appeared_finding_ids'])}"
+        )
+    reviewer = review.get("reviewer") or "none"
+    failover = bool(review.get("failover"))
+    reviewer_line = f"{reviewer}" + (" (failover)" if failover else "")
+    return (
+        f"{module.STATE_MARKER}\n\n### 📒 Review ledger state\n\n"
+        f"- Commit: `{current['head_sha']}`\n"
+        f"- Round: **{current['review_round']}**\n"
+        f"- Status / findings: **{review['status']} / {review['finding_count']}**\n"
+        f"- Reviewer: **{reviewer_line}**\n"
+        f"- Comparison: `{comparison_line}`\n\n"
+        "完整数据保存在 `codex-review-ledger-v2` artifact；此 sticky comment 仅保存 v2 epoch 的跨 rerun 连续游标。\n\n"
+        f"<!-- codex-review-ledger-state:v2:{encoded} -->\n"
+    )
+
+
+def test_parse_state_entries_recovers_cursor_from_pre_humanize_comment():
+    """Backward compat: comments already posted in the old layout must still parse."""
+    module = _module()
+    previous = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="old", preflight={}, audit=_audit("old", ["a", "b"]), prior_entries=[], dispositions={},
+    )
+    current = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+        head_sha="new", preflight={}, audit=_audit("new", ["b", "c"]), prior_entries=[previous], dispositions={},
+    )
+    body = _legacy_state_comment_body(module, [previous, current], current)
+    comments = [{"body": body, "user": {"login": "github-actions[bot]", "type": "Bot"}}]
+
+    restored = module.parse_state_entries(comments)
+
+    assert restored == [previous, current]
 
 
 def test_v2_state_marker_does_not_restore_the_legacy_epoch():
