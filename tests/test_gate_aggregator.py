@@ -10,6 +10,7 @@ rejection (T6 not wired), synthetic-audit generation, pass-verdict requires
 primary_result == success, primary_result/runner domain validation, and
 strict as_bool parsing.
 """
+import builtins
 import importlib.util
 import json
 import sys
@@ -778,6 +779,7 @@ def _capture_requests(monkeypatch):
     recorded = []
 
     def fake_urlopen(request, timeout=None):
+        request.captured_timeout = timeout  # lets tests pin the timeout kwarg (P3-1)
         recorded.append(request)
         return _FakeCreatedResponse()
 
@@ -861,6 +863,38 @@ def test_pr_comment_send_failures_are_fail_open(monkeypatch, capsys, tmp_path, f
         assert any("fork" in line for line in warnings)
 
 
+@pytest.mark.parametrize("failure", ["missing_token", "http_403", "http_500", "url_error"])
+@pytest.mark.parametrize("gate_ok", [True, False])
+def test_pr_comment_warning_output_failure_is_still_fail_open(monkeypatch, tmp_path, failure, gate_ok):
+    """Axis 1 (P3-NEW-1): even when the ::warning:: output ITSELF fails
+    (probe: BrokenPipeError on stdout), nothing may escape `_finish` — the
+    exit code stays exactly what the gate outcome dictates, ok or not."""
+    if failure == "missing_token":
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        _raise_urlopen(monkeypatch, AssertionError("no network call without a token"))
+    else:
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        _raise_urlopen(
+            monkeypatch,
+            {"http_403": _http_error(403), "http_500": _http_error(500), "url_error": urllib.error.URLError("timed out")}[failure],
+        )
+    real_print = builtins.print
+
+    def flaky_print(*args, **kwargs):
+        # Only the warning annotations fail; the Step Summary / notices must
+        # still print so _finish reaches the comment attempt at all.
+        if args and isinstance(args[0], str) and args[0].startswith("::warning::"):
+            raise BrokenPipeError("probe: warning output failed")
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", flaky_print)
+    overrides = {} if gate_ok else {"quality_result": "failure"}
+    summary_path, args = _comment_scenario(tmp_path, overrides)
+    rc = AGG.main(args + ["--pr-comment", "true"])
+    assert rc == (0 if gate_ok else 1)
+
+
 @pytest.mark.parametrize("extra", [[], ["--pr-comment", "false"]], ids=["default_off", "explicit_false"])
 def test_pr_comment_disabled_makes_no_network_call(monkeypatch, tmp_path, extra):
     monkeypatch.setenv("GH_TOKEN", "tok")
@@ -877,13 +911,32 @@ def test_pr_comment_malformed_switch_value_fails_closed(tmp_path):
     assert "malformed boolean input" in summary_path.read_text()
 
 
-def test_pr_comment_prefers_github_token_over_gh_token(monkeypatch, tmp_path):
-    monkeypatch.setenv("GITHUB_TOKEN", "primary-tok")
-    monkeypatch.setenv("GH_TOKEN", "fallback-tok")
+@pytest.mark.parametrize(
+    "github_token,gh_token,expected_token",
+    [
+        ("primary-tok", "fallback-tok", "primary-tok"),
+        ("primary-tok", None, "primary-tok"),
+        ("", "fallback-tok", "fallback-tok"),
+        (None, "fallback-tok", "fallback-tok"),
+    ],
+    ids=["both_set", "github_only", "empty_github_falls_through", "gh_only"],
+)
+def test_pr_comment_token_resolution(monkeypatch, tmp_path, github_token, gh_token, expected_token):
+    """Axis 3 (P3-2): GITHUB_TOKEN wins when set to a non-empty value; an
+    EMPTY-string GITHUB_TOKEN must fall through to GH_TOKEN — the `or` in
+    the env lookup is part of the fail-open contract."""
+    if github_token is None:
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_TOKEN", github_token)
+    if gh_token is None:
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GH_TOKEN", gh_token)
     recorded = _capture_requests(monkeypatch)
     summary_path, args = _comment_scenario(tmp_path, {})
     assert AGG.main(args + ["--pr-comment", "true"]) == 0
-    assert recorded[0].get_header("Authorization") == "Bearer primary-tok"
+    assert recorded[0].get_header("Authorization") == f"Bearer {expected_token}"
 
 
 def test_post_issue_comment_posts_to_the_pr_issue_comments_api(monkeypatch):
@@ -894,4 +947,8 @@ def test_post_issue_comment_posts_to_the_pr_issue_comments_api(monkeypatch):
     assert request.full_url == "https://api.github.com/repos/zlxlabs/gate/issues/42/comments"
     assert request.get_method() == "POST"
     assert request.get_header("Authorization") == "Bearer tok"
+    # The 15s timeout is part of the fail-open contract (it bounds the hang
+    # risk of the synchronous POST) — pin it so a regression cannot silently
+    # drop it (P3-1).
+    assert request.captured_timeout == 15
     assert json.loads(request.data.decode("utf-8")) == {"body": "hello gate"}
