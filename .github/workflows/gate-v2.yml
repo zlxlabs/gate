@@ -79,9 +79,11 @@ on:
 # actions: read   — Jobs API (resolve this run's numeric job id for the
 #                    primary/OCR jobs' REVIEW_JOB_ID) + actions/download-artifact
 #                    in the gate job.
-# pull-requests: write — the quality job's PR-size preflight action and the OCR
-#                    advisory job may post PR comments; primary/gate never
-#                    comment (Step Summary only — see the gate job).
+# pull-requests: write — the quality job's PR-size preflight action, the OCR
+#                    advisory job, and the gate job's Stage 4 PR-comment
+#                    receipt (fail-open email-visible mirror of the Step
+#                    Summary — see the gate job) post PR comments; primary
+#                    never comments (Step Summary only).
 permissions:
   actions: read
   contents: read
