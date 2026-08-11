@@ -35,8 +35,10 @@
 #              needs.quality/needs.primary + the canonical primary audit
 #              artifact via the portable aggregator script in
 #              .github/actions/gate-aggregator/aggregate.py, and is the only
-#              job with receipt-writing authority (Step Summary only in this
-#              PR — PR-comment "double receipt" is Stage 4, not this file).
+#              job with receipt-writing authority (Step Summary +, since this
+#              Stage 4 piece, one fail-open PR comment per run reusing the
+#              same text — the reconciler / async-ledger parts of Stage 4
+#              remain future work, not this file).
 #   notify   — same fail-only Feishu notification semantics as legacy,
 #              triggered by `gate` (not by quality/primary individually).
 name: gate
@@ -658,6 +660,12 @@ jobs:
           AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
           AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
+          # Stage 4 PR-comment receipt (--pr-comment true below): one new,
+          # fail-open comment per run reusing the Step Summary text. Token via
+          # env only, never argv. On fork PRs GitHub downgrades this token to
+          # read-only and the POST 403s — the aggregator degrades that to a
+          # ::warning:: by design, never a gate failure.
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
@@ -675,7 +683,8 @@ jobs:
             --audit-artifact-name "$AUDIT_ARTIFACT_NAME" \
             --audit-dir "${{ runner.temp }}/primary-audit" \
             --summary-path "$GITHUB_STEP_SUMMARY" \
-            --terminal-path "$TERMINAL_PATH"
+            --terminal-path "$TERMINAL_PATH" \
+            --pr-comment true
 
       - name: Upload gate terminal envelope
         if: always()

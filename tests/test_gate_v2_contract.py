@@ -368,6 +368,22 @@ def test_gate_job_forwards_the_raw_runner_input_for_strict_validation():
     assert '--runner "$RUNNER_MODE"' in aggregate_step["run"]
 
 
+def test_gate_job_enables_the_stage4_pr_comment_receipt():
+    # Cross-publish-boundary pin, same technique as the REVIEW_EXPECTED pin
+    # above: the workflow must pass BOTH the switch and a token env, and the
+    # portable script's argparse must actually accept the flag — a workflow
+    # passing a flag the checked-out script rejects would abort the required
+    # gate job with an argparse error, and a script reading a token from argv
+    # would leak it into process lists/logs.
+    raw, _ = _load_workflow()
+    aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
+    assert aggregate_step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "--pr-comment true" in aggregate_step["run"]
+    script = AGGREGATOR_SCRIPT.read_text(encoding="utf-8")
+    assert '"--pr-comment"' in script
+    assert 'os.environ.get("GITHUB_TOKEN")' in script
+
+
 def test_gate_job_timeout_is_five_minutes():
     raw, _ = _load_workflow()
     assert raw["jobs"]["gate"]["timeout-minutes"] == 5
