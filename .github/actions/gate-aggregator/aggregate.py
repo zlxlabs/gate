@@ -6,8 +6,10 @@ gate-hub repo's ceo-plans/2026-07-24-shadow-review-independence.md, "Required
 Gate" + "Fork, waiver and notification semantics" sections). Per that plan's
 "Caller / reusable workflow boundary", this aggregator is a portable script
 that depends ONLY on python3 stdlib + data the calling workflow hands it — no
-gate-hub import, no hosted-image-specific tool, no network call of its own
-beyond what the workflow already downloaded as an artifact. It is invoked as a
+gate-hub import, no hosted-image-specific tool. The one network call it may
+make is the optional Stage 4 PR-comment receipt (one fail-open issue-comment
+POST via stdlib urllib, gated behind `--pr-comment`, off by default); it never
+feeds back into the verdict, the exit code, or any persisted state. It is invoked as a
 plain `python3 aggregate.py ...` step (see .github/workflows/gate-v2.yml's
 `gate` job) rather than wrapped in an `action.yml` composite action: GitHub
 Actions' `uses:` keyword cannot itself take an expression, so the ONLY way to
@@ -71,7 +73,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -527,10 +532,75 @@ def render_summary(outcome: Outcome) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Stage 4 PR-comment receipt: post ONE NEW issue comment per run whose body is
+# the exact render_summary() product that just went to the Step Summary —
+# never a second, hand-maintained copy of the text (two copies would drift).
+# Deliberate design choices (locked in the task card):
+#   - fail-open: a notification outage must never turn a green gate red, so
+#     every failure mode (missing token, fork-PR 403, 5xx, network error)
+#     degrades to a ::warning:: annotation and nothing else — no ::error::,
+#     no changed exit code, no exception escaping.
+#   - no sticky/marker/PATCH de-dup: GitHub only emails on comment CREATION,
+#     and the high-iteration stage wants one mail per gate run; not looking
+#     up existing comments also removes the check-then-act race.
+#   - token comes from the environment only (GITHUB_TOKEN/GH_TOKEN), never
+#     argv (argv shows up in process lists and logs).
+def _post_issue_comment(*, repository: str, pr_number: int, body: str, token: str) -> None:
+    """POST one new comment on the PR via the issues-comments API (stdlib
+    urllib only — this script must stay portable, no gh-CLI dependency).
+    Raises on any transport or API failure; the fail-open boundary is
+    `_post_pr_comment_fail_open`, not this function.
+    """
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments",
+        data=json.dumps({"body": body}, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "gate-aggregator",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15):
+        pass  # urlopen raises HTTPError for any non-2xx; a 201 body needs no parsing
+
+
+def _post_pr_comment_fail_open(*, body: str, repository: Optional[str], pr_number: Optional[int]) -> None:
+    """Best-effort Stage 4 PR-comment receipt. NEVER raises and NEVER prints
+    ::error::: the Step Summary plus the exit code stay the authoritative
+    receipt; this is only the email-visible mirror of it. The try wraps the
+    WHOLE comment attempt (token lookup, target check, POST) so no failure in
+    any part of it can leak out and redden the gate.
+    """
+    try:
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if not token:
+            print("::warning::--pr-comment is enabled but neither GITHUB_TOKEN nor GH_TOKEN is set — skipping the PR comment (Step Summary remains the authoritative receipt)")
+            return
+        if not repository or pr_number is None:
+            print("::warning::--pr-comment is enabled but repository/pr-number is unavailable — skipping the PR comment (Step Summary remains the authoritative receipt)")
+            return
+        _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            print(
+                "::warning::could not post the gate PR comment (HTTP 403) — expected on fork PRs, where GitHub "
+                "downgrades `pull-requests: write` to read-only; this is not a gate malfunction. "
+                "Step Summary remains the authoritative receipt."
+            )
+        else:
+            print(f"::warning::could not post the gate PR comment (HTTP {exc.code}) — Step Summary remains the authoritative receipt")
+    except Exception as exc:
+        print(f"::warning::could not post the gate PR comment ({type(exc).__name__}: {exc}) — Step Summary remains the authoritative receipt")
+
+
 def _finish(
     outcome: Outcome, summary_path: Optional[str], *, terminal_path: Optional[str] = None, repository: Optional[str] = None,
     identity: Optional[Identity] = None, quality_result: Optional[str] = None, primary_result: Optional[str] = None,
     review_expected: Optional[bool] = None, is_draft: Optional[bool] = None, runner: Optional[str] = None,
+    pr_comment: bool = False, pr_number: Optional[int] = None,
 ) -> int:
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
@@ -561,6 +631,14 @@ def _finish(
         temporary_path = terminal_path.with_name(f".{terminal_path.name}.tmp")
         temporary_path.write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary_path.replace(terminal_path)
+    # Stage 4 PR-comment receipt comes LAST in the side-effect order — after
+    # the Step Summary append and the terminal-envelope replace — so a killed
+    # process can never leave a "comment says pass but terminal/summary was
+    # never persisted" inconsistency; the reverse (terminal persisted, comment
+    # never posted) is the safe direction. Fail-open by construction: it
+    # cannot change the exit code on the next line.
+    if pr_comment:
+        _post_pr_comment_fail_open(body=summary, repository=repository, pr_number=pr_number)
     return 0 if outcome.ok else 1
 
 
@@ -591,7 +669,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--audit-artifact-name", default=None)
     parser.add_argument("--terminal-path", default=None, help="gate-terminal.json output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
+    parser.add_argument(
+        "--pr-comment",
+        default="false",
+        help="'true'/'false' (strictly parsed, default false) — Stage 4: also post the aggregate verdict "
+        "as ONE new PR comment, reusing the Step Summary text verbatim. Fail-open; the token is read "
+        "from the GITHUB_TOKEN/GH_TOKEN environment, never from argv.",
+    )
     args = parser.parse_args(argv)
+
+    try:
+        pr_comment = as_bool(args.pr_comment)
+    except BoolParseError as exc:
+        return _finish(
+            Outcome(ok=False, problems=[f"malformed boolean input — fail-closed: {exc}"]),
+            args.summary_path,
+        )
 
     audit_source_attempt: Optional[int] = None
     if args.audit_source_attempt:
@@ -609,12 +702,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ],
                 ),
                 args.summary_path,
+                pr_comment=pr_comment,
+                repository=args.repository,
+                pr_number=args.pr_number,
             )
 
     if not args.repository or not args.head_sha:
         return _finish(
             Outcome(ok=False, problems=["malformed repository/head_sha identity input — fail-closed"]),
             args.summary_path,
+            pr_comment=pr_comment,
+            repository=args.repository,
+            pr_number=args.pr_number,
         )
 
     identity = Identity(
@@ -632,6 +731,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _finish(
             Outcome(ok=False, problems=[f"malformed boolean input — fail-closed: {exc}"]),
             args.summary_path,
+            pr_comment=pr_comment,
+            repository=args.repository,
+            pr_number=args.pr_number,
         )
 
     audit, audit_error = find_audit_file(args.audit_dir)
@@ -660,6 +762,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         review_expected=review_expected,
         is_draft=is_draft,
         runner=args.runner,
+        pr_comment=pr_comment,
+        pr_number=identity.pr,
     )
 
 
