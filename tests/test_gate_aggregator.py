@@ -747,6 +747,76 @@ def test_synthetic_verdict_null_is_explained_before_the_json(kwargs):
     assert text.index(explanation) < text.index('  "verdict": null')
 
 
+# ── human-first action line: every gate_result answers "what do I do now" ────
+#
+# Axis tables (task card, P2-1/P2-2/P3-1/P3-2):
+#   axis 1 — every gate_result (pass/fail/skipped-draft/skipped-hosted/
+#     unavailable) carries an ACTION SENTENCE telling the recipient what to do
+#     now; fail and unavailable also carry the direct run URL built from the
+#     identity quintuple (repository + run_id), never a new CLI/env input.
+#   axis 2 — ordering: `**Result:` stays the first verdict line, the action
+#     sentence comes BEFORE the `Terminal state:` machine codes
+#     (classification= may never appear ahead of the human sentence), and a
+#     primary-fail summary must not point at the Problems list for findings
+#     it does not contain.
+
+_RUN_URL = "https://github.com/zlxlabs/gate/actions/runs/999"
+
+
+@pytest.mark.parametrize(
+    "overrides,audit_record,gate_result,action_phrases,needs_run_url",
+    [
+        ({}, "__default__", "pass", ["No action needed"], False),
+        (
+            {"primary_result": "failure"}, _valid_primary_record(verdict="fail"),
+            "fail", ["Action needed", "the primary reviewer rejected this change"], True,
+        ),
+        (
+            {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
+            "skipped", ["No action needed", "draft", "ready for review"], False,
+        ),
+        (
+            {"primary_result": "skipped", "runner": "hosted", "review_expected": "false"}, None,
+            "skipped", ["No action needed", "runner=self", "runner=hosted"], False,
+        ),
+        (
+            {"primary_result": "cancelled"}, None,
+            "unavailable", ["Action needed", "could not be determined"], True,
+        ),
+    ],
+    ids=["pass", "fail", "skipped_draft", "skipped_hosted", "unavailable"],
+)
+def test_action_line_precedes_machine_codes_for_every_gate_result(tmp_path, overrides, audit_record, gate_result, action_phrases, needs_run_url):
+    _, summary_path, args = _visible_scenario(tmp_path, overrides, audit_record)
+    AGG.main(args)
+    text = summary_path.read_text()
+
+    # Axis 2: Result stays the first verdict line and the machine codes stay
+    # behind it…
+    assert text.index(f"**Result: {gate_result}**") < text.index("Terminal state: classification=")
+    # …and EVERY action-sentence phrase lands before the machine codes (axis
+    # 1: the human sentence first, classification= never ahead of it).
+    terminal_pos = text.index("Terminal state: classification=")
+    for phrase in action_phrases:
+        assert phrase in text
+        assert text.index(phrase) < terminal_pos
+    if needs_run_url:
+        # Fail/unavailable must hand the recipient a direct run entry point
+        # (axis 1) — built from repository + run_id, before the machine codes.
+        assert _RUN_URL in text
+        assert text.index(_RUN_URL) < terminal_pos
+
+
+def test_primary_fail_summary_no_longer_points_at_problems_for_findings(tmp_path):
+    # P2-1: the Problems list only mirrors the verdict string; the summary
+    # must not claim the findings live there.
+    _, summary_path, args = _visible_scenario(tmp_path, {"primary_result": "failure"}, _valid_primary_record(verdict="fail"))
+    AGG.main(args)
+    text = summary_path.read_text()
+    assert "see the findings listed under Problems" not in text
+    assert _RUN_URL in text
+
+
 # ── Stage 4 PR-comment receipt: switch x outcome x failure injection ────────
 #
 # Axis tables (task card):
@@ -832,7 +902,7 @@ def test_pr_comment_body_matches_step_summary_for_every_outcome(monkeypatch, cap
     assert "::warning::" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("failure", ["missing_token", "http_403", "http_500", "url_error"])
+@pytest.mark.parametrize("failure", ["missing_token", "http_403", "http_429", "http_500", "url_error"])
 @pytest.mark.parametrize("gate_ok", [True, False])
 def test_pr_comment_send_failures_are_fail_open(monkeypatch, capsys, tmp_path, failure, gate_ok):
     if failure == "missing_token":
@@ -843,7 +913,7 @@ def test_pr_comment_send_failures_are_fail_open(monkeypatch, capsys, tmp_path, f
         monkeypatch.setenv("GH_TOKEN", "tok")
         _raise_urlopen(
             monkeypatch,
-            {"http_403": _http_error(403), "http_500": _http_error(500), "url_error": urllib.error.URLError("timed out")}[failure],
+            {"http_403": _http_error(403), "http_429": _http_error(429), "http_500": _http_error(500), "url_error": urllib.error.URLError("timed out")}[failure],
         )
     overrides = {} if gate_ok else {"quality_result": "failure"}
     summary_path, args = _comment_scenario(tmp_path, overrides)
@@ -863,7 +933,27 @@ def test_pr_comment_send_failures_are_fail_open(monkeypatch, capsys, tmp_path, f
         assert any("fork" in line for line in warnings)
 
 
-@pytest.mark.parametrize("failure", ["missing_token", "http_403", "http_500", "url_error"])
+def test_http_403_warning_names_rate_limit_or_permission_not_just_fork(monkeypatch, capsys, tmp_path):
+    # Axis 3 (P3-3): this scenario is a SAME-REPO run (runner=self, non-draft),
+    # where a 403 means rate-limit (GitHub secondary limits answer 403 or 429)
+    # or a permission failure — attributing every 403 to the fork downgrade
+    # would mask both. The warning must carry the status code and the
+    # rate-limit/permission alternative, and must not ASSERT the fork cause.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _raise_urlopen(monkeypatch, _http_error(403))
+    summary_path, args = _comment_scenario(tmp_path, {})
+    rc = AGG.main(args + ["--pr-comment", "true"])
+    assert rc == 0  # fail-open: exit code unchanged
+    warnings = [line for line in capsys.readouterr().out.splitlines() if line.startswith("::warning::")]
+    assert any("HTTP 403" in line and "rate-limit" in line and "permission" in line for line in warnings)
+    # Fork may still be named as ONE possibility (the fork assertion above
+    # stays green), but the warning must not present fork as the settled
+    # cause of every 403.
+    assert not any("expected on fork PRs, where GitHub" in line for line in warnings)
+
+
+@pytest.mark.parametrize("failure", ["missing_token", "http_403", "http_429", "http_500", "url_error"])
 @pytest.mark.parametrize("gate_ok", [True, False])
 def test_pr_comment_warning_output_failure_is_still_fail_open(monkeypatch, tmp_path, failure, gate_ok):
     """Axis 1 (P3-NEW-1): even when the ::warning:: output ITSELF fails
@@ -877,7 +967,7 @@ def test_pr_comment_warning_output_failure_is_still_fail_open(monkeypatch, tmp_p
         monkeypatch.setenv("GH_TOKEN", "tok")
         _raise_urlopen(
             monkeypatch,
-            {"http_403": _http_error(403), "http_500": _http_error(500), "url_error": urllib.error.URLError("timed out")}[failure],
+            {"http_403": _http_error(403), "http_429": _http_error(429), "http_500": _http_error(500), "url_error": urllib.error.URLError("timed out")}[failure],
         )
     real_print = builtins.print
 
