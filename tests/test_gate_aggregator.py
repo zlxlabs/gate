@@ -549,3 +549,196 @@ def test_terminal_publish_barrier_failures(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="simulated partial terminal write"):
         AGG.main(_cli_args(audit_dir, tmp_path / "summary.txt", terminal_path=str(terminal_path)))
     assert not terminal_path.exists()
+
+
+# ── visible terminal state (issues #32/#43): classification x output slot ──
+#
+# Axis table: every classification must render its four-state gate_result on
+# the Step Summary top line, expose classification/reason_code/gate_result in
+# the Summary body, and emit a same-typed annotation carrying reason_code —
+# while the exit code stays exactly what the pass/fail semantics dictated
+# before this rendering existed (expected_skip stays 0/green).
+
+_TERMINAL_GOLDEN = """{
+  "schema_version": 1,
+  "kind": "gate_terminal",
+  "repository": "zlxlabs/gate",
+  "repository_id": 123,
+  "pr_number": 42,
+  "run_id": 999,
+  "run_attempt": 1,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "quality_result": "success",
+  "primary_result": "success",
+  "review_expected": true,
+  "is_draft": false,
+  "runner": "self",
+  "gate_result": "pass",
+  "classification": "code_pass",
+  "reason_code": "primary_pass",
+  "audit": {
+    "available": true,
+    "source_attempt": 1,
+    "artifact_name": "primary-audit-v2-1"
+  }
+}
+"""
+
+
+def test_terminal_envelope_bytes_unchanged_by_rendering_work():
+    # gate-terminal.json is a cross-job publish boundary whose schema this
+    # card must NOT touch: lock the envelope bytes for a fixed outcome.
+    outcome = AGG.Outcome(
+        ok=True, classification="code_pass", reason_code="primary_pass", gate_result="pass",
+        audit_available=True, audit_source_attempt=1, audit_artifact_name="primary-audit-v2-1",
+    )
+    envelope = AGG.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=IDENTITY, quality_result="success",
+        primary_result="success", review_expected=True, is_draft=False, runner="self", outcome=outcome,
+    )
+    assert json.dumps(envelope, ensure_ascii=False, indent=2) + "\n" == _TERMINAL_GOLDEN
+
+
+def _visible_scenario(tmp_path, overrides, audit_record="__default__"):
+    audit_dir = tmp_path / "audit"
+    if audit_record is not None:
+        audit_dir.mkdir()
+        record = _valid_primary_record() if audit_record == "__default__" else audit_record
+        (audit_dir / "primary-review-audit.json").write_text(json.dumps(record))
+    summary_path = tmp_path / "summary.md"
+    return audit_dir, summary_path, _cli_args(audit_dir, summary_path, **overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides,audit_record,classification,reason_code,gate_result,exit_code,annotation",
+    [
+        ({}, "__default__", "code_pass", "primary_pass", "pass", 0, "::notice::"),
+        (
+            {"primary_result": "failure"}, _valid_primary_record(verdict="fail"),
+            "code_fail", "primary_findings", "fail", 1, "::error::",
+        ),
+        (
+            {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
+            "expected_skip", "review_not_expected", "skipped", 0, "::notice::",
+        ),
+        (
+            {"primary_result": "failure"}, _valid_primary_record(verdict="unavailable"),
+            "review_unavailable", "primary_unavailable", "unavailable", 1, "::error::",
+        ),
+        (
+            {"quality_result": "failure"}, "__default__",
+            "ci_failure", "quality_failure", "fail", 1, "::error::",
+        ),
+        ({}, None, "integration_error", "audit_missing", "unavailable", 1, "::error::"),
+    ],
+)
+def test_visible_terminal_state_axis(
+    capsys, tmp_path, overrides, audit_record, classification, reason_code, gate_result, exit_code, annotation,
+):
+    _, summary_path, args = _visible_scenario(tmp_path, overrides, audit_record)
+    rc = AGG.main(args)
+    out = capsys.readouterr().out
+    text = summary_path.read_text()
+
+    # Exit code is exactly the pre-existing pass/fail semantic (skipped -> 0).
+    assert rc == exit_code
+
+    # Output slot 1 — Summary top line shows the four-state gate_result, and
+    # never one of the other three states (skipped must not read as pass,
+    # unavailable must not read as fail).
+    assert f"**Result: {gate_result}**" in text
+    for other in AGG.GATE_RESULT_DOMAIN:
+        if other != gate_result:
+            assert f"**Result: {other}**" not in text
+
+    # Output slot 2 — Summary body exposes all three terminal fields.
+    assert (
+        f"classification=`{classification}`, reason_code=`{reason_code}`, gate_result=`{gate_result}`"
+    ) in text
+
+    # Output slot 3 — annotation of the expected type carrying reason_code,
+    # visible on the checks list page without expanding the run.
+    assert f"{annotation}gate terminal state:" in out
+    assert f"reason_code={reason_code}" in out
+    opposite = "::error::" if annotation == "::notice::" else "::notice::"
+    assert f"{opposite}gate terminal state:" not in out
+
+
+def test_visible_expected_skip_summary_names_draft_as_the_skip_reason(capsys, tmp_path):
+    _, summary_path, args = _visible_scenario(
+        tmp_path, {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
+    )
+    assert AGG.main(args) == 0
+    text = summary_path.read_text()
+    assert "**Result: skipped**" in text
+    assert "draft=True" in text
+
+
+# ── wording axis (issue #43): unreadable-conclusion ≠ reviewer rejection ────
+
+
+@pytest.mark.parametrize(
+    "kwargs,must_say,must_not_say",
+    [
+        (
+            {"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")},
+            ["REJECTED", "Problems"],
+            ["could NOT be read"],
+        ),
+        (
+            {"audit": None, "audit_error": "missing"},
+            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
+            ["REJECTED"],
+        ),
+        (
+            {"audit": _valid_primary_record(kind="synthetic_primary")},
+            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
+            ["REJECTED"],
+        ),
+        (
+            {"audit_source_attempt": 2},
+            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
+            ["REJECTED"],
+        ),
+        (
+            {"primary_result": "failure", "audit": _valid_primary_record(verdict="pass")},
+            ["contradicts", "Check the primary job logs"],
+            ["could NOT be read", "REJECTED"],
+        ),
+        (
+            {"primary_result": "skipped", "audit": None},
+            ["should have run but was skipped", "NOT the normal draft/fork"],
+            ["could NOT be read"],
+        ),
+    ],
+    ids=["primary_findings", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip"],
+)
+def test_reason_code_wording_cannot_be_misread(kwargs, must_say, must_not_say):
+    outcome = AGG.evaluate(**_base_kwargs(**kwargs))
+    text = AGG.render_summary(outcome)
+    for phrase in must_say:
+        assert phrase in text
+    for phrase in must_not_say:
+        assert phrase not in text
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"audit": None, "audit_error": "missing"},
+        {"audit": _valid_primary_record(kind="synthetic_primary")},
+        {"audit_source_attempt": 2},
+        {"primary_result": "cancelled", "audit": None},
+    ],
+    ids=["audit_missing", "audit_invalid", "audit_source_mismatch", "primary_cancelled"],
+)
+def test_synthetic_verdict_null_is_explained_before_the_json(kwargs):
+    # A human sentence explaining `"verdict": null` must precede the synthetic
+    # audit JSON, and it must say "not a reviewer rejection" (issue #43).
+    outcome = AGG.evaluate(**_base_kwargs(**kwargs))
+    assert outcome.synthetic_audit is not None
+    text = AGG.render_summary(outcome)
+    explanation = '"verdict": null` below means the primary conclusion could not be read'
+    assert explanation in text
+    assert "NOT a reviewer rejection" in text
+    assert text.index(explanation) < text.index('  "verdict": null')
