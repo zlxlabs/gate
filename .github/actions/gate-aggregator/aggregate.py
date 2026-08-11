@@ -460,7 +460,8 @@ def find_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str]]:
 # unexpected_primary_skip must never read as the normal draft/fork skip.
 REASON_CODE_EXPLANATIONS = {
     "primary_findings": (
-        "The primary reviewer REJECTED this change — see the findings listed under Problems."
+        "The primary reviewer REJECTED this change — the specific findings are in the primary "
+        "review result for this run (linked above); the Problems list below only mirrors the verdict."
     ),
     "audit_missing": (
         "The primary reviewer's conclusion could NOT be read for this run (no audit artifact was "
@@ -485,7 +486,60 @@ REASON_CODE_EXPLANATIONS = {
 }
 
 
-def render_summary(outcome: Outcome) -> str:
+def _action_sentence(
+    outcome: Outcome, *, repository: Optional[str], identity: Optional[Identity],
+    is_draft: Optional[bool], runner: Optional[str],
+) -> Optional[str]:
+    """The one-line "what do I do now" sentence rendered immediately after
+    `**Result: …**` and BEFORE the machine codes — the aggregate mail/comment
+    goes to people who were not watching the run, so the human action comes
+    first and `classification=`/`reason_code=` follow it (never the other way
+    round). Every gate_result gets one, including pass ("no action needed").
+    The run URL is built from data the aggregator already has (repository +
+    identity.run_id) — deliberately no new CLI flag or env var (locked
+    decision: GHES server-URL configurability is out of scope)."""
+    run_url = None
+    if repository and identity is not None:
+        run_url = f"https://github.com/{repository}/actions/runs/{identity.run_id}"
+    gate_result = outcome.gate_result
+    if gate_result == "pass":
+        return "No action needed — quality passed and the primary reviewer approved this change; the gate is green."
+    if gate_result == "skipped":
+        if is_draft:
+            return (
+                "No action needed — the primary review is intentionally skipped while the PR is a draft; "
+                "the full primary review will run once you mark the PR ready for review."
+            )
+        if runner == "hosted":
+            return (
+                "No action needed — the primary review only runs on runner=self and this run used "
+                "runner=hosted, so the skip is expected; if you need the primary review on this PR, "
+                "switch runner to self."
+            )
+        return "No action needed — the primary review was not expected for this PR, so the skip is accepted."
+    if gate_result == "fail":
+        if outcome.reason_code == "primary_findings":
+            sentence = "Action needed — the primary reviewer rejected this change: read its findings, address them, and push again."
+        else:
+            sentence = "Action needed — the gate is red: fix the problem(s) listed under Problems below, then re-run."
+        if run_url:
+            sentence += f" Full details: {run_url}"
+        return sentence
+    if gate_result == "unavailable":
+        sentence = (
+            "Action needed — the primary review outcome could not be determined (this is neither an "
+            "approval nor a rejection): investigate the run before merging."
+        )
+        if run_url:
+            sentence += f" Run: {run_url}"
+        return sentence
+    return None
+
+
+def render_summary(
+    outcome: Outcome, *, repository: Optional[str] = None, identity: Optional[Identity] = None,
+    is_draft: Optional[bool] = None, runner: Optional[str] = None,
+) -> str:
     lines = ["### Required Gate v2 — aggregate verdict", ""]
     # Top line shows the four-state gate_result (pass/fail/skipped/unavailable)
     # instead of collapsing to ok -> pass|fail, so an accepted skip (draft/fork)
@@ -496,6 +550,11 @@ def render_summary(outcome: Outcome) -> str:
     gate_result = outcome.gate_result or ("pass" if outcome.ok else "fail")
     lines.append(f"**Result: {gate_result}**")
     if outcome.classification is not None:
+        # Human-first: the action sentence answers "what do I do now" BEFORE
+        # the machine codes (never after), for every terminal gate_result.
+        action = _action_sentence(outcome, repository=repository, identity=identity, is_draft=is_draft, runner=runner)
+        if action:
+            lines.append(action)
         lines.append(
             f"Terminal state: classification=`{outcome.classification}`, "
             f"reason_code=`{outcome.reason_code}`, gate_result=`{outcome.gate_result}`"
@@ -600,10 +659,15 @@ def _post_pr_comment_fail_open(*, body: str, repository: Optional[str], pr_numbe
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
+            # A 403 is NOT always the fork downgrade: on a same-repo PR the
+            # same status means a secondary rate-limit (GitHub answers 403 or
+            # 429) or a permission failure. The rendering layer cannot tell
+            # fork from same-repo here, so name both instead of misattributing
+            # every 403 to fork (P3-3).
             _warn(
-                "::warning::could not post the gate PR comment (HTTP 403) — expected on fork PRs, where GitHub "
-                "downgrades `pull-requests: write` to read-only; this is not a gate malfunction. "
-                "Step Summary remains the authoritative receipt."
+                "::warning::could not post the gate PR comment (HTTP 403) — this may be the expected "
+                "read-only token downgrade on fork PRs, or a rate-limit or permission problem on a "
+                "same-repo PR. Step Summary remains the authoritative receipt."
             )
         else:
             _warn(f"::warning::could not post the gate PR comment (HTTP {exc.code}) — Step Summary remains the authoritative receipt")
@@ -620,7 +684,7 @@ def _finish(
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
     ::notice::/::error:: annotations, and map ok -> exit code."""
-    summary = render_summary(outcome)
+    summary = render_summary(outcome, repository=repository, identity=identity, is_draft=is_draft, runner=runner)
     print(summary)
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as handle:
