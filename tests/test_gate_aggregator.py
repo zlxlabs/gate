@@ -10,9 +10,12 @@ rejection (T6 not wired), synthetic-audit generation, pass-verdict requires
 primary_result == success, primary_result/runner domain validation, and
 strict as_bool parsing.
 """
+import builtins
 import importlib.util
 import json
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -742,3 +745,300 @@ def test_synthetic_verdict_null_is_explained_before_the_json(kwargs):
     assert explanation in text
     assert "NOT a reviewer rejection" in text
     assert text.index(explanation) < text.index('  "verdict": null')
+
+
+# ── human-first action line: every gate_result answers "what do I do now" ────
+#
+# Axis tables (task card, P2-1/P2-2/P3-1/P3-2):
+#   axis 1 — every gate_result (pass/fail/skipped-draft/skipped-hosted/
+#     unavailable) carries an ACTION SENTENCE telling the recipient what to do
+#     now; fail and unavailable also carry the direct run URL built from the
+#     identity quintuple (repository + run_id), never a new CLI/env input.
+#   axis 2 — ordering: `**Result:` stays the first verdict line, the action
+#     sentence comes BEFORE the `Terminal state:` machine codes
+#     (classification= may never appear ahead of the human sentence), and a
+#     primary-fail summary must not point at the Problems list for findings
+#     it does not contain.
+
+_RUN_URL = "https://github.com/zlxlabs/gate/actions/runs/999"
+
+
+@pytest.mark.parametrize(
+    "overrides,audit_record,gate_result,action_phrases,needs_run_url",
+    [
+        ({}, "__default__", "pass", ["No action needed"], False),
+        (
+            {"primary_result": "failure"}, _valid_primary_record(verdict="fail"),
+            "fail", ["Action needed", "the primary reviewer rejected this change"], True,
+        ),
+        (
+            {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
+            "skipped", ["No action needed", "draft", "ready for review"], False,
+        ),
+        (
+            {"primary_result": "skipped", "runner": "hosted", "review_expected": "false"}, None,
+            "skipped", ["No action needed", "runner=self", "runner=hosted"], False,
+        ),
+        (
+            {"primary_result": "cancelled"}, None,
+            "unavailable", ["Action needed", "could not be determined"], True,
+        ),
+    ],
+    ids=["pass", "fail", "skipped_draft", "skipped_hosted", "unavailable"],
+)
+def test_action_line_precedes_machine_codes_for_every_gate_result(tmp_path, overrides, audit_record, gate_result, action_phrases, needs_run_url):
+    _, summary_path, args = _visible_scenario(tmp_path, overrides, audit_record)
+    AGG.main(args)
+    text = summary_path.read_text()
+
+    # Axis 2: Result stays the first verdict line and the machine codes stay
+    # behind it…
+    assert text.index(f"**Result: {gate_result}**") < text.index("Terminal state: classification=")
+    # …and EVERY action-sentence phrase lands before the machine codes (axis
+    # 1: the human sentence first, classification= never ahead of it).
+    terminal_pos = text.index("Terminal state: classification=")
+    for phrase in action_phrases:
+        assert phrase in text
+        assert text.index(phrase) < terminal_pos
+    if needs_run_url:
+        # Fail/unavailable must hand the recipient a direct run entry point
+        # (axis 1) — built from repository + run_id, before the machine codes.
+        assert _RUN_URL in text
+        assert text.index(_RUN_URL) < terminal_pos
+
+
+def test_primary_fail_summary_no_longer_points_at_problems_for_findings(tmp_path):
+    # P2-1: the Problems list only mirrors the verdict string; the summary
+    # must not claim the findings live there.
+    _, summary_path, args = _visible_scenario(tmp_path, {"primary_result": "failure"}, _valid_primary_record(verdict="fail"))
+    AGG.main(args)
+    text = summary_path.read_text()
+    assert "see the findings listed under Problems" not in text
+    assert _RUN_URL in text
+
+
+# ── Stage 4 PR-comment receipt: switch x outcome x failure injection ────────
+#
+# Axis tables (task card):
+#   axis 1 — every gate_result (pass/fail/skipped/unavailable) AND the
+#     malformed-input legacy path posts ONE new issue comment whose body is
+#     byte-for-byte the same render_summary() product that went to the Step
+#     Summary (no second, drifting copy of the text).
+#   axis 2 — every send failure (missing token, 403 fork-PR token downgrade,
+#     5xx, network error) is fail-open: ::warning:: only, never ::error::,
+#     exit code identical to not sending at all.
+#   axis 3 — the switch defaults OFF and then not a single network call may
+#     happen (zero behavior change for every existing caller).
+# The network seam is urllib.request.urlopen, monkeypatched everywhere — no
+# test may emit a real HTTP request.
+
+
+class _FakeCreatedResponse:
+    """Stands in for the 201-Created response urlopen returns; the sender
+    only needs it to be a context manager (urlopen itself raises HTTPError
+    for any non-2xx)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _capture_requests(monkeypatch):
+    recorded = []
+
+    def fake_urlopen(request, timeout=None):
+        request.captured_timeout = timeout  # lets tests pin the timeout kwarg (P3-1)
+        recorded.append(request)
+        return _FakeCreatedResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return recorded
+
+
+def _raise_urlopen(monkeypatch, exc):
+    def fake_urlopen(request, timeout=None):
+        raise exc
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+
+def _http_error(code):
+    return urllib.error.HTTPError("https://api.github.com/x", code, "boom", hdrs=None, fp=None)
+
+
+def _comment_scenario(tmp_path, overrides):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
+    summary_path = tmp_path / "summary.md"
+    return summary_path, _cli_args(audit_dir, summary_path, **overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_rc",
+    [
+        ({}, 0),
+        ({"quality_result": "failure"}, 1),
+        ({"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, 0),
+        ({"primary_result": "cancelled"}, 1),
+        ({"is_draft": "banana"}, 1),
+    ],
+    ids=["pass", "fail", "skipped_draft", "unavailable_cancelled", "malformed_input"],
+)
+def test_pr_comment_body_matches_step_summary_for_every_outcome(monkeypatch, capsys, tmp_path, overrides, expected_rc):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    recorded = _capture_requests(monkeypatch)
+    summary_path, args = _comment_scenario(tmp_path, overrides)
+    rc = AGG.main(args + ["--pr-comment", "true"])
+    assert rc == expected_rc
+    assert len(recorded) == 1
+    # The summary file was created fresh with exactly one append, so its
+    # content IS the render_summary() product — the comment body must equal
+    # it byte-for-byte (axis 1: same text, never a second copy).
+    assert json.loads(recorded[0].data.decode("utf-8")) == {"body": summary_path.read_text()}
+    assert "::warning::" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure", ["missing_token", "http_403", "http_429", "http_500", "url_error"])
+@pytest.mark.parametrize("gate_ok", [True, False])
+def test_pr_comment_send_failures_are_fail_open(monkeypatch, capsys, tmp_path, failure, gate_ok):
+    if failure == "missing_token":
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        _raise_urlopen(monkeypatch, AssertionError("no network call without a token"))
+    else:
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        _raise_urlopen(
+            monkeypatch,
+            {"http_403": _http_error(403), "http_429": _http_error(429), "http_500": _http_error(500), "url_error": urllib.error.URLError("timed out")}[failure],
+        )
+    overrides = {} if gate_ok else {"quality_result": "failure"}
+    summary_path, args = _comment_scenario(tmp_path, overrides)
+    rc = AGG.main(args + ["--pr-comment", "true"])
+    out = capsys.readouterr().out
+    # Axis 2/4 hard contract: exit code identical to not sending at all.
+    assert rc == (0 if gate_ok else 1)
+    assert "::warning::" in out
+    if gate_ok:
+        # On a passing gate the ONLY annotations are ::notice:: — the comment
+        # path must never add an ::error:: of its own.
+        assert "::error::" not in out
+    if failure == "http_403":
+        # Fork-PR token downgrade is EXPECTED, not a malfunction — the
+        # warning must say so (locked decision 3).
+        warnings = [line for line in out.splitlines() if line.startswith("::warning::")]
+        assert any("fork" in line for line in warnings)
+
+
+def test_http_403_warning_names_rate_limit_or_permission_not_just_fork(monkeypatch, capsys, tmp_path):
+    # Axis 3 (P3-3): this scenario is a SAME-REPO run (runner=self, non-draft),
+    # where a 403 means rate-limit (GitHub secondary limits answer 403 or 429)
+    # or a permission failure — attributing every 403 to the fork downgrade
+    # would mask both. The warning must carry the status code and the
+    # rate-limit/permission alternative, and must not ASSERT the fork cause.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _raise_urlopen(monkeypatch, _http_error(403))
+    summary_path, args = _comment_scenario(tmp_path, {})
+    rc = AGG.main(args + ["--pr-comment", "true"])
+    assert rc == 0  # fail-open: exit code unchanged
+    warnings = [line for line in capsys.readouterr().out.splitlines() if line.startswith("::warning::")]
+    assert any("HTTP 403" in line and "rate-limit" in line and "permission" in line for line in warnings)
+    # Fork may still be named as ONE possibility (the fork assertion above
+    # stays green), but the warning must not present fork as the settled
+    # cause of every 403.
+    assert not any("expected on fork PRs, where GitHub" in line for line in warnings)
+
+
+@pytest.mark.parametrize("failure", ["missing_token", "http_403", "http_429", "http_500", "url_error"])
+@pytest.mark.parametrize("gate_ok", [True, False])
+def test_pr_comment_warning_output_failure_is_still_fail_open(monkeypatch, tmp_path, failure, gate_ok):
+    """Axis 1 (P3-NEW-1): even when the ::warning:: output ITSELF fails
+    (probe: BrokenPipeError on stdout), nothing may escape `_finish` — the
+    exit code stays exactly what the gate outcome dictates, ok or not."""
+    if failure == "missing_token":
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        _raise_urlopen(monkeypatch, AssertionError("no network call without a token"))
+    else:
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        _raise_urlopen(
+            monkeypatch,
+            {"http_403": _http_error(403), "http_429": _http_error(429), "http_500": _http_error(500), "url_error": urllib.error.URLError("timed out")}[failure],
+        )
+    real_print = builtins.print
+
+    def flaky_print(*args, **kwargs):
+        # Only the warning annotations fail; the Step Summary / notices must
+        # still print so _finish reaches the comment attempt at all.
+        if args and isinstance(args[0], str) and args[0].startswith("::warning::"):
+            raise BrokenPipeError("probe: warning output failed")
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", flaky_print)
+    overrides = {} if gate_ok else {"quality_result": "failure"}
+    summary_path, args = _comment_scenario(tmp_path, overrides)
+    rc = AGG.main(args + ["--pr-comment", "true"])
+    assert rc == (0 if gate_ok else 1)
+
+
+@pytest.mark.parametrize("extra", [[], ["--pr-comment", "false"]], ids=["default_off", "explicit_false"])
+def test_pr_comment_disabled_makes_no_network_call(monkeypatch, tmp_path, extra):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _raise_urlopen(monkeypatch, AssertionError("no network call allowed while --pr-comment is off"))
+    summary_path, args = _comment_scenario(tmp_path, {})
+    assert AGG.main(args + extra) == 0
+    assert "pass" in summary_path.read_text()
+
+
+def test_pr_comment_malformed_switch_value_fails_closed(tmp_path):
+    summary_path, args = _comment_scenario(tmp_path, {})
+    rc = AGG.main(args + ["--pr-comment", "banana"])
+    assert rc == 1
+    assert "malformed boolean input" in summary_path.read_text()
+
+
+@pytest.mark.parametrize(
+    "github_token,gh_token,expected_token",
+    [
+        ("primary-tok", "fallback-tok", "primary-tok"),
+        ("primary-tok", None, "primary-tok"),
+        ("", "fallback-tok", "fallback-tok"),
+        (None, "fallback-tok", "fallback-tok"),
+    ],
+    ids=["both_set", "github_only", "empty_github_falls_through", "gh_only"],
+)
+def test_pr_comment_token_resolution(monkeypatch, tmp_path, github_token, gh_token, expected_token):
+    """Axis 3 (P3-2): GITHUB_TOKEN wins when set to a non-empty value; an
+    EMPTY-string GITHUB_TOKEN must fall through to GH_TOKEN — the `or` in
+    the env lookup is part of the fail-open contract."""
+    if github_token is None:
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_TOKEN", github_token)
+    if gh_token is None:
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GH_TOKEN", gh_token)
+    recorded = _capture_requests(monkeypatch)
+    summary_path, args = _comment_scenario(tmp_path, {})
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    assert recorded[0].get_header("Authorization") == f"Bearer {expected_token}"
+
+
+def test_post_issue_comment_posts_to_the_pr_issue_comments_api(monkeypatch):
+    recorded = _capture_requests(monkeypatch)
+    AGG._post_issue_comment(repository="zlxlabs/gate", pr_number=42, body="hello gate", token="tok")
+    assert len(recorded) == 1
+    request = recorded[0]
+    assert request.full_url == "https://api.github.com/repos/zlxlabs/gate/issues/42/comments"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer tok"
+    # The 15s timeout is part of the fail-open contract (it bounds the hang
+    # risk of the synchronous POST) — pin it so a regression cannot silently
+    # drop it (P3-1).
+    assert request.captured_timeout == 15
+    assert json.loads(request.data.decode("utf-8")) == {"body": "hello gate"}

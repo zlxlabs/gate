@@ -35,8 +35,10 @@
 #              needs.quality/needs.primary + the canonical primary audit
 #              artifact via the portable aggregator script in
 #              .github/actions/gate-aggregator/aggregate.py, and is the only
-#              job with receipt-writing authority (Step Summary only in this
-#              PR — PR-comment "double receipt" is Stage 4, not this file).
+#              job with receipt-writing authority (Step Summary +, since this
+#              Stage 4 piece, one fail-open PR comment per run reusing the
+#              same text — the reconciler / async-ledger parts of Stage 4
+#              remain future work, not this file).
 #   notify   — same fail-only Feishu notification semantics as legacy,
 #              triggered by `gate` (not by quality/primary individually).
 name: gate
@@ -77,9 +79,11 @@ on:
 # actions: read   — Jobs API (resolve this run's numeric job id for the
 #                    primary/OCR jobs' REVIEW_JOB_ID) + actions/download-artifact
 #                    in the gate job.
-# pull-requests: write — the quality job's PR-size preflight action and the OCR
-#                    advisory job may post PR comments; primary/gate never
-#                    comment (Step Summary only — see the gate job).
+# pull-requests: write — the quality job's PR-size preflight action, the OCR
+#                    advisory job, and the gate job's Stage 4 PR-comment
+#                    receipt (fail-open email-visible mirror of the Step
+#                    Summary — see the gate job) post PR comments; primary
+#                    never comments (Step Summary only).
 permissions:
   actions: read
   contents: read
@@ -658,6 +662,12 @@ jobs:
           AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
           AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
+          # Stage 4 PR-comment receipt (--pr-comment true below): one new,
+          # fail-open comment per run reusing the Step Summary text. Token via
+          # env only, never argv. On fork PRs GitHub downgrades this token to
+          # read-only and the POST 403s — the aggregator degrades that to a
+          # ::warning:: by design, never a gate failure.
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
@@ -675,7 +685,8 @@ jobs:
             --audit-artifact-name "$AUDIT_ARTIFACT_NAME" \
             --audit-dir "${{ runner.temp }}/primary-audit" \
             --summary-path "$GITHUB_STEP_SUMMARY" \
-            --terminal-path "$TERMINAL_PATH"
+            --terminal-path "$TERMINAL_PATH" \
+            --pr-comment true
 
       - name: Upload gate terminal envelope
         if: always()
