@@ -567,33 +567,48 @@ def _post_issue_comment(*, repository: str, pr_number: int, body: str, token: st
         pass  # urlopen raises HTTPError for any non-2xx; a 201 body needs no parsing
 
 
+def _warn(message: str) -> None:
+    """Print one ::warning:: annotation, itself fail-open: this only runs
+    inside the fail-open boundary below, where stdout may already be a
+    broken pipe (probe: BrokenPipeError). A failed warning print must never
+    escape `_finish` and turn a green gate into a crash — so even THIS
+    print is guarded. Guard-of-the-guard, deliberately no logging/raising.
+    """
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
 def _post_pr_comment_fail_open(*, body: str, repository: Optional[str], pr_number: Optional[int]) -> None:
     """Best-effort Stage 4 PR-comment receipt. NEVER raises and NEVER prints
     ::error::: the Step Summary plus the exit code stay the authoritative
     receipt; this is only the email-visible mirror of it. The try wraps the
     WHOLE comment attempt (token lookup, target check, POST) so no failure in
-    any part of it can leak out and redden the gate.
+    any part of it can leak out and redden the gate; the warning annotations
+    themselves go through `_warn`, so a broken-pipe stdout cannot escape
+    either.
     """
     try:
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         if not token:
-            print("::warning::--pr-comment is enabled but neither GITHUB_TOKEN nor GH_TOKEN is set — skipping the PR comment (Step Summary remains the authoritative receipt)")
+            _warn("::warning::--pr-comment is enabled but neither GITHUB_TOKEN nor GH_TOKEN is set — skipping the PR comment (Step Summary remains the authoritative receipt)")
             return
         if not repository or pr_number is None:
-            print("::warning::--pr-comment is enabled but repository/pr-number is unavailable — skipping the PR comment (Step Summary remains the authoritative receipt)")
+            _warn("::warning::--pr-comment is enabled but repository/pr-number is unavailable — skipping the PR comment (Step Summary remains the authoritative receipt)")
             return
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
-            print(
+            _warn(
                 "::warning::could not post the gate PR comment (HTTP 403) — expected on fork PRs, where GitHub "
                 "downgrades `pull-requests: write` to read-only; this is not a gate malfunction. "
                 "Step Summary remains the authoritative receipt."
             )
         else:
-            print(f"::warning::could not post the gate PR comment (HTTP {exc.code}) — Step Summary remains the authoritative receipt")
+            _warn(f"::warning::could not post the gate PR comment (HTTP {exc.code}) — Step Summary remains the authoritative receipt")
     except Exception as exc:
-        print(f"::warning::could not post the gate PR comment ({type(exc).__name__}: {exc}) — Step Summary remains the authoritative receipt")
+        _warn(f"::warning::could not post the gate PR comment ({type(exc).__name__}: {exc}) — Step Summary remains the authoritative receipt")
 
 
 def _finish(
