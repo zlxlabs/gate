@@ -61,6 +61,30 @@ jobs:
         # pair on demand, avoiding a full-history clone for every Gate run.
         with: { fetch-depth: 1 }
 
+      - name: Detect repository quality entry
+        id: quality-entry
+        env:
+          GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
+        run: |
+          mkdir -p "$GATE_ARTIFACT_DIR"
+          if [ -e scripts/gate-quality ]; then
+            if [ ! -x scripts/gate-quality ]; then
+              echo "::error::scripts/gate-quality exists but is not executable"
+              exit 1
+            fi
+            echo "mode=entry" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::DEPRECATION: scripts/gate-quality is missing; using legacy quality auto-detection"
+            echo "mode=legacy" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run scripts/gate-quality
+        if: ${{ steps.quality-entry.outputs.mode == 'entry' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
+        run: ./scripts/gate-quality
+
       - name: PR size preflight
         uses: zlxlabs/gate/.github/actions/pr-size-preflight@9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc
         with:
@@ -72,17 +96,20 @@ jobs:
           token: ${{ github.token }}
 
       - name: Lint / format
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
           if [ -f Makefile ] && grep -qE '^lint:' Makefile; then make lint
           else echo "no 'lint' make target — skipping"; fi
 
       - name: Duplicate check (jscpd, advisory)
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         # Advisory during onboarding: reports duplication but does NOT block (legacy repos
         # carry pre-existing dup). v2: switch to blocking-on-increase via a baseline.
         continue-on-error: true
         run: npx --yes jscpd --threshold "${JSCPD_THRESHOLD:-5}" --reporters console .
 
       - name: Dependency direction (dependency-cruiser)
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
           if [ -f .dependency-cruiser.js ] || [ -f .dependency-cruiser.json ]; then
             npx --yes --package=dependency-cruiser depcruise --config .dependency-cruiser.* --output-type err src
@@ -111,7 +138,7 @@ jobs:
       # (self 上这个字段本来就不该来自 actions/cache,是已知的账本盲区,见 PR 描述)。
       - name: Restore uv download cache
         id: uv-cache
-        if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
@@ -142,7 +169,7 @@ jobs:
       # 容器),这里仍然设置它是为了 D3「三个生态一并补齐接口」和未来该仓改造后可以
       # 直接受益,现在设置了但暂时没有真实效果,不是 bug。
       - name: Point package manager caches at the VM201 local cache volume (self, personal canary)
-        if: ${{ inputs.runner == 'self' && inputs.tier == 'personal' }}
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.runner == 'self' && inputs.tier == 'personal' }}
         run: |
           cache_root=/opt/gate-hub-cache
           echo "UV_CACHE_DIR=$cache_root/uv" >> "$GITHUB_ENV"
@@ -196,7 +223,7 @@ jobs:
       # install: null,ledger 及其消费者不受影响(有测试钉死)。
       - name: Install dependencies
         id: install
-        if: ${{ inputs.tier == 'personal' }}
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.tier == 'personal' }}
         continue-on-error: true
         env:
           UV_CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}
@@ -233,11 +260,13 @@ jobs:
           [ "$status" != "failed" ]
 
       - name: Tests
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
           if   [ -f Makefile ] && grep -qE '^test:' Makefile; then make test
           elif [ -f package.json ]; then npm test --if-present
           elif [ -f pyproject.toml ]; then
-            if   command -v uv >/dev/null;     then uv run --frozen pytest -q || uv run pytest -q
+            if   command -v uv >/dev/null;     then
+              if [ -f uv.lock ]; then uv run --frozen pytest -q; else uv run pytest -q; fi
             elif command -v pytest >/dev/null; then pytest -q
             else echo "no python test runner on this runner — skipping (runs on self-hosted)"; fi
           else echo "no tests detected"; fi
@@ -252,7 +281,7 @@ jobs:
       # 复用」的整个目的反着来。self 仓这一步直接跳过,累积量的容量/TTL 治理见
       # docs/designs/ci-cache-strategy.md D6(GC 接入是独立待办,见该文档补充说明)。
       - name: Prune uv cache before persistence
-        if: ${{ inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         run: uv cache prune --ci || true
 
       - name: Agent review gate
