@@ -5,7 +5,7 @@ Scope: this is the D1 "Required Gate" half of the shadow-review-independence
 rollout (see the private gate-hub repo's
 ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
 .github/workflows/gate.yml and its own tests/test_gate_contract.py are
-untouched and unaffected by this file.
+kept behaviorally aligned with this file.
 """
 import json
 import re
@@ -31,6 +31,8 @@ ARTIFACT_PREFIX_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-"
 )
+QUALITY_ENTRY_PATH = "scripts/gate-quality"
+QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 # fromJSON('["self-hosted","linux","ci"]') — capture each array literal in runs-on.
 _FROMJSON_LABELS_RE = re.compile(r"fromJSON\('(\[[^\]]*\])'\)")
 
@@ -547,6 +549,57 @@ def test_pr_size_preflight_runs_before_expensive_checks_in_quality():
     assert preflight_index < names.index("Lint / format")
     preflight = steps[preflight_index]
     assert preflight["uses"].startswith("zlxlabs/gate/.github/actions/pr-size-preflight@")
+
+
+def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["quality"]["steps"]
+    detect = next(step for step in steps if step.get("name") == "Detect repository quality entry")
+    run = detect["run"]
+    assert detect["id"] == "quality-entry"
+    assert f"[ -e {QUALITY_ENTRY_PATH} ]" in run
+    assert "DEPRECATION: scripts/gate-quality is missing" in run
+    assert 'echo "mode=legacy" >> "$GITHUB_OUTPUT"' in run
+    assert "[ ! -x scripts/gate-quality ]" in run
+    assert "scripts/gate-quality exists but is not executable" in run
+    assert "exit 1" in run
+
+    entry = next(step for step in steps if step.get("name") == "Run scripts/gate-quality")
+    assert entry["if"] == "${{ steps.quality-entry.outputs.mode == 'entry' }}"
+    assert entry["working-directory"] == "${{ github.workspace }}"
+    assert entry["run"].strip() == "./scripts/gate-quality"
+    assert detect["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
+    assert entry["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
+    names = [step.get("name") for step in steps]
+    assert names.count("Run scripts/gate-quality") == 1
+    assert sum(step.get("run", "").strip() == "./scripts/gate-quality" for step in steps) == 1
+    assert names.index("PR size preflight") < names.index("Run scripts/gate-quality")
+
+    legacy_steps = [step for step in steps if step.get("name") in {
+        "Lint / format", "Duplicate check (jscpd, advisory)",
+        "Dependency direction (dependency-cruiser)", "Install dependencies", "Tests",
+    }]
+    assert legacy_steps
+    for step in legacy_steps:
+        assert f"{QUALITY_ENTRY_MODE} == 'legacy'" in str(step.get("if", ""))
+
+
+def test_v2_quality_entry_detection_and_legacy_python_selection_match_v1():
+    legacy_raw = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "gate.yml").read_text())
+    legacy_steps = legacy_raw["jobs"]["gate"]["steps"]
+    raw, _ = _load_workflow()
+    quality_steps = raw["jobs"]["quality"]["steps"]
+    for name in ("Detect repository quality entry", "Run scripts/gate-quality"):
+        legacy_step = next(step for step in legacy_steps if step.get("name") == name)
+        v2_step = next(step for step in quality_steps if step.get("name") == name)
+        assert v2_step.get("run") == legacy_step.get("run")
+        assert v2_step.get("env") == legacy_step.get("env")
+
+    legacy_tests = next(step for step in legacy_steps if step.get("name") == "Tests")
+    v2_tests = next(step for step in quality_steps if step.get("name") == "Tests")
+    assert "uv run --frozen pytest -q || uv run pytest -q" not in v2_tests["run"]
+    assert "if [ -f uv.lock ]; then" in v2_tests["run"]
+    assert v2_tests["run"] == legacy_tests["run"]
 
 
 # ── notify job ────────────────────────────────────────────────────────────

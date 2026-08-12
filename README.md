@@ -32,6 +32,24 @@ jobs:
       FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}   # 公开仓必须 secret;私有仓可用同名 variable 兜底
 ```
 
+### 仓库自有质量入口（推荐）
+
+接入仓库可以在仓库根目录提供固定入口 `scripts/gate-quality`，由业务仓库拥有完整的
+质量流水线（依赖安装、lint、unit/integration/e2e 测试及其隔离方式）；gate 只负责
+调用、资源、权限、超时、聚合与审计。
+
+```bash
+chmod +x scripts/gate-quality
+```
+
+gate checkout 后从仓库根目录以独立进程执行 `./scripts/gate-quality` 一次，并传入
+临时目录环境变量 `GATE_ARTIFACT_DIR`。入口进程的退出码原样决定 quality 结果：非零
+即失败，gate 不重试、不替换命令，也不接收任意测试命令输入。
+
+迁移期间，入口缺失会输出醒目的弃用告警并继续 legacy 自动探测；入口路径存在但不可
+执行会立即失败且不会回退。入口可执行后，legacy 的 install/lint/duplicate/test 猜测
+步骤全部跳过。未迁移仓库应尽快补上入口，避免依赖兼容路径。
+
 ## Required Gate v2 + Shadow Calibration v2（canary，2026-07-26 起）
 
 上面的 `gate.yml`（legacy）仍是未迁移仓库的默认路径，原样继续服务。`shadow-review-

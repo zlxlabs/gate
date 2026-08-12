@@ -13,6 +13,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate.yml"
 LEGACY_REVIEW_LEDGER_SHA = "9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc"
+QUALITY_ENTRY_PATH = "scripts/gate-quality"
+QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 
@@ -131,6 +133,60 @@ def test_pr_size_preflight_runs_before_expensive_checks_and_uses_review_capacity
     assert preflight["with"]["max-diff-lines"] == "${{ inputs.max_diff_lines }}"
     assert preflight["with"]["max-review-shards"] == "${{ inputs.max_review_shards }}"
     assert preflight["with"]["warn-lines"] == "${{ inputs.pr_size_warn_lines }}"
+
+
+def test_quality_entry_missing_warns_and_selects_legacy_mode():
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    detect = next(step for step in steps if step.get("name") == "Detect repository quality entry")
+    run = detect["run"]
+    assert f"[ -e {QUALITY_ENTRY_PATH} ]" in run
+    assert "DEPRECATION: scripts/gate-quality is missing" in run
+    assert 'echo "mode=legacy" >> "$GITHUB_OUTPUT"' in run
+
+
+def test_quality_entry_non_executable_fails_without_legacy_fallback():
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    detect = next(step for step in steps if step.get("name") == "Detect repository quality entry")
+    run = detect["run"]
+    assert f"[ ! -x {QUALITY_ENTRY_PATH} ]" in run
+    assert f"{QUALITY_ENTRY_PATH} exists but is not executable" in run
+    assert "exit 1" in run
+    legacy_steps = [step for step in steps if step.get("name") in {
+        "Lint / format", "Duplicate check (jscpd, advisory)",
+        "Dependency direction (dependency-cruiser)", "Install dependencies", "Tests",
+    }]
+    assert legacy_steps
+    for step in legacy_steps:
+        assert f"{QUALITY_ENTRY_MODE} == 'legacy'" in str(step.get("if", ""))
+
+
+def test_quality_entry_executable_runs_once_from_repository_root_with_artifact_dir():
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    detect = next(step for step in steps if step.get("name") == "Detect repository quality entry")
+    entry = next(step for step in steps if step.get("name") == "Run scripts/gate-quality")
+    assert detect["id"] == "quality-entry"
+    assert detect["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
+    assert entry["if"] == "${{ steps.quality-entry.outputs.mode == 'entry' }}"
+    assert entry["working-directory"] == "${{ github.workspace }}"
+    assert entry["run"].strip() == "./scripts/gate-quality"
+    assert entry["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
+    assert names.count("Run scripts/gate-quality") == 1
+    assert sum(step.get("run", "").strip() == "./scripts/gate-quality" for step in steps) == 1
+    assert names.index("PR size preflight") < names.index("Run scripts/gate-quality")
+
+
+def test_legacy_python_tests_choose_one_command_without_retrying_pytest():
+    raw, _ = _load()
+    tests = next(step for step in raw["jobs"]["gate"]["steps"] if step.get("name") == "Tests")
+    run = tests["run"]
+    assert "uv run --frozen pytest -q || uv run pytest -q" not in run
+    assert "if [ -f uv.lock ]; then" in run
+    assert "uv run --frozen pytest -q" in run
+    assert "uv run pytest -q" in run
 
 
 def test_checkout_is_shallow_and_preflight_restores_exact_diff_endpoints():
