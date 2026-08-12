@@ -165,6 +165,7 @@ def test_quality_entry_non_executable_fails_without_legacy_fallback():
 def test_quality_entry_executable_runs_once_from_repository_root_with_artifact_dir():
     raw, _ = _load()
     steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
     detect = next(step for step in steps if step.get("name") == "Detect repository quality entry")
     entry = next(step for step in steps if step.get("name") == "Run scripts/gate-quality")
     assert detect["id"] == "quality-entry"
@@ -173,6 +174,7 @@ def test_quality_entry_executable_runs_once_from_repository_root_with_artifact_d
     assert entry["working-directory"] == "${{ github.workspace }}"
     assert entry["run"].strip() == "./scripts/gate-quality"
     assert entry["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
+    assert names.index("PR size preflight") < names.index("Run scripts/gate-quality")
 
 
 def test_legacy_python_tests_choose_one_command_without_retrying_pytest():
