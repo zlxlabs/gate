@@ -571,6 +571,8 @@ def test_quality_entry_contract_covers_missing_non_executable_and_executable_sta
     assert detect["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
     assert entry["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
     names = [step.get("name") for step in steps]
+    assert names.count("Run scripts/gate-quality") == 1
+    assert sum(step.get("run", "").strip() == "./scripts/gate-quality" for step in steps) == 1
     assert names.index("PR size preflight") < names.index("Run scripts/gate-quality")
 
     legacy_steps = [step for step in steps if step.get("name") in {

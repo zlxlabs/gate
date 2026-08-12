@@ -150,8 +150,8 @@ def test_quality_entry_non_executable_fails_without_legacy_fallback():
     steps = raw["jobs"]["gate"]["steps"]
     detect = next(step for step in steps if step.get("name") == "Detect repository quality entry")
     run = detect["run"]
-    assert "[ ! -x scripts/gate-quality ]" in run
-    assert "scripts/gate-quality exists but is not executable" in run
+    assert f"[ ! -x {QUALITY_ENTRY_PATH} ]" in run
+    assert f"{QUALITY_ENTRY_PATH} exists but is not executable" in run
     assert "exit 1" in run
     legacy_steps = [step for step in steps if step.get("name") in {
         "Lint / format", "Duplicate check (jscpd, advisory)",
@@ -174,6 +174,8 @@ def test_quality_entry_executable_runs_once_from_repository_root_with_artifact_d
     assert entry["working-directory"] == "${{ github.workspace }}"
     assert entry["run"].strip() == "./scripts/gate-quality"
     assert entry["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
+    assert names.count("Run scripts/gate-quality") == 1
+    assert sum(step.get("run", "").strip() == "./scripts/gate-quality" for step in steps) == 1
     assert names.index("PR size preflight") < names.index("Run scripts/gate-quality")
 
 
