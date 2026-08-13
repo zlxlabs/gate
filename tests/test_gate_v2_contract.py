@@ -573,7 +573,24 @@ def test_pr_size_preflight_runs_before_expensive_checks_in_quality():
     preflight_index = names.index("PR size preflight")
     assert preflight_index < names.index("Lint / format")
     preflight = steps[preflight_index]
-    assert preflight["uses"].startswith("zlxlabs/gate/.github/actions/pr-size-preflight@")
+    assert preflight["uses"] == "./_gate-action-src/.github/actions/pr-size-preflight"
+
+
+def test_quality_preflight_checks_out_the_reusable_workflow_source():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["quality"]["steps"]
+    checkout = next(
+        step for step in steps
+        if step.get("name") == "Checkout gate actions at this workflow's own commit"
+    )
+    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["with"] == {
+        "repository": "${{ job.workflow_repository }}",
+        "ref": "${{ job.workflow_sha }}",
+        "path": "_gate-action-src",
+    }
+    names = [step.get("name") for step in steps]
+    assert names.index(checkout["name"]) < names.index("PR size preflight")
 
 
 def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():

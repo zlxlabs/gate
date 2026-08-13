@@ -73,6 +73,10 @@ def test_permissions_have_no_pr_or_issue_write_scope():
     assert raw["permissions"] == {"actions": "read", "contents": "read"}
 
 
+def test_shadow_workflow_has_no_internal_gate_self_references():
+    assert "zlxlabs/gate/" not in WORKFLOW.read_text()
+
+
 # ── concurrency contract: Shadow lifecycle group, isolated from Required Gate ─────
 
 def test_concurrency_group_is_shadow_v2_and_defined_once_at_workflow_level():

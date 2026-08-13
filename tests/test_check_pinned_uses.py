@@ -76,6 +76,23 @@ def test_dash_uses_in_composite_metadata_reports_line_ref_and_cli_failure(tmp_pa
     assert ".github/actions/local/action.yml:4:main" in checked.stdout
 
 
+def test_dash_uses_in_composite_metadata_rejects_independent_sha(tmp_path):
+    metadata = tmp_path / ".github" / "actions" / "local" / "action.yml"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "runs:\n"
+        "  using: composite\n"
+        f"  steps:\n    - uses: zlxlabs/gate/.github/actions/review-ledger@{INDEPENDENT_SHA}\n",
+        encoding="utf-8",
+    )
+
+    violations = find_pinned_use_violations(tmp_path)
+
+    assert [(item.file_path, item.line_number, item.ref) for item in violations] == [
+        (".github/actions/local/action.yml", 4, INDEPENDENT_SHA)
+    ]
+
+
 def test_cli_rejects_independent_sha_and_floating_ref(tmp_path):
     workflow = tmp_path / ".github" / "workflows" / "sample.yml"
     workflow.parent.mkdir(parents=True)
