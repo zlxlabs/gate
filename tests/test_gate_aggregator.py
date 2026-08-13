@@ -1194,6 +1194,34 @@ def test_receipt_unlink_failure_and_write_success_replaces_old_receipt(monkeypat
     assert unlink_calls == 1
 
 
+def test_receipt_cleanup_failure_destroys_stale_payload_with_invalid_marker(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _capture_requests(monkeypatch)
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    receipt_path.write_text(json.dumps({"delivery": "created", "run_id": "old"}), encoding="utf-8")
+    _, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+    original_unlink = Path.unlink
+    original_write_text = Path.write_text
+
+    def fail_receipt_write(path, data, **kwargs):
+        if path.name == ".gate-pr-comment-receipt.json.tmp":
+            raise OSError("simulated disk full")
+        return original_write_text(path, data, **kwargs)
+
+    def fail_all_unlinks(path, missing_ok=False):
+        if path == receipt_path:
+            raise OSError("simulated stale receipt lock")
+        return original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "write_text", fail_receipt_write)
+    monkeypatch.setattr(Path, "unlink", fail_all_unlinks)
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    assert receipt_path.read_bytes() == b"invalid gate PR-comment receipt\n"
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert "stale receipt was destroyed; upload will red" in capsys.readouterr().out
+
+
 def test_http_403_warning_names_rate_limit_or_permission_not_just_fork(monkeypatch, capsys, tmp_path):
     # Axis 3 (P3-3): this scenario is a SAME-REPO run (runner=self, non-draft),
     # where a 403 means rate-limit (GitHub secondary limits answer 403 or 429)
