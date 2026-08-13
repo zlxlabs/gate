@@ -11,6 +11,7 @@ primary_result == success, primary_result/runner domain validation, and
 strict as_bool parsing.
 """
 import builtins
+import hashlib
 import importlib.util
 import json
 import sys
@@ -463,6 +464,8 @@ def _cli_args(audit_dir, summary_path, **overrides):
     ]
     if "audit_source_attempt" in values:
         args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
+    if values.get("comment_receipt_path") is not None:
+        args.extend(["--comment-receipt-path", values["comment_receipt_path"]])
     return args
 
 def test_main_exit_code_zero_on_pass(tmp_path):
@@ -931,6 +934,60 @@ def test_pr_comment_send_failures_are_fail_open(monkeypatch, capsys, tmp_path, f
         # warning must say so (locked decision 3).
         warnings = [line for line in out.splitlines() if line.startswith("::warning::")]
         assert any("fork" in line for line in warnings)
+
+
+@pytest.mark.parametrize(
+    "status,reason_code,error_category",
+    [
+        (403, "http_403", "permission_or_rate_limit"),
+        (500, "http_5xx", "server_error"),
+    ],
+)
+def test_pr_comment_failures_write_a_cross_job_receipt(monkeypatch, capsys, tmp_path, status, reason_code, error_category):
+    """The real CLI producer must leave durable evidence after fail-open POST failure."""
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _raise_urlopen(monkeypatch, _http_error(status))
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    summary_path, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "schema_version": 1,
+        "kind": "gate_pr_comment_receipt",
+        "repository": "zlxlabs/gate",
+        "repository_id": IDENTITY.repository_id,
+        "pr_number": IDENTITY.pr,
+        "run_id": IDENTITY.run_id,
+        "run_attempt": IDENTITY.run_attempt,
+        "head_sha": IDENTITY.head_sha,
+        "comment_expected": True,
+        "comment_created": False,
+        "delivery": "not_created",
+        "reason_code": reason_code,
+        "error_category": error_category,
+        "http_status": status,
+        "comment_body_sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+    }
+    assert "::warning::" in capsys.readouterr().out
+
+
+def test_pr_comment_success_writes_quiet_created_receipt(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _capture_requests(monkeypatch)
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    summary_path, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["comment_expected"] is True
+    assert payload["comment_created"] is True
+    assert payload["delivery"] == "created"
+    assert payload["reason_code"] == "posted"
+    assert payload["error_category"] is None
+    assert payload["http_status"] is None
+    assert payload["comment_body_sha256"] == hashlib.sha256(summary_path.read_bytes()).hexdigest()
+    assert "::warning::" not in capsys.readouterr().out
 
 
 def test_http_403_warning_names_rate_limit_or_permission_not_just_fork(monkeypatch, capsys, tmp_path):
