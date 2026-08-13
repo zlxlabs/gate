@@ -78,8 +78,19 @@ jobs:
             echo "mode=legacy" >> "$GITHUB_OUTPUT"
           fi
 
+      # `uses:` cannot take an expression. Check out this reusable workflow's own
+      # source at the exact commit selected by the caller, then invoke its actions
+      # through workspace-relative paths so they follow the caller's workflow pin.
+      - name: Checkout gate actions at this workflow's own commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-action-src
+          sparse-checkout: .github/actions
+
       - name: PR size preflight
-        uses: zlxlabs/gate/.github/actions/pr-size-preflight@9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc
+        uses: ./_gate-action-src/.github/actions/pr-size-preflight
         with:
           base-sha: ${{ github.event.pull_request.base.sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
@@ -323,7 +334,7 @@ jobs:
       - name: Build review effectiveness ledger
         if: always()
         continue-on-error: true
-        uses: zlxlabs/gate/.github/actions/review-ledger@9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc
+        uses: ./_gate-action-src/.github/actions/review-ledger
         with:
           audit-path: ${{ runner.temp }}/codex-review-result.json
           preflight-path: ${{ runner.temp }}/pr-size-preflight.json

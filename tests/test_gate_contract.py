@@ -12,7 +12,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate.yml"
-LEGACY_REVIEW_LEDGER_SHA = "9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc"
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 
@@ -129,7 +128,7 @@ def test_pr_size_preflight_runs_before_expensive_checks_and_uses_review_capacity
     preflight_index = names.index("PR size preflight")
     assert preflight_index < names.index("Lint / format")
     preflight = steps[preflight_index]
-    assert preflight["uses"].startswith("zlxlabs/gate/.github/actions/pr-size-preflight@")
+    assert preflight["uses"] == "./_gate-action-src/.github/actions/pr-size-preflight"
     assert preflight["with"]["max-diff-lines"] == "${{ inputs.max_diff_lines }}"
     assert preflight["with"]["max-review-shards"] == "${{ inputs.max_review_shards }}"
     assert preflight["with"]["warn-lines"] == "${{ inputs.pr_size_warn_lines }}"
@@ -287,7 +286,7 @@ def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     steps = raw["jobs"]["gate"]["steps"]
     build = next(step for step in steps if step.get("name") == "Build review effectiveness ledger")
     assert build["if"] == "always()"
-    assert build["uses"].startswith("zlxlabs/gate/.github/actions/review-ledger@")
+    assert build["uses"] == "./_gate-action-src/.github/actions/review-ledger"
     assert "codex-review-result.json" in build["with"]["audit-path"]
     assert "pr-size-preflight.json" in build["with"]["preflight-path"]
     assert "install-result.json" in build["with"]["install-path"]
@@ -300,13 +299,24 @@ def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     assert upload["with"]["retention-days"] == 90
 
 
-def test_legacy_gate_keeps_v1_ledger_pin_and_artifact_epoch():
+def test_legacy_internal_actions_follow_the_reusable_workflow_source():
     raw, _ = _load()
     steps = raw["jobs"]["gate"]["steps"]
+    checkout = next(
+        step for step in steps
+        if step.get("name") == "Checkout gate actions at this workflow's own commit"
+    )
+    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["with"] == {
+        "repository": "${{ job.workflow_repository }}",
+        "ref": "${{ job.workflow_sha }}",
+        "path": "_gate-action-src",
+        "sparse-checkout": ".github/actions",
+    }
     build = next(step for step in steps if step.get("name") == "Build review effectiveness ledger")
     upload = next(step for step in steps if step.get("name") == "Upload review effectiveness ledger")
 
-    assert build["uses"] == f"zlxlabs/gate/.github/actions/review-ledger@{LEGACY_REVIEW_LEDGER_SHA}"
+    assert build["uses"] == "./_gate-action-src/.github/actions/review-ledger"
     assert upload["with"]["name"] == "codex-review-ledger"
 
 
