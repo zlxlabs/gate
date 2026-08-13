@@ -691,6 +691,7 @@ jobs:
           AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
           AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
+          COMMENT_RECEIPT_PATH: ${{ runner.temp }}/gate-pr-comment-receipt.json
           # Stage 4 PR-comment receipt (--pr-comment true below): one new,
           # fail-open comment per run reusing the Step Summary text. Token via
           # env only, never argv. On fork PRs GitHub downgrades this token to
@@ -715,6 +716,7 @@ jobs:
             --audit-dir "${{ runner.temp }}/primary-audit" \
             --summary-path "$GITHUB_STEP_SUMMARY" \
             --terminal-path "$TERMINAL_PATH" \
+            --comment-receipt-path "$COMMENT_RECEIPT_PATH" \
             --pr-comment true
 
       - name: Upload gate terminal envelope
@@ -724,6 +726,15 @@ jobs:
           name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-terminal.json
           if-no-files-found: error
+
+      - name: Upload gate PR-comment receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-pr-comment-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gate-pr-comment-receipt.json
+          if-no-files-found: error
+          retention-days: 30
 
   # ── ledger (independent persistence health check) ───────────────────────
   ledger:

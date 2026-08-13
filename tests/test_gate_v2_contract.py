@@ -31,6 +31,10 @@ ARTIFACT_PREFIX_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-"
 )
+COMMENT_RECEIPT_NAME_EXPR = (
+    "gate-pr-comment-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+    "-${{ github.run_id }}-${{ github.run_attempt }}"
+)
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 # fromJSON('["self-hosted","linux","ci"]') — capture each array literal in runs-on.
@@ -384,6 +388,27 @@ def test_gate_job_enables_the_stage4_pr_comment_receipt():
     script = AGGREGATOR_SCRIPT.read_text(encoding="utf-8")
     assert '"--pr-comment"' in script
     assert 'os.environ.get("GITHUB_TOKEN")' in script
+
+
+def test_gate_job_publishes_the_durable_pr_comment_receipt():
+    raw, _ = _load_workflow()
+    gate_steps = raw["jobs"]["gate"]["steps"]
+    aggregate_step = next(s for s in gate_steps if s.get("name") == "Aggregate required verdict")
+    assert aggregate_step["env"]["COMMENT_RECEIPT_PATH"] == "${{ runner.temp }}/gate-pr-comment-receipt.json"
+    assert '--comment-receipt-path "$COMMENT_RECEIPT_PATH"' in aggregate_step["run"]
+    assert "--pr-comment true" in aggregate_step["run"]
+
+    upload = next(s for s in gate_steps if s.get("name") == "Upload gate PR-comment receipt")
+    assert upload["if"] == "always()"
+    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["with"] == {
+        "name": COMMENT_RECEIPT_NAME_EXPR,
+        "path": "${{ runner.temp }}/gate-pr-comment-receipt.json",
+        "if-no-files-found": "error",
+        "retention-days": 30,
+    }
+    assert "continue-on-error" not in upload
+    assert upload["with"]["path"] == aggregate_step["env"]["COMMENT_RECEIPT_PATH"]
 
 
 def test_gate_job_timeout_is_five_minutes():
