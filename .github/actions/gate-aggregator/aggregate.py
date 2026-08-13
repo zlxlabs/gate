@@ -9,7 +9,10 @@ that depends ONLY on python3 stdlib + data the calling workflow hands it — no
 gate-hub import, no hosted-image-specific tool. The one network call it may
 make is the optional Stage 4 PR-comment receipt (one fail-open issue-comment
 POST via stdlib urllib, gated behind `--pr-comment`, off by default); it never
-feeds back into the verdict, the exit code, or any persisted state. It is invoked as a
+feeds back into the verdict or the exit code. When the caller supplies
+`--comment-receipt-path`, the result of that attempt is also persisted as a
+separate, versioned durable receipt artifact; this artifact is evidence for
+consumers, not gate state. It is invoked as a
 plain `python3 aggregate.py ...` step (see .github/workflows/gate-v2.yml's
 `gate` job) rather than wrapped in an `action.yml` composite action: GitHub
 Actions' `uses:` keyword cannot itself take an expression, so the ONLY way to
@@ -21,6 +24,16 @@ zlxlabs/gate/.github/actions/gate-aggregator@main` reference would instead
 float independently of whatever SHA a canary caller has pinned for
 gate-v2.yml, defeating the "pin to a reviewed SHA during canary" governance
 model ("Caller / reusable workflow boundary" in the plan).
+
+Issue #51 second-exit design: retain the existing fail-open PR-comment
+semantics and add a durable `gate_pr_comment_receipt` JSON artifact at the
+workflow boundary. The artifact records whether the comment was created and,
+when it was not, a stable reason category plus HTTP status where available.
+The reusable workflow uploads it with `if: always()` and
+`if-no-files-found: error`, so a real consumer can distinguish "receipt was
+created" from "receipt was expected but not created" without depending on the
+same PR-comment API path. Successful comment delivery adds no annotation or
+second notification; it only records the quiet machine-readable receipt.
 
 This module intentionally duplicates (does NOT import) two small pieces of
 gate-hub's scripts/review/contracts.py: the primary-verdict domain and the
