@@ -16,6 +16,16 @@ from typing import Any
 
 
 MARKER = "<!-- pr-size-preflight -->"
+SIZE_FILTER_CONTRACT = "v1"
+EXCLUDED_SUFFIXES = (
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf",
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".whl",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".icns", ".svg",
+    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".min.js", ".min.css", ".map", ".lock",
+)
+GENERATED_PATCH_LINE_LIMIT = 5000
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -48,6 +58,74 @@ def classify(diff_lines: int, max_diff_lines: int, warn_lines: int, max_review_s
     return "single", True
 
 
+def _numstat_entries(numstat: bytes) -> tuple[dict[str, bool], int, int, int]:
+    fields = numstat.split(b"\0")
+    binary_by_path: dict[str, bool] = {}
+    additions = deletions = changed_files = 0
+    index = 0
+    while index < len(fields) - 1:
+        record = fields[index]
+        index += 1
+        if not record:
+            continue
+        parts = record.split(b"\t", 2)
+        if len(parts) != 3:
+            raise ValueError("invalid git numstat record")
+        added, deleted, path = parts
+        changed_files += 1
+        if added.isdigit():
+            additions += int(added)
+        if deleted.isdigit():
+            deletions += int(deleted)
+        paths = [path] if path else []
+        if not path:
+            if index + 1 >= len(fields):
+                raise ValueError("truncated git numstat rename record")
+            old_path, new_path = fields[index], fields[index + 1]
+            index += 2
+            if not old_path or not new_path:
+                raise ValueError("invalid git numstat rename record")
+            paths = [old_path, new_path]
+        is_binary = added == b"-" and deleted == b"-"
+        for raw_path in paths:
+            binary_by_path[raw_path.decode("utf-8", "surrogateescape")] = is_binary
+    return binary_by_path, additions, deletions, changed_files
+
+
+def _byte_line_count(value: bytes) -> int:
+    if not value:
+        return 0
+    return value.count(b"\n") + (not value.endswith(b"\n"))
+
+
+def _patch_sections(patch: bytes) -> list[int]:
+    sections: list[int] = []
+    current_lines = 0
+    lines = patch.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    for line in lines:
+        if line.startswith(b"diff --git "):
+            if current_lines:
+                sections.append(current_lines)
+            current_lines = 1
+        elif current_lines:
+            current_lines += 1
+    if current_lines:
+        sections.append(current_lines)
+    return sections
+
+
+def _exclusion_rule(path: str, is_binary: bool, raw_lines: int) -> str | None:
+    if is_binary:
+        return "R1"
+    if path.lower().endswith(EXCLUDED_SUFFIXES):
+        return "R2"
+    if raw_lines > GENERATED_PATCH_LINE_LIMIT:
+        return "R3"
+    return None
+
+
 def measure(
     repo: Path,
     base_sha: str,
@@ -59,28 +137,44 @@ def measure(
 ) -> dict[str, Any]:
     ensure_review_commits(repo, base_sha, head_sha)
     patch = _git(repo, "diff", "--no-ext-diff", "--binary", base_sha, head_sha)
-    numstat = _git(repo, "diff", "--numstat", base_sha, head_sha).decode("utf-8", "replace")
-    additions = deletions = changed_files = 0
-    for line in numstat.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) != 3:
-            continue
-        changed_files += 1
-        if parts[0].isdigit():
-            additions += int(parts[0])
-        if parts[1].isdigit():
-            deletions += int(parts[1])
-    diff_lines = len(patch.splitlines())
-    classification, reviewable = classify(diff_lines, max_diff_lines, warn_lines, max_review_shards)
+    numstat = _git(repo, "diff", "--numstat", "-z", base_sha, head_sha)
+    binary_by_path, additions, deletions, changed_files = _numstat_entries(numstat)
+    paths = [
+        raw_path.decode("utf-8", "surrogateescape")
+        for raw_path in _git(repo, "diff", "--name-only", "-z", base_sha, head_sha).split(b"\0")
+        if raw_path
+    ]
+    section_lines = _patch_sections(patch)
+    if len(paths) != len(section_lines):
+        raise ValueError(
+            f"git diff file metadata mismatch: paths={len(paths)} sections={len(section_lines)}"
+        )
+    excluded_files: list[dict[str, Any]] = []
+    reviewable_lines = 0
+    for path, raw_lines in zip(paths, section_lines):
+        if path not in binary_by_path:
+            raise ValueError(f"git numstat has no entry for diff path {path!r}")
+        is_binary = binary_by_path[path]
+        rule = _exclusion_rule(path, is_binary, raw_lines)
+        if rule is None:
+            reviewable_lines += raw_lines
+        else:
+            excluded_files.append({"path": path, "rule": rule, "raw_lines": raw_lines})
+    raw_patch_lines = _byte_line_count(patch)
+    classification, reviewable = classify(reviewable_lines, max_diff_lines, warn_lines, max_review_shards)
     return {
         "schema_version": 1,
+        "size_filter_contract": SIZE_FILTER_CONTRACT,
         "base_sha": base_sha,
         "head_sha": head_sha,
-        "diff_lines": diff_lines,
+        "diff_lines": reviewable_lines,
+        "reviewable_lines": reviewable_lines,
+        "raw_patch_lines": raw_patch_lines,
         "changed_lines": additions + deletions,
         "additions": additions,
         "deletions": deletions,
         "changed_files": changed_files,
+        "excluded_files": excluded_files,
         "classification": classification,
         "reviewable": reviewable,
         "review_plan": "blocked" if not reviewable else ("single" if classification == "single" else "sharded"),
@@ -96,37 +190,39 @@ def measure(
 def render_comment(result: dict[str, Any]) -> str:
     kind = result["classification"]
     thresholds = result["thresholds"]
+    reviewable_lines = result["reviewable_lines"]
     if kind == "blocked":
         title = "⛔ PR 体积预检：超过完整审查能力，已拦截"
         explanation = (
-            f"当前审查 Patch 为 **{result['diff_lines']} 行**，超过最多 "
+            f"当前审查 Patch 为 **{reviewable_lines} 行**，超过最多 "
             f"**{thresholds['hard_lines']} 行 / {thresholds.get('max_review_shards', '?')} 个分片**的完整审查预算。"
         )
         action = "请把改动拆成可独立验收的 small PR 或 stacked PR；未拆分前 Gate 不会把未审完的改动放行。"
     elif kind == "warning":
         title = "⚠️ PR 体积预检：强警告"
         explanation = (
-            f"当前审查 Patch 为 **{result['diff_lines']} 行**，已超过强警告线 "
+            f"当前审查 Patch 为 **{reviewable_lines} 行**，已超过强警告线 "
             f"**{thresholds['warn_lines']} 行**。本轮仍会完整分片 review，但反馈更慢、修复成本更高。"
         )
         action = "后续请按单一功能拆成 small PR；如果存在依赖关系，使用 stacked PR。"
     elif kind == "sharded":
         title = "ℹ️ PR 体积预检：将自动分片审查"
         explanation = (
-            f"当前审查 Patch 为 **{result['diff_lines']} 行**，超过单轮预算 "
+            f"当前审查 Patch 为 **{reviewable_lines} 行**，超过单轮预算 "
             f"**{thresholds['single_turn_lines']} 行**，Codex 会覆盖所有分片并做跨模块整合。"
         )
         action = "这次可以继续，但下次优先按单一功能拆成 small PR，以缩短反馈时间。"
     else:
         title = "✅ PR 体积已回到单轮审查范围"
-        explanation = f"当前审查 Patch 为 **{result['diff_lines']} 行**，可由 Codex 单轮完整审查。"
+        explanation = f"当前审查 Patch 为 **{reviewable_lines} 行**，可由 Codex 单轮完整审查。"
         action = "此前的大 PR 提醒已解除。"
     changed_lines = result.get("changed_lines", result["additions"] + result["deletions"])
     return (
         f"{MARKER}\n\n### {title}\n\n{explanation}\n\n"
         f"- 文件：{result['changed_files']}\n"
         f"- 实际增删：{changed_lines} 行（+{result['additions']} / -{result['deletions']}）\n"
-        f"- 审查 Patch：{result['diff_lines']} 行（包含上下文和 diff 元数据）\n"
+        f"- 审查 Patch：{reviewable_lines} 行（可审文本口径）\n"
+        f"- 原始 Patch：{result['raw_patch_lines']} 行（含被排除文件）\n"
         f"- Reviewed commit: `{result['head_sha']}`\n\n{action}\n"
     )
 
@@ -173,9 +269,31 @@ def _append_summary(result: dict[str, Any], path: str) -> None:
         summary.write(
             "### PR size preflight\n\n"
             f"- Status: `{status}`\n- Review patch: {result['diff_lines']} lines\n"
+            f"- Reviewable text: {result['reviewable_lines']} lines\n"
+            f"- Raw patch: {result['raw_patch_lines']} lines\n"
             f"- Changed: {result.get('changed_lines', result['additions'] + result['deletions'])} lines "
             f"(+{result['additions']} / -{result['deletions']})\n"
             f"- Files: {result['changed_files']}\n- Plan: `{result['review_plan']}`\n"
+        )
+        excluded_files = result["excluded_files"]
+        if excluded_files:
+            summary.write("- Excluded files:\n")
+            for item in excluded_files:
+                path = json.dumps(item["path"], ensure_ascii=False)
+                summary.write(
+                    f"  - {path} — rule `{item['rule']}`, raw patch {item['raw_lines']} lines\n"
+                )
+        else:
+            summary.write("- Excluded files: none\n")
+
+
+def _append_action_outputs(result: dict[str, Any], path: str) -> None:
+    with open(path, "a", encoding="utf-8") as output:
+        output.write(f"reviewable-lines={result['reviewable_lines']}\n")
+        output.write(
+            "excluded-files="
+            + json.dumps(result["excluded_files"], ensure_ascii=False, separators=(",", ":"))
+            + "\n"
         )
 
 
@@ -207,6 +325,8 @@ def main() -> int:
     print(json.dumps(result, ensure_ascii=False))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         _append_summary(result, os.environ["GITHUB_STEP_SUMMARY"])
+    if os.environ.get("GITHUB_OUTPUT"):
+        _append_action_outputs(result, os.environ["GITHUB_OUTPUT"])
 
     token = os.environ.get("GH_TOKEN", "")
     if token and result["pr_number"]:

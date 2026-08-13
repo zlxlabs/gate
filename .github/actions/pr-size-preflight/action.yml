@@ -7,10 +7,18 @@ inputs:
   warn-lines: { required: true }
   max-review-shards: { required: true }
   token: { required: true }
+outputs:
+  reviewable-lines:
+    description: Number of patch lines included in the review budget.
+    value: ${{ steps.measure.outputs.reviewable-lines }}
+  excluded-files:
+    description: JSON array of files excluded by the size filter contract.
+    value: ${{ steps.measure.outputs.excluded-files }}
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: measure
+      shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
