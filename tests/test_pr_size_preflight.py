@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -113,6 +114,83 @@ def test_size_filter_rules_are_ordered_and_case_insensitive():
     assert module._exclusion_rule("asset.png", True, 6000) == "R1"
 
 
+def test_binary_pdf_uses_r1_before_extension_rule():
+    module = _module()
+
+    assert module._exclusion_rule("asset.pdf", True, 6000) == "R1"
+
+
+def test_large_pdf_uses_r2_before_generated_rule():
+    module = _module()
+
+    assert module._exclusion_rule("export.pdf", False, 6001) == "R2"
+
+
+def test_size_filter_decodes_quoted_unicode_path_from_numstat_z(tmp_path):
+    module = _module()
+    repo = tmp_path / "quoted-path-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    path = "目录/报告 final`v1`.PDF"
+    (repo / "README.md").write_text("fixture base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "目录").mkdir()
+    (repo / path).write_text("pdf-shaped text\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "head"], cwd=repo, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    result = module.measure(repo, base, head, max_diff_lines=20, warn_lines=40, max_review_shards=3)
+
+    assert result["excluded_files"] == [{"path": path, "rule": "R2", "raw_lines": 7}]
+    assert "\\347" not in result["excluded_files"][0]["path"]
+
+
+def test_size_filter_decodes_rename_paths_from_numstat_z(tmp_path):
+    module = _module()
+    repo = tmp_path / "rename-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "old.txt").write_text("rename me\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    subprocess.run(["git", "mv", "docs/old.txt", "docs/new.PDF"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "head"], cwd=repo, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    result = module.measure(repo, base, head, max_diff_lines=20, warn_lines=40, max_review_shards=3)
+
+    assert result["excluded_files"] == [{"path": "docs/new.PDF", "rule": "R2", "raw_lines": 7}]
+
+
+def test_u2028_does_not_change_byte_patch_line_count(tmp_path):
+    module = _module()
+    repo, base, head = _repo(tmp_path, 1)
+    (repo / "app.py").write_text('value = "left\u2028right"\n')
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "u2028"], cwd=repo, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    patch = subprocess.check_output(
+        ["git", "diff", "--no-ext-diff", "--binary", base, head], cwd=repo
+    )
+    old_byte_lines = len(patch.splitlines())
+
+    result = module.measure(repo, base, head, max_diff_lines=old_byte_lines, warn_lines=20, max_review_shards=3)
+
+    assert old_byte_lines == 7
+    assert result["raw_patch_lines"] == old_byte_lines
+    assert result["reviewable_lines"] == old_byte_lines
+    assert result["classification"] == "single"
+
+
 def test_measurement_fetches_only_missing_pr_endpoints_from_a_shallow_clone(tmp_path):
     module = _module()
     source, base, head = _repo(tmp_path, 20)
@@ -186,7 +264,77 @@ def test_summary_and_action_outputs_show_excluded_file_details(tmp_path):
     summary_text = summary.read_text()
     assert "Reviewable text: 10 lines" in summary_text
     assert "Raw patch: 5041 lines" in summary_text
-    assert "`docs.pdf` — rule `R2`, raw patch 9 lines" in summary_text
+    assert '"docs.pdf" — rule `R2`, raw patch 9 lines' in summary_text
+
+
+def test_summary_quotes_paths_with_backticks_without_code_span(tmp_path):
+    module = _module()
+    result = {
+        "classification": "single",
+        "reviewable_lines": 0,
+        "diff_lines": 0,
+        "raw_patch_lines": 8,
+        "changed_lines": 0,
+        "additions": 0,
+        "deletions": 0,
+        "changed_files": 1,
+        "review_plan": "single",
+        "excluded_files": [
+            {"path": "reports/final`v1`.pdf", "rule": "R2", "raw_lines": 8},
+        ],
+    }
+    summary = tmp_path / "summary.md"
+
+    module._append_summary(result, str(summary))
+
+    summary_text = summary.read_text()
+    assert '"reports/final`v1`.pdf" — rule `R2`, raw patch 8 lines' in summary_text
+
+
+def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, monkeypatch):
+    module = _module()
+    repo, base, head = _fixture_repo(tmp_path)
+    result_path = tmp_path / "main-result.json"
+    output_path = tmp_path / "github-output"
+    summary_path = tmp_path / "github-summary.md"
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "fixture/repo")
+    monkeypatch.setenv("PR_NUMBER", "0")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "preflight.py",
+            "--base-sha", base,
+            "--head-sha", head,
+            "--max-diff-lines", "20",
+            "--warn-lines", "40",
+            "--max-review-shards", "3",
+            "--output", str(result_path),
+        ],
+    )
+
+    assert module.main() == 0
+
+    output_bytes = output_path.read_bytes()
+    summary_bytes = summary_path.read_bytes()
+    expected_excluded = json.dumps(
+        [
+            {"path": "assets/payload.bin", "rule": "R1", "raw_lines": 10},
+            {"path": "docs.pdf", "rule": "R2", "raw_lines": 9},
+            {"path": "exports/survey.doc.html", "rule": "R3", "raw_lines": 5012},
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    assert b"reviewable-lines=10\n" in output_bytes
+    assert b"excluded-files=" + expected_excluded + b"\n" in output_bytes
+    assert b"Reviewable text: 10 lines" in summary_bytes
+    assert b"`exports/survey.doc.html`" not in summary_bytes
+    assert b'"exports/survey.doc.html"' in summary_bytes
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert outputs["reviewable-lines"] == "10"
     assert json.loads(outputs["excluded-files"]) == result["excluded_files"]
