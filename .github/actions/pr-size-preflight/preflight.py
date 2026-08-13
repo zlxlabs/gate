@@ -186,7 +186,7 @@ def render_comment(result: dict[str, Any]) -> str:
         title = "✅ PR 体积已回到单轮审查范围"
         explanation = f"当前审查 Patch 为 **{reviewable_lines} 行**，可由 Codex 单轮完整审查。"
         action = "此前的大 PR 提醒已解除。"
-    changed_lines = result["changed_lines"]
+    changed_lines = result.get("changed_lines", result["additions"] + result["deletions"])
     return (
         f"{MARKER}\n\n### {title}\n\n{explanation}\n\n"
         f"- 文件：{result['changed_files']}\n"
