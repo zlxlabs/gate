@@ -805,9 +805,11 @@ def _finish(
     # cannot change the exit code on the next line.
     if comment_receipt_path:
         receipt_path = Path(comment_receipt_path)
+        receipt_unlink_failed = False
         try:
             receipt_path.unlink(missing_ok=True)
         except OSError as exc:
+            receipt_unlink_failed = True
             _warn(f"::warning::could not remove the previous gate PR-comment receipt ({type(exc).__name__}: {exc})")
         if pr_comment:
             receipt = _post_pr_comment_fail_open(
@@ -821,7 +823,28 @@ def _finish(
         try:
             _write_comment_receipt(comment_receipt_path, receipt)
         except OSError as exc:
-            _warn(f"::warning::could not persist the gate PR-comment receipt ({type(exc).__name__}: {exc})")
+            if receipt_unlink_failed and receipt_path.exists():
+                try:
+                    receipt_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if receipt_path.exists():
+                    try:
+                        receipt_path.write_bytes(b"invalid gate PR-comment receipt\n")
+                    except OSError as invalidate_exc:
+                        _warn(
+                            "::warning::gate PR-comment receipt write failed and the stale receipt "
+                            f"could not be cleared ({type(invalidate_exc).__name__}: {invalidate_exc}); "
+                            "receipt channel is untrusted"
+                        )
+                    else:
+                        _warn("::warning::gate PR-comment receipt write failed and the stale receipt was destroyed; upload will red")
+                else:
+                    _warn("::warning::gate PR-comment receipt write failed and the stale receipt was cleared; upload will red")
+            elif receipt_path.exists():
+                _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); receipt channel is untrusted")
+            else:
+                _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); file is missing and upload will red")
     elif pr_comment:
         _post_pr_comment_fail_open(
             body=summary, repository=repository, pr_number=pr_number, identity=identity,

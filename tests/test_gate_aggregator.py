@@ -1128,7 +1128,70 @@ def test_receipt_write_failure_is_fail_open_and_cannot_publish_stale_file(
     monkeypatch.setattr(Path, "write_text", fail_receipt_write)
     assert AGG.main(args + ["--pr-comment", "true"]) == expected_rc
     assert not receipt_path.exists()
-    assert "could not persist the gate PR-comment receipt" in capsys.readouterr().out
+    assert "file is missing and upload will red" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("quality_result,expected_rc", [("success", 0), ("failure", 1)])
+def test_receipt_unlink_failure_and_write_failure_cannot_leave_stale_receipt(
+    monkeypatch, capsys, tmp_path, quality_result, expected_rc
+):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _capture_requests(monkeypatch)
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    receipt_path.write_text(json.dumps({"delivery": "created", "run_id": "old"}), encoding="utf-8")
+    _, args = _comment_scenario(
+        tmp_path,
+        {"comment_receipt_path": str(receipt_path), "quality_result": quality_result},
+    )
+    original_unlink = Path.unlink
+    original_write_text = Path.write_text
+    unlink_calls = 0
+
+    def fail_first_unlink(path, missing_ok=False):
+        nonlocal unlink_calls
+        if path == receipt_path and unlink_calls == 0:
+            unlink_calls += 1
+            raise OSError("simulated stale receipt lock")
+        return original_unlink(path, missing_ok=missing_ok)
+
+    def fail_receipt_write(path, data, **kwargs):
+        if path.name == ".gate-pr-comment-receipt.json.tmp":
+            raise OSError("simulated disk full")
+        return original_write_text(path, data, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_unlink)
+    monkeypatch.setattr(Path, "write_text", fail_receipt_write)
+    assert AGG.main(args + ["--pr-comment", "true"]) == expected_rc
+    assert not receipt_path.exists()
+    output = capsys.readouterr().out
+    assert "stale receipt was cleared; upload will red" in output
+    assert "receipt channel is untrusted" not in output
+    assert unlink_calls == 1
+
+
+def test_receipt_unlink_failure_and_write_success_replaces_old_receipt(monkeypatch, tmp_path):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _capture_requests(monkeypatch)
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    receipt_path.write_text(json.dumps({"delivery": "created", "run_id": "old"}), encoding="utf-8")
+    _, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+    original_unlink = Path.unlink
+    unlink_calls = 0
+
+    def fail_first_unlink(path, missing_ok=False):
+        nonlocal unlink_calls
+        if path == receipt_path and unlink_calls == 0:
+            unlink_calls += 1
+            raise OSError("simulated stale receipt lock")
+        return original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_unlink)
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["delivery"] == "created"
+    assert payload["run_id"] == IDENTITY.run_id
+    assert payload["run_id"] != "old"
+    assert unlink_calls == 1
 
 
 def test_http_403_warning_names_rate_limit_or_permission_not_just_fork(monkeypatch, capsys, tmp_path):
