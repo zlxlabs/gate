@@ -16,6 +16,16 @@ from typing import Any
 
 
 MARKER = "<!-- pr-size-preflight -->"
+SIZE_FILTER_CONTRACT = "v1"
+EXCLUDED_SUFFIXES = (
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf",
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".whl",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".icns", ".svg",
+    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".min.js", ".min.css", ".map", ".lock",
+)
+GENERATED_PATCH_LINE_LIMIT = 5000
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -48,6 +58,42 @@ def classify(diff_lines: int, max_diff_lines: int, warn_lines: int, max_review_s
     return "single", True
 
 
+def _numstat_entries(numstat: str) -> list[tuple[str, bool]]:
+    entries: list[tuple[str, bool]] = []
+    for line in numstat.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        additions, deletions, path = parts
+        entries.append((path, additions == "-" and deletions == "-"))
+    return entries
+
+
+def _patch_sections(patch: str) -> list[int]:
+    sections: list[int] = []
+    current_lines = 0
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            if current_lines:
+                sections.append(current_lines)
+            current_lines = 1
+        elif current_lines:
+            current_lines += 1
+    if current_lines:
+        sections.append(current_lines)
+    return sections
+
+
+def _exclusion_rule(path: str, is_binary: bool, raw_lines: int) -> str | None:
+    if is_binary:
+        return "R1"
+    if path.lower().endswith(EXCLUDED_SUFFIXES):
+        return "R2"
+    if raw_lines > GENERATED_PATCH_LINE_LIMIT:
+        return "R3"
+    return None
+
+
 def measure(
     repo: Path,
     base_sha: str,
@@ -70,17 +116,35 @@ def measure(
             additions += int(parts[0])
         if parts[1].isdigit():
             deletions += int(parts[1])
-    diff_lines = len(patch.splitlines())
-    classification, reviewable = classify(diff_lines, max_diff_lines, warn_lines, max_review_shards)
+    entries = _numstat_entries(numstat)
+    section_lines = _patch_sections(patch.decode("utf-8", "replace"))
+    if len(entries) != len(section_lines):
+        raise ValueError(
+            f"git diff file metadata mismatch: numstat={len(entries)} sections={len(section_lines)}"
+        )
+    excluded_files: list[dict[str, Any]] = []
+    reviewable_lines = 0
+    for (path, is_binary), raw_lines in zip(entries, section_lines):
+        rule = _exclusion_rule(path, is_binary, raw_lines)
+        if rule is None:
+            reviewable_lines += raw_lines
+        else:
+            excluded_files.append({"path": path, "rule": rule, "raw_lines": raw_lines})
+    raw_patch_lines = len(patch.splitlines())
+    classification, reviewable = classify(reviewable_lines, max_diff_lines, warn_lines, max_review_shards)
     return {
         "schema_version": 1,
+        "size_filter_contract": SIZE_FILTER_CONTRACT,
         "base_sha": base_sha,
         "head_sha": head_sha,
-        "diff_lines": diff_lines,
+        "diff_lines": reviewable_lines,
+        "reviewable_lines": reviewable_lines,
+        "raw_patch_lines": raw_patch_lines,
         "changed_lines": additions + deletions,
         "additions": additions,
         "deletions": deletions,
         "changed_files": changed_files,
+        "excluded_files": excluded_files,
         "classification": classification,
         "reviewable": reviewable,
         "review_plan": "blocked" if not reviewable else ("single" if classification == "single" else "sharded"),
