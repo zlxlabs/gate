@@ -311,6 +311,7 @@ def test_legacy_internal_actions_follow_the_reusable_workflow_source():
         "repository": "${{ job.workflow_repository }}",
         "ref": "${{ job.workflow_sha }}",
         "path": "_gate-action-src",
+        "sparse-checkout": ".github/actions",
     }
     build = next(step for step in steps if step.get("name") == "Build review effectiveness ledger")
     upload = next(step for step in steps if step.get("name") == "Upload review effectiveness ledger")

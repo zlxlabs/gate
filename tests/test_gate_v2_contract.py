@@ -588,9 +588,23 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
         "repository": "${{ job.workflow_repository }}",
         "ref": "${{ job.workflow_sha }}",
         "path": "_gate-action-src",
+        "sparse-checkout": ".github/actions",
     }
     names = [step.get("name") for step in steps]
     assert names.index(checkout["name"]) < names.index("PR size preflight")
+
+
+def test_quality_action_sparse_checkout_excludes_tests_tree():
+    raw, _ = _load_workflow()
+    checkout = next(
+        step for step in raw["jobs"]["quality"]["steps"]
+        if step.get("name") == "Checkout gate actions at this workflow's own commit"
+    )
+    sparse_paths = checkout["with"]["sparse-checkout"]
+    if isinstance(sparse_paths, str):
+        sparse_paths = sparse_paths.splitlines()
+    assert ".github/actions" in sparse_paths
+    assert not any(path == "tests" or path.startswith("tests/") for path in sparse_paths)
 
 
 def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():
