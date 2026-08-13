@@ -9,7 +9,7 @@ from scripts.check_pinned_uses import find_pinned_use_violations
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHECK_SCRIPT = REPO_ROOT / "scripts" / "check_pinned_uses.py"
-PINNED_SHA = "9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc"
+INDEPENDENT_SHA = "9a7927410b8caef10d1c0ae5c31b3bb94bb1f5fc"
 
 
 def test_current_live_workflows_have_no_floating_internal_uses():
@@ -76,21 +76,21 @@ def test_dash_uses_in_composite_metadata_reports_line_ref_and_cli_failure(tmp_pa
     assert ".github/actions/local/action.yml:4:main" in checked.stdout
 
 
-def test_cli_passes_head_and_fails_injected_main(tmp_path):
+def test_cli_rejects_independent_sha_and_floating_ref(tmp_path):
     workflow = tmp_path / ".github" / "workflows" / "sample.yml"
     workflow.parent.mkdir(parents=True)
     workflow.write_text(
-        f"jobs:\n  gate:\n    uses: zlxlabs/gate/.github/workflows/gate.yml@{PINNED_SHA}\n",
+        f"jobs:\n  gate:\n    uses: zlxlabs/gate/.github/workflows/gate.yml@{INDEPENDENT_SHA}\n",
         encoding="utf-8",
     )
-    clean = subprocess.run(
+    independent = subprocess.run(
         [sys.executable, str(CHECK_SCRIPT), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert clean.returncode == 0
-    assert "OK:" in clean.stdout
+    assert independent.returncode == 1
+    assert f".github/workflows/sample.yml:3:{INDEPENDENT_SHA}" in independent.stdout
 
     workflow.write_text(
         "jobs:\n  gate:\n    uses: zlxlabs/gate/.github/workflows/gate.yml@main\n",

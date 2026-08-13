@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject floating references to this repository from live workflow code."""
+"""Reject independently referenced uses of this repository from live workflow code."""
 
 from __future__ import annotations
 
@@ -10,13 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 USES_LINE_PREFIX = re.compile(r"^(?:uses:|-\s+uses:)(?P<value>.*)$")
 
 
 @dataclass(frozen=True)
 class InternalUseViolation:
-    """One internal action/workflow reference that is not pinned immutably."""
+    """One absolute internal action/workflow reference."""
 
     file_path: str
     line_number: int
@@ -45,7 +44,7 @@ def discover_use_files(repo_root: Path, include_templates: bool) -> list[Path]:
 
 
 def parse_internal_use_value(line: str) -> tuple[str, str] | None:
-    """Extract an internal `uses:` value and its ref from one YAML line."""
+    """Extract an absolute internal `uses:` value and its ref from one YAML line."""
 
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
@@ -66,7 +65,7 @@ def parse_internal_use_value(line: str) -> tuple[str, str] | None:
 def find_pinned_use_violations(
     repo_root: Path, include_templates: bool = False
 ) -> list[InternalUseViolation]:
-    """Return internal uses refs that are neither relative nor full commit SHAs."""
+    """Return all absolute internal uses; live self-references must be relative."""
 
     violations: list[InternalUseViolation] = []
     for file_path in discover_use_files(repo_root, include_templates):
@@ -78,10 +77,7 @@ def find_pinned_use_violations(
             if parsed is None:
                 continue
             _, ref = parsed
-            if not FULL_COMMIT_SHA.fullmatch(ref):
-                violations.append(
-                    InternalUseViolation(relative_path, line_number, ref)
-                )
+            violations.append(InternalUseViolation(relative_path, line_number, ref))
     return violations
 
 
@@ -123,10 +119,10 @@ def main(argv: list[str] | None = None) -> int:
         for violation in violations:
             print(
                 f"{violation.file_path}:{violation.line_number}:{violation.ref}: "
-                "internal uses must use a full 40-hex commit SHA"
+                "internal uses must use a workspace-relative path; independent refs are forbidden"
             )
         print(
-            f"FAIL: found {len(violations)} floating or malformed internal uses "
+            f"FAIL: found {len(violations)} independently referenced internal uses "
             f"in {len(files)} scanned file(s)",
             file=sys.stderr,
         )
@@ -134,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"OK: checked {len(files)} live workflow/action metadata file(s); "
-        "all internal uses are pinned"
+        "all internal uses are workspace-relative"
     )
     return 0
 
