@@ -1219,7 +1219,7 @@ def test_receipt_cleanup_failure_destroys_stale_payload_with_invalid_marker(monk
     assert receipt_path.read_bytes() == b"invalid gate PR-comment receipt\n"
     with pytest.raises(json.JSONDecodeError):
         json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert "stale receipt was destroyed; upload will red" in capsys.readouterr().out
+    assert "stale receipt was destroyed; an invalid marker was written, upload will pass but consumers' json.loads will fail-loud" in capsys.readouterr().out
 
 
 def test_http_403_warning_names_rate_limit_or_permission_not_just_fork(monkeypatch, capsys, tmp_path):

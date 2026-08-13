@@ -33,10 +33,13 @@ transport failure after the POST was attempted is recorded as
 `delivery=unknown`, never as a definite `not_created`, because the server may
 already have created the comment before the response was lost.
 The reusable workflow uploads it with `if: always()` and
-`if-no-files-found: error`, so a real consumer can distinguish "receipt was
-created" from "receipt was expected but not created" without depending on the
-same PR-comment API path. Successful comment delivery adds no annotation or
-second notification; it only records the quiet machine-readable receipt.
+`if-no-files-found: error`. A consumer must distinguish three receipt states:
+missing artifact means the write failed and stale content was cleared;
+an artifact that is not parseable means the write failed and old evidence was
+poisoned; a parseable old JSON artifact means cleanup also failed and the
+`receipt channel is untrusted` warning is the deciding signal. Successful
+comment delivery adds no annotation or second notification; it only records
+the quiet machine-readable receipt.
 
 This module intentionally duplicates (does NOT import) two small pieces of
 gate-hub's scripts/review/contracts.py: the primary-verdict domain and the
@@ -838,7 +841,7 @@ def _finish(
                             "receipt channel is untrusted"
                         )
                     else:
-                        _warn("::warning::gate PR-comment receipt write failed and the stale receipt was destroyed; upload will red")
+                        _warn("::warning::gate PR-comment receipt write failed and the stale receipt was destroyed; an invalid marker was written, upload will pass but consumers' json.loads will fail-loud")
                 else:
                     _warn("::warning::gate PR-comment receipt write failed and the stale receipt was cleared; upload will red")
             elif receipt_path.exists():
