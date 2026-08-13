@@ -396,6 +396,7 @@ def test_gate_job_publishes_the_durable_pr_comment_receipt():
     aggregate_step = next(s for s in gate_steps if s.get("name") == "Aggregate required verdict")
     assert aggregate_step["env"]["COMMENT_RECEIPT_PATH"] == "${{ runner.temp }}/gate-pr-comment-receipt.json"
     assert '--comment-receipt-path "$COMMENT_RECEIPT_PATH"' in aggregate_step["run"]
+    assert "--pr-comment true" in aggregate_step["run"]
 
     upload = next(s for s in gate_steps if s.get("name") == "Upload gate PR-comment receipt")
     assert upload["if"] == "always()"
@@ -407,6 +408,7 @@ def test_gate_job_publishes_the_durable_pr_comment_receipt():
         "retention-days": 30,
     }
     assert "continue-on-error" not in upload
+    assert upload["with"]["path"] == aggregate_step["env"]["COMMENT_RECEIPT_PATH"]
 
 
 def test_gate_job_timeout_is_five_minutes():

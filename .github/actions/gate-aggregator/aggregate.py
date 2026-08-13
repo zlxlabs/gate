@@ -28,7 +28,10 @@ model ("Caller / reusable workflow boundary" in the plan).
 Issue #51 second-exit design: retain the existing fail-open PR-comment
 semantics and add a durable `gate_pr_comment_receipt` JSON artifact at the
 workflow boundary. The artifact records whether the comment was created and,
-when it was not, a stable reason category plus HTTP status where available.
+when it was not, a stable reason category plus HTTP status where available. A
+transport failure after the POST was attempted is recorded as
+`delivery=unknown`, never as a definite `not_created`, because the server may
+already have created the comment before the response was lost.
 The reusable workflow uploads it with `if: always()` and
 `if-no-files-found: error`, so a real consumer can distinguish "receipt was
 created" from "receipt was expected but not created" without depending on the
@@ -664,7 +667,9 @@ def _build_comment_receipt(
 
     The body itself stays in the Step Summary/comment contract; a digest lets
     a consumer correlate this receipt to that exact body without copying the
-    potentially large comment into a second durable artifact.
+    potentially large comment into a second durable artifact. `delivery` is
+    one of `created`, `not_created`, `unknown`, or `not_enabled`; the created
+    field is null whenever the outcome is not determinable or was disabled.
     """
     return {
         "schema_version": COMMENT_RECEIPT_SCHEMA_VERSION,
@@ -675,8 +680,8 @@ def _build_comment_receipt(
         "run_id": identity.run_id if identity else None,
         "run_attempt": identity.run_attempt if identity else None,
         "head_sha": identity.head_sha if identity else None,
-        "comment_expected": True,
-        "comment_created": delivery == "created",
+        "comment_expected": delivery != "not_enabled",
+        "comment_created": True if delivery == "created" else False if delivery == "not_created" else None,
         "delivery": delivery,
         "reason_code": reason_code,
         "error_category": error_category,
@@ -697,18 +702,18 @@ def _post_pr_comment_fail_open(
     either.
     """
     try:
+        if not repository or pr_number is None:
+            _warn("::warning::--pr-comment is enabled but repository/pr-number is unavailable — skipping the PR comment (Step Summary remains the authoritative receipt)")
+            return _build_comment_receipt(
+                body=body, repository=repository, pr_number=pr_number, identity=identity,
+                delivery="not_created", reason_code="missing_target", error_category="configuration",
+            )
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         if not token:
             _warn("::warning::--pr-comment is enabled but neither GITHUB_TOKEN nor GH_TOKEN is set — skipping the PR comment (Step Summary remains the authoritative receipt)")
             return _build_comment_receipt(
                 body=body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="not_created", reason_code="missing_token", error_category="configuration",
-            )
-        if not repository or pr_number is None:
-            _warn("::warning::--pr-comment is enabled but repository/pr-number is unavailable — skipping the PR comment (Step Summary remains the authoritative receipt)")
-            return _build_comment_receipt(
-                body=body, repository=repository, pr_number=pr_number, identity=identity,
-                delivery="not_created", reason_code="missing_target", error_category="configuration",
             )
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
         return _build_comment_receipt(
@@ -745,7 +750,7 @@ def _post_pr_comment_fail_open(
         _warn(f"::warning::could not post the gate PR comment ({type(exc).__name__}: {exc}) — Step Summary remains the authoritative receipt")
         return _build_comment_receipt(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
-            delivery="not_created", reason_code="transport_error", error_category="network_error",
+            delivery="unknown", reason_code="network_indeterminate", error_category="network_error",
         )
 
 
@@ -798,12 +803,29 @@ def _finish(
     # never persisted" inconsistency; the reverse (terminal persisted, comment
     # never posted) is the safe direction. Fail-open by construction: it
     # cannot change the exit code on the next line.
-    if pr_comment:
-        receipt = _post_pr_comment_fail_open(
+    if comment_receipt_path:
+        receipt_path = Path(comment_receipt_path)
+        try:
+            receipt_path.unlink(missing_ok=True)
+        except OSError as exc:
+            _warn(f"::warning::could not remove the previous gate PR-comment receipt ({type(exc).__name__}: {exc})")
+        if pr_comment:
+            receipt = _post_pr_comment_fail_open(
+                body=summary, repository=repository, pr_number=pr_number, identity=identity,
+            )
+        else:
+            receipt = _build_comment_receipt(
+                body=summary, repository=repository, pr_number=pr_number, identity=identity,
+                delivery="not_enabled", reason_code="not_enabled",
+            )
+        try:
+            _write_comment_receipt(comment_receipt_path, receipt)
+        except OSError as exc:
+            _warn(f"::warning::could not persist the gate PR-comment receipt ({type(exc).__name__}: {exc})")
+    elif pr_comment:
+        _post_pr_comment_fail_open(
             body=summary, repository=repository, pr_number=pr_number, identity=identity,
         )
-        if comment_receipt_path:
-            _write_comment_receipt(comment_receipt_path, receipt)
     return 0 if outcome.ok else 1
 
 
@@ -824,7 +846,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
-    parser.add_argument("--pr-number", required=True, type=int)
+    parser.add_argument("--pr-number", default=None, type=int)
     parser.add_argument(
         "--audit-source-attempt",
         default=None,
@@ -850,6 +872,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _finish(
             Outcome(ok=False, problems=[f"malformed boolean input — fail-closed: {exc}"]),
             args.summary_path,
+            repository=args.repository,
+            pr_number=args.pr_number,
+            comment_receipt_path=args.comment_receipt_path,
+        )
+
+    if args.pr_number is None:
+        return _finish(
+            Outcome(ok=False, problems=["missing PR number — fail-closed"]),
+            args.summary_path,
+            pr_comment=pr_comment,
+            repository=args.repository,
+            pr_number=None,
+            comment_receipt_path=args.comment_receipt_path,
         )
 
     audit_source_attempt: Optional[int] = None

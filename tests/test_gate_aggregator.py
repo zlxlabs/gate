@@ -457,11 +457,12 @@ def _cli_args(audit_dir, summary_path, **overrides):
         "--head-sha", values["head_sha"],
         "--run-id", values["run_id"],
         "--run-attempt", values["run_attempt"],
-        "--pr-number", values["pr_number"],
         "--audit-artifact-name", values["audit_artifact_name"], "--terminal-path", values["terminal_path"],
         "--audit-dir", str(audit_dir),
         "--summary-path", str(summary_path),
     ]
+    if values.get("pr_number") is not None:
+        args.extend(["--pr-number", values["pr_number"]])
     if "audit_source_attempt" in values:
         args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
     if values.get("comment_receipt_path") is not None:
@@ -980,14 +981,154 @@ def test_pr_comment_success_writes_quiet_created_receipt(monkeypatch, capsys, tm
 
     assert AGG.main(args + ["--pr-comment", "true"]) == 0
     payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert payload["comment_expected"] is True
-    assert payload["comment_created"] is True
-    assert payload["delivery"] == "created"
-    assert payload["reason_code"] == "posted"
+    assert payload == {
+        "schema_version": 1,
+        "kind": "gate_pr_comment_receipt",
+        "repository": "zlxlabs/gate",
+        "repository_id": IDENTITY.repository_id,
+        "pr_number": IDENTITY.pr,
+        "run_id": IDENTITY.run_id,
+        "run_attempt": IDENTITY.run_attempt,
+        "head_sha": IDENTITY.head_sha,
+        "comment_expected": True,
+        "comment_created": True,
+        "delivery": "created",
+        "reason_code": "posted",
+        "error_category": None,
+        "http_status": None,
+        "comment_body_sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+    }
+    assert "::warning::" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "failure,delivery,reason_code,error_category,http_status,created",
+    [
+        ("http_429", "not_created", "http_429", "permission_or_rate_limit", 429, False),
+        ("http_other", "not_created", "http_error", "http_error", 400, False),
+        ("url_error", "unknown", "network_indeterminate", "network_error", None, None),
+    ],
+)
+def test_pr_comment_receipt_distinguishes_known_http_and_indeterminate_network_failures(
+    monkeypatch, tmp_path, failure, delivery, reason_code, error_category, http_status, created
+):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _raise_urlopen(
+        monkeypatch,
+        {"http_429": _http_error(429), "http_other": _http_error(400), "url_error": urllib.error.URLError("reset")}[failure],
+    )
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    _, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["delivery"] == delivery
+    assert payload["reason_code"] == reason_code
+    assert payload["error_category"] == error_category
+    assert payload["http_status"] == http_status
+    assert payload["comment_created"] is created
+
+
+def test_pr_comment_receipt_records_missing_token_without_attempting_request(monkeypatch, tmp_path):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    _raise_urlopen(monkeypatch, AssertionError("missing token must not call urlopen"))
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    _, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["delivery"] == "not_created"
+    assert payload["reason_code"] == "missing_token"
+    assert payload["error_category"] == "configuration"
+    assert payload["http_status"] is None
+    assert payload["comment_created"] is False
+
+
+def test_missing_pr_number_is_cli_reachable_and_writes_missing_target_receipt(monkeypatch, tmp_path):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _raise_urlopen(monkeypatch, AssertionError("missing target must not call urlopen"))
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    _, args = _comment_scenario(tmp_path, {"pr_number": None, "comment_receipt_path": str(receipt_path)})
+
+    assert AGG.main(args + ["--pr-comment", "true"]) == 1
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["delivery"] == "not_created"
+    assert payload["reason_code"] == "missing_target"
+    assert payload["error_category"] == "configuration"
+    assert payload["pr_number"] is None
+
+
+def test_pr_comment_receipt_records_not_enabled_without_network(monkeypatch, tmp_path):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _raise_urlopen(monkeypatch, AssertionError("disabled comment must not call urlopen"))
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    _, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+
+    assert AGG.main(args + ["--pr-comment", "false"]) == 0
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["comment_expected"] is False
+    assert payload["comment_created"] is None
+    assert payload["delivery"] == "not_enabled"
+    assert payload["reason_code"] == "not_enabled"
     assert payload["error_category"] is None
     assert payload["http_status"] is None
-    assert payload["comment_body_sha256"] == hashlib.sha256(summary_path.read_bytes()).hexdigest()
-    assert "::warning::" not in capsys.readouterr().out
+
+
+def test_malformed_comment_switch_still_writes_receipt_when_path_is_given(tmp_path):
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    _, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+
+    assert AGG.main(args + ["--pr-comment", "banana"]) == 1
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["delivery"] == "not_enabled"
+    assert payload["reason_code"] == "not_enabled"
+
+
+def test_comment_receipt_uses_temp_file_then_atomic_replace(monkeypatch, tmp_path):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _capture_requests(monkeypatch)
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    _, args = _comment_scenario(tmp_path, {"comment_receipt_path": str(receipt_path)})
+    replaces = []
+    original_replace = Path.replace
+
+    def record_replace(source, target):
+        if source.name == ".gate-pr-comment-receipt.json.tmp":
+            replaces.append((source, target))
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", record_replace)
+    assert AGG.main(args + ["--pr-comment", "true"]) == 0
+    assert len(replaces) == 1
+    assert replaces[0][1] == receipt_path
+    assert receipt_path.is_file()
+    assert not (tmp_path / ".gate-pr-comment-receipt.json.tmp").exists()
+
+
+@pytest.mark.parametrize("quality_result,expected_rc", [("success", 0), ("failure", 1)])
+def test_receipt_write_failure_is_fail_open_and_cannot_publish_stale_file(
+    monkeypatch, capsys, tmp_path, quality_result, expected_rc
+):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    _capture_requests(monkeypatch)
+    receipt_path = tmp_path / "gate-pr-comment-receipt.json"
+    receipt_path.write_text("old receipt", encoding="utf-8")
+    _, args = _comment_scenario(
+        tmp_path,
+        {"comment_receipt_path": str(receipt_path), "quality_result": quality_result},
+    )
+    original_write_text = Path.write_text
+
+    def fail_receipt_write(path, data, **kwargs):
+        if path.name == ".gate-pr-comment-receipt.json.tmp":
+            raise OSError("simulated disk full")
+        return original_write_text(path, data, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_receipt_write)
+    assert AGG.main(args + ["--pr-comment", "true"]) == expected_rc
+    assert not receipt_path.exists()
+    assert "could not persist the gate PR-comment receipt" in capsys.readouterr().out
 
 
 def test_http_403_warning_names_rate_limit_or_permission_not_just_fork(monkeypatch, capsys, tmp_path):
