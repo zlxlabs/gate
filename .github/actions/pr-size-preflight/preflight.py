@@ -58,22 +58,54 @@ def classify(diff_lines: int, max_diff_lines: int, warn_lines: int, max_review_s
     return "single", True
 
 
-def _numstat_entries(numstat: str) -> list[tuple[str, bool]]:
-    entries: list[tuple[str, bool]] = []
-    for line in numstat.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) != 3:
+def _numstat_entries(numstat: bytes) -> tuple[dict[str, bool], int, int, int]:
+    fields = numstat.split(b"\0")
+    binary_by_path: dict[str, bool] = {}
+    additions = deletions = changed_files = 0
+    index = 0
+    while index < len(fields) - 1:
+        record = fields[index]
+        index += 1
+        if not record:
             continue
-        additions, deletions, path = parts
-        entries.append((path, additions == "-" and deletions == "-"))
-    return entries
+        parts = record.split(b"\t", 2)
+        if len(parts) != 3:
+            raise ValueError("invalid git numstat record")
+        added, deleted, path = parts
+        changed_files += 1
+        if added.isdigit():
+            additions += int(added)
+        if deleted.isdigit():
+            deletions += int(deleted)
+        paths = [path] if path else []
+        if not path:
+            if index + 1 >= len(fields):
+                raise ValueError("truncated git numstat rename record")
+            old_path, new_path = fields[index], fields[index + 1]
+            index += 2
+            if not old_path or not new_path:
+                raise ValueError("invalid git numstat rename record")
+            paths = [old_path, new_path]
+        is_binary = added == b"-" and deleted == b"-"
+        for raw_path in paths:
+            binary_by_path[raw_path.decode("utf-8", "surrogateescape")] = is_binary
+    return binary_by_path, additions, deletions, changed_files
 
 
-def _patch_sections(patch: str) -> list[int]:
+def _byte_line_count(value: bytes) -> int:
+    if not value:
+        return 0
+    return value.count(b"\n") + (not value.endswith(b"\n"))
+
+
+def _patch_sections(patch: bytes) -> list[int]:
     sections: list[int] = []
     current_lines = 0
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
+    lines = patch.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    for line in lines:
+        if line.startswith(b"diff --git "):
             if current_lines:
                 sections.append(current_lines)
             current_lines = 1
@@ -105,32 +137,30 @@ def measure(
 ) -> dict[str, Any]:
     ensure_review_commits(repo, base_sha, head_sha)
     patch = _git(repo, "diff", "--no-ext-diff", "--binary", base_sha, head_sha)
-    numstat = _git(repo, "diff", "--numstat", base_sha, head_sha).decode("utf-8", "replace")
-    additions = deletions = changed_files = 0
-    for line in numstat.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) != 3:
-            continue
-        changed_files += 1
-        if parts[0].isdigit():
-            additions += int(parts[0])
-        if parts[1].isdigit():
-            deletions += int(parts[1])
-    entries = _numstat_entries(numstat)
-    section_lines = _patch_sections(patch.decode("utf-8", "replace"))
-    if len(entries) != len(section_lines):
+    numstat = _git(repo, "diff", "--numstat", "-z", base_sha, head_sha)
+    binary_by_path, additions, deletions, changed_files = _numstat_entries(numstat)
+    paths = [
+        raw_path.decode("utf-8", "surrogateescape")
+        for raw_path in _git(repo, "diff", "--name-only", "-z", base_sha, head_sha).split(b"\0")
+        if raw_path
+    ]
+    section_lines = _patch_sections(patch)
+    if len(paths) != len(section_lines):
         raise ValueError(
-            f"git diff file metadata mismatch: numstat={len(entries)} sections={len(section_lines)}"
+            f"git diff file metadata mismatch: paths={len(paths)} sections={len(section_lines)}"
         )
     excluded_files: list[dict[str, Any]] = []
     reviewable_lines = 0
-    for (path, is_binary), raw_lines in zip(entries, section_lines):
+    for path, raw_lines in zip(paths, section_lines):
+        if path not in binary_by_path:
+            raise ValueError(f"git numstat has no entry for diff path {path!r}")
+        is_binary = binary_by_path[path]
         rule = _exclusion_rule(path, is_binary, raw_lines)
         if rule is None:
             reviewable_lines += raw_lines
         else:
             excluded_files.append({"path": path, "rule": rule, "raw_lines": raw_lines})
-    raw_patch_lines = len(patch.splitlines())
+    raw_patch_lines = _byte_line_count(patch)
     classification, reviewable = classify(reviewable_lines, max_diff_lines, warn_lines, max_review_shards)
     return {
         "schema_version": 1,
@@ -249,8 +279,9 @@ def _append_summary(result: dict[str, Any], path: str) -> None:
         if excluded_files:
             summary.write("- Excluded files:\n")
             for item in excluded_files:
+                path = json.dumps(item["path"], ensure_ascii=False)
                 summary.write(
-                    f"  - `{item['path']}` — rule `{item['rule']}`, raw patch {item['raw_lines']} lines\n"
+                    f"  - {path} — rule `{item['rule']}`, raw patch {item['raw_lines']} lines\n"
                 )
         else:
             summary.write("- Excluded files: none\n")

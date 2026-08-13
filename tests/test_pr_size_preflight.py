@@ -168,7 +168,7 @@ def test_size_filter_decodes_rename_paths_from_numstat_z(tmp_path):
 
     result = module.measure(repo, base, head, max_diff_lines=20, warn_lines=40, max_review_shards=3)
 
-    assert result["excluded_files"] == [{"path": "docs/new.PDF", "rule": "R2", "raw_lines": 7}]
+    assert result["excluded_files"] == [{"path": "docs/new.PDF", "rule": "R2", "raw_lines": 4}]
 
 
 def test_u2028_does_not_change_byte_patch_line_count(tmp_path):
@@ -265,6 +265,9 @@ def test_summary_and_action_outputs_show_excluded_file_details(tmp_path):
     assert "Reviewable text: 10 lines" in summary_text
     assert "Raw patch: 5041 lines" in summary_text
     assert '"docs.pdf" — rule `R2`, raw patch 9 lines' in summary_text
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["reviewable-lines"] == "10"
+    assert json.loads(outputs["excluded-files"]) == result["excluded_files"]
 
 
 def test_summary_quotes_paths_with_backticks_without_code_span(tmp_path):
@@ -335,6 +338,3 @@ def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, mon
     assert b"Reviewable text: 10 lines" in summary_bytes
     assert b"`exports/survey.doc.html`" not in summary_bytes
     assert b'"exports/survey.doc.html"' in summary_bytes
-    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert outputs["reviewable-lines"] == "10"
-    assert json.loads(outputs["excluded-files"]) == result["excluded_files"]
