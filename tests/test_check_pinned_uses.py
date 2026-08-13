@@ -108,6 +108,8 @@ def test_cli_rejects_independent_sha_and_floating_ref(tmp_path):
     )
     assert independent.returncode == 1
     assert f".github/workflows/sample.yml:3:{INDEPENDENT_SHA}" in independent.stdout
+    assert "internal uses must use a workspace-relative path" in independent.stdout
+    assert "FAIL: found 1 independently referenced internal uses" in independent.stderr
 
     workflow.write_text(
         "jobs:\n  gate:\n    uses: zlxlabs/gate/.github/workflows/gate.yml@main\n",
