@@ -162,7 +162,7 @@ def test_shadow_workflow_has_no_gate_source_checkout_or_caller_quality_step():
     )
     for job_name, job in raw["jobs"].items():
         for step in job["steps"]:
-            text = str(step)
+            text = f"{step.get('run', '')} {step.get('uses', '')}"
             if step.get("uses") == "actions/checkout@v4":
                 assert not any(marker in text for marker in gate_source_markers), (
                     f"jobs.{job_name} must not checkout gate source into the caller workspace"

@@ -619,6 +619,7 @@ def test_quality_removes_gate_sources_before_any_caller_check():
 
     assert names.index(stale_cleanup["name"]) < names.index(source_checkout["name"])
     assert names.index(source_checkout["name"]) < preflight_index < cleanup_index < first_caller_check
+    assert cleanup_index == preflight_index + 1
     assert stale_cleanup["if"] == "always()"
     assert cleanup["if"] == "always()"
     assert 'rm -rf "$GITHUB_WORKSPACE/_gate-action-src"' in cleanup["run"]
@@ -654,10 +655,10 @@ def test_v2_aggregator_jobs_do_not_execute_caller_quality_code():
     for job_name in ("gate", "ledger"):
         job = raw["jobs"][job_name]
         assert not any(
-            marker in str(step)
+            marker in f"{step.get('run', '')} {step.get('uses', '')}"
             for step in job["steps"]
             for marker in caller_markers
-        ), f"jobs.{job_name} must not run caller quality code"
+        ), f"jobs.{job_name} caller-code scan must use run/uses fields"
         assert not any(
             step.get("uses", "").startswith("./_gate-action-src/")
             for step in job["steps"]

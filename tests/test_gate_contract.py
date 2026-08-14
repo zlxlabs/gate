@@ -166,12 +166,15 @@ def test_gate_source_lifetimes_are_outside_caller_checks():
         < names.index(preflight_cleanup["name"])
         < first_caller_check
     )
+    assert names.index(preflight_cleanup["name"]) == names.index("PR size preflight") + 1
     assert (
         names.index(ledger_cleanup_before["name"])
         < names.index(ledger_checkout["name"])
         < names.index(ledger_build["name"])
         < names.index(ledger_cleanup_after["name"])
     )
+    assert names.index(ledger_checkout["name"]) == names.index(ledger_cleanup_before["name"]) + 1
+    assert names.index(ledger_cleanup_after["name"]) == names.index(ledger_build["name"]) + 1
 
     for cleanup in (stale_cleanup, preflight_cleanup, ledger_cleanup_before, ledger_cleanup_after):
         assert cleanup["if"] == "always()"
