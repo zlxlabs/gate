@@ -134,6 +134,65 @@ def test_pr_size_preflight_runs_before_expensive_checks_and_uses_review_capacity
     assert preflight["with"]["warn-lines"] == "${{ inputs.pr_size_warn_lines }}"
 
 
+def test_gate_source_lifetimes_are_outside_caller_checks():
+    raw, _ = _load()
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    stale_cleanup = next(s for s in steps if s.get("name") == "Remove stale gate source directories")
+    preflight_checkout = next(
+        s for s in steps if s.get("name") == "Checkout gate actions at this workflow's own commit"
+    )
+    preflight_cleanup = next(
+        s for s in steps if s.get("name") == "Remove gate action source before caller checks"
+    )
+    ledger_cleanup_before = next(
+        s for s in steps if s.get("name") == "Remove stale gate source directories before ledger checkout"
+    )
+    ledger_checkout = next(
+        s for s in steps if s.get("name") == "Checkout gate actions for review ledger at this workflow's own commit"
+    )
+    ledger_build = next(s for s in steps if s.get("name") == "Build review effectiveness ledger")
+    ledger_cleanup_after = next(
+        s for s in steps if s.get("name") == "Remove gate action source after review ledger"
+    )
+    first_caller_check = names.index("Run scripts/gate-quality")
+
+    assert names.index(stale_cleanup["name"]) < names.index(preflight_checkout["name"])
+    assert (
+        names.index(preflight_checkout["name"])
+        < names.index("PR size preflight")
+        < names.index(preflight_cleanup["name"])
+        < first_caller_check
+    )
+    assert names.index(preflight_cleanup["name"]) == names.index("PR size preflight") + 1 and names[names.index(preflight_cleanup["name"]) + 1] == "Run scripts/gate-quality"
+    assert (
+        names.index(ledger_cleanup_before["name"])
+        < names.index(ledger_checkout["name"])
+        < names.index(ledger_build["name"])
+        < names.index(ledger_cleanup_after["name"])
+    )
+    assert names.index(ledger_checkout["name"]) == names.index(ledger_cleanup_before["name"]) + 1 and names.index(ledger_cleanup_after["name"]) == names.index(ledger_build["name"]) + 1
+
+    for cleanup in (stale_cleanup, preflight_cleanup, ledger_cleanup_before, ledger_cleanup_after):
+        assert cleanup["if"] == "always()"
+        assert 'rm -rf "$GITHUB_WORKSPACE/_gate-action-src"' in cleanup["run"]
+        if cleanup is stale_cleanup or cleanup is ledger_cleanup_before:
+            assert "for path in _gate-action-src _gate-aggregator-src; do" in cleanup["run"]
+            assert 'if [ -e "$GITHUB_WORKSPACE/$path" ]; then' in cleanup["run"]
+        else:
+            assert 'if [ -e "$GITHUB_WORKSPACE/_gate-action-src" ]; then' in cleanup["run"]
+    assert 'rm -rf "$GITHUB_WORKSPACE/_gate-aggregator-src"' in stale_cleanup["run"]
+    assert 'if [ -e "$GITHUB_WORKSPACE/_gate-aggregator-src" ]; then' in preflight_cleanup["run"]
+    assert 'if [ -e "$GITHUB_WORKSPACE/_gate-aggregator-src" ]; then' in ledger_cleanup_after["run"]
+
+    assert ledger_checkout["with"] == {
+        "repository": "${{ job.workflow_repository }}",
+        "ref": "${{ job.workflow_sha }}",
+        "path": "_gate-action-src",
+        "sparse-checkout": ".github/actions",
+    }
+
+
 def test_quality_entry_missing_warns_and_selects_legacy_mode():
     raw, _ = _load()
     steps = raw["jobs"]["gate"]["steps"]

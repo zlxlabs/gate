@@ -147,6 +147,31 @@ def test_resolve_has_no_checkout_step():
     assert not any(str(s.get("uses", "")).startswith("actions/checkout") for s in steps)
 
 
+def test_shadow_workflow_has_no_gate_source_checkout_or_caller_quality_step():
+    raw, _ = _load_workflow()
+    gate_source_markers = ("job.workflow_repository", "job.workflow_sha", "_gate-action-src", "_gate-aggregator-src", "./_gate-")
+    caller_quality_markers = (
+        "scripts/gate-quality",
+        "make lint",
+        "jscpd",
+        "depcruise",
+        "npm test",
+        "pytest",
+        "uv sync",
+        "pnpm install",
+    )
+    for job_name, job in raw["jobs"].items():
+        for step in job["steps"]:
+            text = f"{step.get('run', '')} {step.get('uses', '')}"
+            if step.get("uses") == "actions/checkout@v4":
+                assert not any(marker in text for marker in gate_source_markers), (
+                    f"jobs.{job_name} must not checkout gate source into the caller workspace"
+                )
+            assert not any(marker in text for marker in caller_quality_markers), (
+                f"jobs.{job_name} must not run caller quality checks"
+            )
+
+
 # ── resolve -> shadow matrix data flow, including the empty-list boundary ──────
 #
 # P1 fix (2026-07-26, codex review of an earlier draft of this workflow): GitHub Actions

@@ -9,6 +9,8 @@
 # 这是它从 zj1123581321/ci-templates 再迁到 zlxlabs/gate 的原因(见 README)。
 # 本文件只有通用门禁逻辑、没有秘密;敏感部分留在别处:codex review 的 prompt/策略
 # 在 self-hosted runner 本地磁盘(GATE_HUB_DIR),仓库清单/runner 基建在私有 gate-hub 仓。
+# Workspace lifecycle audit: the preflight source checkout must end before caller
+# checks; the later ledger action gets a separate short-lived checkout.
 name: gate
 
 on:
@@ -61,6 +63,19 @@ jobs:
         # pair on demand, avoiding a full-history clone for every Gate run.
         with: { fetch-depth: 1 }
 
+      - name: Remove stale gate source directories
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/_gate-action-src"
+          rm -rf "$GITHUB_WORKSPACE/_gate-aggregator-src"
+          for path in _gate-action-src _gate-aggregator-src; do
+            if [ -e "$GITHUB_WORKSPACE/$path" ]; then
+              echo "::error::gate source directory still exists after cleanup: $path"
+              exit 1
+            fi
+          done
+
       - name: Detect repository quality entry
         id: quality-entry
         env:
@@ -98,6 +113,20 @@ jobs:
           max-review-shards: ${{ inputs.max_review_shards }}
           warn-lines: ${{ inputs.pr_size_warn_lines }}
           token: ${{ github.token }}
+
+      - name: Remove gate action source before caller checks
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/_gate-action-src"
+          if [ -e "$GITHUB_WORKSPACE/_gate-action-src" ]; then
+            echo "::error::gate action source directory still exists before caller checks"
+            exit 1
+          fi
+          if [ -e "$GITHUB_WORKSPACE/_gate-aggregator-src" ]; then
+            echo "::error::gate aggregator source directory exists before caller checks"
+            exit 1
+          fi
 
       - name: Run scripts/gate-quality
         if: ${{ steps.quality-entry.outputs.mode == 'entry' }}
@@ -331,6 +360,28 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Remove stale gate source directories before ledger checkout
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/_gate-action-src"
+          rm -rf "$GITHUB_WORKSPACE/_gate-aggregator-src"
+          for path in _gate-action-src _gate-aggregator-src; do
+            if [ -e "$GITHUB_WORKSPACE/$path" ]; then
+              echo "::error::gate source directory still exists before ledger checkout: $path"
+              exit 1
+            fi
+          done
+
+      - name: Checkout gate actions for review ledger at this workflow's own commit
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-action-src
+          sparse-checkout: .github/actions
+
       - name: Build review effectiveness ledger
         if: always()
         continue-on-error: true
@@ -342,6 +393,20 @@ jobs:
           token: ${{ github.token }}
           codex-expected: ${{ inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}
           codex-waived: ${{ contains(github.event.pull_request.labels.*.name, 'codex-review-waived') }}
+
+      - name: Remove gate action source after review ledger
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/_gate-action-src"
+          if [ -e "$GITHUB_WORKSPACE/_gate-action-src" ]; then
+            echo "::error::gate action source directory still exists after review ledger"
+            exit 1
+          fi
+          if [ -e "$GITHUB_WORKSPACE/_gate-aggregator-src" ]; then
+            echo "::error::gate aggregator source directory exists after review ledger"
+            exit 1
+          fi
 
       - name: Upload review effectiveness ledger
         if: always()

@@ -594,6 +594,77 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
     assert names.index(checkout["name"]) < names.index("PR size preflight")
 
 
+def test_quality_removes_gate_sources_before_any_caller_check():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["quality"]["steps"]
+    names = [step.get("name") for step in steps]
+    stale_cleanup = next(s for s in steps if s.get("name") == "Remove stale gate source directories")
+    source_checkout = next(
+        s for s in steps if s.get("name") == "Checkout gate actions at this workflow's own commit"
+    )
+    preflight_index = names.index("PR size preflight")
+    cleanup = next(s for s in steps if s.get("name") == "Remove gate action source before caller checks")
+    cleanup_index = names.index(cleanup["name"])
+    first_caller_check = min(
+        names.index(name)
+        for name in (
+            "Run scripts/gate-quality",
+            "Lint / format",
+            "Duplicate check (jscpd, advisory)",
+            "Dependency direction (dependency-cruiser)",
+            "Install dependencies",
+            "Tests",
+        )
+    )
+
+    assert names.index(stale_cleanup["name"]) < names.index(source_checkout["name"])
+    assert names.index(source_checkout["name"]) < preflight_index < cleanup_index < first_caller_check
+    assert cleanup_index == preflight_index + 1 and names[cleanup_index + 1] == "Run scripts/gate-quality"
+    assert stale_cleanup["if"] == "always()"
+    assert cleanup["if"] == "always()"
+    assert 'rm -rf "$GITHUB_WORKSPACE/_gate-action-src"' in cleanup["run"]
+    assert 'if [ -e "$GITHUB_WORKSPACE/_gate-action-src" ]; then' in cleanup["run"]
+    assert 'if [ -e "$GITHUB_WORKSPACE/_gate-aggregator-src" ]; then' in cleanup["run"]
+    assert 'rm -rf "$GITHUB_WORKSPACE/_gate-aggregator-src"' in stale_cleanup["run"]
+    assert "for path in _gate-action-src _gate-aggregator-src; do" in stale_cleanup["run"]
+    assert 'if [ -e "$GITHUB_WORKSPACE/$path" ]; then' in stale_cleanup["run"]
+
+    for name in (
+        "Run scripts/gate-quality",
+        "Lint / format",
+        "Duplicate check (jscpd, advisory)",
+        "Dependency direction (dependency-cruiser)",
+        "Install dependencies",
+        "Tests",
+    ):
+        assert cleanup_index < names.index(name), f"gate source cleanup must precede {name}"
+
+
+def test_v2_aggregator_jobs_do_not_execute_caller_quality_code():
+    raw, _ = _load_workflow()
+    caller_markers = (
+        "scripts/gate-quality",
+        "make lint",
+        "jscpd",
+        "depcruise",
+        "npm test",
+        "pytest",
+        "uv sync",
+        "pnpm install",
+    )
+    for job_name in ("gate", "ledger"):
+        job = raw["jobs"][job_name]
+        assert not any(
+            marker in f"{step.get('run', '')} {step.get('uses', '')}"
+            for step in job["steps"]
+            for marker in caller_markers
+        ), f"jobs.{job_name} caller-code scan must use run/uses fields"
+        assert not any(
+            step.get("uses", "").startswith("./_gate-action-src/")
+            for step in job["steps"]
+        )
+
+
 def test_quality_action_sparse_checkout_excludes_tests_tree():
     raw, _ = _load_workflow()
     checkout = next(
