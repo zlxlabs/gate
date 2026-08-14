@@ -149,13 +149,7 @@ def test_resolve_has_no_checkout_step():
 
 def test_shadow_workflow_has_no_gate_source_checkout_or_caller_quality_step():
     raw, _ = _load_workflow()
-    gate_source_markers = (
-        "job.workflow_repository",
-        "job.workflow_sha",
-        "_gate-action-src",
-        "_gate-aggregator-src",
-        "./_gate-",
-    )
+    gate_source_markers = ("job.workflow_repository", "job.workflow_sha", "_gate-action-src", "_gate-aggregator-src", "./_gate-")
     caller_quality_markers = (
         "scripts/gate-quality",
         "make lint",
