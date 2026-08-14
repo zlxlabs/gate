@@ -135,6 +135,8 @@ def test_pr_size_preflight_runs_before_expensive_checks_and_uses_review_capacity
 
 
 def test_gate_source_lifetimes_are_outside_caller_checks():
+    # Red verification: removing either caller-side cleanup or the ledger re-checkout
+    # makes this full-file contract suite fail; evidence is recorded in delegate report.
     raw, _ = _load()
     steps = raw["jobs"]["gate"]["steps"]
     names = [step.get("name") for step in steps]
