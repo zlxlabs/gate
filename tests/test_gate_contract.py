@@ -167,6 +167,7 @@ def test_gate_source_lifetimes_are_outside_caller_checks():
         < first_caller_check
     )
     assert names.index(preflight_cleanup["name"]) == names.index("PR size preflight") + 1
+    assert names[names.index(preflight_cleanup["name"]) + 1] == "Run scripts/gate-quality"
     assert (
         names.index(ledger_cleanup_before["name"])
         < names.index(ledger_checkout["name"])
