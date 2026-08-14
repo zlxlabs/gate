@@ -619,8 +619,7 @@ def test_quality_removes_gate_sources_before_any_caller_check():
 
     assert names.index(stale_cleanup["name"]) < names.index(source_checkout["name"])
     assert names.index(source_checkout["name"]) < preflight_index < cleanup_index < first_caller_check
-    assert cleanup_index == preflight_index + 1
-    assert names[cleanup_index + 1] == "Run scripts/gate-quality"
+    assert cleanup_index == preflight_index + 1 and names[cleanup_index + 1] == "Run scripts/gate-quality"
     assert stale_cleanup["if"] == "always()"
     assert cleanup["if"] == "always()"
     assert 'rm -rf "$GITHUB_WORKSPACE/_gate-action-src"' in cleanup["run"]
