@@ -9,6 +9,8 @@
 # 这是它从 zj1123581321/ci-templates 再迁到 zlxlabs/gate 的原因(见 README)。
 # 本文件只有通用门禁逻辑、没有秘密;敏感部分留在别处:codex review 的 prompt/策略
 # 在 self-hosted runner 本地磁盘(GATE_HUB_DIR),仓库清单/runner 基建在私有 gate-hub 仓。
+# Workspace lifecycle audit: the preflight source checkout must end before caller
+# checks; the later ledger action gets a separate short-lived checkout.
 name: gate
 
 on:
