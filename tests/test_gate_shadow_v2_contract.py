@@ -10,7 +10,10 @@ Required Gate leaves workflow-level concurrency unset and Shadow retains its own
 shadow/draft lifecycle group.
 """
 from pathlib import Path
+import subprocess
+import tempfile
 
+import pytest
 import yaml
 
 from _gha_lint import find_arithmetic_gha_expression_offenders
@@ -304,9 +307,56 @@ def test_shadow_max_parallel_is_one_and_documented_as_canary_scoped_not_fleet_wi
     assert "broker-lite" in text
 
 
-def test_shadow_timeout_is_fifteen_minutes():
+def test_shadow_timeout_is_parameterized_with_unchanged_default_and_headroom():
     raw, _ = _load_workflow()
-    assert raw["jobs"]["shadow"]["timeout-minutes"] == 15
+    inputs = _load_workflow()[1]["workflow_call"]["inputs"]
+    assert inputs["shadow_timeout_minutes"] == {"type": "number", "default": 15}
+    assert raw["jobs"]["shadow"]["timeout-minutes"] == "${{ inputs.shadow_timeout_minutes }}"
+
+    steps = raw["jobs"]["shadow"]["steps"]
+    setup = next(s for s in steps if s.get("name") == "Set review-shadow timeout budget")
+    assert setup["if"] == "matrix.reviewer != '__none__'"
+    assert setup["env"] == {"SHADOW_TIMEOUT_MINUTES": "${{ inputs.shadow_timeout_minutes }}"}
+    run = setup["run"]
+    assert "$(( (SHADOW_TIMEOUT_MINUTES - 2) * 60 ))" in run
+    assert 'echo "REVIEW_GATE_TIMEOUT_S=$review_gate_timeout_s" >> "$GITHUB_ENV"' in run
+    assert 'if [ "$SHADOW_TIMEOUT_MINUTES" -le 2 ]' in run
+    assert 'if [ "$SHADOW_TIMEOUT_MINUTES" -gt 60 ]' in run
+
+
+def _run_shadow_timeout_setup(setup, value):
+    with tempfile.TemporaryDirectory() as directory:
+        env_file = Path(directory) / "github-env"
+        env = {"SHADOW_TIMEOUT_MINUTES": value, "GITHUB_ENV": str(env_file)}
+        result = subprocess.run(
+            ["bash", "-c", setup["run"]], env=env, text=True,
+            capture_output=True, check=False,
+        )
+        return result, env_file.read_bytes() if env_file.exists() else b""
+
+
+def test_shadow_timeout_setup_emits_default_and_larger_internal_budgets():
+    raw, _ = _load_workflow()
+    setup = next(s for s in raw["jobs"]["shadow"]["steps"] if s.get("name") == "Set review-shadow timeout budget")
+
+    default_result, default_payload = _run_shadow_timeout_setup(setup, "15")
+    larger_result, larger_payload = _run_shadow_timeout_setup(setup, "20")
+
+    assert default_result.returncode == 0
+    assert default_payload == b"REVIEW_GATE_TIMEOUT_S=780\n"
+    assert larger_result.returncode == 0
+    assert larger_payload == b"REVIEW_GATE_TIMEOUT_S=1080\n"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "15.5", "61"])
+def test_shadow_timeout_setup_rejects_invalid_or_excessive_values(value):
+    raw, _ = _load_workflow()
+    setup = next(s for s in raw["jobs"]["shadow"]["steps"] if s.get("name") == "Set review-shadow timeout budget")
+
+    result, payload = _run_shadow_timeout_setup(setup, value)
+
+    assert result.returncode != 0
+    assert payload == b""
 
 
 def test_shadow_upload_step_name_pattern_matches_summary_download_pattern():

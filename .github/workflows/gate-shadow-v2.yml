@@ -79,6 +79,7 @@ on:
       design_doc:        { type: string, default: "" }   # e.g. docs/DESIGN.md — same meaning as gate-v2.yml's input
       max_diff_lines:    { type: number, default: 4000 } # per-review-turn diff budget — same default as gate-v2.yml
       max_review_shards: { type: number, default: 8 }    # total large-PR coverage budget — same default as gate-v2.yml
+      shadow_timeout_minutes: { type: number, default: 15 } # shadow job hard timeout; 2 minutes are reserved for setup/upload
       # Deliberately NOT mirrored from gate-v2.yml: `has_ui`, `timeout_minutes`,
       # `pr_size_warn_lines`, `primary_timeout_minutes`, `control_runner`. Those are all
       # quality-job- or aggregator-specific inputs with no Shadow Calibration analogue —
@@ -313,16 +314,19 @@ jobs:
     # reaching here via the `resolve` dependency, but the pool selection itself repeats
     # the guard independently, same as every other job in this file's lineage does).
     runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
-    # 15 minutes: review-shadow's OWN internal budget (REVIEW_GATE_TIMEOUT_S) defaults to
-    # 780s (13 minutes — sized to the plan's stated "每个 shadow 13 分钟" figure; not
-    # overridden here, see the "Run review-shadow" step's own comment) — this job's GH
-    # Actions timeout-minutes is intentionally a couple of minutes LARGER than that
+    # The default remains 15 minutes: review-shadow's OWN internal budget
+    # (REVIEW_GATE_TIMEOUT_S) remains 780s (13 minutes — sized to the plan's stated
+    # "每个 shadow 13 分钟" figure). The caller may raise shadow_timeout_minutes for
+    # slower calibration legs; the setup step below derives the matching internal
+    # budget while preserving this same two-minute headroom.
+    # This job's GH Actions timeout-minutes is intentionally a couple of minutes LARGER than
+    # the internal figure
     # internal figure (unlike gate-v2.yml's `primary`, which derives an internal budget
     # SMALLER than its own job timeout via a shell computation), simply reserving
     # headroom for actions/checkout + the Jobs API job-id lookup BEFORE review-shadow
     # even starts, and for the upload-artifact step AFTER it exits — none of which count
     # against review-shadow's own internal deadline.
-    timeout-minutes: 15
+    timeout-minutes: ${{ inputs.shadow_timeout_minutes }}
     steps:
       # `if: matrix.reviewer != '__none__'` on EVERY step from here down (innermost
       # safety-net layer — see this job's own `if:` comment above): the sentinel leg, if
@@ -391,6 +395,29 @@ jobs:
           fi
           echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
 
+      - name: Set review-shadow timeout budget
+        if: matrix.reviewer != '__none__'
+        env:
+          SHADOW_TIMEOUT_MINUTES: ${{ inputs.shadow_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          case "$SHADOW_TIMEOUT_MINUTES" in
+            ''|*[!0-9]*)
+              echo "::error::shadow_timeout_minutes must be a whole number of minutes"
+              exit 1
+              ;;
+          esac
+          if [ "$SHADOW_TIMEOUT_MINUTES" -le 2 ]; then
+            echo "::error::shadow_timeout_minutes must be greater than 2 (2 minutes are reserved for setup and upload); got $SHADOW_TIMEOUT_MINUTES"
+            exit 1
+          fi
+          if [ "$SHADOW_TIMEOUT_MINUTES" -gt 60 ]; then
+            echo "::error::shadow_timeout_minutes must be at most 60 to bound runner occupancy; got $SHADOW_TIMEOUT_MINUTES"
+            exit 1
+          fi
+          review_gate_timeout_s=$(( (SHADOW_TIMEOUT_MINUTES - 2) * 60 ))
+          echo "REVIEW_GATE_TIMEOUT_S=$review_gate_timeout_s" >> "$GITHUB_ENV"
+
       - name: Run review-shadow
         if: matrix.reviewer != '__none__'
         env:
@@ -406,10 +433,10 @@ jobs:
           # CALLER's commit; job.workflow_sha is THIS reusable workflow file's commit).
           REVIEW_CALLER_SHA: ${{ github.workflow_sha }}
           REVIEW_REUSABLE_WORKFLOW_SHA: ${{ job.workflow_sha }}
-          # REVIEW_GATE_TIMEOUT_S is intentionally NOT set here: review-shadow's own
-          # default (780s) already matches the plan's stated "13 分钟" shadow budget
-          # figure verbatim (see review-shadow's own docstring) — unlike primary, no
-          # shell computation is needed to derive it from this job's timeout-minutes.
+          # REVIEW_GATE_TIMEOUT_S is written by the immediately preceding setup step.
+          # Its default is 780s (15 minutes minus the existing two-minute headroom),
+          # preserving the old review-shadow budget while allowing slower callers to
+          # raise both the job limit and internal deadline together.
           GH_TOKEN: ${{ github.token }}
           # Routed through env: rather than interpolated into the `run:` string below —
           # same hygiene fix as the "Resolve numeric job id" step above.
