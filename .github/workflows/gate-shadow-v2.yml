@@ -320,8 +320,7 @@ jobs:
     # slower calibration legs; the setup step below derives the matching internal
     # budget while preserving this same two-minute headroom.
     # This job's GH Actions timeout-minutes is intentionally a couple of minutes LARGER than
-    # the internal figure
-    # internal figure (unlike gate-v2.yml's `primary`, which derives an internal budget
+    # the internal figure (unlike gate-v2.yml's `primary`, which derives an internal budget
     # SMALLER than its own job timeout via a shell computation), simply reserving
     # headroom for actions/checkout + the Jobs API job-id lookup BEFORE review-shadow
     # even starts, and for the upload-artifact step AFTER it exits — none of which count
