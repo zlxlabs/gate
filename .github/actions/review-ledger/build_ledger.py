@@ -226,7 +226,14 @@ def _review_summary(
             "shards": 1 if coverage_complete else None,
         }
         findings = result["findings"] if isinstance(result, dict) else []
-        cost_usd, tokens, shadows = audit.get("cost"), audit.get("tokens"), {}
+        cost_usd, tokens = audit.get("cost"), audit.get("tokens")
+        expected_shadows = audit["expected_shadows"]
+        shadows = {} if not expected_shadows else {
+            "shadow_mode": "detached",
+            "status": "detached_unavailable",
+            "expected_shadows": list(expected_shadows),
+            "outcomes": None,
+        }
     else:
         result = result or {}
         findings = result.get("findings") or []
@@ -335,8 +342,6 @@ def _primary_identity(
         isinstance(name, str) and name for name in audit["expected_shadows"]
     ):
         raise ValueError("canonical primary expected_shadows must be an array of names")
-    if audit["expected_shadows"]:
-        raise ValueError("canonical primary expected_shadows outcomes are unavailable")
     attempts = audit["attempts"]
     if not isinstance(attempts, list):
         raise ValueError("canonical primary attempts must be an array of objects")

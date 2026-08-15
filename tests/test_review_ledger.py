@@ -222,6 +222,52 @@ def test_v2_review_preserves_result_and_recomputes_legacy_coverage(
     assert review["finding_count"] == 1
 
 
+def test_v2_detached_shadows_are_recorded_as_unavailable_without_losing_expectations():
+    module = _module()
+    audit = _v2_audit("pass", expected_shadows=["claude-glm", "gemini-pro"])
+
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=_preflight(), audit=audit,
+        prior_entries=[], dispositions={},
+    )
+
+    assert entry["review"]["shadows"] == {
+        "shadow_mode": "detached",
+        "status": "detached_unavailable",
+        "expected_shadows": ["claude-glm", "gemini-pro"],
+        "outcomes": None,
+    }
+    assert entry["review"]["shadows"] != {}
+
+
+@pytest.mark.parametrize("value", [None, {}, "claude-glm", [""], ["claude-glm", 3]])
+def test_v2_detached_shadows_reject_malformed_expected_names(value):
+    module = _module()
+    audit = _v2_audit("pass")
+    audit["expected_shadows"] = value
+
+    with pytest.raises(ValueError, match="expected_shadows"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit,
+            prior_entries=[], dispositions={},
+        )
+
+
+def test_v2_detached_shadows_reject_non_detached_mode():
+    module = _module()
+    audit = _v2_audit("pass", expected_shadows=["claude-glm"])
+    audit["shadow_mode"] = "inline"
+
+    with pytest.raises(ValueError, match="shadow_mode"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit,
+            prior_entries=[], dispositions={},
+        )
+
+
 def test_v2_runtime_rejects_attempt_duration_sum_mismatch():
     module = _module()
     audit = _v2_audit("pass", runtime={"duration_s": 1})
@@ -279,7 +325,7 @@ def test_ledger_consumes_historical_v1_fixture_without_runtime():
     assert entry["review"]["runtime"] is None
 
 
-@pytest.mark.parametrize("field,value", [("cost", -1), ("cost", float("inf")), ("tokens", {}), ("runtime", {"duration_s": -1}), ("runtime", {"duration_s": float("nan")}), ("expected_shadows", ["claude-glm"])])
+@pytest.mark.parametrize("field,value", [("cost", -1), ("cost", float("inf")), ("tokens", {}), ("runtime", {"duration_s": -1}), ("runtime", {"duration_s": float("nan")})])
 def test_v2_review_rejects_invalid_telemetry(field, value):
     module = _module()
     audit = _v2_audit("pass", **{field: value})
@@ -298,7 +344,7 @@ def test_v2_review_rejects_malformed_consumed_payload(mutation):
 
 def test_v2_primary_audit_rejects_mismatched_parent_identity():
     module = _module()
-    audit = _v2_audit("pass")
+    audit = _v2_audit("pass", expected_shadows=["claude-glm"])
     audit["head_sha"] = "stale"
 
     with pytest.raises(ValueError, match="primary audit identity mismatch"):
