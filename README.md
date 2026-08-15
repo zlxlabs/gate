@@ -98,10 +98,13 @@ PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式�
 刻意**不**镜像 `has_ui`/`timeout_minutes`/`pr_size_warn_lines`/`primary_timeout_minutes`/
 `control_runner`：这个 workflow 没有 `quality` job，也没有 required 聚合器，这些字段没有
 对应语义。`shadow_timeout_minutes` 只作用于 shadow matrix，不影响 Required Gate 的
-primary。它必须是 3–60 的整数；其中 2 分钟固定留给 checkout、Jobs API 查 job id 和
-artifact 上传，内部预算按 `(shadow_timeout_minutes - 2) × 60` 秒写入
-`REVIEW_GATE_TIMEOUT_S`。因此未传入参时仍是 15 分钟 job 上限与 780 秒内部预算；非法或
-超过上限的值会 fail-fast。也没有 `secrets:` 声明——`gate-shadow-v2.yml` 从不调用外部
+primary。它必须是无前导零的整数，最终有效范围为 4–60；其中 2 分钟固定留给 checkout、
+Jobs API 查 job id 和 artifact 上传，内部预算按 `(shadow_timeout_minutes - 2) × 60` 秒计算。
+下游 gate-hub `scripts/review/job_budget.py:61-70` 还会保留 30 秒 kill grace 与 60 秒
+finalize reserve；本 workflow 要求扣除这 90 秒后仍至少剩 30 秒 hop budget，所以 4 分钟
+是可接受的最小值（120 - 90 = 30）。非法、前导零、科学计数法文本或超过 60 的值会在
+`resolve` job fail-fast，即使仓库没有 shadow 腿也不会静默接受。未传入参时仍是 15 分钟
+job 上限与 780 秒内部预算。也没有 `secrets:` 声明——`gate-shadow-v2.yml` 从不调用外部
 webhook，也从不发 PR 评论（发校准收据是计划 T6 的范围，尚未实现）。
 
 ### caller 模板位置
