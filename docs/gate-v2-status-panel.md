@@ -31,26 +31,33 @@ The body is a pure projection and is never used as the history database. The
 marker is `gate-v2-status-panel:v1`; it is not an ownership credential.
 
 History authority is the repository's `gate-terminal-v1-*` Actions artifacts.
-The aggregator lists artifacts through the Actions API, filters each terminal
-record by repository, repository id, and PR number, and adds the current
-record before rendering. Each malformed, mismatched, or expired record is
-skipped independently and counted in the receipt/Step Summary. This includes
-prior head SHAs, so a new push adds a row. If an existing own panel is
-available, its parseable history rows are unioned with artifact rows by
-`run_id + run_attempt`; this is a cache/retention fallback, not a replacement
-for the artifact authority. If either source is incomplete, the public panel
-states `历史可能不完整（原因）` and the receipt carries the per-record
-diagnostic. If the panel is deleted, the next run rebuilds from artifacts and
-therefore does not depend on the deleted body.
+When an existing own panel has parseable history rows, the aggregator validates
+those rows through the per-run Actions endpoint
+`actions/runs/{run_id}/artifacts`; it does not scan the repository-wide artifact
+list. Targeted validation is capped at 50 cached run ids. Each malformed,
+mismatched, or expired record is skipped independently and counted in the
+receipt/Step Summary. This includes prior head SHAs, so a new push adds a row.
+The cached rows are unioned with artifact rows by `run_id + run_attempt`; this
+is a cache/retention fallback, not a replacement for the artifact authority.
+If the panel is missing or its marker has no parseable history rows, the next
+run rebuilds from the repository-wide artifact list, bounded to five pages.
+Exceeding either bound marks history as incomplete with a `bounded_scan` reason.
+If either source is incomplete, the public panel states `历史可能不完整（原因）`
+and the receipt carries the per-record diagnostic.
 
 The aggregate step writes `gate-terminal.json` first. The terminal artifact is
 uploaded before the independent `--publish-only` step can PATCH/POST the
 panel; an upload failure therefore suppresses the panel update for that run.
 
 Every aggregate GitHub API request has a 15-second per-call timeout. The
-`--publish-only` phase also has a wall-clock budget controlled by
-`GATE_PUBLISH_BUDGET_SECONDS`, defaulting to 120 seconds. When the budget is
-exhausted, no later request is started and the phase remains fail-open with
+`--publish-only` phase has a wall-clock budget controlled by
+`GATE_PUBLISH_BUDGET_SECONDS`, defaulting to 120 seconds. History
+reconstruction has a child budget controlled by
+`GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS`, defaulting to 45 seconds and
+never exceeding that default. When the history share is exhausted, rows already
+obtained are rendered, history is marked incomplete, and `COMMENT_PUBLISH`
+still gets the remaining total budget. When the total budget is exhausted, no
+later request is started and the phase remains fail-open with
 `reason_code=publish_budget_exhausted`; the durable receipt records
 `completed_operations` and `pending_operations`.
 
