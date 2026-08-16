@@ -8,7 +8,7 @@ Gate" + "Fork, waiver and notification semantics" sections). Per that plan's
 that depends ONLY on python3 stdlib + data the calling workflow hands it — no
 gate-hub import, no hosted-image-specific tool. The one network call it may
 make is the optional Stage 4 PR-comment receipt (one fail-open issue-comment
-POST via stdlib urllib, gated behind `--pr-comment`, off by default); it never
+POST via stdlib urllib for the marker-located status panel); it never
 feeds back into the verdict or the exit code. When the caller supplies
 `--comment-receipt-path`, the result of that attempt is also persisted as a
 separate, versioned durable receipt artifact; this artifact is evidence for
@@ -92,11 +92,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -676,28 +678,14 @@ def render_status_panel(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-# Stage 4 PR-comment receipt: post ONE NEW issue comment per run whose body is
-# the exact render_summary() product that just went to the Step Summary —
-# never a second, hand-maintained copy of the text (two copies would drift).
-# Deliberate design choices (locked in the task card):
-#   - fail-open: a notification outage must never turn a green gate red, so
-#     every failure mode (missing token, fork-PR 403, 5xx, network error)
-#     degrades to a ::warning:: annotation and nothing else — no ::error::,
-#     no changed exit code, no exception escaping.
-#   - no sticky/marker/PATCH de-dup: GitHub only emails on comment CREATION,
-#     and the high-iteration stage wants one mail per gate run; not looking
-#     up existing comments also removes the check-then-act race.
-#   - token comes from the environment only (GITHUB_TOKEN/GH_TOKEN), never
-#     argv (argv shows up in process lists and logs).
-def _post_issue_comment(*, repository: str, pr_number: int, body: str, token: str) -> None:
-    """POST one new comment on the PR via the issues-comments API (stdlib
-    urllib only — this script must stay portable, no gh-CLI dependency).
-    Raises on any transport or API failure; the fail-open boundary is
-    `_post_pr_comment_fail_open`, not this function.
-    """
+# The status panel is the only aggregate PR comment. It is a marker-located
+# projection of durable gate-terminal artifacts; its body is never treated as
+# the history database. PATCH updates do not notify GitHub subscribers.
+def _github_request(*, token: str, url: str, method: str = "GET", payload: Optional[dict[str, Any]] = None) -> bytes:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(
-        f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments",
-        data=json.dumps({"body": body}, ensure_ascii=False).encode("utf-8"),
+        url,
+        data=data,
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -705,10 +693,111 @@ def _post_issue_comment(*, repository: str, pr_number: int, body: str, token: st
             "Content-Type": "application/json",
             "User-Agent": "gate-aggregator",
         },
-        method="POST",
+        method=method,
     )
-    with urllib.request.urlopen(request, timeout=15):
-        pass  # urlopen raises HTTPError for any non-2xx; a 201 body needs no parsing
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return response.read()
+
+
+def _github_json(*, token: str, url: str) -> Any:
+    raw = _github_request(token=token, url=url)
+    return json.loads(raw) if raw else None
+
+
+def _post_issue_comment(*, repository: str, pr_number: int, body: str, token: str) -> None:
+    _github_request(
+        token=token,
+        url=f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments",
+        method="POST",
+        payload={"body": body},
+    )
+
+
+def _patch_issue_comment(*, repository: str, comment_id: int, body: str, token: str) -> None:
+    _github_request(
+        token=token,
+        url=f"https://api.github.com/repos/{repository}/issues/comments/{comment_id}",
+        method="PATCH",
+        payload={"body": body},
+    )
+
+
+def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number: int) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ValueError("gate terminal artifact is not a JSON object")
+    if record.get("schema_version") != 1 or record.get("kind") != "gate_terminal":
+        raise ValueError("gate terminal artifact has an unsupported schema")
+    if record.get("repository") != repository or record.get("repository_id") != repository_id or record.get("pr_number") != pr_number:
+        raise ValueError("gate terminal artifact identity does not match this PR")
+    for field_name in ("run_id", "run_attempt"):
+        if not _is_strict_int(record.get(field_name)) or record[field_name] <= 0:
+            raise ValueError(f"gate terminal {field_name} must be a positive integer")
+    if not isinstance(record.get("head_sha"), str) or not record["head_sha"]:
+        raise ValueError("gate terminal head_sha must be a non-empty string")
+    if record.get("gate_result") not in GATE_RESULT_DOMAIN:
+        raise ValueError("gate terminal gate_result is outside the finite domain")
+    if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
+        raise ValueError("gate terminal classification/reason_code is outside the finite domain")
+    return {
+        "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
+        "repository": repository,
+        "run_id": record["run_id"],
+        "run_attempt": record["run_attempt"],
+        "head_sha": record["head_sha"],
+        "gate_result": record["gate_result"],
+        "classification": record["classification"],
+        "reason_code": record["reason_code"],
+    }
+
+
+def _read_terminal_zip(raw: bytes) -> dict[str, Any]:
+    with zipfile.ZipFile(io.BytesIO(raw)) as bundle:
+        candidates = [name for name in bundle.namelist() if Path(name).name == "gate-terminal.json"]
+        if len(candidates) != 1:
+            raise ValueError(f"terminal artifact must contain exactly one gate-terminal.json, found {len(candidates)}")
+        return json.loads(bundle.read(candidates[0]))
+
+
+def _fetch_terminal_history(*, token: str, repository: str, repository_id: int, pr_number: int) -> list[dict[str, Any]]:
+    prefix = f"gate-terminal-v1-{repository_id}-"
+    artifacts: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        payload = _github_json(
+            token=token,
+            url=f"https://api.github.com/repos/{repository}/actions/artifacts?per_page=100&page={page}",
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
+            raise ValueError("Actions artifacts response has an invalid shape")
+        page_artifacts = payload["artifacts"]
+        artifacts.extend(
+            artifact for artifact in page_artifacts
+            if isinstance(artifact, dict)
+            and not artifact.get("expired")
+            and isinstance(artifact.get("name"), str)
+            and artifact["name"].startswith(prefix)
+            and isinstance(artifact.get("archive_download_url"), str)
+        )
+        if len(page_artifacts) < 100:
+            break
+        page += 1
+    rows = []
+    for artifact in artifacts:
+        record = _read_terminal_zip(_github_request(token=token, url=artifact["archive_download_url"]))
+        rows.append(_terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number))
+    return rows
+
+
+def _merge_panel_rows(current: dict[str, Any], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_identity = {(row["run_id"], row["run_attempt"]): row for row in history}
+    by_identity[(current["run_id"], current["run_attempt"])] = current
+    return list(by_identity.values())
+
+
+def _find_panel_comment(comments: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(comments, list):
+        raise ValueError("PR comments response has an invalid shape")
+    return next((comment for comment in comments if isinstance(comment, dict) and PANEL_MARKER in comment.get("body", "")), None)
 
 
 def _warn(message: str) -> None:
@@ -727,16 +816,10 @@ def _warn(message: str) -> None:
 def _build_comment_receipt(
     *, body: str, repository: Optional[str], pr_number: Optional[int], identity: Optional[Identity],
     delivery: str, reason_code: str, error_category: Optional[str] = None,
-    http_status: Optional[int] = None,
+    http_status: Optional[int] = None, history_error: Optional[str] = None,
+    operation: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Build the cross-job payload for the PR-comment delivery attempt.
-
-    The body itself stays in the Step Summary/comment contract; a digest lets
-    a consumer correlate this receipt to that exact body without copying the
-    potentially large comment into a second durable artifact. `delivery` is
-    one of `created`, `not_created`, `unknown`, or `not_enabled`; the created
-    field is null whenever the outcome is not determinable or was disabled.
-    """
+    """Build durable evidence for panel delivery and reconstruction failures."""
     return {
         "schema_version": COMMENT_RECEIPT_SCHEMA_VERSION,
         "kind": COMMENT_RECEIPT_KIND,
@@ -752,71 +835,80 @@ def _build_comment_receipt(
         "reason_code": reason_code,
         "error_category": error_category,
         "http_status": http_status,
+        "history_error": history_error,
+        "operation": operation,
         "comment_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }
 
 
-def _post_pr_comment_fail_open(
-    *, body: str, repository: Optional[str], pr_number: Optional[int], identity: Optional[Identity],
-) -> dict[str, Any]:
-    """Best-effort Stage 4 PR-comment receipt. NEVER raises and NEVER prints
-    ::error::: the Step Summary plus the exit code stay the authoritative
-    receipt; this is only the email-visible mirror of it. The try wraps the
-    WHOLE comment attempt (token lookup, target check, POST) so no failure in
-    any part of it can leak out and redden the gate; the warning annotations
-    themselves go through `_warn`, so a broken-pipe stdout cannot escape
-    either.
-    """
+def _panel_failure(exc: BaseException) -> tuple[str, str, Optional[int]]:
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 403 or exc.code == 429:
+            return f"http_{exc.code}", "permission_or_rate_limit", exc.code
+        if exc.code >= 500:
+            return "http_5xx", "server_error", exc.code
+        return "http_error", "http_error", exc.code
+    return "network_indeterminate", "network_error", None
+
+
+def _panel_warning(*, phase: str, exc: BaseException, reason_code: str, category: str, http_status: Optional[int]) -> None:
+    status = str(http_status) if http_status is not None else "unavailable"
+    _warn(
+        f"::warning::gate status panel {phase} failed — HTTP status={status}; "
+        f"permission category={category}; reason={reason_code}; "
+        "gate verdict is unchanged and Step Summary remains authoritative"
+    )
+
+
+def _post_status_panel_fail_open(
+    *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
+    pr_number: Optional[int], identity: Optional[Identity],
+) -> tuple[str, dict[str, Any]]:
+    """Publish the one marker-located status panel without affecting verdict."""
+    body = render_status_panel([current])
     try:
         if not repository or pr_number is None:
-            _warn("::warning::--pr-comment is enabled but repository/pr-number is unavailable — skipping the PR comment (Step Summary remains the authoritative receipt)")
-            return _build_comment_receipt(
-                body=body, repository=repository, pr_number=pr_number, identity=identity,
-                delivery="not_created", reason_code="missing_target", error_category="configuration",
-            )
+            reason_code, category, status = "missing_target", "configuration", None
+            _panel_warning(phase="target resolution", exc=ValueError("missing target"), reason_code=reason_code, category=category, http_status=status)
+            return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         if not token:
-            _warn("::warning::--pr-comment is enabled but neither GITHUB_TOKEN nor GH_TOKEN is set — skipping the PR comment (Step Summary remains the authoritative receipt)")
-            return _build_comment_receipt(
-                body=body, repository=repository, pr_number=pr_number, identity=identity,
-                delivery="not_created", reason_code="missing_token", error_category="configuration",
+            reason_code, category, status = "missing_token", "configuration", None
+            _panel_warning(phase="authentication", exc=ValueError("missing token"), reason_code=reason_code, category=category, http_status=status)
+            return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
+
+        comments = _github_json(token=token, url=f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100")
+        existing = _find_panel_comment(comments)
+        try:
+            history = _fetch_terminal_history(token=token, repository=repository, repository_id=repository_id or 0, pr_number=pr_number)
+        except Exception as exc:
+            reason_code, category, status = _panel_failure(exc)
+            _panel_warning(phase="history reconstruction", exc=exc, reason_code=reason_code, category=category, http_status=status)
+            cached_body = existing.get("body", body) if existing else body
+            return cached_body, _build_comment_receipt(
+                body=cached_body, repository=repository, pr_number=pr_number, identity=identity,
+                delivery="not_created", reason_code="history_unavailable", error_category=category,
+                http_status=status, history_error=f"{type(exc).__name__}: {exc}",
             )
+        body = render_status_panel(_merge_panel_rows(current, history))
+        if existing:
+            _patch_issue_comment(repository=repository, comment_id=int(existing["id"]), body=body, token=token)
+            return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="updated", reason_code="patched", operation="PATCH")
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
-        return _build_comment_receipt(
-            body=body, repository=repository, pr_number=pr_number, identity=identity,
-            delivery="created", reason_code="posted",
-        )
+        return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="created", reason_code="posted", operation="POST")
     except urllib.error.HTTPError as exc:
-        if exc.code == 403:
-            # A 403 is NOT always the fork downgrade: on a same-repo PR the
-            # same status means a secondary rate-limit (GitHub answers 403 or
-            # 429) or a permission failure. The rendering layer cannot tell
-            # fork from same-repo here, so name both instead of misattributing
-            # every 403 to fork (P3-3).
-            _warn(
-                "::warning::could not post the gate PR comment (HTTP 403) — this may be the expected "
-                "read-only token downgrade on fork PRs, or a rate-limit or permission problem on a "
-                "same-repo PR. Step Summary remains the authoritative receipt."
-            )
-        else:
-            _warn(f"::warning::could not post the gate PR comment (HTTP {exc.code}) — Step Summary remains the authoritative receipt")
-        if exc.code == 403:
-            reason_code, category = "http_403", "permission_or_rate_limit"
-        elif exc.code == 429:
-            reason_code, category = "http_429", "permission_or_rate_limit"
-        elif exc.code >= 500:
-            reason_code, category = "http_5xx", "server_error"
-        else:
-            reason_code, category = "http_error", "http_error"
-        return _build_comment_receipt(
+        reason_code, category, status = _panel_failure(exc)
+        _panel_warning(phase="comment publish", exc=exc, reason_code=reason_code, category=category, http_status=status)
+        return body, _build_comment_receipt(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
-            delivery="not_created", reason_code=reason_code, error_category=category, http_status=exc.code,
+            delivery="not_created", reason_code=reason_code, error_category=category, http_status=status,
         )
     except Exception as exc:
-        _warn(f"::warning::could not post the gate PR comment ({type(exc).__name__}: {exc}) — Step Summary remains the authoritative receipt")
-        return _build_comment_receipt(
+        reason_code, category, status = _panel_failure(exc)
+        _panel_warning(phase="comment publish", exc=exc, reason_code=reason_code, category=category, http_status=status)
+        return body, _build_comment_receipt(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
-            delivery="unknown", reason_code="network_indeterminate", error_category="network_error",
+            delivery="unknown", reason_code=reason_code, error_category=category, http_status=status,
         )
 
 
@@ -828,11 +920,51 @@ def _write_comment_receipt(path: str, receipt: dict[str, Any]) -> None:
     temporary_path.replace(target)
 
 
+def _panel_current_row(
+    *, outcome: Outcome, repository: Optional[str], identity: Optional[Identity],
+) -> dict[str, Any]:
+    gate_result = outcome.gate_result if outcome.gate_result in GATE_RESULT_DOMAIN else "unavailable"
+    classification = outcome.classification if outcome.classification in TERMINAL_CLASSIFICATION_DOMAIN else "integration_error"
+    reason_code = outcome.reason_code if outcome.reason_code in TERMINAL_REASON_DOMAIN else "audit_invalid"
+    return {
+        "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
+        "repository": repository or "",
+        "run_id": identity.run_id if identity else 0,
+        "run_attempt": identity.run_attempt if identity else 0,
+        "head_sha": identity.head_sha if identity else "unknown",
+        "gate_result": gate_result,
+        "classification": classification,
+        "reason_code": reason_code,
+    }
+
+
+def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any]) -> None:
+    if receipt.get("delivery") in ("created", "updated") and not receipt.get("history_error"):
+        return
+    status = receipt.get("http_status") if receipt.get("http_status") is not None else "unavailable"
+    diagnostic = (
+        "### Gate v2 status panel delivery diagnostic\n\n"
+        f"- Delivery: `{receipt.get('delivery')}`\n"
+        f"- HTTP status: `{status}`\n"
+        f"- Permission category: `{receipt.get('error_category')}`\n"
+        f"- Reason: `{receipt.get('reason_code')}`\n"
+    )
+    if receipt.get("history_error"):
+        diagnostic += f"- History reconstruction: `{receipt['history_error']}`\n"
+    print(diagnostic)
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write("\n" + diagnostic)
+        except OSError as exc:
+            _warn(f"::warning::could not append the status panel diagnostic to Step Summary ({type(exc).__name__}: {exc})")
+
+
 def _finish(
     outcome: Outcome, summary_path: Optional[str], *, terminal_path: Optional[str] = None, repository: Optional[str] = None,
     identity: Optional[Identity] = None, quality_result: Optional[str] = None, primary_result: Optional[str] = None,
     review_expected: Optional[bool] = None, is_draft: Optional[bool] = None, runner: Optional[str] = None,
-    pr_comment: bool = False, pr_number: Optional[int] = None, comment_receipt_path: Optional[str] = None,
+    pr_number: Optional[int] = None, comment_receipt_path: Optional[str] = None,
 ) -> int:
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
@@ -863,12 +995,18 @@ def _finish(
         temporary_path = terminal_path.with_name(f".{terminal_path.name}.tmp")
         temporary_path.write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary_path.replace(terminal_path)
-    # Stage 4 PR-comment receipt comes LAST in the side-effect order — after
+    # The status panel comes LAST in the side-effect order — after
     # the Step Summary append and the terminal-envelope replace — so a killed
     # process can never leave a "comment says pass but terminal/summary was
     # never persisted" inconsistency; the reverse (terminal persisted, comment
     # never posted) is the safe direction. Fail-open by construction: it
     # cannot change the exit code on the next line.
+    current = _panel_current_row(outcome=outcome, repository=repository, identity=identity)
+    _, receipt = _post_status_panel_fail_open(
+        current=current, repository=repository, repository_id=identity.repository_id if identity else None,
+        pr_number=pr_number, identity=identity,
+    )
+    _append_panel_diagnostic(summary_path, receipt)
     if comment_receipt_path:
         receipt_path = Path(comment_receipt_path)
         receipt_unlink_failed = False
@@ -877,15 +1015,6 @@ def _finish(
         except OSError as exc:
             receipt_unlink_failed = True
             _warn(f"::warning::could not remove the previous gate PR-comment receipt ({type(exc).__name__}: {exc})")
-        if pr_comment:
-            receipt = _post_pr_comment_fail_open(
-                body=summary, repository=repository, pr_number=pr_number, identity=identity,
-            )
-        else:
-            receipt = _build_comment_receipt(
-                body=summary, repository=repository, pr_number=pr_number, identity=identity,
-                delivery="not_enabled", reason_code="not_enabled",
-            )
         try:
             _write_comment_receipt(comment_receipt_path, receipt)
         except OSError as exc:
@@ -911,10 +1040,6 @@ def _finish(
                 _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); receipt channel is untrusted")
             else:
                 _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); file is missing and upload will red")
-    elif pr_comment:
-        _post_pr_comment_fail_open(
-            body=summary, repository=repository, pr_number=pr_number, identity=identity,
-        )
     return 0 if outcome.ok else 1
 
 
@@ -946,31 +1071,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--terminal-path", default=None, help="gate-terminal.json output path")
     parser.add_argument("--comment-receipt-path", default=None, help="durable PR-comment delivery receipt JSON output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
-    parser.add_argument(
-        "--pr-comment",
-        default="false",
-        help="'true'/'false' (strictly parsed, default false) — Stage 4: also post the aggregate verdict "
-        "as ONE new PR comment, reusing the Step Summary text verbatim. Fail-open; the token is read "
-        "from the GITHUB_TOKEN/GH_TOKEN environment, never from argv.",
-    )
     args = parser.parse_args(argv)
-
-    try:
-        pr_comment = as_bool(args.pr_comment)
-    except BoolParseError as exc:
-        return _finish(
-            Outcome(ok=False, problems=[f"malformed boolean input — fail-closed: {exc}"]),
-            args.summary_path,
-            repository=args.repository,
-            pr_number=args.pr_number,
-            comment_receipt_path=args.comment_receipt_path,
-        )
 
     if args.pr_number is None:
         return _finish(
             Outcome(ok=False, problems=["missing PR number — fail-closed"]),
             args.summary_path,
-            pr_comment=pr_comment,
             repository=args.repository,
             pr_number=None,
             comment_receipt_path=args.comment_receipt_path,
@@ -992,7 +1098,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ],
                 ),
                 args.summary_path,
-                pr_comment=pr_comment,
                 repository=args.repository,
                 pr_number=args.pr_number,
                 comment_receipt_path=args.comment_receipt_path,
@@ -1002,7 +1107,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _finish(
             Outcome(ok=False, problems=["malformed repository/head_sha identity input — fail-closed"]),
             args.summary_path,
-            pr_comment=pr_comment,
             repository=args.repository,
             pr_number=args.pr_number,
             comment_receipt_path=args.comment_receipt_path,
@@ -1023,7 +1127,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _finish(
             Outcome(ok=False, problems=[f"malformed boolean input — fail-closed: {exc}"]),
             args.summary_path,
-            pr_comment=pr_comment,
             repository=args.repository,
             pr_number=args.pr_number,
             comment_receipt_path=args.comment_receipt_path,
@@ -1055,7 +1158,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         review_expected=review_expected,
         is_draft=is_draft,
         runner=args.runner,
-        pr_comment=pr_comment,
         pr_number=identity.pr,
         comment_receipt_path=args.comment_receipt_path,
     )
