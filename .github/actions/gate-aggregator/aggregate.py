@@ -824,7 +824,10 @@ def _fetch_terminal_history(*, token: str, repository: str, repository_id: int, 
         if len(page_artifacts) < 100:
             break
         page += 1
-    result = HistoryLoad()
+    if not artifacts:
+        result = HistoryLoad(incomplete_reasons=[f"no terminal artifact matched {prefix}"])
+    else:
+        result = HistoryLoad()
     for artifact in artifacts:
         name = artifact["name"]
         if artifact.get("expired") is True:
@@ -1104,7 +1107,12 @@ def _panel_current_row(
 
 
 def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any]) -> None:
-    if receipt.get("delivery") in ("created", "updated") and not receipt.get("history_error"):
+    if (
+        receipt.get("delivery") in ("created", "updated")
+        and not receipt.get("history_error")
+        and not receipt.get("history_incomplete")
+        and not receipt.get("self_heal_errors")
+    ):
         return
     status = receipt.get("http_status") if receipt.get("http_status") is not None else "unavailable"
     diagnostic = (
@@ -1116,6 +1124,18 @@ def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any
     )
     if receipt.get("history_error"):
         diagnostic += f"- History reconstruction: `{receipt['history_error']}`\n"
+    if receipt.get("history_skipped_count"):
+        diagnostic += f"- Skipped history records: `{receipt['history_skipped_count']}`\n"
+        for record in receipt.get("history_skipped_records", []):
+            diagnostic += f"  - `{record.get('name')}`: `{record.get('reason')}`\n"
+    if receipt.get("history_incomplete_reasons"):
+        diagnostic += "- History completeness: `incomplete`\n"
+        for reason in receipt["history_incomplete_reasons"]:
+            diagnostic += f"  - `{reason}`\n"
+    if receipt.get("self_heal_errors"):
+        diagnostic += "- Comment self-heal: `partial`\n"
+        for error in receipt["self_heal_errors"]:
+            diagnostic += f"  - `{error}`\n"
     print(diagnostic)
     if summary_path:
         try:
