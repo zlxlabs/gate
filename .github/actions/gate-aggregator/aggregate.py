@@ -1018,7 +1018,7 @@ def _post_status_panel_fail_open(
         incomplete_reasons = list(history.incomplete_reasons)
         artifact_keys = {(row["run_id"], row["run_attempt"]) for row in history.rows}
         cache_only = [row for row in cached_rows if (row["run_id"], row["run_attempt"]) not in artifact_keys]
-        if cache_only and history.rows:
+        if cache_only:
             incomplete_reasons.append(
                 "artifact history does not contain cached rows: "
                 + ", ".join(f"{row['run_id']}/{row['run_attempt']}" for row in cache_only)
