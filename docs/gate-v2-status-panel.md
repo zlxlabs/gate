@@ -8,8 +8,16 @@ Gate v2 publishes one aggregate status panel per pull request:
 
 The publisher obtains its own GitHub API identity from `/user`, lists all PR
 comment pages, and considers a comment owned only when both the marker and the
-API author identity match. It PATCHes the earliest own marker comment; a
-non-own comment is never modified. If no own marker exists it POSTs once, then
+API author identity match. When `/user` returns HTTP 403 or 404 for an Actions
+installation token, identity resolution falls back to the documented
+`github-actions[bot]` / user id `41898282` pair. No other identity error enters
+that fallback: 5xx, network, and invalid-response failures remain fail-open
+diagnostics with `operation=IDENTITY`. The receipt records
+`identity_source=user_api` or `identity_source=actions_bot_fallback`.
+
+For ownership matching, a comment author id takes precedence; the login is
+used only when the comment has no id. It PATCHes the earliest own marker
+comment; a non-own comment is never modified. If no own marker exists it POSTs once, then
 re-lists own markers, PATCHes the earliest one, and deletes later own
 duplicates. This closes the local POST race while the gate job's per-PR
 concurrency group serializes normal runs. It uses only GitHub's supported
@@ -57,6 +65,7 @@ OCR advisory comments use one marker per reviewer:
 
 The OCR publisher follows the same own-author, all-pages, earliest-marker,
 find → PATCH / absent → POST rule, including POST verification and duplicate
-self-healing. Delivery failures are fail-open and recorded in the Step Summary
-plus the uploaded delivery diagnostic/event artifact with HTTP status and
-permission category.
+self-healing. It uses the same `/user` 403/404 Actions-bot fallback and
+`identity_source` field. Delivery failures are fail-open and recorded in the
+Step Summary plus the uploaded delivery diagnostic/event artifact with HTTP
+status and permission category.

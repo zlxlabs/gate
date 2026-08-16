@@ -884,6 +884,55 @@ def test_status_panel_publisher_creates_once_then_patches(monkeypatch):
     assert sum(operation[0] == "POST" for operation in operations) == 1
 
 
+@pytest.mark.parametrize("status", [403, 404])
+def test_installation_token_identity_403_or_404_falls_back_and_publishes(monkeypatch, status):
+    current = _panel_terminal_row(5, 1, "pass", "e" * 40)
+    identity_error = urllib.error.HTTPError("https://api.github.com/user", status, "forbidden", hdrs=None, fp=None)
+    calls = []
+    operations = []
+
+    def fake_json(**kwargs):
+        url = kwargs["url"]
+        calls.append(url)
+        if url == "https://api.github.com/user":
+            raise identity_error
+        if "/issues/42/comments" in url:
+            return []
+        if "/actions/artifacts" in url:
+            return {"artifacts": []}
+        raise AssertionError(f"unexpected GitHub API call: {url}")
+
+    monkeypatch.setenv("GH_TOKEN", "installation-token")
+    monkeypatch.setattr(AGG, "_github_json", fake_json)
+    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
+
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
+        identity=IDENTITY,
+    )
+
+    assert calls.count("https://api.github.com/user") == 1
+    assert operations and AGG.PANEL_MARKER in operations[0]
+    assert receipt["delivery"] == "created"
+    assert receipt["operation"] == "POST"
+    assert receipt["identity_source"] == "actions_bot_fallback"
+
+
+def test_identity_http_500_is_reported_as_identity_failure(monkeypatch):
+    error = urllib.error.HTTPError("https://api.github.com/user", 500, "server error", hdrs=None, fp=None)
+    monkeypatch.setenv("GH_TOKEN", "installation-token")
+    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: (_ for _ in ()).throw(error))
+
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=_panel_terminal_row(1, 1, "pass", "a" * 40),
+        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+    )
+
+    assert receipt["operation"] == "IDENTITY"
+    assert receipt["http_status"] == 500
+    assert receipt["error_category"] == "server_error"
+
+
 def test_status_panel_rebuild_after_comment_deletion_uses_terminal_history(monkeypatch):
     current = _panel_terminal_row(5, 1, "pass", "e" * 40)
     history = [_panel_terminal_row(i, 1, result, chr(96 + i) * 40) for i, result in enumerate(
@@ -1204,6 +1253,18 @@ def test_panel_marker_candidates_require_own_author_and_choose_earliest(monkeypa
     selected = AGG._find_panel_comments(comments, owner)
     assert [comment["id"] for comment in selected] == [2, 3]
     assert all(comment["user"]["id"] == owner["id"] for comment in selected)
+
+
+def test_panel_marker_matching_prefers_id_over_login():
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = [
+        {"id": 1, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": {"id": 7, "login": "workflow-bot"}},
+        {"id": 2, "created_at": "2026-08-16T00:01:00Z", "body": AGG.PANEL_MARKER, "user": {"login": "workflow-bot"}},
+    ]
+
+    selected = AGG._find_panel_comments(comments, owner)
+
+    assert [comment["id"] for comment in selected] == [2]
 
 
 def test_panel_comment_lookup_paginates_all_pages(monkeypatch):

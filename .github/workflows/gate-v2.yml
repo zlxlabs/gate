@@ -595,33 +595,46 @@ jobs:
 
           set +e
           export MARKER="$marker"
+          identity_source="user_api"
           identity_output="$(gh api user 2>&1)"
           identity_status=$?
           if [ "$identity_status" -ne 0 ]; then
             http_status="$(printf '%s\n' "$identity_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
             [ -n "$http_status" ] || http_status="unavailable"
-            jq -n --arg http_status "$http_status" \
-              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: $http_status, permission_category: "permission_or_rate_limit"}' \
-              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: permission_or_rate_limit" "- Reason: workflow_identity_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning::OCR advisory sticky identity lookup failed; HTTP status=$http_status; permission category=permission_or_rate_limit"
-            exit 0
+            case "$http_status" in
+              403|404)
+                workflow_id=41898282
+                workflow_login='github-actions[bot]'
+                identity_source="actions_bot_fallback"
+                ;;
+              *)
+                jq -n --arg http_status "$http_status" \
+                  '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: $http_status, identity_source: null, permission_category: "permission_or_rate_limit"}' \
+                  > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+                printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: permission_or_rate_limit" "- Reason: workflow_identity_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
+                echo "::warning::OCR advisory sticky identity lookup failed; HTTP status=$http_status; permission category=permission_or_rate_limit"
+                exit 0
+                ;;
+            esac
+          else
+            workflow_id="$(printf '%s\n' "$identity_output" | jq -er '.id | select(type == "number" and floor == .)')"
+            workflow_id_status=$?
+            workflow_login="$(printf '%s\n' "$identity_output" | jq -er '.login | select(type == "string" and length > 0)')"
+            workflow_login_status=$?
+            if [ "$workflow_id_status" -ne 0 ] || [ "$workflow_login_status" -ne 0 ]; then
+              jq -n '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: null, identity_source: null, permission_category: "configuration"}' \
+                > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+              printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: unavailable" "- Permission category: configuration" "- Reason: workflow_identity_invalid" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::OCR advisory sticky identity response was invalid"
+              exit 0
+            fi
           fi
-          workflow_id="$(printf '%s\n' "$identity_output" | jq -er '.id | select(type == "number" and floor == .)')"
-          workflow_login="$(printf '%s\n' "$identity_output" | jq -er '.login | select(type == "string" and length > 0)')"
-          if [ "$?" -ne 0 ]; then
-            jq -n '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: null, permission_category: "configuration"}' \
-              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: unavailable" "- Permission category: configuration" "- Reason: workflow_identity_invalid" >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning::OCR advisory sticky identity response was invalid"
-            exit 0
-          fi
-          export WORKFLOW_ID="$workflow_id" WORKFLOW_LOGIN="$workflow_login"
+          export WORKFLOW_ID="$workflow_id" WORKFLOW_LOGIN="$workflow_login" IDENTITY_SOURCE="$identity_source"
           list_own_comments() {
             gh api --paginate --slurp \
               "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" |
               jq -c --arg marker "$MARKER" --arg login "$WORKFLOW_LOGIN" --argjson owner_id "$WORKFLOW_ID" \
-                '(add // []) | map(select((.body // "") | contains($marker)) | select(((.user.id // null) == $owner_id) or ((.user.login // "") == $login))) | sort_by([(.created_at // ""), (.id // 0)])'
+                '(add // []) | map(select((.body // "") | contains($marker)) | select((((.user.id // null) != null) and (.user.id == $owner_id)) or (((.user.id // null) == null) and ((.user.login // "") == $login)))) | sort_by([(.created_at // ""), (.id // 0)])'
           }
           lookup_output="$(list_own_comments 2>&1)"
           lookup_status=$?
@@ -630,8 +643,8 @@ jobs:
             [ -n "$http_status" ] || http_status="unavailable"
             permission_category="network_error"
             case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
-            jq -n --arg delivery "not_created" --arg operation "LOOKUP" --arg http_status "$http_status" --arg permission_category "$permission_category" \
-              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, permission_category: $permission_category}' \
+            jq -n --arg delivery "not_created" --arg operation "LOOKUP" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" \
+              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category}' \
               > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
             printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Reason: comment_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::OCR advisory sticky lookup failed; HTTP status=$http_status; permission category=$permission_category"
@@ -652,8 +665,8 @@ jobs:
             [ -n "$http_status" ] || http_status="unavailable"
             permission_category="network_error"
             case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
-            jq -n --arg delivery "not_created" --arg operation "$operation" --arg http_status "$http_status" --arg permission_category "$permission_category" \
-              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, permission_category: $permission_category}' \
+            jq -n --arg delivery "not_created" --arg operation "$operation" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" \
+              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category}' \
               > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
             printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Operation: $operation" >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::OCR advisory sticky $operation failed; HTTP status=$http_status; permission category=$permission_category"
@@ -698,8 +711,8 @@ jobs:
           if [ "$operation" = "POST" ]; then
             delivery="created"
           fi
-          jq -n --arg delivery "$delivery" --arg operation "$operation" --arg self_heal_error "$self_heal_error" \
-            '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, permission_category: null, self_heal_error: (if $self_heal_error == "" then null else $self_heal_error end)}' \
+          jq -n --arg delivery "$delivery" --arg operation "$operation" --arg identity_source "$IDENTITY_SOURCE" --arg self_heal_error "$self_heal_error" \
+            '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, identity_source: $identity_source, permission_category: null, self_heal_error: (if $self_heal_error == "" then null else $self_heal_error end)}' \
             > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
           if [ -n "$self_heal_error" ]; then
             printf '%s\n' "" "- Self-heal: $self_heal_error" >> "$GITHUB_STEP_SUMMARY"
