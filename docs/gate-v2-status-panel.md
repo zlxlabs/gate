@@ -12,7 +12,12 @@ API author identity match. It PATCHes the earliest own marker comment; a
 non-own comment is never modified. If no own marker exists it POSTs once, then
 re-lists own markers, PATCHes the earliest one, and deletes later own
 duplicates. This closes the local POST race while the gate job's per-PR
-concurrency group serializes normal runs.
+concurrency group serializes normal runs. It uses only GitHub's supported
+`group` and `cancel-in-progress: false` keys. GitHub's default concurrency
+queue keeps one run running and at most one pending; when a newer run arrives,
+an older pending run may be canceled. A canceled intermediate run reaches no
+panel publish step, and the surviving run's idempotent find/PATCH/POST and
+POST self-healing still enforce the one-comment invariant.
 
 The body is a pure projection and is never used as the history database. The
 marker is `gate-v2-status-panel:v1`; it is not an ownership credential.

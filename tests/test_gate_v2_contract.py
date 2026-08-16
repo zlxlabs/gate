@@ -138,13 +138,11 @@ def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     assert "concurrency" not in raw
     gate_concurrency = raw["jobs"]["gate"].get("concurrency", {})
     assert gate_concurrency.get("cancel-in-progress") is False
-    assert gate_concurrency.get("queue") == "max"
     assert str(gate_concurrency.get("group", "")).startswith("gate-required-v2-panel-")
     assert "github.repository_id" in gate_concurrency["group"]
     assert "github.event.pull_request.number" in gate_concurrency["group"]
     ledger_concurrency = raw["jobs"]["ledger"].get("concurrency", {})
     assert ledger_concurrency.get("cancel-in-progress") is False
-    assert ledger_concurrency.get("queue") == "max"
     group = str(ledger_concurrency.get("group", ""))
     assert group.startswith("gate-required-v2-ledger-")
     assert "github.repository_id" in group
@@ -158,6 +156,26 @@ def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     for job_name, job in raw["jobs"].items():
         if job_name not in {"ledger", "gate"}:
             assert "concurrency" not in job
+
+
+def test_all_workflow_concurrency_mappings_use_only_github_supported_keys():
+    allowed_keys = {"group", "cancel-in-progress"}
+    workflow_paths = sorted(REPO_ROOT.joinpath(".github", "workflows").glob("*.yml"))
+    workflow_paths += sorted(REPO_ROOT.joinpath(".github", "workflows").glob("*.yaml"))
+    assert workflow_paths
+    for workflow_path in workflow_paths:
+        raw = yaml.safe_load(workflow_path.read_text())
+        mappings = []
+        if isinstance(raw, dict) and "concurrency" in raw:
+            mappings.append(("workflow", raw["concurrency"]))
+        jobs = raw.get("jobs", {}) if isinstance(raw, dict) else {}
+        for job_name, job in jobs.items():
+            if isinstance(job, dict) and "concurrency" in job:
+                mappings.append((f"job {job_name}", job["concurrency"]))
+        for location, concurrency in mappings:
+            assert isinstance(concurrency, dict), f"{workflow_path}:{location} concurrency must be a mapping"
+            unexpected = set(concurrency) - allowed_keys
+            assert not unexpected, f"{workflow_path}:{location} has unsupported concurrency keys: {sorted(unexpected)}"
 
 
 def test_gate_status_panel_publish_happens_after_terminal_upload():

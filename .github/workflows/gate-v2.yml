@@ -729,7 +729,6 @@ jobs:
     concurrency:
       group: gate-required-v2-panel-${{ github.repository_id }}-${{ github.event.pull_request.number }}
       cancel-in-progress: false
-      queue: max
     # 控制面默认跟随 runner 走自建：hosted 因账单预算硬断不可用的实测概率高于
     # 自建机群整体不可用概率，2026-07-27 已造成全组织停摆；v1 已经如此路由，
     # 本次只是补齐未完成灰度。取整税数据：2026-08-01 单日 145 计费分钟 / 12.8 实际分钟。
@@ -934,7 +933,6 @@ jobs:
     concurrency:
       group: gate-required-v2-ledger-${{ github.repository_id }}
       cancel-in-progress: false
-      queue: max
     runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
