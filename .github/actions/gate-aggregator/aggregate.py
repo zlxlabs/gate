@@ -123,6 +123,8 @@ PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
 PANEL_MARKER = "<!-- gate-v2-status-panel:v1 -->"
 PANEL_HISTORY_ROW_SCHEMA_VERSION = 1
+ACTIONS_BOT_ID = 41898282
+ACTIONS_BOT_LOGIN = "github-actions[bot]"
 PANEL_BUCKET_BY_GATE_RESULT = {
     "pass": "可合并",
     "fail": "要修代码",
@@ -719,10 +721,15 @@ def _github_json(*, token: str, url: str) -> Any:
 
 
 def _github_identity(token: str) -> dict[str, Any]:
-    payload = _github_json(token=token, url="https://api.github.com/user")
+    try:
+        payload = _github_json(token=token, url="https://api.github.com/user")
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (403, 404):
+            raise
+        return {"id": ACTIONS_BOT_ID, "login": ACTIONS_BOT_LOGIN, "identity_source": "actions_bot_fallback"}
     if not isinstance(payload, dict) or not _is_strict_int(payload.get("id")) or not isinstance(payload.get("login"), str) or not payload["login"]:
         raise ValueError("GitHub identity response is missing a strict numeric id or login")
-    return {"id": payload["id"], "login": payload["login"]}
+    return {"id": payload["id"], "login": payload["login"], "identity_source": "user_api"}
 
 
 def _fetch_panel_comments(*, token: str, repository: str, pr_number: int) -> list[dict[str, Any]]:
@@ -872,7 +879,11 @@ def _find_panel_comments(comments: Any, owner: dict[str, Any]) -> list[dict[str,
         user = comment.get("user")
         if not isinstance(user, dict):
             continue
-        if user.get("id") == owner_id or user.get("login") == owner_login:
+        if user.get("id") is not None:
+            is_owner = user["id"] == owner_id
+        else:
+            is_owner = user.get("login") == owner_login
+        if is_owner:
             selected.append(comment)
     return sorted(selected, key=lambda comment: (str(comment.get("created_at", "")), int(comment.get("id", 0))))
 
@@ -933,6 +944,7 @@ def _build_panel_delivery(
     http_status: Optional[int] = None, history_error: Optional[str] = None,
     operation: Optional[str] = None, history_skipped_records: Optional[list[dict[str, str]]] = None,
     history_incomplete_reasons: Optional[list[str]] = None, self_heal_errors: Optional[list[str]] = None,
+    identity_source: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build durable evidence for panel delivery and reconstruction failures."""
     return {
@@ -957,6 +969,7 @@ def _build_panel_delivery(
         "history_incomplete": bool(history_incomplete_reasons),
         "self_heal_errors": self_heal_errors or [],
         "operation": operation,
+        "identity_source": identity_source,
         "comment_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }
 
@@ -986,6 +999,7 @@ def _post_status_panel_fail_open(
 ) -> tuple[str, dict[str, Any]]:
     """Publish the one marker-located status panel without affecting verdict."""
     body = render_status_panel([current])
+    identity_source: Optional[str] = None
     try:
         if not repository or pr_number is None:
             reason_code, category, status = "missing_target", "configuration", None
@@ -997,7 +1011,17 @@ def _post_status_panel_fail_open(
             _panel_warning(phase="authentication", exc=ValueError("missing token"), reason_code=reason_code, category=category, http_status=status)
             return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
 
-        owner = _github_identity(token)
+        try:
+            owner = _github_identity(token)
+        except Exception as exc:
+            reason_code, category, status = _panel_failure(exc)
+            _panel_warning(phase="identity", exc=exc, reason_code=reason_code, category=category, http_status=status)
+            return body, _build_panel_delivery(
+                body=body, repository=repository, pr_number=pr_number, identity=identity,
+                delivery="not_created", reason_code=reason_code, error_category=category,
+                http_status=status, operation="IDENTITY",
+            )
+        identity_source = owner.get("identity_source", "user_api")
         comments = _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number)
         own_panels = _find_panel_comments(comments, owner)
         existing = own_panels[0] if own_panels else None
@@ -1011,6 +1035,7 @@ def _post_status_panel_fail_open(
                 body=cached_body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="not_created", reason_code="history_unavailable", error_category=category,
                 http_status=status, history_error=f"{type(exc).__name__}: {exc}", operation="LOOKUP",
+                identity_source=identity_source,
             )
         if isinstance(history, list):
             history = HistoryLoad(rows=history)
@@ -1040,6 +1065,7 @@ def _post_status_panel_fail_open(
                 delivery="updated", reason_code="history_incomplete" if incomplete_reasons else "patched",
                 operation="PATCH", history_skipped_records=history.skipped_records,
                 history_incomplete_reasons=incomplete_reasons, self_heal_errors=self_heal_errors,
+                identity_source=identity_source,
             )
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
         try:
@@ -1063,6 +1089,7 @@ def _post_status_panel_fail_open(
             delivery="created", reason_code="post_self_heal_partial" if self_heal_errors else "posted",
             operation="POST", history_skipped_records=history.skipped_records,
             history_incomplete_reasons=incomplete_reasons, self_heal_errors=self_heal_errors,
+            identity_source=identity_source,
         )
     except urllib.error.HTTPError as exc:
         reason_code, category, status = _panel_failure(exc)
@@ -1070,6 +1097,7 @@ def _post_status_panel_fail_open(
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="not_created", reason_code=reason_code, error_category=category, http_status=status,
+            identity_source=identity_source,
         )
     except Exception as exc:
         reason_code, category, status = _panel_failure(exc)
@@ -1077,6 +1105,7 @@ def _post_status_panel_fail_open(
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="unknown", reason_code=reason_code, error_category=category, http_status=status,
+            identity_source=identity_source,
         )
 
 
