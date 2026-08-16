@@ -1043,7 +1043,7 @@ def test_fetch_terminal_history_consumes_a_persisted_terminal_artifact(monkeypat
             "archive_download_url": "https://api.github.com/archive/1",
         }]},
     )
-    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: archive.getvalue())
+    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: archive.getvalue())
     rows = AGG._fetch_terminal_history(
         token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
     )
@@ -1579,7 +1579,7 @@ def test_history_loader_skips_other_pr_and_bad_records_individually(monkeypatch)
             {"name": "gate-terminal-v1-123-expired", "expired": True, "archive_download_url": "expired"},
         ]},
     )
-    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: zipped[kwargs["url"]])
+    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: zipped[kwargs["url"]])
     result = AGG._fetch_terminal_history(token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42)
     assert [row["run_id"] for row in result.rows] == [9]
     assert {entry["name"] for entry in result.skipped_records} == {

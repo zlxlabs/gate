@@ -101,6 +101,7 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -790,6 +791,13 @@ def render_status_panel(rows: list[dict[str, Any]], *, history_warning: Optional
 # The status panel is the only aggregate PR comment. It is a marker-located
 # projection of durable gate-terminal artifacts; its body is never treated as
 # the history database. PATCH updates do not notify GitHub subscribers.
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
 def _github_request(*, token: str, url: str, method: str = "GET", payload: Optional[dict[str, Any]] = None) -> bytes:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(
@@ -819,6 +827,53 @@ def _github_request(*, token: str, url: str, method: str = "GET", payload: Optio
     if budget is not None:
         budget.timeout()
     return raw
+
+
+def _download_terminal_zip(*, token: str, url: str) -> bytes:
+    """Download one terminal zip while keeping GitHub auth off signed blobs."""
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    budget = _ACTIVE_PUBLISH_BUDGET.get()
+    api_headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "gate-aggregator",
+    }
+
+    def open_once(request: urllib.request.Request) -> bytes:
+        timeout = budget.timeout() if budget is not None else GITHUB_API_TIMEOUT_SECONDS
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                raw = response.read()
+        except (socket.timeout, TimeoutError) as exc:
+            if budget is not None:
+                try:
+                    budget.timeout()
+                except _PublishBudgetExhausted as budget_exc:
+                    raise budget_exc from exc
+            raise
+        if budget is not None:
+            budget.timeout()
+        return raw
+
+    request = urllib.request.Request(url, headers=api_headers, method="GET")
+    try:
+        return open_once(request)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 302:
+            raise
+        location = exc.headers.get("Location") if exc.headers is not None else None
+        if not isinstance(location, str) or not location:
+            raise ValueError("artifact zip redirect did not include a Location header")
+        if urllib.parse.urlsplit(location).hostname is None:
+            raise ValueError("artifact zip redirect Location is not an absolute URL")
+        redirect_headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "gate-aggregator",
+        }
+        if urllib.parse.urlsplit(location).hostname.lower() == "api.github.com":
+            redirect_headers.update(api_headers)
+        return open_once(urllib.request.Request(location, headers=redirect_headers, method="GET"))
 
 
 def _github_json(*, token: str, url: str) -> Any:
@@ -931,7 +986,7 @@ def _consume_terminal_artifact(
         result.incomplete_reasons.append(f"artifact {name} has no archive URL")
         return True
     try:
-        record = _read_terminal_zip(_github_request(token=token, url=archive_url))
+        record = _read_terminal_zip(_download_terminal_zip(token=token, url=archive_url))
         result.rows.append(_terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number))
     except _PublishBudgetExhausted:
         result.incomplete_reasons.append(f"history budget exhausted while downloading {name}")
