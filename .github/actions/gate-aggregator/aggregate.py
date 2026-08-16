@@ -118,6 +118,14 @@ TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expect
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
 COMMENT_RECEIPT_SCHEMA_VERSION = 1
 COMMENT_RECEIPT_KIND = "gate_pr_comment_receipt"
+PANEL_MARKER = "<!-- gate-v2-status-panel:v1 -->"
+PANEL_HISTORY_ROW_SCHEMA_VERSION = 1
+PANEL_BUCKET_BY_GATE_RESULT = {
+    "pass": "可合并",
+    "fail": "要修代码",
+    "skipped": "无需动作",
+    "unavailable": "修基础设施",
+}
 
 # The `runner` reusable-workflow input's only two legal values (see
 # gate-v2.yml's `inputs.runner`). A typo (e.g. "slef") must never be silently
@@ -611,6 +619,61 @@ def render_summary(
         lines.append("```")
         lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def _panel_action(row: dict[str, Any]) -> str:
+    """Return the recipient-facing action for one validated panel row."""
+    gate_result = row["gate_result"]
+    action = PANEL_BUCKET_BY_GATE_RESULT[gate_result]
+    if gate_result == "skipped":
+        return f"{action}（主审未跑，绿≠过审）"
+    return action
+
+
+def render_status_panel(rows: list[dict[str, Any]]) -> str:
+    """Render the public sticky panel from rows only.
+
+    The renderer is deliberately a pure projection: it does not read a prior
+    comment, infer history from rendered Markdown, or mutate its input. Rows
+    are sorted by their durable run identity so a rerun produces the same
+    body for the same input set.
+    """
+    ordered = sorted(rows, key=lambda row: (row["run_id"], row["run_attempt"]))
+    if not ordered:
+        raise ValueError("status panel requires at least one terminal row")
+    current = ordered[-1]
+    current_result = current["gate_result"]
+    lines = [
+        PANEL_MARKER,
+        "",
+        "### Required Gate v2 — 状态面板",
+        "",
+        f"当前状态：**{current_result}** · **{_panel_action(current)}**",
+    ]
+    if current_result == "skipped":
+        lines.extend(["", "> 主审未跑，绿≠过审。draft / fork / hosted 的跳过不代表真实通过。"])
+    lines.extend([
+        "",
+        f"当前裁决：`{current['classification']}` / `{current['reason_code']}`",
+        "",
+        "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
+        "",
+        "| Run | Attempt | Head | 状态 | 收件人动作 |",
+        "| ---: | ---: | :--- | :--- | :--- |",
+    ])
+    for row in ordered:
+        short_sha = row["head_sha"][:7]
+        run_link = f"[{row['run_id']}](https://github.com/{row['repository']}/actions/runs/{row['run_id']})"
+        lines.append(
+            f"| {run_link} | {row['run_attempt']} | `{short_sha}` | "
+            f"`{row['gate_result']}` | {_panel_action(row)} |"
+        )
+    lines.extend([
+        "",
+        "历史行按 `run_id` + `run_attempt` 去重并只增不删；删除本评论后可由 `gate_terminal` 制品重建。",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 # Stage 4 PR-comment receipt: post ONE NEW issue comment per run whose body is

@@ -1331,3 +1331,48 @@ def test_post_issue_comment_posts_to_the_pr_issue_comments_api(monkeypatch):
     # drop it (P3-1).
     assert request.captured_timeout == 15
     assert json.loads(request.data.decode("utf-8")) == {"body": "hello gate"}
+
+
+def _panel_row(run_id, run_attempt, gate_result, *, head_sha=None):
+    return {
+        "schema_version": AGG.PANEL_HISTORY_ROW_SCHEMA_VERSION,
+        "repository": "zlxlabs/gate",
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha or (chr(96 + run_id) * 40),
+        "gate_result": gate_result,
+        "classification": {
+            "pass": "code_pass",
+            "fail": "code_fail",
+            "skipped": "expected_skip",
+            "unavailable": "integration_error",
+        }[gate_result],
+        "reason_code": {
+            "pass": "primary_pass",
+            "fail": "primary_findings",
+            "skipped": "review_not_expected",
+            "unavailable": "audit_missing",
+        }[gate_result],
+    }
+
+
+def test_panel_bucket_mapping_exhaustively_covers_current_gate_result_domain():
+    assert set(AGG.PANEL_BUCKET_BY_GATE_RESULT) == set(AGG.GATE_RESULT_DOMAIN)
+
+
+@pytest.mark.parametrize("gate_result", AGG.GATE_RESULT_DOMAIN)
+def test_status_panel_renders_every_gate_result_and_action_bucket(gate_result):
+    body = AGG.render_status_panel([_panel_row(1, 1, gate_result)])
+    assert AGG.PANEL_MARKER in body
+    assert f"当前状态：**{gate_result}**" in body
+    assert AGG.PANEL_BUCKET_BY_GATE_RESULT[gate_result] in body
+
+
+def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
+    rows = [_panel_row(3, 1, "pass"), _panel_row(2, 2, "fail"), _panel_row(2, 1, "skipped")]
+    original = [dict(row) for row in rows]
+    body = AGG.render_status_panel(rows)
+    assert rows == original
+    assert body.index("| [2]") < body.index("| [3]")
+    assert body.index("| [2]") < body.index("| [2]") + 1
+    assert "主审未跑，绿≠过审" in body
