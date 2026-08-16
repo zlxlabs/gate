@@ -1355,6 +1355,18 @@ def test_history_api_failure_preserves_existing_panel_body_and_records_diagnosti
     assert receipt["history_error"]
 
 
+def test_history_skip_count_is_written_to_step_summary(tmp_path, capsys):
+    summary = tmp_path / "summary.md"
+    receipt = AGG._build_panel_delivery(
+        body="panel", repository="zlxlabs/gate", pr_number=42, identity=IDENTITY,
+        delivery="updated", reason_code="patched",
+        history_skipped_records=[{"name": "old", "reason": "expired_artifact"}],
+    )
+    AGG._append_panel_diagnostic(str(summary), receipt)
+    assert "Skipped history records: `1`" in summary.read_text(encoding="utf-8")
+    assert "`old`: `expired_artifact`" in capsys.readouterr().out
+
+
 
 def _panel_row(run_id, run_attempt, gate_result, *, head_sha=None):
     return {

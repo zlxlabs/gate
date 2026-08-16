@@ -1051,7 +1051,7 @@ def _post_status_panel_fail_open(
             after_post = []
         if after_post:
             winner = after_post[0]
-            if int(winner["id"]) != int(after_post[-1]["id"]) or len(after_post) > 1:
+            if winner.get("body") != body or len(after_post) > 1:
                 try:
                     _patch_issue_comment(repository=repository, comment_id=int(winner["id"]), body=body, token=token)
                     for duplicate in after_post[1:]:
@@ -1186,6 +1186,7 @@ def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any
         receipt.get("delivery") in ("created", "updated")
         and not receipt.get("history_error")
         and not receipt.get("history_incomplete")
+        and not receipt.get("history_skipped_count")
         and not receipt.get("self_heal_errors")
     ):
         return
