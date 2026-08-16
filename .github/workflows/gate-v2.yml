@@ -604,6 +604,9 @@ jobs:
             [ -n "$http_status" ] || http_status="unavailable"
             permission_category="network_error"
             case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
+            jq -n --arg delivery "not_created" --arg operation "LOOKUP" --arg http_status "$http_status" --arg permission_category "$permission_category" \
+              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, permission_category: $permission_category}' \
+              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
             printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Reason: comment_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::OCR advisory sticky lookup failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
@@ -630,7 +633,11 @@ jobs:
             echo "::warning::OCR advisory sticky $operation failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
           fi
-          jq -n --arg delivery "updated" --arg operation "$operation" \
+          delivery="updated"
+          if [ "$operation" = "POST" ]; then
+            delivery="created"
+          fi
+          jq -n --arg delivery "$delivery" --arg operation "$operation" \
             '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, permission_category: null}' \
             > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
           echo "OCR advisory sticky $operation succeeded for reviewer $REVIEWER"
