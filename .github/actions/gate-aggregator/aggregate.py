@@ -91,12 +91,15 @@ tests/test_gate_aggregator.py for the full decision matrix):
 from __future__ import annotations
 
 import argparse
+import contextvars
 import hashlib
 import io
 import json
 import os
 import re
+import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -121,6 +124,17 @@ TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expect
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
 PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
+GITHUB_API_TIMEOUT_SECONDS = 15
+DEFAULT_PUBLISH_BUDGET_SECONDS = 120
+PUBLISH_BUDGET_ENV = "GATE_PUBLISH_BUDGET_SECONDS"
+PUBLISH_OPERATION_ORDER = (
+    "IDENTITY",
+    "COMMENT_LOOKUP",
+    "HISTORY_RECONSTRUCTION",
+    "COMMENT_PUBLISH",
+    "POST_VERIFY",
+    "SELF_HEAL",
+)
 PANEL_MARKER = "<!-- gate-v2-status-panel:v1 -->"
 PANEL_HISTORY_ROW_SCHEMA_VERSION = 1
 ACTIONS_BOT_ID = 41898282
@@ -223,6 +237,61 @@ class HistoryLoad:
     rows: list[dict[str, Any]] = field(default_factory=list)
     skipped_records: list[dict[str, str]] = field(default_factory=list)
     incomplete_reasons: list[str] = field(default_factory=list)
+
+
+class _PublishBudgetExhausted(Exception):
+    def __init__(self, operation: str):
+        self.operation = operation
+        super().__init__(f"publish budget exhausted during {operation}")
+
+
+@dataclass
+class _PublishBudget:
+    seconds: float
+    started_at: float = field(default_factory=time.monotonic)
+    completed_operations: list[str] = field(default_factory=list)
+    pending_operations: list[str] = field(default_factory=lambda: list(PUBLISH_OPERATION_ORDER))
+    current_operation: Optional[str] = None
+
+    @classmethod
+    def from_environment(cls) -> "_PublishBudget":
+        raw = os.environ.get(PUBLISH_BUDGET_ENV)
+        seconds = DEFAULT_PUBLISH_BUDGET_SECONDS if raw is None else float(raw)
+        if seconds <= 0:
+            raise ValueError(f"{PUBLISH_BUDGET_ENV} must be greater than zero")
+        return cls(seconds=seconds)
+
+    def remaining(self) -> float:
+        return self.seconds - (time.monotonic() - self.started_at)
+
+    def timeout(self) -> float:
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise _PublishBudgetExhausted(self.current_operation or "UNKNOWN")
+        return min(GITHUB_API_TIMEOUT_SECONDS, remaining)
+
+    def begin(self, operation: str) -> None:
+        self.current_operation = operation
+        self.timeout()
+
+    def complete(self, operation: str) -> None:
+        if operation not in self.completed_operations:
+            self.completed_operations.append(operation)
+        if operation in self.pending_operations:
+            self.pending_operations.remove(operation)
+
+    def add(self, operation: str) -> None:
+        if operation not in self.completed_operations and operation not in self.pending_operations:
+            self.pending_operations.append(operation)
+
+    def discard(self, operation: str) -> None:
+        if operation in self.pending_operations:
+            self.pending_operations.remove(operation)
+
+
+_ACTIVE_PUBLISH_BUDGET: contextvars.ContextVar[Optional[_PublishBudget]] = contextvars.ContextVar(
+    "active_publish_budget", default=None,
+)
 
 
 def build_terminal_envelope(
@@ -711,8 +780,18 @@ def _github_request(*, token: str, url: str, method: str = "GET", payload: Optio
         },
         method=method,
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return response.read()
+    budget = _ACTIVE_PUBLISH_BUDGET.get()
+    timeout = budget.timeout() if budget is not None else GITHUB_API_TIMEOUT_SECONDS
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except (socket.timeout, TimeoutError) as exc:
+        if budget is not None and budget.remaining() <= 0:
+            raise _PublishBudgetExhausted(budget.current_operation or "UNKNOWN") from exc
+        raise
+    if budget is not None and budget.remaining() <= 0:
+        raise _PublishBudgetExhausted(budget.current_operation or "UNKNOWN")
+    return raw
 
 
 def _github_json(*, token: str, url: str) -> Any:
@@ -944,7 +1023,8 @@ def _build_panel_delivery(
     http_status: Optional[int] = None, history_error: Optional[str] = None,
     operation: Optional[str] = None, history_skipped_records: Optional[list[dict[str, str]]] = None,
     history_incomplete_reasons: Optional[list[str]] = None, self_heal_errors: Optional[list[str]] = None,
-    identity_source: Optional[str] = None,
+    identity_source: Optional[str] = None, completed_operations: Optional[list[str]] = None,
+    pending_operations: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Build durable evidence for panel delivery and reconstruction failures."""
     return {
@@ -970,6 +1050,8 @@ def _build_panel_delivery(
         "self_heal_errors": self_heal_errors or [],
         "operation": operation,
         "identity_source": identity_source,
+        "completed_operations": completed_operations or [],
+        "pending_operations": pending_operations or [],
         "comment_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }
 
@@ -993,9 +1075,9 @@ def _panel_warning(*, phase: str, exc: BaseException, reason_code: str, category
     )
 
 
-def _post_status_panel_fail_open(
+def _post_status_panel_fail_open_with_budget(
     *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
-    pr_number: Optional[int], identity: Optional[Identity],
+    pr_number: Optional[int], identity: Optional[Identity], budget: _PublishBudget,
 ) -> tuple[str, dict[str, Any]]:
     """Publish the one marker-located status panel without affecting verdict."""
     body = render_status_panel([current])
@@ -1012,7 +1094,11 @@ def _post_status_panel_fail_open(
             return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
 
         try:
+            budget.begin("IDENTITY")
             owner = _github_identity(token)
+            budget.complete("IDENTITY")
+        except _PublishBudgetExhausted:
+            raise
         except Exception as exc:
             reason_code, category, status = _panel_failure(exc)
             _panel_warning(phase="identity", exc=exc, reason_code=reason_code, category=category, http_status=status)
@@ -1020,13 +1106,20 @@ def _post_status_panel_fail_open(
                 body=body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="not_created", reason_code=reason_code, error_category=category,
                 http_status=status, operation="IDENTITY",
+                completed_operations=budget.completed_operations, pending_operations=budget.pending_operations,
             )
         identity_source = owner.get("identity_source", "user_api")
+        budget.begin("COMMENT_LOOKUP")
         comments = _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number)
+        budget.complete("COMMENT_LOOKUP")
         own_panels = _find_panel_comments(comments, owner)
         existing = own_panels[0] if own_panels else None
         try:
+            budget.begin("HISTORY_RECONSTRUCTION")
             history = _fetch_terminal_history(token=token, repository=repository, repository_id=repository_id or 0, pr_number=pr_number)
+            budget.complete("HISTORY_RECONSTRUCTION")
+        except _PublishBudgetExhausted:
+            raise
         except Exception as exc:
             reason_code, category, status = _panel_failure(exc)
             _panel_warning(phase="history reconstruction", exc=exc, reason_code=reason_code, category=category, http_status=status)
@@ -1035,7 +1128,8 @@ def _post_status_panel_fail_open(
                 body=cached_body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="not_created", reason_code="history_unavailable", error_category=category,
                 http_status=status, history_error=f"{type(exc).__name__}: {exc}", operation="LOOKUP",
-                identity_source=identity_source,
+                identity_source=identity_source, completed_operations=budget.completed_operations,
+                pending_operations=budget.pending_operations,
             )
         if isinstance(history, list):
             history = HistoryLoad(rows=history)
@@ -1054,42 +1148,82 @@ def _post_status_panel_fail_open(
         )
         self_heal_errors: list[str] = []
         if existing:
+            budget.discard("POST_VERIFY")
+            budget.begin("COMMENT_PUBLISH")
             _patch_issue_comment(repository=repository, comment_id=int(existing["id"]), body=body, token=token)
+            budget.complete("COMMENT_PUBLISH")
             for duplicate in own_panels[1:]:
+                budget.add("SELF_HEAL")
+                budget.begin("SELF_HEAL")
                 try:
                     _delete_issue_comment(repository=repository, comment_id=int(duplicate["id"]), token=token)
+                    budget.complete("SELF_HEAL")
+                except _PublishBudgetExhausted:
+                    raise
                 except Exception as exc:
                     self_heal_errors.append(f"comment {duplicate.get('id')}: {type(exc).__name__}: {exc}")
+            if not own_panels[1:]:
+                budget.discard("SELF_HEAL")
             return body, _build_panel_delivery(
                 body=body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="updated", reason_code="history_incomplete" if incomplete_reasons else "patched",
                 operation="PATCH", history_skipped_records=history.skipped_records,
                 history_incomplete_reasons=incomplete_reasons, self_heal_errors=self_heal_errors,
-                identity_source=identity_source,
+                identity_source=identity_source, completed_operations=budget.completed_operations,
+                pending_operations=budget.pending_operations,
             )
+        budget.begin("COMMENT_PUBLISH")
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
+        budget.complete("COMMENT_PUBLISH")
+        budget.begin("POST_VERIFY")
         try:
             after_post = _find_panel_comments(
                 _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number), owner,
             )
+            budget.complete("POST_VERIFY")
+        except _PublishBudgetExhausted:
+            raise
         except Exception as exc:
             self_heal_errors.append(f"post verification: {type(exc).__name__}: {exc}")
             after_post = []
+            budget.discard("POST_VERIFY")
         if after_post:
             winner = after_post[0]
             if winner.get("body") != body or len(after_post) > 1:
+                budget.add("SELF_HEAL")
+                budget.begin("SELF_HEAL")
                 try:
                     _patch_issue_comment(repository=repository, comment_id=int(winner["id"]), body=body, token=token)
                     for duplicate in after_post[1:]:
                         _delete_issue_comment(repository=repository, comment_id=int(duplicate["id"]), token=token)
+                    budget.complete("SELF_HEAL")
+                except _PublishBudgetExhausted:
+                    raise
                 except Exception as exc:
                     self_heal_errors.append(f"post self-heal: {type(exc).__name__}: {exc}")
+            else:
+                budget.discard("SELF_HEAL")
+        else:
+            budget.discard("SELF_HEAL")
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="created", reason_code="post_self_heal_partial" if self_heal_errors else "posted",
             operation="POST", history_skipped_records=history.skipped_records,
             history_incomplete_reasons=incomplete_reasons, self_heal_errors=self_heal_errors,
-            identity_source=identity_source,
+            identity_source=identity_source, completed_operations=budget.completed_operations,
+            pending_operations=budget.pending_operations,
+        )
+    except _PublishBudgetExhausted as exc:
+        delivery = "unknown" if "COMMENT_PUBLISH" in budget.completed_operations else "not_created"
+        _panel_warning(
+            phase="publish budget", exc=exc, reason_code="publish_budget_exhausted",
+            category="network_error", http_status=None,
+        )
+        return body, _build_panel_delivery(
+            body=body, repository=repository, pr_number=pr_number, identity=identity,
+            delivery=delivery, reason_code="publish_budget_exhausted", error_category="network_error",
+            operation=exc.operation, identity_source=identity_source,
+            completed_operations=budget.completed_operations, pending_operations=budget.pending_operations,
         )
     except urllib.error.HTTPError as exc:
         reason_code, category, status = _panel_failure(exc)
@@ -1097,7 +1231,8 @@ def _post_status_panel_fail_open(
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="not_created", reason_code=reason_code, error_category=category, http_status=status,
-            identity_source=identity_source,
+            identity_source=identity_source, completed_operations=budget.completed_operations,
+            pending_operations=budget.pending_operations,
         )
     except Exception as exc:
         reason_code, category, status = _panel_failure(exc)
@@ -1105,8 +1240,35 @@ def _post_status_panel_fail_open(
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="unknown", reason_code=reason_code, error_category=category, http_status=status,
-            identity_source=identity_source,
+            identity_source=identity_source, completed_operations=budget.completed_operations,
+            pending_operations=budget.pending_operations,
         )
+
+
+def _post_status_panel_fail_open(
+    *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
+    pr_number: Optional[int], identity: Optional[Identity],
+) -> tuple[str, dict[str, Any]]:
+    body = render_status_panel([current])
+    try:
+        budget = _PublishBudget.from_environment()
+    except ValueError as exc:
+        _panel_warning(
+            phase="publish budget", exc=exc, reason_code="invalid_publish_budget",
+            category="configuration", http_status=None,
+        )
+        return body, _build_panel_delivery(
+            body=body, repository=repository, pr_number=pr_number, identity=identity,
+            delivery="not_created", reason_code="invalid_publish_budget", error_category="configuration",
+        )
+    token = _ACTIVE_PUBLISH_BUDGET.set(budget)
+    try:
+        return _post_status_panel_fail_open_with_budget(
+            current=current, repository=repository, repository_id=repository_id,
+            pr_number=pr_number, identity=identity, budget=budget,
+        )
+    finally:
+        _ACTIVE_PUBLISH_BUDGET.reset(token)
 
 
 def _write_panel_delivery(path: str, receipt: dict[str, Any]) -> None:
