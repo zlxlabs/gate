@@ -810,11 +810,14 @@ def _github_request(*, token: str, url: str, method: str = "GET", payload: Optio
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
     except (socket.timeout, TimeoutError) as exc:
-        if budget is not None and budget.remaining() <= 0:
-            raise _PublishBudgetExhausted(budget.current_operation or "UNKNOWN") from exc
+        if budget is not None:
+            try:
+                budget.timeout()
+            except _PublishBudgetExhausted as budget_exc:
+                raise budget_exc from exc
         raise
-    if budget is not None and budget.remaining() <= 0:
-        raise _PublishBudgetExhausted(budget.current_operation or "UNKNOWN")
+    if budget is not None:
+        budget.timeout()
     return raw
 
 

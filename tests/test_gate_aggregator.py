@@ -962,6 +962,65 @@ def test_status_panel_rebuild_after_comment_deletion_uses_terminal_history(monke
     assert "当前状态：**pass** · **可合并**" in body
 
 
+def test_existing_panel_history_targets_cached_runs_without_repo_wide_scan(monkeypatch):
+    current = _panel_terminal_row(10, 1, "pass", "j" * 40)
+    cached = [_panel_terminal_row(run_id, 1, "fail", chr(96 + run_id) * 40) for run_id in (7, 8, 9)]
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = [{"id": 7, "created_at": "2026-08-16T00:00:00Z", "body": AGG.render_status_panel(cached), "user": owner}]
+    calls = []
+    operations = []
+
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments)
+    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: calls.append(kwargs["url"]) or {"artifacts": []})
+    monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
+
+    body, receipt = AGG._post_status_panel_fail_open(
+        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
+        identity=IDENTITY,
+    )
+
+    assert calls == [
+        "https://api.github.com/repos/zlxlabs/gate/actions/runs/7/artifacts",
+        "https://api.github.com/repos/zlxlabs/gate/actions/runs/8/artifacts",
+        "https://api.github.com/repos/zlxlabs/gate/actions/runs/9/artifacts",
+    ]
+    assert all("/actions/artifacts?" not in url for url in calls)
+    assert receipt["history_incomplete"] is True
+    assert operations == [body]
+
+
+def test_targeted_history_run_count_is_bounded(monkeypatch):
+    calls = []
+    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: calls.append(kwargs["url"]) or {"artifacts": []})
+
+    result = AGG._fetch_terminal_history(
+        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
+        target_run_ids=list(range(1, AGG.MAX_TARGETED_HISTORY_RUNS + 7)),
+    )
+
+    assert len(calls) == AGG.MAX_TARGETED_HISTORY_RUNS
+    assert any("bounded_scan" in reason for reason in result.incomplete_reasons)
+
+
+def test_repo_wide_history_scan_stops_at_page_limit(monkeypatch):
+    calls = []
+
+    def fake_json(**kwargs):
+        calls.append(kwargs["url"])
+        return {"artifacts": [{"name": f"unrelated-{len(calls)}-{index}"} for index in range(100)]}
+
+    monkeypatch.setattr(AGG, "_github_json", fake_json)
+    result = AGG._fetch_terminal_history(
+        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
+    )
+
+    assert len(calls) == AGG.MAX_REPO_WIDE_HISTORY_PAGES
+    assert calls[-1].endswith(f"page={AGG.MAX_REPO_WIDE_HISTORY_PAGES}")
+    assert any("bounded_scan" in reason for reason in result.incomplete_reasons)
+
+
 def test_fetch_terminal_history_consumes_a_persisted_terminal_artifact(monkeypatch, tmp_path):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
@@ -1154,6 +1213,17 @@ def test_github_timeout_and_publish_budget_defaults_are_centralized(monkeypatch)
     assert len(urlopen_calls) == 1
     timeout_keywords = [keyword for keyword in urlopen_calls[0].keywords if keyword.arg == "timeout"]
     assert len(timeout_keywords) == 1
+
+
+def test_history_reconstruction_budget_has_one_bounded_configuration_point(monkeypatch):
+    assert AGG.DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS <= 45
+    monkeypatch.delenv(AGG.HISTORY_RECONSTRUCTION_BUDGET_ENV, raising=False)
+    assert AGG._PublishBudget.from_environment().history_seconds == 45
+    monkeypatch.setenv(AGG.HISTORY_RECONSTRUCTION_BUDGET_ENV, "3.5")
+    assert AGG._PublishBudget.from_environment().history_seconds == 3.5
+    monkeypatch.setenv(AGG.HISTORY_RECONSTRUCTION_BUDGET_ENV, "45.1")
+    with pytest.raises(ValueError, match="between zero and 45"):
+        AGG._PublishBudget.from_environment()
 
 
 def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypatch):
