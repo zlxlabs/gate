@@ -1051,6 +1051,57 @@ def test_fetch_terminal_history_consumes_a_persisted_terminal_artifact(monkeypat
     assert rows.rows[0]["gate_result"] == "pass"
 
 
+def test_terminal_artifact_redirect_drops_auth_for_blob_download(monkeypatch):
+    record = {
+        "schema_version": 1, "kind": "gate_terminal", "repository": "zlxlabs/gate",
+        "repository_id": 123, "pr_number": 42, "run_id": 9, "run_attempt": 1,
+        "head_sha": "a" * 40, "gate_result": "pass", "classification": "code_pass",
+        "reason_code": "primary_pass",
+    }
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("gate-terminal.json", json.dumps(record))
+    archive_url = "https://api.github.com/repos/zlxlabs/gate/actions/artifacts/9/zip"
+    blob_url = "https://blob.example.test/signed-artifact.zip?sig=secret"
+    calls = []
+
+    class RedirectStub:
+        def open(self, request, timeout=None):
+            headers = dict(request.header_items())
+            calls.append((request.full_url, headers, timeout))
+            if request.full_url == archive_url:
+                raise urllib.error.HTTPError(
+                    archive_url, 302, "redirect", {"Location": blob_url}, None,
+                )
+            assert request.full_url == blob_url
+            assert "Authorization" not in headers
+            return _FakeResponse(archive.getvalue())
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: RedirectStub())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            urllib.error.HTTPError(archive_url, 302, "redirect", {"Location": blob_url}, None)
+        ),
+    )
+    monkeypatch.setattr(
+        AGG, "_github_json",
+        lambda **kwargs: {"artifacts": [{
+            "name": "gate-terminal-v1-123-valid", "expired": False,
+            "archive_download_url": archive_url,
+        }]},
+    )
+
+    result = AGG._fetch_terminal_history(
+        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
+    )
+
+    assert [row["run_id"] for row in result.rows] == [9]
+    assert [call[0] for call in calls] == [archive_url, blob_url]
+    assert calls[0][1]["Authorization"] == "Bearer tok"
+    assert "Authorization" not in calls[1][1]
+
+
 @pytest.mark.parametrize("existing", [False, True], ids=["POST", "PATCH"])
 def test_status_panel_post_or_patch_failure_is_fail_open(monkeypatch, existing):
     error = urllib.error.HTTPError("https://api.github.com/x", 403, "forbidden", hdrs=None, fp=None)
