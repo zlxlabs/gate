@@ -117,8 +117,13 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
     assert "REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md" in comment_step["run"]
     assert 'gate-v2-ocr-advisory:${REVIEWER}:v1' in comment_step["run"]
     assert 'issues/$PR_NUMBER/comments?per_page=100' in comment_step["run"]
+    assert "gh api user" in comment_step["run"]
+    assert "--paginate --slurp" in comment_step["run"]
+    assert "owner_id" in comment_step["run"] and "WORKFLOW_LOGIN" in comment_step["run"]
     assert '--method PATCH' in comment_step["run"]
     assert '--method POST' in comment_step["run"]
+    assert '--method DELETE' in comment_step["run"]
+    assert "post verification" in comment_step["run"]
     assert 'advisory-delivery-${REVIEWER}.json' in comment_step["run"]
 
     upload_step = next(s for s in ocr["steps"] if s.get("name") == "Upload advisory review event")
@@ -397,10 +402,14 @@ def test_gate_job_forwards_the_raw_runner_input_for_strict_validation():
 
 def test_gate_job_enables_the_sticky_status_panel_without_a_per_run_switch():
     raw, _ = _load_workflow()
-    aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
-    assert aggregate_step["env"]["GH_TOKEN"] == "${{ github.token }}"
-    assert "--panel-delivery-path \"$PANEL_DELIVERY_PATH\"" in aggregate_step["run"]
-    assert "--pr-comment" not in aggregate_step["run"]
+    steps = raw["jobs"]["gate"]["steps"]
+    aggregate_step = next(s for s in steps if s.get("name") == "Aggregate required verdict")
+    publish_step = next(s for s in steps if s.get("name") == "Publish gate status panel")
+    assert "GH_TOKEN" in publish_step["env"]
+    assert "--publish-only" in publish_step["run"]
+    assert "--panel-delivery-path \"$PANEL_DELIVERY_PATH\"" in publish_step["run"]
+    assert "--panel-delivery-path" not in aggregate_step["run"]
+    assert "--pr-comment" not in publish_step["run"]
     script = AGGREGATOR_SCRIPT.read_text(encoding="utf-8")
     assert '"--pr-comment"' not in script
     assert 'os.environ.get("GITHUB_TOKEN")' in script
@@ -409,9 +418,9 @@ def test_gate_job_enables_the_sticky_status_panel_without_a_per_run_switch():
 def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
     raw, _ = _load_workflow()
     gate_steps = raw["jobs"]["gate"]["steps"]
-    aggregate_step = next(s for s in gate_steps if s.get("name") == "Aggregate required verdict")
-    assert aggregate_step["env"]["PANEL_DELIVERY_PATH"] == "${{ runner.temp }}/gate-status-panel-delivery.json"
-    assert '--panel-delivery-path "$PANEL_DELIVERY_PATH"' in aggregate_step["run"]
+    publish_step = next(s for s in gate_steps if s.get("name") == "Publish gate status panel")
+    assert publish_step["env"]["PANEL_DELIVERY_PATH"] == "${{ runner.temp }}/gate-status-panel-delivery.json"
+    assert '--panel-delivery-path "$PANEL_DELIVERY_PATH"' in publish_step["run"]
 
     upload = next(s for s in gate_steps if s.get("name") == "Upload gate status panel delivery diagnostic")
     assert upload["if"] == "always()"
@@ -423,7 +432,7 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
         "retention-days": 30,
     }
     assert "continue-on-error" not in upload
-    assert upload["with"]["path"] == aggregate_step["env"]["PANEL_DELIVERY_PATH"]
+    assert upload["with"]["path"] == publish_step["env"]["PANEL_DELIVERY_PATH"]
 
 
 def test_gate_job_timeout_is_five_minutes():

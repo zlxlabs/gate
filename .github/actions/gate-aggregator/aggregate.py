@@ -1106,6 +1106,81 @@ def _panel_current_row(
     }
 
 
+def _persist_panel_delivery(path: str, receipt: dict[str, Any]) -> None:
+    """Persist the second-exit receipt while clearing stale evidence safely."""
+    receipt_path = Path(path)
+    receipt_unlink_failed = False
+    try:
+        receipt_path.unlink(missing_ok=True)
+    except OSError as exc:
+        receipt_unlink_failed = True
+        _warn(f"::warning::could not remove the previous gate PR-comment receipt ({type(exc).__name__}: {exc})")
+    try:
+        _write_panel_delivery(path, receipt)
+    except OSError as exc:
+        if receipt_unlink_failed and receipt_path.exists():
+            try:
+                receipt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if receipt_path.exists():
+                try:
+                    receipt_path.write_bytes(b"invalid gate PR-comment receipt\n")
+                except OSError as invalidate_exc:
+                    _warn(
+                        "::warning::gate PR-comment receipt write failed and the stale receipt "
+                        f"could not be cleared ({type(invalidate_exc).__name__}: {invalidate_exc}); "
+                        "receipt channel is untrusted"
+                    )
+                else:
+                    _warn("::warning::gate PR-comment receipt write failed and the stale receipt was destroyed; an invalid marker was written, upload will pass but consumers' json.loads will fail-loud")
+            else:
+                _warn("::warning::gate PR-comment receipt write failed and the stale receipt was cleared; upload will red")
+        elif receipt_path.exists():
+            _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); receipt channel is untrusted")
+        else:
+            _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); file is missing and upload will red")
+
+
+def _publish_only(args: argparse.Namespace) -> int:
+    """Publish only after the caller has uploaded the terminal envelope."""
+    identity = Identity(
+        repository_id=args.repository_id,
+        head_sha=args.head_sha,
+        run_id=args.run_id,
+        run_attempt=args.run_attempt,
+        pr=args.pr_number,
+    )
+    current: dict[str, Any]
+    try:
+        if not args.terminal_path:
+            raise ValueError("terminal path is missing")
+        record = json.loads(Path(args.terminal_path).read_text(encoding="utf-8"))
+        current = _terminal_row(record, repository=args.repository, repository_id=args.repository_id, pr_number=args.pr_number)
+    except Exception as exc:
+        current = _panel_current_row(
+            outcome=Outcome(ok=False, classification="integration_error", reason_code="audit_invalid", gate_result="unavailable"),
+            repository=args.repository,
+            identity=identity,
+        )
+        body = render_status_panel([current], history_warning=f"terminal artifact unavailable: {type(exc).__name__}: {exc}")
+        receipt = _build_panel_delivery(
+            body=body, repository=args.repository, pr_number=args.pr_number, identity=identity,
+            delivery="not_created", reason_code="terminal_unavailable", error_category="configuration",
+            history_error=f"{type(exc).__name__}: {exc}", operation="PUBLISH_ONLY",
+        )
+        _panel_warning(phase="terminal artifact validation", exc=exc, reason_code="terminal_unavailable", category="configuration", http_status=None)
+    else:
+        body, receipt = _post_status_panel_fail_open(
+            current=current, repository=args.repository, repository_id=args.repository_id,
+            pr_number=args.pr_number, identity=identity,
+        )
+    _append_panel_diagnostic(args.summary_path, receipt)
+    if args.panel_delivery_path:
+        _persist_panel_delivery(args.panel_delivery_path, receipt)
+    return 0
+
+
 def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any]) -> None:
     if (
         receipt.get("delivery") in ("created", "updated")
@@ -1180,51 +1255,6 @@ def _finish(
         temporary_path = terminal_path.with_name(f".{terminal_path.name}.tmp")
         temporary_path.write_text(json.dumps(terminal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary_path.replace(terminal_path)
-    # The status panel comes LAST in the side-effect order — after
-    # the Step Summary append and the terminal-envelope replace — so a killed
-    # process can never leave a "comment says pass but terminal/summary was
-    # never persisted" inconsistency; the reverse (terminal persisted, comment
-    # never posted) is the safe direction. Fail-open by construction: it
-    # cannot change the exit code on the next line.
-    current = _panel_current_row(outcome=outcome, repository=repository, identity=identity)
-    _, receipt = _post_status_panel_fail_open(
-        current=current, repository=repository, repository_id=identity.repository_id if identity else None,
-        pr_number=pr_number, identity=identity,
-    )
-    _append_panel_diagnostic(summary_path, receipt)
-    if panel_delivery_path:
-        receipt_path = Path(panel_delivery_path)
-        receipt_unlink_failed = False
-        try:
-            receipt_path.unlink(missing_ok=True)
-        except OSError as exc:
-            receipt_unlink_failed = True
-            _warn(f"::warning::could not remove the previous gate PR-comment receipt ({type(exc).__name__}: {exc})")
-        try:
-            _write_panel_delivery(panel_delivery_path, receipt)
-        except OSError as exc:
-            if receipt_unlink_failed and receipt_path.exists():
-                try:
-                    receipt_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                if receipt_path.exists():
-                    try:
-                        receipt_path.write_bytes(b"invalid gate PR-comment receipt\n")
-                    except OSError as invalidate_exc:
-                        _warn(
-                            "::warning::gate PR-comment receipt write failed and the stale receipt "
-                            f"could not be cleared ({type(invalidate_exc).__name__}: {invalidate_exc}); "
-                            "receipt channel is untrusted"
-                        )
-                    else:
-                        _warn("::warning::gate PR-comment receipt write failed and the stale receipt was destroyed; an invalid marker was written, upload will pass but consumers' json.loads will fail-loud")
-                else:
-                    _warn("::warning::gate PR-comment receipt write failed and the stale receipt was cleared; upload will red")
-            elif receipt_path.exists():
-                _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); receipt channel is untrusted")
-            else:
-                _warn(f"::warning::gate PR-comment receipt write failed ({type(exc).__name__}: {exc}); file is missing and upload will red")
     return 0 if outcome.ok else 1
 
 
@@ -1256,7 +1286,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--terminal-path", default=None, help="gate-terminal.json output path")
     parser.add_argument("--panel-delivery-path", default=None, help="durable status-panel delivery diagnostic JSON output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
+    parser.add_argument("--publish-only", action="store_true", help="publish the panel after terminal artifact upload")
     args = parser.parse_args(argv)
+
+    if args.publish_only:
+        if args.pr_number is None:
+            _warn("::warning::status panel publish skipped because PR number is missing")
+            return 0
+        return _publish_only(args)
 
     if args.pr_number is None:
         return _finish(

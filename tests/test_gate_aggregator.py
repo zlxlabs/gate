@@ -1018,6 +1018,32 @@ def test_terminal_artifact_written_by_real_aggregate_is_panel_history_producer_f
     assert AGG.PANEL_MARKER in AGG.render_status_panel([row])
 
 
+def test_publish_only_consumes_the_real_terminal_producer_fixture_after_upload(monkeypatch, tmp_path):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
+    summary_path = tmp_path / "summary.md"
+    terminal_path = tmp_path / "gate-terminal.json"
+    delivery_path = tmp_path / "panel-delivery.json"
+    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
+    owner = {"id": 99, "login": "workflow-bot"}
+    operations = []
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
+    publish_args = _cli_args(
+        audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
+    ) + ["--publish-only"]
+    assert AGG.main(publish_args) == 0
+    receipt = json.loads(delivery_path.read_text(encoding="utf-8"))
+    assert receipt["delivery"] == "created"
+    assert operations and AGG.PANEL_MARKER in operations[0]
+
+
 @pytest.mark.parametrize(
     "status,category",
     [(403, "permission_or_rate_limit"), (500, "server_error")],

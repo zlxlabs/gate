@@ -595,9 +595,35 @@ jobs:
 
           set +e
           export MARKER="$marker"
-          lookup_output="$(gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-            --jq '.[] | select((.body // "") | contains(env.MARKER)) | .id' 2>&1)"
+          identity_output="$(gh api user 2>&1)"
+          identity_status=$?
+          if [ "$identity_status" -ne 0 ]; then
+            http_status="$(printf '%s\n' "$identity_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
+            [ -n "$http_status" ] || http_status="unavailable"
+            jq -n --arg http_status "$http_status" \
+              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: $http_status, permission_category: "permission_or_rate_limit"}' \
+              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: permission_or_rate_limit" "- Reason: workflow_identity_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::OCR advisory sticky identity lookup failed; HTTP status=$http_status; permission category=permission_or_rate_limit"
+            exit 0
+          fi
+          workflow_id="$(printf '%s\n' "$identity_output" | jq -er '.id | select(type == "number" and floor == .)')"
+          workflow_login="$(printf '%s\n' "$identity_output" | jq -er '.login | select(type == "string" and length > 0)')"
+          if [ "$?" -ne 0 ]; then
+            jq -n '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: null, permission_category: "configuration"}' \
+              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: unavailable" "- Permission category: configuration" "- Reason: workflow_identity_invalid" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::OCR advisory sticky identity response was invalid"
+            exit 0
+          fi
+          export WORKFLOW_ID="$workflow_id" WORKFLOW_LOGIN="$workflow_login"
+          list_own_comments() {
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" |
+              jq -c --arg marker "$MARKER" --arg login "$WORKFLOW_LOGIN" --argjson owner_id "$WORKFLOW_ID" \
+                '(add // []) | map(select((.body // "") | contains($marker)) | select(((.user.id // null) == $owner_id) or ((.user.login // "") == $login))) | sort_by([(.created_at // ""), (.id // 0)])'
+          }
+          lookup_output="$(list_own_comments 2>&1)"
           lookup_status=$?
           if [ "$lookup_status" -ne 0 ]; then
             http_status="$(printf '%s\n' "$lookup_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
@@ -611,7 +637,8 @@ jobs:
             echo "::warning::OCR advisory sticky lookup failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
           fi
-          comment_id="$(printf '%s\n' "$lookup_output" | head -n1)"
+          comment_id="$(printf '%s\n' "$lookup_output" | jq -r '.[0].id // empty')"
+          self_heal_error=""
           if [ -n "$comment_id" ]; then
             operation="PATCH"
             publish_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" --method PATCH --input "$payload_path" 2>&1)"
@@ -633,13 +660,50 @@ jobs:
             echo "::warning::OCR advisory sticky $operation failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
           fi
+          if [ "$operation" = "PATCH" ]; then
+            duplicate_ids="$(printf '%s\n' "$lookup_output" | jq -r '.[1:][]?.id')"
+            while IFS= read -r duplicate_id; do
+              [ -n "$duplicate_id" ] || continue
+              delete_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$duplicate_id" --method DELETE 2>&1)"
+              if [ "$?" -ne 0 ]; then
+                self_heal_error="comment $duplicate_id delete failed: $delete_output"
+              fi
+            done <<< "$duplicate_ids"
+          else
+            after_post="$(list_own_comments 2>&1)"
+            after_status=$?
+            if [ "$after_status" -ne 0 ]; then
+              self_heal_error="post verification failed: $after_post"
+            else
+              winner_id="$(printf '%s\n' "$after_post" | jq -r '.[0].id // empty')"
+              if [ -n "$winner_id" ]; then
+                heal_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$winner_id" --method PATCH --input "$payload_path" 2>&1)"
+                if [ "$?" -ne 0 ]; then
+                  self_heal_error="post winner PATCH failed: $heal_output"
+                else
+                  duplicate_ids="$(printf '%s\n' "$after_post" | jq -r '.[1:][]?.id')"
+                  while IFS= read -r duplicate_id; do
+                    [ -n "$duplicate_id" ] || continue
+                    delete_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$duplicate_id" --method DELETE 2>&1)"
+                    if [ "$?" -ne 0 ]; then
+                      self_heal_error="comment $duplicate_id delete failed: $delete_output"
+                    fi
+                  done <<< "$duplicate_ids"
+                fi
+              fi
+            fi
+          fi
           delivery="updated"
           if [ "$operation" = "POST" ]; then
             delivery="created"
           fi
-          jq -n --arg delivery "$delivery" --arg operation "$operation" \
-            '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, permission_category: null}' \
+          jq -n --arg delivery "$delivery" --arg operation "$operation" --arg self_heal_error "$self_heal_error" \
+            '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, permission_category: null, self_heal_error: (if $self_heal_error == "" then null else $self_heal_error end)}' \
             > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+          if [ -n "$self_heal_error" ]; then
+            printf '%s\n' "" "- Self-heal: $self_heal_error" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::OCR advisory sticky self-heal was partial: $self_heal_error"
+          fi
           echo "OCR advisory sticky $operation succeeded for reviewer $REVIEWER"
 
       - name: Upload advisory review event
@@ -789,10 +853,6 @@ jobs:
           AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
           AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
-          PANEL_DELIVERY_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
-          # The aggregate publisher always maintains one marker-located panel.
-          # Token via env only, never argv. POST/PATCH failures are fail-open
-          # and are recorded in Step Summary plus this diagnostic artifact.
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
@@ -811,16 +871,51 @@ jobs:
             --audit-artifact-name "$AUDIT_ARTIFACT_NAME" \
             --audit-dir "${{ runner.temp }}/primary-audit" \
             --summary-path "$GITHUB_STEP_SUMMARY" \
-            --terminal-path "$TERMINAL_PATH" \
-            --panel-delivery-path "$PANEL_DELIVERY_PATH"
+            --terminal-path "$TERMINAL_PATH"
 
       - name: Upload gate terminal envelope
         if: always()
+        id: upload-gate-terminal
         uses: actions/upload-artifact@v4
         with:
           name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-terminal.json
           if-no-files-found: error
+
+      - name: Publish gate status panel
+        if: always() && steps.upload-gate-terminal.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          PRIMARY_RESULT: ${{ needs.primary.result }}
+          RUNNER_MODE: ${{ inputs.runner }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
+          PANEL_DELIVERY_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
+        run: |
+          python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
+            --quality-result "$QUALITY_RESULT" \
+            --primary-result "$PRIMARY_RESULT" \
+            --runner "$RUNNER_MODE" \
+            --is-draft "$IS_DRAFT" \
+            --review-expected "$REVIEW_EXPECTED" \
+            --repository-id "$REPOSITORY_ID" \
+            --repository "$REPOSITORY" \
+            --head-sha "$HEAD_SHA" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --pr-number "$PR_NUMBER" \
+            --summary-path "$GITHUB_STEP_SUMMARY" \
+            --terminal-path "$TERMINAL_PATH" \
+            --panel-delivery-path "$PANEL_DELIVERY_PATH" \
+            --publish-only
 
       - name: Upload gate status panel delivery diagnostic
         if: always()
