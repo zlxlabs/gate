@@ -76,5 +76,4 @@ self-healing. It uses the same `/user` 403/404 Actions-bot fallback and
 `identity_source` field. Delivery failures are fail-open and recorded in the
 Step Summary plus the uploaded delivery diagnostic/event artifact with HTTP
 status and permission category. OCR GitHub calls are capped at 15 seconds and
-share a 120-second publish budget; an exhausted budget is recorded as
-`reason_code=publish_budget_exhausted`.
+share a 120-second publish budget.

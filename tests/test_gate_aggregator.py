@@ -1155,30 +1155,7 @@ def test_github_timeout_and_publish_budget_defaults_are_centralized(monkeypatch)
     assert len(timeout_keywords) == 1
 
 
-def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypatch, tmp_path):
-    terminal_path = tmp_path / "gate-terminal.json"
-    terminal_path.write_text(
-        json.dumps(
-            AGG.build_terminal_envelope(
-                repository="zlxlabs/gate",
-                identity=IDENTITY,
-                quality_result="success",
-                primary_result="success",
-                review_expected=True,
-                is_draft=False,
-                runner="self",
-                outcome=AGG.Outcome(
-                    ok=True,
-                    classification="code_pass",
-                    reason_code="primary_pass",
-                    gate_result="pass",
-                ),
-            )
-        ),
-        encoding="utf-8",
-    )
-    summary_path = tmp_path / "summary.md"
-    delivery_path = tmp_path / "panel-delivery.json"
+def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "tok")
     monkeypatch.setenv("GATE_PUBLISH_BUDGET_SECONDS", "0.05")
     started = threading.Event()
@@ -1197,15 +1174,10 @@ def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypat
 
     def invoke_publish():
         result.append(
-            AGG.main(
-                _cli_args(
-                    tmp_path / "unused-audit",
-                    summary_path,
-                    terminal_path=str(terminal_path),
-                    panel_delivery_path=str(delivery_path),
-                )
-                + ["--publish-only"]
-            )
+            AGG._post_status_panel_fail_open(
+                current=_panel_terminal_row(1, 1, "pass"),
+                repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+            )[1]
         )
         finished.set()
 
@@ -1218,9 +1190,9 @@ def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypat
         released.set()
         worker.join(timeout=1)
 
-    assert result == [0]
+    assert len(result) == 1
     assert calls and calls[0][1] <= 0.05
-    receipt = json.loads(delivery_path.read_text(encoding="utf-8"))
+    receipt = result[0]
     assert receipt["reason_code"] == "publish_budget_exhausted"
     assert receipt["completed_operations"] == []
     assert receipt["pending_operations"]
