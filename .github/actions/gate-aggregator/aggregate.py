@@ -132,6 +132,7 @@ DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS = 45
 HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
 MAX_REPO_WIDE_HISTORY_PAGES = 5
 MAX_TARGETED_HISTORY_RUNS = 50
+MAX_HISTORY_WARNING_CHARS = 500
 PUBLISH_OPERATION_ORDER = (
     "IDENTITY",
     "COMMENT_LOOKUP",
@@ -738,7 +739,53 @@ def _panel_action(row: dict[str, Any]) -> str:
     return action
 
 
-def render_status_panel(rows: list[dict[str, Any]], *, history_warning: Optional[str] = None) -> str:
+def _history_reason_category(reason: str) -> str:
+    http_match = re.search(r"\bHTTP\s+Error\s+(\d{3})\b", reason)
+    if http_match:
+        return f"制品下载失败：HTTP {http_match.group(1)}"
+    if reason.startswith("expired artifact "):
+        return "过期制品"
+    if reason.startswith("artifact ") and " has no archive URL" in reason:
+        return "制品缺少 archive URL"
+    if reason.startswith("artifact history does not contain cached rows:"):
+        return "制品历史缺少面板缓存行"
+    if reason.startswith("artifact ") and ": " in reason:
+        detail = reason.split(": ", 1)[1]
+        return f"制品处理失败：{detail.split(':', 1)[0]}"
+    if reason.startswith("bounded_scan:"):
+        return "有界历史扫描达到上限"
+    if reason.startswith("history budget exhausted"):
+        return "历史重建预算耗尽"
+    if reason.startswith("no terminal artifact matched"):
+        return "未找到终态制品"
+    return reason
+
+
+def _summarize_history_reasons(reasons: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for reason in reasons:
+        category = _history_reason_category(reason)
+        counts[category] = counts.get(category, 0) + 1
+    return "；".join(f"{count} 个{category}" for category, count in counts.items())
+
+
+def _bounded_history_warning(*, history_warning: Optional[str], history_reasons: Optional[list[str]]) -> Optional[str]:
+    warning = _summarize_history_reasons(history_reasons) if history_reasons is not None else history_warning
+    if not warning:
+        return None
+    prefix = "> 历史可能不完整："
+    suffix = "…完整明细见 delivery 诊断制品"
+    line = prefix + warning
+    if len(line) <= MAX_HISTORY_WARNING_CHARS:
+        return line
+    available = MAX_HISTORY_WARNING_CHARS - len(prefix) - len(suffix)
+    return prefix + warning[:available].rstrip("；") + suffix
+
+
+def render_status_panel(
+    rows: list[dict[str, Any]], *, history_warning: Optional[str] = None,
+    history_reasons: Optional[list[str]] = None,
+) -> str:
     """Render the public sticky panel from rows only.
 
     The renderer is deliberately a pure projection: it does not read a prior
@@ -764,8 +811,9 @@ def render_status_panel(rows: list[dict[str, Any]], *, history_warning: Optional
         "",
         f"当前裁决：`{current['classification']}` / `{current['reason_code']}`",
     ])
-    if history_warning:
-        lines.extend(["", f"> 历史可能不完整：{history_warning}"])
+    warning_line = _bounded_history_warning(history_warning=history_warning, history_reasons=history_reasons)
+    if warning_line:
+        lines.extend(["", warning_line])
     lines.extend([
         "",
         "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
@@ -1294,7 +1342,7 @@ def _post_status_panel_fail_open_with_budget(
             )
         body = render_status_panel(
             _merge_panel_rows(current, [*history.rows, *cached_rows]),
-            history_warning="；".join(incomplete_reasons) if incomplete_reasons else None,
+            history_reasons=incomplete_reasons if incomplete_reasons else None,
         )
         self_heal_errors: list[str] = []
         if existing:

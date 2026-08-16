@@ -43,7 +43,11 @@ If the panel is missing or its marker has no parseable history rows, the next
 run rebuilds from the repository-wide artifact list, bounded to five pages.
 Exceeding either bound marks history as incomplete with a `bounded_scan` reason.
 If either source is incomplete, the public panel states `历史可能不完整（原因）`
-and the receipt carries the per-record diagnostic.
+and the receipt carries the per-record diagnostic. The panel groups repeated
+incompleteness reasons by category (including HTTP status), renders one line
+per category with a count, and caps the warning blockquote at 500 characters;
+when truncated it points to the delivery diagnostic artifact. The receipt
+retains every original reason unchanged.
 
 The aggregate step writes `gate-terminal.json` first. The terminal artifact is
 uploaded before the independent `--publish-only` step can PATCH/POST the

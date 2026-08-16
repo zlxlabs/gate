@@ -1653,7 +1653,8 @@ def test_existing_panel_cache_is_incomplete_when_artifact_history_is_empty(monke
 
     assert receipt["history_incomplete"] is True
     assert "历史可能不完整" in body
-    assert "artifact history does not contain cached rows: 7/1" in body
+    assert "1 个制品历史缺少面板缓存行" in body
+    assert receipt["history_incomplete_reasons"] == ["artifact history does not contain cached rows: 7/1"]
     assert operations == [body]
 
 
@@ -1712,6 +1713,38 @@ def test_history_skip_count_is_written_to_step_summary(tmp_path, capsys):
     AGG._append_panel_diagnostic(str(summary), receipt)
     assert "Skipped history records: `1`" in summary.read_text(encoding="utf-8")
     assert "`old`: `expired_artifact`" in capsys.readouterr().out
+
+
+def test_status_panel_aggregates_repeated_http_reasons_and_keeps_receipt_detail():
+    reasons = [
+        f"artifact gate-terminal-v1-123-{index}: HTTPError: HTTP Error 401: signed blob rejected"
+        for index in range(21)
+    ]
+    body = AGG.render_status_panel(
+        [_panel_row(1, 1, "pass")], history_reasons=reasons,
+    )
+    warning_line = next(line for line in body.splitlines() if line.startswith("> 历史可能不完整："))
+    receipt = AGG._build_panel_delivery(
+        body=body, repository="zlxlabs/gate", pr_number=42, identity=IDENTITY,
+        delivery="updated", reason_code="history_incomplete",
+        history_incomplete_reasons=reasons,
+    )
+
+    assert "21 个制品下载失败：HTTP 401" in body
+    assert body.count("制品下载失败：HTTP 401") == 1
+    assert len(warning_line) <= AGG.MAX_HISTORY_WARNING_CHARS
+    assert receipt["history_incomplete_reasons"] == reasons
+    assert len(receipt["history_incomplete_reasons"]) == 21
+
+    long_body = AGG.render_status_panel(
+        [_panel_row(1, 1, "pass")],
+        history_reasons=[f"unclassified reason {index}: {'x' * 40}" for index in range(21)],
+    )
+    long_warning_line = next(
+        line for line in long_body.splitlines() if line.startswith("> 历史可能不完整：")
+    )
+    assert len(long_warning_line) <= AGG.MAX_HISTORY_WARNING_CHARS
+    assert "完整明细见 delivery 诊断制品" in long_warning_line
 
 
 
