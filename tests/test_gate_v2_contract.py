@@ -117,7 +117,10 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
     assert "REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md" in comment_step["run"]
     assert 'gate-v2-ocr-advisory:${REVIEWER}:v1' in comment_step["run"]
     assert 'issues/$PR_NUMBER/comments?per_page=100' in comment_step["run"]
-    assert "gh api user" in comment_step["run"]
+    assert "gh_api user" in comment_step["run"]
+    assert "timeout --foreground" in comment_step["run"]
+    assert comment_step["env"]["OCR_GITHUB_TIMEOUT_SECONDS"] == 15
+    assert comment_step["env"]["OCR_PUBLISH_BUDGET_SECONDS"] == 120
     assert 'case "$http_status" in' in comment_step["run"]
     assert "403|404)" in comment_step["run"]
     assert "workflow_id=41898282" in comment_step["run"]
@@ -446,6 +449,7 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
     gate_steps = raw["jobs"]["gate"]["steps"]
     publish_step = next(s for s in gate_steps if s.get("name") == "Publish gate status panel")
     assert publish_step["env"]["PANEL_DELIVERY_PATH"] == "${{ runner.temp }}/gate-status-panel-delivery.json"
+    assert publish_step["env"]["GATE_PUBLISH_BUDGET_SECONDS"] == "${{ vars.GATE_PUBLISH_BUDGET_SECONDS || '120' }}"
     assert '--panel-delivery-path "$PANEL_DELIVERY_PATH"' in publish_step["run"]
 
     upload = next(s for s in gate_steps if s.get("name") == "Upload gate status panel delivery diagnostic")
@@ -461,9 +465,11 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
     assert upload["with"]["path"] == publish_step["env"]["PANEL_DELIVERY_PATH"]
 
 
-def test_gate_job_timeout_is_five_minutes():
+def test_gate_job_timeout_matches_aggregate_publish_budget():
     raw, _ = _load_workflow()
-    assert raw["jobs"]["gate"]["timeout-minutes"] == 5
+    assert raw["jobs"]["gate"]["timeout-minutes"] == 8
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    assert "aggregation is seconds, publish is capped at <=2 minutes" in workflow_text
 
 
 # ── primary job: draft/fork/hosted skip + fail-closed upload ─────────────────

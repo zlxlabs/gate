@@ -10,12 +10,15 @@ rejection (T6 not wired), synthetic-audit generation, pass-verdict requires
 primary_result == success, primary_result/runner domain validation, and
 strict as_bool parsing.
 """
+import ast
 import builtins
 import hashlib
 import importlib.util
 import io
 import json
+import socket
 import sys
+import threading
 import urllib.error
 import urllib.request
 import zipfile
@@ -1091,6 +1094,10 @@ def test_publish_only_consumes_the_real_terminal_producer_fixture_after_upload(m
     receipt = json.loads(delivery_path.read_text(encoding="utf-8"))
     assert receipt["delivery"] == "created"
     assert receipt["history_incomplete"] is False
+    assert receipt["completed_operations"] == [
+        "IDENTITY", "COMMENT_LOOKUP", "HISTORY_RECONSTRUCTION", "COMMENT_PUBLISH", "POST_VERIFY",
+    ]
+    assert receipt["pending_operations"] == []
     assert operations and AGG.PANEL_MARKER in operations[0]
 
 
@@ -1126,6 +1133,69 @@ def test_status_panel_missing_token_is_fail_open_without_network(monkeypatch):
     assert receipt["delivery"] == "not_created"
     assert receipt["reason_code"] == "missing_token"
     assert receipt["error_category"] == "configuration"
+
+
+def test_github_timeout_and_publish_budget_defaults_are_centralized(monkeypatch):
+    assert AGG.GITHUB_API_TIMEOUT_SECONDS == 15
+    assert AGG.DEFAULT_PUBLISH_BUDGET_SECONDS <= 120
+    monkeypatch.delenv(AGG.PUBLISH_BUDGET_ENV, raising=False)
+    assert AGG._PublishBudget.from_environment().seconds == 120
+    monkeypatch.setenv(AGG.PUBLISH_BUDGET_ENV, "3.5")
+    assert AGG._PublishBudget.from_environment().seconds == 3.5
+
+    tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+    urlopen_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "urlopen"
+    ]
+    assert len(urlopen_calls) == 1
+    timeout_keywords = [keyword for keyword in urlopen_calls[0].keywords if keyword.arg == "timeout"]
+    assert len(timeout_keywords) == 1
+
+
+def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setenv("GATE_PUBLISH_BUDGET_SECONDS", "0.05")
+    started = threading.Event()
+    released = threading.Event()
+    finished = threading.Event()
+    calls = []
+
+    def hanging_urlopen(request, timeout=None):
+        calls.append((request.full_url, timeout))
+        started.set()
+        released.wait(timeout=timeout)
+        raise socket.timeout("stub hung")
+
+    monkeypatch.setattr(urllib.request, "urlopen", hanging_urlopen)
+    result = []
+
+    def invoke_publish():
+        result.append(
+            AGG._post_status_panel_fail_open(
+                current=_panel_terminal_row(1, 1, "pass"),
+                repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+            )[1]
+        )
+        finished.set()
+
+    worker = threading.Thread(target=invoke_publish, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(timeout=0.5)
+        assert finished.wait(timeout=0.5), "publish must stop a hanging call within its budget"
+    finally:
+        released.set()
+        worker.join(timeout=1)
+
+    assert len(result) == 1
+    assert calls and calls[0][1] <= 0.05
+    receipt = result[0]
+    assert receipt["reason_code"] == "publish_budget_exhausted"
+    assert receipt["completed_operations"] == []
+    assert receipt["pending_operations"]
 
 
 @pytest.mark.parametrize(

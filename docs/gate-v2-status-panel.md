@@ -47,6 +47,13 @@ The aggregate step writes `gate-terminal.json` first. The terminal artifact is
 uploaded before the independent `--publish-only` step can PATCH/POST the
 panel; an upload failure therefore suppresses the panel update for that run.
 
+Every aggregate GitHub API request has a 15-second per-call timeout. The
+`--publish-only` phase also has a wall-clock budget controlled by
+`GATE_PUBLISH_BUDGET_SECONDS`, defaulting to 120 seconds. When the budget is
+exhausted, no later request is started and the phase remains fail-open with
+`reason_code=publish_budget_exhausted`; the durable receipt records
+`completed_operations` and `pending_operations`.
+
 Each rendered history row has schema version `1` and these fields:
 
 `schema_version`, `repository`, `run_id`, `run_attempt`, `head_sha`,
@@ -68,4 +75,5 @@ find → PATCH / absent → POST rule, including POST verification and duplicate
 self-healing. It uses the same `/user` 403/404 Actions-bot fallback and
 `identity_source` field. Delivery failures are fail-open and recorded in the
 Step Summary plus the uploaded delivery diagnostic/event artifact with HTTP
-status and permission category.
+status and permission category. OCR GitHub calls are capped at 15 seconds and
+share a 120-second publish budget.
