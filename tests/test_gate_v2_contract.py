@@ -31,8 +31,8 @@ ARTIFACT_PREFIX_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-"
 )
-COMMENT_RECEIPT_NAME_EXPR = (
-    "gate-pr-comment-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+PANEL_DELIVERY_NAME_EXPR = (
+    "gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
 )
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
@@ -115,7 +115,11 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
 
     comment_step = next(s for s in ocr["steps"] if s.get("name") == "Post advisory PR comment")
     assert "REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md" in comment_step["run"]
-    assert 'gh pr comment "$PR_NUMBER" --body-file "$comment_path"' in comment_step["run"]
+    assert 'gate-v2-ocr-advisory:${REVIEWER}:v1' in comment_step["run"]
+    assert 'issues/$PR_NUMBER/comments?per_page=100' in comment_step["run"]
+    assert '--method PATCH' in comment_step["run"]
+    assert '--method POST' in comment_step["run"]
+    assert 'advisory-delivery-${REVIEWER}.json' in comment_step["run"]
 
     upload_step = next(s for s in ocr["steps"] if s.get("name") == "Upload advisory review event")
     assert upload_step["with"]["path"] == "${{ runner.temp }}/shadow-events/advisory"
@@ -374,41 +378,35 @@ def test_gate_job_forwards_the_raw_runner_input_for_strict_validation():
     assert '--runner "$RUNNER_MODE"' in aggregate_step["run"]
 
 
-def test_gate_job_enables_the_stage4_pr_comment_receipt():
-    # Cross-publish-boundary pin, same technique as the REVIEW_EXPECTED pin
-    # above: the workflow must pass BOTH the switch and a token env, and the
-    # portable script's argparse must actually accept the flag — a workflow
-    # passing a flag the checked-out script rejects would abort the required
-    # gate job with an argparse error, and a script reading a token from argv
-    # would leak it into process lists/logs.
+def test_gate_job_enables_the_sticky_status_panel_without_a_per_run_switch():
     raw, _ = _load_workflow()
     aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
     assert aggregate_step["env"]["GH_TOKEN"] == "${{ github.token }}"
-    assert "--pr-comment true" in aggregate_step["run"]
+    assert "--panel-delivery-path \"$PANEL_DELIVERY_PATH\"" in aggregate_step["run"]
+    assert "--pr-comment" not in aggregate_step["run"]
     script = AGGREGATOR_SCRIPT.read_text(encoding="utf-8")
-    assert '"--pr-comment"' in script
+    assert '"--pr-comment"' not in script
     assert 'os.environ.get("GITHUB_TOKEN")' in script
 
 
-def test_gate_job_publishes_the_durable_pr_comment_receipt():
+def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
     raw, _ = _load_workflow()
     gate_steps = raw["jobs"]["gate"]["steps"]
     aggregate_step = next(s for s in gate_steps if s.get("name") == "Aggregate required verdict")
-    assert aggregate_step["env"]["COMMENT_RECEIPT_PATH"] == "${{ runner.temp }}/gate-pr-comment-receipt.json"
-    assert '--comment-receipt-path "$COMMENT_RECEIPT_PATH"' in aggregate_step["run"]
-    assert "--pr-comment true" in aggregate_step["run"]
+    assert aggregate_step["env"]["PANEL_DELIVERY_PATH"] == "${{ runner.temp }}/gate-status-panel-delivery.json"
+    assert '--panel-delivery-path "$PANEL_DELIVERY_PATH"' in aggregate_step["run"]
 
-    upload = next(s for s in gate_steps if s.get("name") == "Upload gate PR-comment receipt")
+    upload = next(s for s in gate_steps if s.get("name") == "Upload gate status panel delivery diagnostic")
     assert upload["if"] == "always()"
     assert upload["uses"] == "actions/upload-artifact@v4"
     assert upload["with"] == {
-        "name": COMMENT_RECEIPT_NAME_EXPR,
-        "path": "${{ runner.temp }}/gate-pr-comment-receipt.json",
+        "name": PANEL_DELIVERY_NAME_EXPR,
+        "path": "${{ runner.temp }}/gate-status-panel-delivery.json",
         "if-no-files-found": "error",
         "retention-days": 30,
     }
     assert "continue-on-error" not in upload
-    assert upload["with"]["path"] == aggregate_step["env"]["COMMENT_RECEIPT_PATH"]
+    assert upload["with"]["path"] == aggregate_step["env"]["PANEL_DELIVERY_PATH"]
 
 
 def test_gate_job_timeout_is_five_minutes():

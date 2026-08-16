@@ -10,7 +10,7 @@ gate-hub import, no hosted-image-specific tool. The one network call it may
 make is the optional Stage 4 PR-comment receipt (one fail-open issue-comment
 POST via stdlib urllib for the marker-located status panel); it never
 feeds back into the verdict or the exit code. When the caller supplies
-`--comment-receipt-path`, the result of that attempt is also persisted as a
+`--panel-delivery-path`, the result of that attempt is also persisted as a
 separate, versioned durable receipt artifact; this artifact is evidence for
 consumers, not gate state. It is invoked as a
 plain `python3 aggregate.py ...` step (see .github/workflows/gate-v2.yml's
@@ -26,7 +26,7 @@ gate-v2.yml, defeating the "pin to a reviewed SHA during canary" governance
 model ("Caller / reusable workflow boundary" in the plan).
 
 Issue #51 second-exit design: retain the existing fail-open PR-comment
-semantics and add a durable `gate_pr_comment_receipt` JSON artifact at the
+semantics and add a durable `gate_v2_status_panel_delivery` JSON artifact at the
 workflow boundary. The artifact records whether the comment was created and,
 when it was not, a stable reason category plus HTTP status where available. A
 transport failure after the POST was attempted is recorded as
@@ -118,8 +118,8 @@ QUALITY_RESULT_DOMAIN = PRIMARY_RESULT_DOMAIN
 TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
 TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip")
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
-COMMENT_RECEIPT_SCHEMA_VERSION = 1
-COMMENT_RECEIPT_KIND = "gate_pr_comment_receipt"
+PANEL_DELIVERY_SCHEMA_VERSION = 1
+PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
 PANEL_MARKER = "<!-- gate-v2-status-panel:v1 -->"
 PANEL_HISTORY_ROW_SCHEMA_VERSION = 1
 PANEL_BUCKET_BY_GATE_RESULT = {
@@ -813,7 +813,7 @@ def _warn(message: str) -> None:
         pass
 
 
-def _build_comment_receipt(
+def _build_panel_delivery(
     *, body: str, repository: Optional[str], pr_number: Optional[int], identity: Optional[Identity],
     delivery: str, reason_code: str, error_category: Optional[str] = None,
     http_status: Optional[int] = None, history_error: Optional[str] = None,
@@ -821,8 +821,8 @@ def _build_comment_receipt(
 ) -> dict[str, Any]:
     """Build durable evidence for panel delivery and reconstruction failures."""
     return {
-        "schema_version": COMMENT_RECEIPT_SCHEMA_VERSION,
-        "kind": COMMENT_RECEIPT_KIND,
+        "schema_version": PANEL_DELIVERY_SCHEMA_VERSION,
+        "kind": PANEL_DELIVERY_KIND,
         "repository": repository or "",
         "repository_id": identity.repository_id if identity else None,
         "pr_number": pr_number,
@@ -870,12 +870,12 @@ def _post_status_panel_fail_open(
         if not repository or pr_number is None:
             reason_code, category, status = "missing_target", "configuration", None
             _panel_warning(phase="target resolution", exc=ValueError("missing target"), reason_code=reason_code, category=category, http_status=status)
-            return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
+            return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         if not token:
             reason_code, category, status = "missing_token", "configuration", None
             _panel_warning(phase="authentication", exc=ValueError("missing token"), reason_code=reason_code, category=category, http_status=status)
-            return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
+            return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
 
         comments = _github_json(token=token, url=f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100")
         existing = _find_panel_comment(comments)
@@ -885,7 +885,7 @@ def _post_status_panel_fail_open(
             reason_code, category, status = _panel_failure(exc)
             _panel_warning(phase="history reconstruction", exc=exc, reason_code=reason_code, category=category, http_status=status)
             cached_body = existing.get("body", body) if existing else body
-            return cached_body, _build_comment_receipt(
+            return cached_body, _build_panel_delivery(
                 body=cached_body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="not_created", reason_code="history_unavailable", error_category=category,
                 http_status=status, history_error=f"{type(exc).__name__}: {exc}",
@@ -893,26 +893,26 @@ def _post_status_panel_fail_open(
         body = render_status_panel(_merge_panel_rows(current, history))
         if existing:
             _patch_issue_comment(repository=repository, comment_id=int(existing["id"]), body=body, token=token)
-            return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="updated", reason_code="patched", operation="PATCH")
+            return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="updated", reason_code="patched", operation="PATCH")
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
-        return body, _build_comment_receipt(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="created", reason_code="posted", operation="POST")
+        return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="created", reason_code="posted", operation="POST")
     except urllib.error.HTTPError as exc:
         reason_code, category, status = _panel_failure(exc)
         _panel_warning(phase="comment publish", exc=exc, reason_code=reason_code, category=category, http_status=status)
-        return body, _build_comment_receipt(
+        return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="not_created", reason_code=reason_code, error_category=category, http_status=status,
         )
     except Exception as exc:
         reason_code, category, status = _panel_failure(exc)
         _panel_warning(phase="comment publish", exc=exc, reason_code=reason_code, category=category, http_status=status)
-        return body, _build_comment_receipt(
+        return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="unknown", reason_code=reason_code, error_category=category, http_status=status,
         )
 
 
-def _write_comment_receipt(path: str, receipt: dict[str, Any]) -> None:
+def _write_panel_delivery(path: str, receipt: dict[str, Any]) -> None:
     """Publish the receipt atomically so artifact upload never sees partial JSON."""
     target = Path(path)
     temporary_path = target.with_name(f".{target.name}.tmp")
@@ -964,7 +964,7 @@ def _finish(
     outcome: Outcome, summary_path: Optional[str], *, terminal_path: Optional[str] = None, repository: Optional[str] = None,
     identity: Optional[Identity] = None, quality_result: Optional[str] = None, primary_result: Optional[str] = None,
     review_expected: Optional[bool] = None, is_draft: Optional[bool] = None, runner: Optional[str] = None,
-    pr_number: Optional[int] = None, comment_receipt_path: Optional[str] = None,
+    pr_number: Optional[int] = None, panel_delivery_path: Optional[str] = None,
 ) -> int:
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
@@ -1007,8 +1007,8 @@ def _finish(
         pr_number=pr_number, identity=identity,
     )
     _append_panel_diagnostic(summary_path, receipt)
-    if comment_receipt_path:
-        receipt_path = Path(comment_receipt_path)
+    if panel_delivery_path:
+        receipt_path = Path(panel_delivery_path)
         receipt_unlink_failed = False
         try:
             receipt_path.unlink(missing_ok=True)
@@ -1016,7 +1016,7 @@ def _finish(
             receipt_unlink_failed = True
             _warn(f"::warning::could not remove the previous gate PR-comment receipt ({type(exc).__name__}: {exc})")
         try:
-            _write_comment_receipt(comment_receipt_path, receipt)
+            _write_panel_delivery(panel_delivery_path, receipt)
         except OSError as exc:
             if receipt_unlink_failed and receipt_path.exists():
                 try:
@@ -1069,7 +1069,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--audit-dir", type=Path, default=None)
     parser.add_argument("--audit-artifact-name", default=None)
     parser.add_argument("--terminal-path", default=None, help="gate-terminal.json output path")
-    parser.add_argument("--comment-receipt-path", default=None, help="durable PR-comment delivery receipt JSON output path")
+    parser.add_argument("--panel-delivery-path", default=None, help="durable status-panel delivery diagnostic JSON output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
     args = parser.parse_args(argv)
 
@@ -1079,7 +1079,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.summary_path,
             repository=args.repository,
             pr_number=None,
-            comment_receipt_path=args.comment_receipt_path,
+            panel_delivery_path=args.panel_delivery_path,
         )
 
     audit_source_attempt: Optional[int] = None
@@ -1100,7 +1100,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.summary_path,
                 repository=args.repository,
                 pr_number=args.pr_number,
-                comment_receipt_path=args.comment_receipt_path,
+                panel_delivery_path=args.panel_delivery_path,
             )
 
     if not args.repository or not args.head_sha:
@@ -1109,7 +1109,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.summary_path,
             repository=args.repository,
             pr_number=args.pr_number,
-            comment_receipt_path=args.comment_receipt_path,
+            panel_delivery_path=args.panel_delivery_path,
         )
 
     identity = Identity(
@@ -1129,7 +1129,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.summary_path,
             repository=args.repository,
             pr_number=args.pr_number,
-            comment_receipt_path=args.comment_receipt_path,
+            panel_delivery_path=args.panel_delivery_path,
         )
 
     audit, audit_error = find_audit_file(args.audit_dir)
@@ -1159,7 +1159,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         is_draft=is_draft,
         runner=args.runner,
         pr_number=identity.pr,
-        comment_receipt_path=args.comment_receipt_path,
+        panel_delivery_path=args.panel_delivery_path,
     )
 
 

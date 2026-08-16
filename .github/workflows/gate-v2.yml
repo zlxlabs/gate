@@ -587,7 +587,53 @@ jobs:
             echo "advisory comment is empty; skipping PR comment"
             exit 0
           fi
-          gh pr comment "$PR_NUMBER" --body-file "$comment_path"
+          marker="<!-- gate-v2-ocr-advisory:${REVIEWER}:v1 -->"
+          body_path="$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-sticky-${REVIEWER}.md"
+          payload_path="$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-sticky-${REVIEWER}.json"
+          { printf '%s\n\n' "$marker"; cat "$comment_path"; } > "$body_path"
+          jq -n --rawfile body "$body_path" '{body: $body}' > "$payload_path"
+
+          set +e
+          export MARKER="$marker"
+          lookup_output="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            --jq '.[] | select((.body // "") | contains(env.MARKER)) | .id' 2>&1)"
+          lookup_status=$?
+          if [ "$lookup_status" -ne 0 ]; then
+            http_status="$(printf '%s\n' "$lookup_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
+            [ -n "$http_status" ] || http_status="unavailable"
+            permission_category="network_error"
+            case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Reason: comment_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::OCR advisory sticky lookup failed; HTTP status=$http_status; permission category=$permission_category"
+            exit 0
+          fi
+          comment_id="$(printf '%s\n' "$lookup_output" | head -n1)"
+          if [ -n "$comment_id" ]; then
+            operation="PATCH"
+            publish_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" --method PATCH --input "$payload_path" 2>&1)"
+          else
+            operation="POST"
+            publish_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --method POST --input "$payload_path" 2>&1)"
+          fi
+          publish_status=$?
+          set -e
+          if [ "$publish_status" -ne 0 ]; then
+            http_status="$(printf '%s\n' "$publish_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
+            [ -n "$http_status" ] || http_status="unavailable"
+            permission_category="network_error"
+            case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
+            jq -n --arg delivery "not_created" --arg operation "$operation" --arg http_status "$http_status" --arg permission_category "$permission_category" \
+              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, permission_category: $permission_category}' \
+              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Operation: $operation" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::OCR advisory sticky $operation failed; HTTP status=$http_status; permission category=$permission_category"
+            exit 0
+          fi
+          jq -n --arg delivery "updated" --arg operation "$operation" \
+            '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, permission_category: null}' \
+            > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+          echo "OCR advisory sticky $operation succeeded for reviewer $REVIEWER"
 
       - name: Upload advisory review event
         if: always() && matrix.reviewer != '__none__'
@@ -732,12 +778,10 @@ jobs:
           AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
           AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
-          COMMENT_RECEIPT_PATH: ${{ runner.temp }}/gate-pr-comment-receipt.json
-          # Stage 4 PR-comment receipt (--pr-comment true below): one new,
-          # fail-open comment per run reusing the Step Summary text. Token via
-          # env only, never argv. On fork PRs GitHub downgrades this token to
-          # read-only and the POST 403s — the aggregator degrades that to a
-          # ::warning:: by design, never a gate failure.
+          PANEL_DELIVERY_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
+          # The aggregate publisher always maintains one marker-located panel.
+          # Token via env only, never argv. POST/PATCH failures are fail-open
+          # and are recorded in Step Summary plus this diagnostic artifact.
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
@@ -757,8 +801,7 @@ jobs:
             --audit-dir "${{ runner.temp }}/primary-audit" \
             --summary-path "$GITHUB_STEP_SUMMARY" \
             --terminal-path "$TERMINAL_PATH" \
-            --comment-receipt-path "$COMMENT_RECEIPT_PATH" \
-            --pr-comment true
+            --panel-delivery-path "$PANEL_DELIVERY_PATH"
 
       - name: Upload gate terminal envelope
         if: always()
@@ -768,12 +811,12 @@ jobs:
           path: ${{ runner.temp }}/gate-terminal.json
           if-no-files-found: error
 
-      - name: Upload gate PR-comment receipt
+      - name: Upload gate status panel delivery diagnostic
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-pr-comment-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gate-pr-comment-receipt.json
+          name: gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gate-status-panel-delivery.json
           if-no-files-found: error
           retention-days: 30
 

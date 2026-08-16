@@ -465,8 +465,8 @@ def _cli_args(audit_dir, summary_path, **overrides):
         args.extend(["--pr-number", values["pr_number"]])
     if "audit_source_attempt" in values:
         args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
-    if values.get("comment_receipt_path") is not None:
-        args.extend(["--comment-receipt-path", values["comment_receipt_path"]])
+    if values.get("panel_delivery_path") is not None:
+        args.extend(["--panel-delivery-path", values["panel_delivery_path"]])
     return args
 
 def test_main_exit_code_zero_on_pass(tmp_path):
