@@ -848,12 +848,15 @@ def test_status_panel_publisher_creates_once_then_patches(monkeypatch):
     history = [_panel_terminal_row(i, 1, result, chr(96 + i) * 40) for i, result in enumerate(
         ["skipped", "fail", "fail", "unavailable"], start=1
     )]
-    comments = [[], [{"id": 77, "body": AGG.PANEL_MARKER + "\nold"}]]
+    owner = {"id": 99, "login": "workflow-bot"}
+    existing_comment = {"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER + "\nold", "user": owner}
+    comments = [[], [existing_comment], [existing_comment]]
     operations = []
 
     monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: comments.pop(0))
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: history)
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments.pop(0))
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=history))
     monkeypatch.setattr(
         AGG, "_post_issue_comment",
         lambda **kwargs: operations.append(("POST", kwargs["body"])),
@@ -888,8 +891,10 @@ def test_status_panel_rebuild_after_comment_deletion_uses_terminal_history(monke
     )]
     operations = []
     monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: [])
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: history)
+    owner = {"id": 99, "login": "workflow-bot"}
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=history))
     monkeypatch.setattr(
         AGG, "_post_issue_comment",
         lambda **kwargs: operations.append(("POST", kwargs["body"])),
@@ -930,8 +935,8 @@ def test_fetch_terminal_history_consumes_a_persisted_terminal_artifact(monkeypat
     rows = AGG._fetch_terminal_history(
         token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
     )
-    assert rows[0]["run_id"] == IDENTITY.run_id
-    assert rows[0]["gate_result"] == "pass"
+    assert rows.rows[0]["run_id"] == IDENTITY.run_id
+    assert rows.rows[0]["gate_result"] == "pass"
 
 
 @pytest.mark.parametrize("existing", [False, True], ids=["POST", "PATCH"])
@@ -939,8 +944,11 @@ def test_status_panel_post_or_patch_failure_is_fail_open(monkeypatch, existing):
     error = urllib.error.HTTPError("https://api.github.com/x", 403, "forbidden", hdrs=None, fp=None)
     current = _panel_terminal_row(1, 1, "pass", "a" * 40)
     monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: ([{"id": 7, "body": AGG.PANEL_MARKER}] if existing else []))
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: [])
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = [{"id": 7, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}] if existing else []
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments)
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
     if existing:
         monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: (_ for _ in ()).throw(error))
     else:
@@ -960,23 +968,22 @@ def test_status_panel_mail_invariant_for_five_runs(monkeypatch):
     comments = []
     operations = []
     monkeypatch.setenv("GH_TOKEN", "tok")
+    owner = {"id": 99, "login": "workflow-bot"}
 
     def fake_comments(**kwargs):
         return comments
 
-    def fake_history(**kwargs):
-        return list(rows)
-
     def post(**kwargs):
         operations.append("POST")
-        comments[:] = [{"id": 1, "body": kwargs["body"]}]
+        comments[:] = [{"id": 1, "created_at": "2026-08-16T00:00:00Z", "body": kwargs["body"], "user": owner}]
 
     def patch(**kwargs):
         operations.append("PATCH")
         comments[0]["body"] = kwargs["body"]
 
-    monkeypatch.setattr(AGG, "_github_json", fake_comments)
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", fake_history)
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", fake_comments)
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=list(rows)))
     monkeypatch.setattr(AGG, "_post_issue_comment", post)
     monkeypatch.setattr(AGG, "_patch_issue_comment", patch)
 
@@ -1064,6 +1071,101 @@ def test_post_issue_comment_uses_issue_comments_endpoint(monkeypatch):
     assert request.get_method() == "POST"
     assert request.captured_timeout == 15
     assert json.loads(request.data.decode("utf-8")) == {"body": "hello gate"}
+
+
+def test_panel_marker_candidates_require_own_author_and_choose_earliest(monkeypatch):
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = [
+        {"id": 1, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": {"id": 1, "login": "human"}},
+        {"id": 3, "created_at": "2026-08-16T00:02:00Z", "body": AGG.PANEL_MARKER, "user": owner},
+        {"id": 2, "created_at": "2026-08-16T00:01:00Z", "body": AGG.PANEL_MARKER, "user": owner},
+    ]
+    selected = AGG._find_panel_comments(comments, owner)
+    assert [comment["id"] for comment in selected] == [2, 3]
+    assert all(comment["user"]["id"] == owner["id"] for comment in selected)
+
+
+def test_post_self_heal_deletes_duplicate_and_patches_earliest_own_panel(monkeypatch):
+    current = _panel_terminal_row(5, 1, "pass", "e" * 40)
+    comments = [
+        [],
+        [
+            {"id": 20, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": {"id": 99, "login": "workflow-bot"}},
+            {"id": 21, "created_at": "2026-08-16T00:01:00Z", "body": AGG.PANEL_MARKER, "user": {"id": 99, "login": "workflow-bot"}},
+        ],
+    ]
+    operations = []
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: {"id": 99, "login": "workflow-bot"})
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments.pop(0))
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(("POST", kwargs["body"])))
+    monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: operations.append(("PATCH", kwargs["comment_id"], kwargs["body"])))
+    monkeypatch.setattr(AGG, "_delete_issue_comment", lambda **kwargs: operations.append(("DELETE", kwargs["comment_id"])))
+
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
+        identity=IDENTITY,
+    )
+    assert operations[0][0] == "POST"
+    assert ("PATCH", 20, operations[1][2]) in operations
+    assert ("DELETE", 21) in operations
+    assert receipt["comment_created"] is True
+
+
+def test_history_loader_skips_other_pr_and_bad_records_individually(monkeypatch):
+    valid = {
+        "schema_version": 1, "kind": "gate_terminal", "repository": "zlxlabs/gate",
+        "repository_id": 123, "pr_number": 42, "run_id": 9, "run_attempt": 1,
+        "head_sha": "a" * 40, "gate_result": "pass", "classification": "code_pass",
+        "reason_code": "primary_pass",
+    }
+    other_pr = dict(valid, pr_number=77, run_id=8)
+    bad_schema = dict(valid, schema_version=True, run_id=7)
+    archives = {
+        "valid": valid,
+        "other": other_pr,
+        "bad": bad_schema,
+    }
+    zipped = {}
+    for name, record in archives.items():
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("gate-terminal.json", json.dumps(record))
+        zipped[name] = archive.getvalue()
+    monkeypatch.setattr(
+        AGG, "_github_json",
+        lambda **kwargs: {"artifacts": [
+            {"name": "gate-terminal-v1-123-valid", "expired": False, "archive_download_url": "valid"},
+            {"name": "gate-terminal-v1-123-other", "expired": False, "archive_download_url": "other"},
+            {"name": "gate-terminal-v1-123-bad", "expired": False, "archive_download_url": "bad"},
+            {"name": "gate-terminal-v1-123-expired", "expired": True, "archive_download_url": "expired"},
+        ]},
+    )
+    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: zipped[kwargs["url"]])
+    result = AGG._fetch_terminal_history(token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42)
+    assert [row["run_id"] for row in result.rows] == [9]
+    assert {entry["name"] for entry in result.skipped_records} == {
+        "gate-terminal-v1-123-other", "gate-terminal-v1-123-bad", "gate-terminal-v1-123-expired",
+    }
+    assert any("expired" in reason for reason in result.incomplete_reasons)
+
+
+def test_existing_panel_cache_is_parsed_and_incomplete_history_is_explicit():
+    body = "\n".join([
+        AGG.PANEL_MARKER,
+        "| Run | Attempt | Head | 状态 | 收件人动作 |",
+        "| ---: | ---: | :--- | :--- | :--- |",
+        "| [7](https://github.com/zlxlabs/gate/actions/runs/7) | 1 | `abcdef1` | `fail` | 要修代码 |",
+    ])
+    cached = AGG._parse_panel_history(body)
+    assert cached[0]["run_id"] == 7
+    rendered = AGG.render_status_panel(
+        [_panel_terminal_row(8, 1, "pass", "b" * 40), *cached],
+        history_warning="expired artifact gate-terminal-v1-123-old",
+    )
+    assert "历史可能不完整" in rendered
+    assert "| [7]" in rendered and "| [8]" in rendered
 
 
 

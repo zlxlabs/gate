@@ -661,6 +661,10 @@ jobs:
     # its own verdict from needs.*.result instead of relying on GitHub's
     # default dependency semantics.
     if: always()
+    concurrency:
+      group: gate-required-v2-panel-${{ github.repository_id }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+      queue: max
     # 控制面默认跟随 runner 走自建：hosted 因账单预算硬断不可用的实测概率高于
     # 自建机群整体不可用概率，2026-07-27 已造成全组织停摆；v1 已经如此路由，
     # 本次只是补齐未完成灰度。取整税数据：2026-08-01 单日 145 计费分钟 / 12.8 实际分钟。

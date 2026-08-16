@@ -95,6 +95,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -211,6 +212,15 @@ class Outcome:
     audit_available: bool = False
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
+
+
+@dataclass
+class HistoryLoad:
+    """Best-effort history projection with per-record loss diagnostics."""
+
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    skipped_records: list[dict[str, str]] = field(default_factory=list)
+    incomplete_reasons: list[str] = field(default_factory=list)
 
 
 def build_terminal_envelope(
@@ -632,7 +642,7 @@ def _panel_action(row: dict[str, Any]) -> str:
     return action
 
 
-def render_status_panel(rows: list[dict[str, Any]]) -> str:
+def render_status_panel(rows: list[dict[str, Any]], *, history_warning: Optional[str] = None) -> str:
     """Render the public sticky panel from rows only.
 
     The renderer is deliberately a pure projection: it does not read a prior
@@ -657,6 +667,10 @@ def render_status_panel(rows: list[dict[str, Any]]) -> str:
     lines.extend([
         "",
         f"当前裁决：`{current['classification']}` / `{current['reason_code']}`",
+    ])
+    if history_warning:
+        lines.extend(["", f"> 历史可能不完整：{history_warning}"])
+    lines.extend([
         "",
         "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
         "",
@@ -704,6 +718,29 @@ def _github_json(*, token: str, url: str) -> Any:
     return json.loads(raw) if raw else None
 
 
+def _github_identity(token: str) -> dict[str, Any]:
+    payload = _github_json(token=token, url="https://api.github.com/user")
+    if not isinstance(payload, dict) or not _is_strict_int(payload.get("id")) or not isinstance(payload.get("login"), str) or not payload["login"]:
+        raise ValueError("GitHub identity response is missing a strict numeric id or login")
+    return {"id": payload["id"], "login": payload["login"]}
+
+
+def _fetch_panel_comments(*, token: str, repository: str, pr_number: int) -> list[dict[str, Any]]:
+    comments: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        payload = _github_json(
+            token=token,
+            url=f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100&page={page}",
+        )
+        if not isinstance(payload, list) or any(not isinstance(comment, dict) for comment in payload):
+            raise ValueError("PR comments response has an invalid shape")
+        comments.extend(payload)
+        if len(payload) < 100:
+            return comments
+        page += 1
+
+
 def _post_issue_comment(*, repository: str, pr_number: int, body: str, token: str) -> None:
     _github_request(
         token=token,
@@ -722,10 +759,18 @@ def _patch_issue_comment(*, repository: str, comment_id: int, body: str, token: 
     )
 
 
+def _delete_issue_comment(*, repository: str, comment_id: int, token: str) -> None:
+    _github_request(
+        token=token,
+        url=f"https://api.github.com/repos/{repository}/issues/comments/{comment_id}",
+        method="DELETE",
+    )
+
+
 def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number: int) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise ValueError("gate terminal artifact is not a JSON object")
-    if record.get("schema_version") != 1 or record.get("kind") != "gate_terminal":
+    if type(record.get("schema_version")) is not int or record.get("schema_version") != 1 or record.get("kind") != "gate_terminal":
         raise ValueError("gate terminal artifact has an unsupported schema")
     if record.get("repository") != repository or record.get("repository_id") != repository_id or record.get("pr_number") != pr_number:
         raise ValueError("gate terminal artifact identity does not match this PR")
@@ -758,7 +803,7 @@ def _read_terminal_zip(raw: bytes) -> dict[str, Any]:
         return json.loads(bundle.read(candidates[0]))
 
 
-def _fetch_terminal_history(*, token: str, repository: str, repository_id: int, pr_number: int) -> list[dict[str, Any]]:
+def _fetch_terminal_history(*, token: str, repository: str, repository_id: int, pr_number: int) -> HistoryLoad:
     prefix = f"gate-terminal-v1-{repository_id}-"
     artifacts: list[dict[str, Any]] = []
     page = 1
@@ -773,19 +818,37 @@ def _fetch_terminal_history(*, token: str, repository: str, repository_id: int, 
         artifacts.extend(
             artifact for artifact in page_artifacts
             if isinstance(artifact, dict)
-            and not artifact.get("expired")
             and isinstance(artifact.get("name"), str)
             and artifact["name"].startswith(prefix)
-            and isinstance(artifact.get("archive_download_url"), str)
         )
         if len(page_artifacts) < 100:
             break
         page += 1
-    rows = []
+    result = HistoryLoad()
     for artifact in artifacts:
-        record = _read_terminal_zip(_github_request(token=token, url=artifact["archive_download_url"]))
-        rows.append(_terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number))
-    return rows
+        name = artifact["name"]
+        if artifact.get("expired") is True:
+            result.skipped_records.append({"name": name, "reason": "expired_artifact"})
+            result.incomplete_reasons.append(f"expired artifact {name}")
+            continue
+        archive_url = artifact.get("archive_download_url")
+        if not isinstance(archive_url, str) or not archive_url:
+            result.skipped_records.append({"name": name, "reason": "missing_archive_url"})
+            result.incomplete_reasons.append(f"artifact {name} has no archive URL")
+            continue
+        try:
+            record = _read_terminal_zip(_github_request(token=token, url=archive_url))
+            result.rows.append(_terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number))
+        except ValueError as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            result.skipped_records.append({"name": name, "reason": reason})
+            if "identity does not match" not in str(exc):
+                result.incomplete_reasons.append(f"artifact {name}: {reason}")
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            result.skipped_records.append({"name": name, "reason": reason})
+            result.incomplete_reasons.append(f"artifact {name}: {reason}")
+    return result
 
 
 def _merge_panel_rows(current: dict[str, Any], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -794,10 +857,58 @@ def _merge_panel_rows(current: dict[str, Any], history: list[dict[str, Any]]) ->
     return list(by_identity.values())
 
 
+def _find_panel_comments(comments: Any, owner: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(comments, list):
+        raise ValueError("PR comments response has an invalid shape")
+    owner_id = owner["id"]
+    owner_login = owner["login"]
+    selected = []
+    for comment in comments:
+        if not isinstance(comment, dict) or PANEL_MARKER not in comment.get("body", ""):
+            continue
+        user = comment.get("user")
+        if not isinstance(user, dict):
+            continue
+        if user.get("id") == owner_id or user.get("login") == owner_login:
+            selected.append(comment)
+    return sorted(selected, key=lambda comment: (str(comment.get("created_at", "")), int(comment.get("id", 0))))
+
+
 def _find_panel_comment(comments: Any) -> Optional[dict[str, Any]]:
+    """Compatibility wrapper retained for callers that only need a marker check."""
     if not isinstance(comments, list):
         raise ValueError("PR comments response has an invalid shape")
     return next((comment for comment in comments if isinstance(comment, dict) and PANEL_MARKER in comment.get("body", "")), None)
+
+
+def _parse_panel_history(body: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in body.splitlines():
+        if not line.startswith("| ["):
+            continue
+        parts = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(parts) < 5:
+            continue
+        run_match = re.match(r"\[(\d+)\]\(https://github\.com/([^/]+/[^/]+)/actions/runs/\d+\)", parts[0])
+        attempt_match = re.fullmatch(r"(\d+)", parts[1])
+        head_match = re.fullmatch(r"`([^`]+)`", parts[2])
+        result_match = re.fullmatch(r"`([^`]+)`", parts[3])
+        if not (run_match and attempt_match and head_match and result_match):
+            continue
+        gate_result = result_match.group(1)
+        if gate_result not in GATE_RESULT_DOMAIN:
+            continue
+        rows.append({
+            "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
+            "repository": run_match.group(2),
+            "run_id": int(run_match.group(1)),
+            "run_attempt": int(attempt_match.group(1)),
+            "head_sha": head_match.group(1),
+            "gate_result": gate_result,
+            "classification": "panel_cache",
+            "reason_code": "panel_cache",
+        })
+    return rows
 
 
 def _warn(message: str) -> None:
@@ -817,7 +928,8 @@ def _build_panel_delivery(
     *, body: str, repository: Optional[str], pr_number: Optional[int], identity: Optional[Identity],
     delivery: str, reason_code: str, error_category: Optional[str] = None,
     http_status: Optional[int] = None, history_error: Optional[str] = None,
-    operation: Optional[str] = None,
+    operation: Optional[str] = None, history_skipped_records: Optional[list[dict[str, str]]] = None,
+    history_incomplete_reasons: Optional[list[str]] = None, self_heal_errors: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Build durable evidence for panel delivery and reconstruction failures."""
     return {
@@ -836,6 +948,11 @@ def _build_panel_delivery(
         "error_category": error_category,
         "http_status": http_status,
         "history_error": history_error,
+        "history_skipped_records": history_skipped_records or [],
+        "history_skipped_count": len(history_skipped_records or []),
+        "history_incomplete_reasons": history_incomplete_reasons or [],
+        "history_incomplete": bool(history_incomplete_reasons),
+        "self_heal_errors": self_heal_errors or [],
         "operation": operation,
         "comment_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }
@@ -877,8 +994,10 @@ def _post_status_panel_fail_open(
             _panel_warning(phase="authentication", exc=ValueError("missing token"), reason_code=reason_code, category=category, http_status=status)
             return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="not_created", reason_code=reason_code, error_category=category, http_status=status)
 
-        comments = _github_json(token=token, url=f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100")
-        existing = _find_panel_comment(comments)
+        owner = _github_identity(token)
+        comments = _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number)
+        own_panels = _find_panel_comments(comments, owner)
+        existing = own_panels[0] if own_panels else None
         try:
             history = _fetch_terminal_history(token=token, repository=repository, repository_id=repository_id or 0, pr_number=pr_number)
         except Exception as exc:
@@ -888,14 +1007,60 @@ def _post_status_panel_fail_open(
             return cached_body, _build_panel_delivery(
                 body=cached_body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="not_created", reason_code="history_unavailable", error_category=category,
-                http_status=status, history_error=f"{type(exc).__name__}: {exc}",
+                http_status=status, history_error=f"{type(exc).__name__}: {exc}", operation="LOOKUP",
             )
-        body = render_status_panel(_merge_panel_rows(current, history))
+        if isinstance(history, list):
+            history = HistoryLoad(rows=history)
+        cached_rows = _parse_panel_history(existing.get("body", "")) if existing else []
+        incomplete_reasons = list(history.incomplete_reasons)
+        artifact_keys = {(row["run_id"], row["run_attempt"]) for row in history.rows}
+        cache_only = [row for row in cached_rows if (row["run_id"], row["run_attempt"]) not in artifact_keys]
+        if cache_only and history.rows:
+            incomplete_reasons.append(
+                "artifact history does not contain cached rows: "
+                + ", ".join(f"{row['run_id']}/{row['run_attempt']}" for row in cache_only)
+            )
+        body = render_status_panel(
+            _merge_panel_rows(current, [*history.rows, *cached_rows]),
+            history_warning="；".join(incomplete_reasons) if incomplete_reasons else None,
+        )
+        self_heal_errors: list[str] = []
         if existing:
             _patch_issue_comment(repository=repository, comment_id=int(existing["id"]), body=body, token=token)
-            return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="updated", reason_code="patched", operation="PATCH")
+            for duplicate in own_panels[1:]:
+                try:
+                    _delete_issue_comment(repository=repository, comment_id=int(duplicate["id"]), token=token)
+                except Exception as exc:
+                    self_heal_errors.append(f"comment {duplicate.get('id')}: {type(exc).__name__}: {exc}")
+            return body, _build_panel_delivery(
+                body=body, repository=repository, pr_number=pr_number, identity=identity,
+                delivery="updated", reason_code="history_incomplete" if incomplete_reasons else "patched",
+                operation="PATCH", history_skipped_records=history.skipped_records,
+                history_incomplete_reasons=incomplete_reasons, self_heal_errors=self_heal_errors,
+            )
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
-        return body, _build_panel_delivery(body=body, repository=repository, pr_number=pr_number, identity=identity, delivery="created", reason_code="posted", operation="POST")
+        try:
+            after_post = _find_panel_comments(
+                _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number), owner,
+            )
+        except Exception as exc:
+            self_heal_errors.append(f"post verification: {type(exc).__name__}: {exc}")
+            after_post = []
+        if after_post:
+            winner = after_post[0]
+            if int(winner["id"]) != int(after_post[-1]["id"]) or len(after_post) > 1:
+                try:
+                    _patch_issue_comment(repository=repository, comment_id=int(winner["id"]), body=body, token=token)
+                    for duplicate in after_post[1:]:
+                        _delete_issue_comment(repository=repository, comment_id=int(duplicate["id"]), token=token)
+                except Exception as exc:
+                    self_heal_errors.append(f"post self-heal: {type(exc).__name__}: {exc}")
+        return body, _build_panel_delivery(
+            body=body, repository=repository, pr_number=pr_number, identity=identity,
+            delivery="created", reason_code="post_self_heal_partial" if self_heal_errors else "posted",
+            operation="POST", history_skipped_records=history.skipped_records,
+            history_incomplete_reasons=incomplete_reasons, self_heal_errors=self_heal_errors,
+        )
     except urllib.error.HTTPError as exc:
         reason_code, category, status = _panel_failure(exc)
         _panel_warning(phase="comment publish", exc=exc, reason_code=reason_code, category=category, http_status=status)

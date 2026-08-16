@@ -131,7 +131,12 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
 def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     raw, _ = _load_workflow()
     assert "concurrency" not in raw
-    assert not raw["jobs"]["gate"].get("concurrency", {})
+    gate_concurrency = raw["jobs"]["gate"].get("concurrency", {})
+    assert gate_concurrency.get("cancel-in-progress") is False
+    assert gate_concurrency.get("queue") == "max"
+    assert str(gate_concurrency.get("group", "")).startswith("gate-required-v2-panel-")
+    assert "github.repository_id" in gate_concurrency["group"]
+    assert "github.event.pull_request.number" in gate_concurrency["group"]
     ledger_concurrency = raw["jobs"]["ledger"].get("concurrency", {})
     assert ledger_concurrency.get("cancel-in-progress") is False
     assert ledger_concurrency.get("queue") == "max"
@@ -146,8 +151,20 @@ def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     # Review jobs retain only workflow-level PR cancellation; ledger owns the
     # additional repository-level writer lock.
     for job_name, job in raw["jobs"].items():
-        if job_name != "ledger":
+        if job_name not in {"ledger", "gate"}:
             assert "concurrency" not in job
+
+
+def test_gate_status_panel_publish_happens_after_terminal_upload():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    upload_index = names.index("Upload gate terminal envelope")
+    publish_index = names.index("Publish gate status panel")
+    assert upload_index < publish_index
+    publish = steps[publish_index]
+    assert "steps.upload-gate-terminal.outcome == 'success'" in str(publish.get("if"))
+    assert "--publish-only" in publish["run"]
 
 
 # ── gate aggregator job: required-check identity + always() ─────────────────
