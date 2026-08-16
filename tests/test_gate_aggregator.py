@@ -13,10 +13,12 @@ strict as_bool parsing.
 import builtins
 import hashlib
 import importlib.util
+import io
 import json
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -900,6 +902,56 @@ def test_status_panel_rebuild_after_comment_deletion_uses_terminal_history(monke
     assert sum(operation[0] == "POST" for operation in operations) == 1
     assert body.count("| [") == 5
     assert "当前状态：**pass** · **可合并**" in body
+
+
+def test_fetch_terminal_history_consumes_a_persisted_terminal_artifact(monkeypatch, tmp_path):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
+    terminal_path = tmp_path / "gate-terminal.json"
+    summary_path = tmp_path / "summary.md"
+    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
+    terminal_bytes = terminal_path.read_bytes()
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("gate-terminal.json", terminal_bytes)
+
+    monkeypatch.setattr(
+        AGG, "_github_json",
+        lambda **kwargs: {"artifacts": [{
+            "name": "gate-terminal-v1-123-" + "a" * 40 + "-999-1",
+            "expired": False,
+            "archive_download_url": "https://api.github.com/archive/1",
+        }]},
+    )
+    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: archive.getvalue())
+    rows = AGG._fetch_terminal_history(
+        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
+    )
+    assert rows[0]["run_id"] == IDENTITY.run_id
+    assert rows[0]["gate_result"] == "pass"
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["POST", "PATCH"])
+def test_status_panel_post_or_patch_failure_is_fail_open(monkeypatch, existing):
+    error = urllib.error.HTTPError("https://api.github.com/x", 403, "forbidden", hdrs=None, fp=None)
+    current = _panel_terminal_row(1, 1, "pass", "a" * 40)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: ([{"id": 7, "body": AGG.PANEL_MARKER}] if existing else []))
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: [])
+    if existing:
+        monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: (_ for _ in ()).throw(error))
+    else:
+        monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: (_ for _ in ()).throw(error))
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
+        identity=IDENTITY,
+    )
+    assert receipt["http_status"] == 403
+    assert receipt["error_category"] == "permission_or_rate_limit"
+    assert receipt["comment_created"] is False
 
 
 def test_status_panel_mail_invariant_for_five_runs(monkeypatch):

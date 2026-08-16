@@ -830,7 +830,7 @@ def _build_panel_delivery(
         "run_attempt": identity.run_attempt if identity else None,
         "head_sha": identity.head_sha if identity else None,
         "comment_expected": delivery != "not_enabled",
-        "comment_created": True if delivery == "created" else False if delivery == "not_created" else None,
+        "comment_created": True if delivery == "created" else False if delivery in ("updated", "not_created") else None,
         "delivery": delivery,
         "reason_code": reason_code,
         "error_category": error_category,
