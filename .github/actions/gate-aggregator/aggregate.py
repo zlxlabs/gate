@@ -127,6 +127,10 @@ PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
 GITHUB_API_TIMEOUT_SECONDS = 15
 DEFAULT_PUBLISH_BUDGET_SECONDS = 120
 PUBLISH_BUDGET_ENV = "GATE_PUBLISH_BUDGET_SECONDS"
+DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS = 45
+HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
+MAX_REPO_WIDE_HISTORY_PAGES = 5
+MAX_TARGETED_HISTORY_RUNS = 50
 PUBLISH_OPERATION_ORDER = (
     "IDENTITY",
     "COMMENT_LOOKUP",
@@ -248,10 +252,12 @@ class _PublishBudgetExhausted(Exception):
 @dataclass
 class _PublishBudget:
     seconds: float
+    history_seconds: float = DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS
     started_at: float = field(default_factory=time.monotonic)
     completed_operations: list[str] = field(default_factory=list)
     pending_operations: list[str] = field(default_factory=lambda: list(PUBLISH_OPERATION_ORDER))
     current_operation: Optional[str] = None
+    operation_deadline: Optional[float] = field(default=None, init=False)
 
     @classmethod
     def from_environment(cls) -> "_PublishBudget":
@@ -259,19 +265,35 @@ class _PublishBudget:
         seconds = DEFAULT_PUBLISH_BUDGET_SECONDS if raw is None else float(raw)
         if seconds <= 0:
             raise ValueError(f"{PUBLISH_BUDGET_ENV} must be greater than zero")
-        return cls(seconds=seconds)
+        history_raw = os.environ.get(HISTORY_RECONSTRUCTION_BUDGET_ENV)
+        history_seconds = (
+            DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS
+            if history_raw is None else float(history_raw)
+        )
+        if history_seconds <= 0 or history_seconds > DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS:
+            raise ValueError(
+                f"{HISTORY_RECONSTRUCTION_BUDGET_ENV} must be between zero and "
+                f"{DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS} seconds"
+            )
+        return cls(seconds=seconds, history_seconds=history_seconds)
 
     def remaining(self) -> float:
         return self.seconds - (time.monotonic() - self.started_at)
 
     def timeout(self) -> float:
         remaining = self.remaining()
+        if self.current_operation == "HISTORY_RECONSTRUCTION" and self.operation_deadline is not None:
+            remaining = min(remaining, self.operation_deadline - time.monotonic())
         if remaining <= 0:
             raise _PublishBudgetExhausted(self.current_operation or "UNKNOWN")
         return min(GITHUB_API_TIMEOUT_SECONDS, remaining)
 
     def begin(self, operation: str) -> None:
         self.current_operation = operation
+        self.operation_deadline = (
+            time.monotonic() + self.history_seconds
+            if operation == "HISTORY_RECONSTRUCTION" else None
+        )
         self.timeout()
 
     def complete(self, operation: str) -> None:
@@ -279,6 +301,8 @@ class _PublishBudget:
             self.completed_operations.append(operation)
         if operation in self.pending_operations:
             self.pending_operations.remove(operation)
+        if operation == "HISTORY_RECONSTRUCTION":
+            self.operation_deadline = None
 
     def add(self, operation: str) -> None:
         if operation not in self.completed_operations and operation not in self.pending_operations:
@@ -786,11 +810,14 @@ def _github_request(*, token: str, url: str, method: str = "GET", payload: Optio
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
     except (socket.timeout, TimeoutError) as exc:
-        if budget is not None and budget.remaining() <= 0:
-            raise _PublishBudgetExhausted(budget.current_operation or "UNKNOWN") from exc
+        if budget is not None:
+            try:
+                budget.timeout()
+            except _PublishBudgetExhausted as budget_exc:
+                raise budget_exc from exc
         raise
-    if budget is not None and budget.remaining() <= 0:
-        raise _PublishBudgetExhausted(budget.current_operation or "UNKNOWN")
+    if budget is not None:
+        budget.timeout()
     return raw
 
 
@@ -889,15 +916,92 @@ def _read_terminal_zip(raw: bytes) -> dict[str, Any]:
         return json.loads(bundle.read(candidates[0]))
 
 
-def _fetch_terminal_history(*, token: str, repository: str, repository_id: int, pr_number: int) -> HistoryLoad:
+def _consume_terminal_artifact(
+    result: HistoryLoad, *, artifact: dict[str, Any], token: str, repository: str,
+    repository_id: int, pr_number: int,
+) -> bool:
+    name = artifact["name"]
+    if artifact.get("expired") is True:
+        result.skipped_records.append({"name": name, "reason": "expired_artifact"})
+        result.incomplete_reasons.append(f"expired artifact {name}")
+        return True
+    archive_url = artifact.get("archive_download_url")
+    if not isinstance(archive_url, str) or not archive_url:
+        result.skipped_records.append({"name": name, "reason": "missing_archive_url"})
+        result.incomplete_reasons.append(f"artifact {name} has no archive URL")
+        return True
+    try:
+        record = _read_terminal_zip(_github_request(token=token, url=archive_url))
+        result.rows.append(_terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number))
+    except _PublishBudgetExhausted:
+        result.incomplete_reasons.append(f"history budget exhausted while downloading {name}")
+        return False
+    except ValueError as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        result.skipped_records.append({"name": name, "reason": reason})
+        if "identity does not match" not in str(exc):
+            result.incomplete_reasons.append(f"artifact {name}: {reason}")
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        result.skipped_records.append({"name": name, "reason": reason})
+        result.incomplete_reasons.append(f"artifact {name}: {reason}")
+    return True
+
+
+def _fetch_terminal_history(
+    *, token: str, repository: str, repository_id: int, pr_number: int,
+    target_run_ids: Optional[list[int]] = None,
+) -> HistoryLoad:
     prefix = f"gate-terminal-v1-{repository_id}-"
+    result = HistoryLoad()
+
+    if target_run_ids is not None:
+        unique_run_ids = list(dict.fromkeys(target_run_ids))
+        if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
+            result.incomplete_reasons.append(
+                f"bounded_scan: targeted history run limit {MAX_TARGETED_HISTORY_RUNS} reached"
+            )
+            unique_run_ids = unique_run_ids[:MAX_TARGETED_HISTORY_RUNS]
+        for run_id in unique_run_ids:
+            try:
+                payload = _github_json(
+                    token=token,
+                    url=f"https://api.github.com/repos/{repository}/actions/runs/{run_id}/artifacts",
+                )
+            except _PublishBudgetExhausted:
+                result.incomplete_reasons.append("history budget exhausted during targeted scan")
+                break
+            if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
+                raise ValueError("Actions run artifacts response has an invalid shape")
+            artifacts = [
+                artifact for artifact in payload["artifacts"]
+                if isinstance(artifact, dict)
+                and isinstance(artifact.get("name"), str)
+                and artifact["name"].startswith(prefix)
+            ]
+            if not artifacts:
+                result.incomplete_reasons.append(f"no terminal artifact matched run {run_id}")
+            for artifact in artifacts:
+                if not _consume_terminal_artifact(
+                    result, artifact=artifact, token=token, repository=repository,
+                    repository_id=repository_id, pr_number=pr_number,
+                ):
+                    return result
+        if not unique_run_ids:
+            result.incomplete_reasons.append("no cached panel run ids were available for targeted history")
+        return result
+
     artifacts: list[dict[str, Any]] = []
     page = 1
-    while True:
-        payload = _github_json(
-            token=token,
-            url=f"https://api.github.com/repos/{repository}/actions/artifacts?per_page=100&page={page}",
-        )
+    while page <= MAX_REPO_WIDE_HISTORY_PAGES:
+        try:
+            payload = _github_json(
+                token=token,
+                url=f"https://api.github.com/repos/{repository}/actions/artifacts?per_page=100&page={page}",
+            )
+        except _PublishBudgetExhausted:
+            result.incomplete_reasons.append("history budget exhausted during bounded_scan")
+            break
         if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
             raise ValueError("Actions artifacts response has an invalid shape")
         page_artifacts = payload["artifacts"]
@@ -909,34 +1013,21 @@ def _fetch_terminal_history(*, token: str, repository: str, repository_id: int, 
         )
         if len(page_artifacts) < 100:
             break
+        if page == MAX_REPO_WIDE_HISTORY_PAGES:
+            result.incomplete_reasons.append(
+                f"bounded_scan: repo-wide artifact page limit {MAX_REPO_WIDE_HISTORY_PAGES} reached"
+            )
+            break
         page += 1
     if not artifacts:
-        result = HistoryLoad(incomplete_reasons=[f"no terminal artifact matched {prefix}"])
-    else:
-        result = HistoryLoad()
+        if not result.incomplete_reasons:
+            result.incomplete_reasons.append(f"no terminal artifact matched {prefix}")
     for artifact in artifacts:
-        name = artifact["name"]
-        if artifact.get("expired") is True:
-            result.skipped_records.append({"name": name, "reason": "expired_artifact"})
-            result.incomplete_reasons.append(f"expired artifact {name}")
-            continue
-        archive_url = artifact.get("archive_download_url")
-        if not isinstance(archive_url, str) or not archive_url:
-            result.skipped_records.append({"name": name, "reason": "missing_archive_url"})
-            result.incomplete_reasons.append(f"artifact {name} has no archive URL")
-            continue
-        try:
-            record = _read_terminal_zip(_github_request(token=token, url=archive_url))
-            result.rows.append(_terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number))
-        except ValueError as exc:
-            reason = f"{type(exc).__name__}: {exc}"
-            result.skipped_records.append({"name": name, "reason": reason})
-            if "identity does not match" not in str(exc):
-                result.incomplete_reasons.append(f"artifact {name}: {reason}")
-        except Exception as exc:
-            reason = f"{type(exc).__name__}: {exc}"
-            result.skipped_records.append({"name": name, "reason": reason})
-            result.incomplete_reasons.append(f"artifact {name}: {reason}")
+        if not _consume_terminal_artifact(
+            result, artifact=artifact, token=token, repository=repository,
+            repository_id=repository_id, pr_number=pr_number,
+        ):
+            break
     return result
 
 
@@ -1114,9 +1205,14 @@ def _post_status_panel_fail_open_with_budget(
         budget.complete("COMMENT_LOOKUP")
         own_panels = _find_panel_comments(comments, owner)
         existing = own_panels[0] if own_panels else None
+        cached_rows = _parse_panel_history(existing.get("body", "")) if existing else []
+        target_run_ids = [row["run_id"] for row in cached_rows] if cached_rows else None
         try:
             budget.begin("HISTORY_RECONSTRUCTION")
-            history = _fetch_terminal_history(token=token, repository=repository, repository_id=repository_id or 0, pr_number=pr_number)
+            history = _fetch_terminal_history(
+                token=token, repository=repository, repository_id=repository_id or 0,
+                pr_number=pr_number, target_run_ids=target_run_ids,
+            )
             budget.complete("HISTORY_RECONSTRUCTION")
         except _PublishBudgetExhausted:
             raise
@@ -1133,7 +1229,6 @@ def _post_status_panel_fail_open_with_budget(
             )
         if isinstance(history, list):
             history = HistoryLoad(rows=history)
-        cached_rows = _parse_panel_history(existing.get("body", "")) if existing else []
         incomplete_reasons = list(history.incomplete_reasons)
         artifact_keys = {(row["run_id"], row["run_attempt"]) for row in history.rows}
         cache_only = [row for row in cached_rows if (row["run_id"], row["run_attempt"]) not in artifact_keys]
