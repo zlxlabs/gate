@@ -884,9 +884,10 @@ def test_status_panel_publisher_creates_once_then_patches(monkeypatch):
     assert sum(operation[0] == "POST" for operation in operations) == 1
 
 
-def test_installation_token_identity_403_falls_back_and_publishes(monkeypatch):
+@pytest.mark.parametrize("status", [403, 404])
+def test_installation_token_identity_403_or_404_falls_back_and_publishes(monkeypatch, status):
     current = _panel_terminal_row(5, 1, "pass", "e" * 40)
-    identity_error = urllib.error.HTTPError("https://api.github.com/user", 403, "forbidden", hdrs=None, fp=None)
+    identity_error = urllib.error.HTTPError("https://api.github.com/user", status, "forbidden", hdrs=None, fp=None)
     calls = []
     operations = []
 
