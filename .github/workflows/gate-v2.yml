@@ -539,10 +539,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REVIEWER: ${{ matrix.reviewer }}
+          OCR_GITHUB_TIMEOUT_SECONDS: 15
         run: |
           set -euo pipefail
+          gh_api() {
+            timeout --foreground "${OCR_GITHUB_TIMEOUT_SECONDS}s" gh api "$@"
+          }
           export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"
-          job_id="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs" \
+          job_id="$(gh_api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs" \
             --paginate --jq '.jobs[] | select(.name == env.JOB_NAME_SUFFIX or (.name | endswith("/ " + env.JOB_NAME_SUFFIX))) | .id' \
             | head -n1)"
           if [ -z "$job_id" ]; then
@@ -576,6 +580,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEWER: ${{ matrix.reviewer }}
           REVIEW_SHADOW_EVENT_DIR: ${{ runner.temp }}/shadow-events
+          OCR_GITHUB_TIMEOUT_SECONDS: 15
+          OCR_PUBLISH_BUDGET_SECONDS: 120
         run: |
           set -euo pipefail
           comment_path="$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md"
@@ -593,14 +599,51 @@ jobs:
           { printf '%s\n\n' "$marker"; cat "$comment_path"; } > "$body_path"
           jq -n --rawfile body "$body_path" '{body: $body}' > "$payload_path"
 
+          publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
+          publish_budget_exhausted=0
+          gh_api() {
+            local remaining_ms request_timeout_ms
+            remaining_ms=$(( publish_deadline_ms - $(date +%s%3N) ))
+            if [ "$remaining_ms" -le 0 ]; then
+              publish_budget_exhausted=1
+              return 124
+            fi
+            request_timeout_ms=$(( OCR_GITHUB_TIMEOUT_SECONDS * 1000 ))
+            if [ "$request_timeout_ms" -gt "$remaining_ms" ]; then
+              request_timeout_ms="$remaining_ms"
+            fi
+            timeout --foreground "${request_timeout_ms}ms" gh api "$@"
+            local status=$?
+            if [ "$(( publish_deadline_ms - $(date +%s%3N) ))" -le 0 ]; then
+              publish_budget_exhausted=1
+              return 124
+            fi
+            return "$status"
+          }
+          mark_budget_if_expired() {
+            local status="$1"
+            if [ "$status" -eq 124 ] && [ "$(( publish_deadline_ms - $(date +%s%3N) ))" -le 0 ]; then
+              publish_budget_exhausted=1
+            fi
+          }
+
           set +e
           export MARKER="$marker"
           identity_source="user_api"
-          identity_output="$(gh api user 2>&1)"
+          identity_output="$(gh_api user 2>&1)"
           identity_status=$?
+          mark_budget_if_expired "$identity_status"
           if [ "$identity_status" -ne 0 ]; then
             http_status="$(printf '%s\n' "$identity_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
             [ -n "$http_status" ] || http_status="unavailable"
+            if [ "$publish_budget_exhausted" -eq 1 ]; then
+              jq -n --arg http_status "$http_status" \
+                '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: $http_status, identity_source: null, permission_category: "network_error", reason_code: "publish_budget_exhausted"}' \
+                > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+              printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: network_error" "- Reason: publish_budget_exhausted" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::OCR advisory sticky identity lookup exhausted the publish budget"
+              exit 0
+            fi
             case "$http_status" in
               403|404)
                 workflow_id=41898282
@@ -609,7 +652,7 @@ jobs:
                 ;;
               *)
                 jq -n --arg http_status "$http_status" \
-                  '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: $http_status, identity_source: null, permission_category: "permission_or_rate_limit"}' \
+                  '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: $http_status, identity_source: null, permission_category: "permission_or_rate_limit", reason_code: "workflow_identity_lookup_failed"}' \
                   > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
                 printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: permission_or_rate_limit" "- Reason: workflow_identity_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
                 echo "::warning::OCR advisory sticky identity lookup failed; HTTP status=$http_status; permission category=permission_or_rate_limit"
@@ -622,7 +665,7 @@ jobs:
             workflow_login="$(printf '%s\n' "$identity_output" | jq -er '.login | select(type == "string" and length > 0)')"
             workflow_login_status=$?
             if [ "$workflow_id_status" -ne 0 ] || [ "$workflow_login_status" -ne 0 ]; then
-              jq -n '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: null, identity_source: null, permission_category: "configuration"}' \
+              jq -n '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: null, identity_source: null, permission_category: "configuration", reason_code: "workflow_identity_invalid"}' \
                 > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
               printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: unavailable" "- Permission category: configuration" "- Reason: workflow_identity_invalid" >> "$GITHUB_STEP_SUMMARY"
               echo "::warning::OCR advisory sticky identity response was invalid"
@@ -631,22 +674,25 @@ jobs:
           fi
           export WORKFLOW_ID="$workflow_id" WORKFLOW_LOGIN="$workflow_login" IDENTITY_SOURCE="$identity_source"
           list_own_comments() {
-            gh api --paginate --slurp \
+            gh_api --paginate --slurp \
               "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" |
               jq -c --arg marker "$MARKER" --arg login "$WORKFLOW_LOGIN" --argjson owner_id "$WORKFLOW_ID" \
                 '(add // []) | map(select((.body // "") | contains($marker)) | select((((.user.id // null) != null) and (.user.id == $owner_id)) or (((.user.id // null) == null) and ((.user.login // "") == $login)))) | sort_by([(.created_at // ""), (.id // 0)])'
           }
           lookup_output="$(list_own_comments 2>&1)"
           lookup_status=$?
+          mark_budget_if_expired "$lookup_status"
           if [ "$lookup_status" -ne 0 ]; then
             http_status="$(printf '%s\n' "$lookup_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
             [ -n "$http_status" ] || http_status="unavailable"
             permission_category="network_error"
             case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
-            jq -n --arg delivery "not_created" --arg operation "LOOKUP" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" \
-              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category}' \
+            reason_code="comment_lookup_failed"
+            if [ "$publish_budget_exhausted" -eq 1 ]; then reason_code="publish_budget_exhausted"; fi
+            jq -n --arg delivery "not_created" --arg operation "LOOKUP" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" --arg reason_code "$reason_code" \
+              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category, reason_code: $reason_code}' \
               > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Reason: comment_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Reason: $reason_code" >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::OCR advisory sticky lookup failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
           fi
@@ -654,21 +700,24 @@ jobs:
           self_heal_error=""
           if [ -n "$comment_id" ]; then
             operation="PATCH"
-            publish_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" --method PATCH --input "$payload_path" 2>&1)"
+            publish_output="$(gh_api "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" --method PATCH --input "$payload_path" 2>&1)"
           else
             operation="POST"
-            publish_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --method POST --input "$payload_path" 2>&1)"
+            publish_output="$(gh_api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --method POST --input "$payload_path" 2>&1)"
           fi
           publish_status=$?
+          mark_budget_if_expired "$publish_status"
           if [ "$publish_status" -ne 0 ]; then
             http_status="$(printf '%s\n' "$publish_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
             [ -n "$http_status" ] || http_status="unavailable"
             permission_category="network_error"
             case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
-            jq -n --arg delivery "not_created" --arg operation "$operation" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" \
-              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category}' \
+            reason_code="comment_publish_failed"
+            if [ "$publish_budget_exhausted" -eq 1 ]; then reason_code="publish_budget_exhausted"; fi
+            jq -n --arg delivery "not_created" --arg operation "$operation" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" --arg reason_code "$reason_code" \
+              '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category, reason_code: $reason_code}' \
               > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Operation: $operation" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Operation: $operation" "- Reason: $reason_code" >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::OCR advisory sticky $operation failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
           fi
@@ -676,28 +725,35 @@ jobs:
             duplicate_ids="$(printf '%s\n' "$lookup_output" | jq -r '.[1:][]?.id')"
             while IFS= read -r duplicate_id; do
               [ -n "$duplicate_id" ] || continue
-              delete_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$duplicate_id" --method DELETE 2>&1)"
-              if [ "$?" -ne 0 ]; then
+              delete_output="$(gh_api "repos/$GITHUB_REPOSITORY/issues/comments/$duplicate_id" --method DELETE 2>&1)"
+              delete_status=$?
+              mark_budget_if_expired "$delete_status"
+              if [ "$delete_status" -ne 0 ]; then
                 self_heal_error="comment $duplicate_id delete failed: $delete_output"
               fi
             done <<< "$duplicate_ids"
           else
             after_post="$(list_own_comments 2>&1)"
             after_status=$?
+            mark_budget_if_expired "$after_status"
             if [ "$after_status" -ne 0 ]; then
               self_heal_error="post verification failed: $after_post"
             else
               winner_id="$(printf '%s\n' "$after_post" | jq -r '.[0].id // empty')"
               if [ -n "$winner_id" ]; then
-                heal_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$winner_id" --method PATCH --input "$payload_path" 2>&1)"
-                if [ "$?" -ne 0 ]; then
+                heal_output="$(gh_api "repos/$GITHUB_REPOSITORY/issues/comments/$winner_id" --method PATCH --input "$payload_path" 2>&1)"
+                heal_status=$?
+                mark_budget_if_expired "$heal_status"
+                if [ "$heal_status" -ne 0 ]; then
                   self_heal_error="post winner PATCH failed: $heal_output"
                 else
                   duplicate_ids="$(printf '%s\n' "$after_post" | jq -r '.[1:][]?.id')"
                   while IFS= read -r duplicate_id; do
                     [ -n "$duplicate_id" ] || continue
-                    delete_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$duplicate_id" --method DELETE 2>&1)"
-                    if [ "$?" -ne 0 ]; then
+                    delete_output="$(gh_api "repos/$GITHUB_REPOSITORY/issues/comments/$duplicate_id" --method DELETE 2>&1)"
+                    delete_status=$?
+                    mark_budget_if_expired "$delete_status"
+                    if [ "$delete_status" -ne 0 ]; then
                       self_heal_error="comment $duplicate_id delete failed: $delete_output"
                     fi
                   done <<< "$duplicate_ids"
@@ -711,9 +767,14 @@ jobs:
           if [ "$operation" = "POST" ]; then
             delivery="created"
           fi
-          jq -n --arg delivery "$delivery" --arg operation "$operation" --arg identity_source "$IDENTITY_SOURCE" --arg self_heal_error "$self_heal_error" \
-            '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, identity_source: $identity_source, permission_category: null, self_heal_error: (if $self_heal_error == "" then null else $self_heal_error end)}' \
+          reason_code=""
+          if [ "$publish_budget_exhausted" -eq 1 ]; then reason_code="publish_budget_exhausted"; fi
+          jq -n --arg delivery "$delivery" --arg operation "$operation" --arg identity_source "$IDENTITY_SOURCE" --arg reason_code "$reason_code" --arg self_heal_error "$self_heal_error" \
+            '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, identity_source: $identity_source, permission_category: null, reason_code: (if $reason_code == "" then null else $reason_code end), self_heal_error: (if $self_heal_error == "" then null else $self_heal_error end)}' \
             > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+          if [ "$publish_budget_exhausted" -eq 1 ]; then
+            printf '%s\n' "" "- Reason: publish_budget_exhausted" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ -n "$self_heal_error" ]; then
             printf '%s\n' "" "- Self-heal: $self_heal_error" >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::OCR advisory sticky self-heal was partial: $self_heal_error"
@@ -746,10 +807,9 @@ jobs:
     # 自建机群整体不可用概率，2026-07-27 已造成全组织停摆；v1 已经如此路由，
     # 本次只是补齐未完成灰度。取整税数据：2026-08-01 单日 145 计费分钟 / 12.8 实际分钟。
     runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
-    # 5 minutes (plan value): the aggregator only checks out its own small
-    # source tree, downloads one artifact, and runs a stdlib-only script — it
-    # must never need anywhere near quality/primary's budgets.
-    timeout-minutes: 5
+    # 8 minutes: aggregation is seconds, publish is capped at <=2 minutes,
+    # and the remaining time covers artifact download/upload and runner jitter.
+    timeout-minutes: 8
     steps:
       # `uses:` cannot itself take an expression, so the only way to pin the
       # aggregator script to the EXACT commit this reusable workflow file is
@@ -912,6 +972,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
           PANEL_DELIVERY_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
+          GATE_PUBLISH_BUDGET_SECONDS: ${{ vars.GATE_PUBLISH_BUDGET_SECONDS || '120' }}
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
