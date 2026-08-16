@@ -15,7 +15,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import socket
 import sys
+import threading
 import urllib.error
 import urllib.request
 import zipfile
@@ -1126,6 +1128,77 @@ def test_status_panel_missing_token_is_fail_open_without_network(monkeypatch):
     assert receipt["delivery"] == "not_created"
     assert receipt["reason_code"] == "missing_token"
     assert receipt["error_category"] == "configuration"
+
+
+def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypatch, tmp_path):
+    terminal_path = tmp_path / "gate-terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            AGG.build_terminal_envelope(
+                repository="zlxlabs/gate",
+                identity=IDENTITY,
+                quality_result="success",
+                primary_result="success",
+                review_expected=True,
+                is_draft=False,
+                runner="self",
+                outcome=AGG.Outcome(
+                    ok=True,
+                    classification="code_pass",
+                    reason_code="primary_pass",
+                    gate_result="pass",
+                ),
+            )
+        ),
+        encoding="utf-8",
+    )
+    summary_path = tmp_path / "summary.md"
+    delivery_path = tmp_path / "panel-delivery.json"
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setenv("GATE_PUBLISH_BUDGET_SECONDS", "0.05")
+    started = threading.Event()
+    released = threading.Event()
+    finished = threading.Event()
+    calls = []
+
+    def hanging_urlopen(request, timeout=None):
+        calls.append((request.full_url, timeout))
+        started.set()
+        released.wait(timeout=timeout)
+        raise socket.timeout("stub hung")
+
+    monkeypatch.setattr(urllib.request, "urlopen", hanging_urlopen)
+    result = []
+
+    def invoke_publish():
+        result.append(
+            AGG.main(
+                _cli_args(
+                    tmp_path / "unused-audit",
+                    summary_path,
+                    terminal_path=str(terminal_path),
+                    panel_delivery_path=str(delivery_path),
+                )
+                + ["--publish-only"]
+            )
+        )
+        finished.set()
+
+    worker = threading.Thread(target=invoke_publish, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(timeout=0.5)
+        assert finished.wait(timeout=0.5), "publish must stop a hanging call within its budget"
+    finally:
+        released.set()
+        worker.join(timeout=1)
+
+    assert result == [0]
+    assert calls and calls[0][1] <= 0.05
+    receipt = json.loads(delivery_path.read_text(encoding="utf-8"))
+    assert receipt["reason_code"] == "publish_budget_exhausted"
+    assert receipt["completed_operations"] == []
+    assert receipt["pending_operations"]
 
 
 @pytest.mark.parametrize(
