@@ -1334,6 +1334,29 @@ def test_existing_panel_cache_is_unioned_when_artifact_history_is_incomplete(mon
     assert operations == [body]
 
 
+def test_existing_panel_cache_is_incomplete_when_artifact_history_is_empty(monkeypatch):
+    current = _panel_terminal_row(8, 1, "pass", "b" * 40)
+    owner = {"id": 99, "login": "workflow-bot"}
+    cached_body = AGG.render_status_panel([_panel_terminal_row(7, 1, "fail", "a" * 40)])
+    comments = [{"id": 7, "created_at": "2026-08-16T00:00:00Z", "body": cached_body, "user": owner}]
+    operations = []
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments)
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
+
+    body, receipt = AGG._post_status_panel_fail_open(
+        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
+        identity=IDENTITY,
+    )
+
+    assert receipt["history_incomplete"] is True
+    assert "历史可能不完整" in body
+    assert "artifact history does not contain cached rows: 7/1" in body
+    assert operations == [body]
+
+
 def test_history_api_failure_preserves_existing_panel_body_and_records_diagnostic(monkeypatch):
     current = _panel_terminal_row(8, 1, "pass", "b" * 40)
     owner = {"id": 99, "login": "workflow-bot"}
