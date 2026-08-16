@@ -1065,6 +1065,100 @@ def test_status_panel_http_failure_is_fail_open_and_diagnostic(monkeypatch, caps
     assert "permission category=" + category in output
 
 
+def test_status_panel_missing_token_is_fail_open_without_network(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network call")))
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=_panel_terminal_row(1, 1, "pass", "a" * 40),
+        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+    )
+    assert receipt["delivery"] == "not_created"
+    assert receipt["reason_code"] == "missing_token"
+    assert receipt["error_category"] == "configuration"
+
+
+@pytest.mark.parametrize(
+    "failure,expected_delivery,expected_status",
+    [
+        (urllib.error.HTTPError("https://api.github.com/x", 429, "rate", hdrs=None, fp=None), "not_created", 429),
+        (urllib.error.URLError("timed out"), "unknown", None),
+    ],
+    ids=["http-429", "network-timeout"],
+)
+def test_publish_only_transport_failures_are_fail_open_and_leave_receipt(monkeypatch, tmp_path, failure, expected_delivery, expected_status):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
+    summary_path = tmp_path / "summary.md"
+    terminal_path = tmp_path / "gate-terminal.json"
+    delivery_path = tmp_path / "panel-delivery.json"
+    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
+
+    owner = {"id": 99, "login": "workflow-bot"}
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: (_ for _ in ()).throw(failure))
+    args = _cli_args(
+        audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
+    ) + ["--publish-only"]
+    assert AGG.main(args) == 0
+    receipt = json.loads(delivery_path.read_text(encoding="utf-8"))
+    assert receipt["delivery"] == expected_delivery
+    assert receipt["http_status"] == expected_status
+    assert "HTTP status" in summary_path.read_text(encoding="utf-8")
+
+
+def test_warning_output_failure_stays_fail_open(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    def broken_print(*args, **kwargs):
+        raise OSError("closed stdout")
+    monkeypatch.setattr("builtins.print", broken_print)
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=_panel_terminal_row(1, 1, "pass", "a" * 40),
+        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+    )
+    assert receipt["reason_code"] == "missing_token"
+
+
+def test_panel_delivery_receipt_uses_temp_file_then_atomic_replace(monkeypatch, tmp_path):
+    path = tmp_path / "panel-delivery.json"
+    replacements = []
+    original_replace = Path.replace
+    def record_replace(source, target):
+        replacements.append((source, target))
+        return original_replace(source, target)
+    monkeypatch.setattr(Path, "replace", record_replace)
+    AGG._persist_panel_delivery(str(path), {"delivery": "created"})
+    assert replacements == [(path.with_name(".panel-delivery.json.tmp"), path)]
+    assert json.loads(path.read_text(encoding="utf-8"))["delivery"] == "created"
+    assert not path.with_name(".panel-delivery.json.tmp").exists()
+
+
+def test_panel_delivery_write_failure_clears_stale_file_and_stays_fail_open(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "panel-delivery.json"
+    path.write_text("old receipt", encoding="utf-8")
+    monkeypatch.setattr(AGG, "_write_panel_delivery", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+    AGG._persist_panel_delivery(str(path), {"delivery": "created"})
+    assert not path.exists()
+    assert "file is missing and upload will red" in capsys.readouterr().out
+
+
+def test_panel_delivery_cleanup_failure_writes_invalid_marker(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "panel-delivery.json"
+    path.write_text("old receipt", encoding="utf-8")
+    monkeypatch.setattr(Path, "unlink", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("locked")))
+    monkeypatch.setattr(AGG, "_write_panel_delivery", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+    AGG._persist_panel_delivery(str(path), {"delivery": "created"})
+    assert path.read_bytes() == b"invalid gate PR-comment receipt\n"
+    assert "stale receipt was destroyed; an invalid marker was written" in capsys.readouterr().out
+
+
 def test_patch_request_uses_issue_comment_endpoint(monkeypatch):
     calls = []
 
@@ -1109,6 +1203,23 @@ def test_panel_marker_candidates_require_own_author_and_choose_earliest(monkeypa
     selected = AGG._find_panel_comments(comments, owner)
     assert [comment["id"] for comment in selected] == [2, 3]
     assert all(comment["user"]["id"] == owner["id"] for comment in selected)
+
+
+def test_panel_comment_lookup_paginates_all_pages(monkeypatch):
+    owner = {"id": 99, "login": "workflow-bot"}
+    page_one = [{"id": i, "body": "ordinary", "user": owner} for i in range(100)]
+    page_two = [{"id": 101, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}]
+    calls = []
+    def fake_json(**kwargs):
+        calls.append(kwargs["url"])
+        return page_one if "&page=1" in kwargs["url"] else page_two
+    monkeypatch.setattr(AGG, "_github_json", fake_json)
+    comments = AGG._fetch_panel_comments(token="tok", repository="zlxlabs/gate", pr_number=42)
+    assert len(comments) == 101
+    assert calls == [
+        "https://api.github.com/repos/zlxlabs/gate/issues/42/comments?per_page=100&page=1",
+        "https://api.github.com/repos/zlxlabs/gate/issues/42/comments?per_page=100&page=2",
+    ]
 
 
 def test_post_self_heal_deletes_duplicate_and_patches_earliest_own_panel(monkeypatch):
@@ -1221,6 +1332,27 @@ def test_existing_panel_cache_is_unioned_when_artifact_history_is_incomplete(mon
     assert "历史可能不完整" in body
     assert "| [7]" in body and "| [8]" in body
     assert operations == [body]
+
+
+def test_history_api_failure_preserves_existing_panel_body_and_records_diagnostic(monkeypatch):
+    current = _panel_terminal_row(8, 1, "pass", "b" * 40)
+    owner = {"id": 99, "login": "workflow-bot"}
+    old_body = AGG.render_status_panel([_panel_terminal_row(7, 1, "fail", "a" * 40)])
+    comments = [{"id": 7, "created_at": "2026-08-16T00:00:00Z", "body": old_body, "user": owner}]
+    error = urllib.error.HTTPError("https://api.github.com/actions/artifacts", 503, "down", hdrs=None, fp=None)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments)
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: (_ for _ in ()).throw(AssertionError("must preserve old body")))
+    body, receipt = AGG._post_status_panel_fail_open(
+        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+    )
+    assert body == old_body
+    assert receipt["delivery"] == "not_created"
+    assert receipt["reason_code"] == "history_unavailable"
+    assert receipt["http_status"] == 503
+    assert receipt["history_error"]
 
 
 

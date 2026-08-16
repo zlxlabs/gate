@@ -1211,7 +1211,10 @@ def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any
         diagnostic += "- Comment self-heal: `partial`\n"
         for error in receipt["self_heal_errors"]:
             diagnostic += f"  - `{error}`\n"
-    print(diagnostic)
+    try:
+        print(diagnostic)
+    except Exception:
+        pass
     if summary_path:
         try:
             with open(summary_path, "a", encoding="utf-8") as handle:

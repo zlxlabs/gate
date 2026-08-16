@@ -647,7 +647,6 @@ jobs:
             publish_output="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --method POST --input "$payload_path" 2>&1)"
           fi
           publish_status=$?
-          set -e
           if [ "$publish_status" -ne 0 ]; then
             http_status="$(printf '%s\n' "$publish_output" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | head -n1)"
             [ -n "$http_status" ] || http_status="unavailable"
@@ -690,6 +689,8 @@ jobs:
                     fi
                   done <<< "$duplicate_ids"
                 fi
+              else
+                self_heal_error="post verification returned no own marker"
               fi
             fi
           fi
