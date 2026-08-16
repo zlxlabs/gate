@@ -1043,12 +1043,63 @@ def test_fetch_terminal_history_consumes_a_persisted_terminal_artifact(monkeypat
             "archive_download_url": "https://api.github.com/archive/1",
         }]},
     )
-    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: archive.getvalue())
+    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: archive.getvalue())
     rows = AGG._fetch_terminal_history(
         token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
     )
     assert rows.rows[0]["run_id"] == IDENTITY.run_id
     assert rows.rows[0]["gate_result"] == "pass"
+
+
+def test_terminal_artifact_redirect_drops_auth_for_blob_download(monkeypatch):
+    record = {
+        "schema_version": 1, "kind": "gate_terminal", "repository": "zlxlabs/gate",
+        "repository_id": 123, "pr_number": 42, "run_id": 9, "run_attempt": 1,
+        "head_sha": "a" * 40, "gate_result": "pass", "classification": "code_pass",
+        "reason_code": "primary_pass",
+    }
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("gate-terminal.json", json.dumps(record))
+    archive_url = "https://api.github.com/repos/zlxlabs/gate/actions/artifacts/9/zip"
+    blob_url = "https://blob.example.test/signed-artifact.zip?sig=secret"
+    calls = []
+
+    class RedirectStub:
+        def open(self, request, timeout=None):
+            headers = dict(request.header_items())
+            calls.append((request.full_url, headers, timeout))
+            if request.full_url == archive_url:
+                raise urllib.error.HTTPError(
+                    archive_url, 302, "redirect", {"Location": blob_url}, None,
+                )
+            assert request.full_url == blob_url
+            assert "Authorization" not in headers
+            return _FakeResponse(archive.getvalue())
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: RedirectStub())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            urllib.error.HTTPError(archive_url, 302, "redirect", {"Location": blob_url}, None)
+        ),
+    )
+    monkeypatch.setattr(
+        AGG, "_github_json",
+        lambda **kwargs: {"artifacts": [{
+            "name": "gate-terminal-v1-123-valid", "expired": False,
+            "archive_download_url": archive_url,
+        }]},
+    )
+
+    result = AGG._fetch_terminal_history(
+        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
+    )
+
+    assert [row["run_id"] for row in result.rows] == [9]
+    assert [call[0] for call in calls] == [archive_url, blob_url]
+    assert calls[0][1]["Authorization"] == "Bearer tok"
+    assert "Authorization" not in calls[1][1]
 
 
 @pytest.mark.parametrize("existing", [False, True], ids=["POST", "PATCH"])
@@ -1528,7 +1579,7 @@ def test_history_loader_skips_other_pr_and_bad_records_individually(monkeypatch)
             {"name": "gate-terminal-v1-123-expired", "expired": True, "archive_download_url": "expired"},
         ]},
     )
-    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: zipped[kwargs["url"]])
+    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: zipped[kwargs["url"]])
     result = AGG._fetch_terminal_history(token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42)
     assert [row["run_id"] for row in result.rows] == [9]
     assert {entry["name"] for entry in result.skipped_records} == {
@@ -1602,7 +1653,8 @@ def test_existing_panel_cache_is_incomplete_when_artifact_history_is_empty(monke
 
     assert receipt["history_incomplete"] is True
     assert "历史可能不完整" in body
-    assert "artifact history does not contain cached rows: 7/1" in body
+    assert "1 个制品历史缺少面板缓存行" in body
+    assert receipt["history_incomplete_reasons"] == ["artifact history does not contain cached rows: 7/1"]
     assert operations == [body]
 
 
@@ -1661,6 +1713,38 @@ def test_history_skip_count_is_written_to_step_summary(tmp_path, capsys):
     AGG._append_panel_diagnostic(str(summary), receipt)
     assert "Skipped history records: `1`" in summary.read_text(encoding="utf-8")
     assert "`old`: `expired_artifact`" in capsys.readouterr().out
+
+
+def test_status_panel_aggregates_repeated_http_reasons_and_keeps_receipt_detail():
+    reasons = [
+        f"artifact gate-terminal-v1-123-{index}: HTTPError: HTTP Error 401: signed blob rejected"
+        for index in range(21)
+    ]
+    body = AGG.render_status_panel(
+        [_panel_row(1, 1, "pass")], history_reasons=reasons,
+    )
+    warning_line = next(line for line in body.splitlines() if line.startswith("> 历史可能不完整："))
+    receipt = AGG._build_panel_delivery(
+        body=body, repository="zlxlabs/gate", pr_number=42, identity=IDENTITY,
+        delivery="updated", reason_code="history_incomplete",
+        history_incomplete_reasons=reasons,
+    )
+
+    assert "21 个制品下载失败：HTTP 401" in body
+    assert body.count("制品下载失败：HTTP 401") == 1
+    assert len(warning_line) <= AGG.MAX_HISTORY_WARNING_CHARS
+    assert receipt["history_incomplete_reasons"] == reasons
+    assert len(receipt["history_incomplete_reasons"]) == 21
+
+    long_body = AGG.render_status_panel(
+        [_panel_row(1, 1, "pass")],
+        history_reasons=[f"unclassified reason {index}: {'x' * 40}" for index in range(21)],
+    )
+    long_warning_line = next(
+        line for line in long_body.splitlines() if line.startswith("> 历史可能不完整：")
+    )
+    assert len(long_warning_line) <= AGG.MAX_HISTORY_WARNING_CHARS
+    assert "完整明细见 delivery 诊断制品" in long_warning_line
 
 
 
