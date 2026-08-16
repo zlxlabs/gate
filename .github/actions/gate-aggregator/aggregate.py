@@ -252,10 +252,12 @@ class _PublishBudgetExhausted(Exception):
 @dataclass
 class _PublishBudget:
     seconds: float
+    history_seconds: float = DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS
     started_at: float = field(default_factory=time.monotonic)
     completed_operations: list[str] = field(default_factory=list)
     pending_operations: list[str] = field(default_factory=lambda: list(PUBLISH_OPERATION_ORDER))
     current_operation: Optional[str] = None
+    operation_deadline: Optional[float] = field(default=None, init=False)
 
     @classmethod
     def from_environment(cls) -> "_PublishBudget":
@@ -263,19 +265,35 @@ class _PublishBudget:
         seconds = DEFAULT_PUBLISH_BUDGET_SECONDS if raw is None else float(raw)
         if seconds <= 0:
             raise ValueError(f"{PUBLISH_BUDGET_ENV} must be greater than zero")
-        return cls(seconds=seconds)
+        history_raw = os.environ.get(HISTORY_RECONSTRUCTION_BUDGET_ENV)
+        history_seconds = (
+            DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS
+            if history_raw is None else float(history_raw)
+        )
+        if history_seconds <= 0 or history_seconds > DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS:
+            raise ValueError(
+                f"{HISTORY_RECONSTRUCTION_BUDGET_ENV} must be between zero and "
+                f"{DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS} seconds"
+            )
+        return cls(seconds=seconds, history_seconds=history_seconds)
 
     def remaining(self) -> float:
         return self.seconds - (time.monotonic() - self.started_at)
 
     def timeout(self) -> float:
         remaining = self.remaining()
+        if self.current_operation == "HISTORY_RECONSTRUCTION" and self.operation_deadline is not None:
+            remaining = min(remaining, self.operation_deadline - time.monotonic())
         if remaining <= 0:
             raise _PublishBudgetExhausted(self.current_operation or "UNKNOWN")
         return min(GITHUB_API_TIMEOUT_SECONDS, remaining)
 
     def begin(self, operation: str) -> None:
         self.current_operation = operation
+        self.operation_deadline = (
+            time.monotonic() + self.history_seconds
+            if operation == "HISTORY_RECONSTRUCTION" else None
+        )
         self.timeout()
 
     def complete(self, operation: str) -> None:
@@ -283,6 +301,8 @@ class _PublishBudget:
             self.completed_operations.append(operation)
         if operation in self.pending_operations:
             self.pending_operations.remove(operation)
+        if operation == "HISTORY_RECONSTRUCTION":
+            self.operation_deadline = None
 
     def add(self, operation: str) -> None:
         if operation not in self.completed_operations and operation not in self.pending_operations:
