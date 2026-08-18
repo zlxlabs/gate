@@ -373,7 +373,7 @@ jobs:
       # `success` (a job with zero executed steps is not the same as a job whose OWN
       # `if:` was false, which reports `skipped` instead — either outcome is harmless
       # here, since normal operation never reaches this branch at all).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: matrix.reviewer != '__none__'
         with: { fetch-depth: 1 }
 
@@ -507,7 +507,7 @@ jobs:
         # disk for it to upload in the first place — its "Run review-shadow" step never
         # ran either).
         if: always() && matrix.reviewer != '__none__'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: shadow-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shadow-events
@@ -573,7 +573,7 @@ jobs:
       # scans its events-dir NON-recursively for `*.json`, so a flat layout is required
       # for it to see every event file at all.
       - name: Download all shadow event artifacts for this run
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: ${{ runner.temp }}/shadow-events-all
           pattern: shadow-event-*-${{ github.run_id }}-${{ github.run_attempt }}

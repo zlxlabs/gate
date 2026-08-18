@@ -37,6 +37,14 @@ PANEL_DELIVERY_NAME_EXPR = (
 )
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
+CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+EXPECTED_ACTION_REFS = {
+    "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+    "actions/cache": "0057852bfaa89a56745cba8c7296529d2fc39830",
+    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "actions/download-artifact": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+}
 # fromJSON('["self-hosted","linux","ci"]') — capture each array literal in runs-on.
 _FROMJSON_LABELS_RE = re.compile(r"fromJSON\('(\[[^\]]*\])'\)")
 
@@ -76,6 +84,18 @@ def test_is_workflow_call_named_gate():
     raw, trigger = _load_workflow()
     assert "workflow_call" in trigger
     assert raw["name"] == "gate"
+
+
+def test_production_v2_official_actions_are_exactly_sha_pinned():
+    raw, _ = _load_workflow()
+    actual = {}
+    for job in raw["jobs"].values():
+        for step in job.get("steps", []):
+            uses = step.get("uses", "")
+            if uses.startswith("actions/"):
+                action, ref = uses.split("@", 1)
+                actual.setdefault(action, set()).add(ref)
+    assert actual == {action: {ref} for action, ref in EXPECTED_ACTION_REFS.items()}
 
 
 def test_secrets_explicit_and_feishu_optional():
@@ -255,7 +275,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     primary_steps = raw["jobs"]["primary"]["steps"]
     upload = next(s for s in primary_steps if s.get("name") == "Upload canonical primary audit")
     assert upload["if"] == "always()"
-    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
     assert upload["with"]["name"] == ARTIFACT_NAME_EXPR
     # fail-closed: unlike legacy's advisory codex-audit upload, this upload has no
     # continue-on-error. P1 fix (2026-07-26, canary probe #2): if-no-files-found MUST be
@@ -295,7 +315,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
     terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
-    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == "actions/upload-artifact@v4" and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error"} and "continue-on-error" not in terminal_upload
+    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error"} and "continue-on-error" not in terminal_upload
 
 
 def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
@@ -341,7 +361,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
 
     upload = steps[upload_index]
-    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
     assert upload["with"] == {
         "name": "codex-review-ledger-v2",
         "path": "${{ runner.temp }}/review-ledger/ledger.jsonl",
@@ -454,7 +474,7 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
 
     upload = next(s for s in gate_steps if s.get("name") == "Upload gate status panel delivery diagnostic")
     assert upload["if"] == "always()"
-    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
     assert upload["with"] == {
         "name": PANEL_DELIVERY_NAME_EXPR,
         "path": "${{ runner.temp }}/gate-status-panel-delivery.json",
@@ -639,7 +659,7 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
         step for step in steps
         if step.get("name") == "Checkout gate actions at this workflow's own commit"
     )
-    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["uses"] == CHECKOUT_ACTION
     assert checkout["with"] == {
         "repository": "${{ job.workflow_repository }}",
         "ref": "${{ job.workflow_sha }}",

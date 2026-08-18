@@ -31,6 +31,13 @@ REQUIRED_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
 RUNNER_GUARD = "inputs.runner == 'self'"
+CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+EXPECTED_ACTION_REFS = {
+    "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "actions/download-artifact": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+}
 
 
 def _load_workflow():
@@ -56,6 +63,18 @@ def test_is_workflow_call_named_gate_shadow():
     raw, trigger = _load_workflow()
     assert "workflow_call" in trigger
     assert raw["name"] == "gate-shadow"
+
+
+def test_shadow_v2_official_actions_are_exactly_sha_pinned():
+    raw, _ = _load_workflow()
+    actual = {}
+    for job in raw["jobs"].values():
+        for step in job.get("steps", []):
+            uses = step.get("uses", "")
+            if uses.startswith("actions/"):
+                action, ref = uses.split("@", 1)
+                actual.setdefault(action, set()).add(ref)
+    assert actual == {action: {ref} for action, ref in EXPECTED_ACTION_REFS.items()}
 
 
 def test_no_secrets_declared():
@@ -166,7 +185,7 @@ def test_shadow_workflow_has_no_gate_source_checkout_or_caller_quality_step():
     for job_name, job in raw["jobs"].items():
         for step in job["steps"]:
             text = f"{step.get('run', '')} {step.get('uses', '')}"
-            if step.get("uses") == "actions/checkout@v4":
+            if step.get("uses") == CHECKOUT_ACTION:
                 assert not any(marker in text for marker in gate_source_markers), (
                     f"jobs.{job_name} must not checkout gate source into the caller workspace"
                 )
@@ -269,7 +288,7 @@ def test_shadow_job_steps_each_carry_the_sentinel_guard():
     raw, _ = _load_workflow()
     steps = raw["jobs"]["shadow"]["steps"]
     guarded_step_names = {
-        "actions/checkout@v4",
+        CHECKOUT_ACTION,
         "Resolve numeric job id for REVIEW_JOB_ID",
         "Run review-shadow",
     }
@@ -412,7 +431,7 @@ def test_shadow_upload_step_name_pattern_matches_summary_download_pattern():
     shadow_steps = raw["jobs"]["shadow"]["steps"]
     upload = next(s for s in shadow_steps if s.get("name") == "Upload shadow calibration event")
     assert upload["if"] == "always() && matrix.reviewer != '__none__'"
-    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
     upload_name = str(upload["with"]["name"])
     assert upload_name == "shadow-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}"
     # P1 fix (2026-07-26, canary probe #2): must be explicit `error`, not the earlier

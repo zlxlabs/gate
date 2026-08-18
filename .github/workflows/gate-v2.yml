@@ -110,7 +110,7 @@ jobs:
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 1 }
 
       - name: Remove stale gate source directories
@@ -147,7 +147,7 @@ jobs:
       # source at the exact commit selected by the caller, then invoke the action
       # through a workspace-relative path so it follows the caller's workflow pin.
       - name: Checkout gate actions at this workflow's own commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -209,7 +209,7 @@ jobs:
       - name: Restore uv download cache
         id: uv-cache
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}
@@ -289,7 +289,7 @@ jobs:
       - name: Upload v2 review ledger inputs
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -334,7 +334,7 @@ jobs:
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 1 }
 
       - name: Compute and validate review-primary's internal timeout budget
@@ -441,13 +441,13 @@ jobs:
         # must never see a "success" primary job without a matching artifact
         # to validate — so this step deliberately has NO `continue-on-error`.
         # P1 fix (2026-07-26, canary probe #2): an earlier draft of this step relied on
-        # `actions/upload-artifact@v4`'s DEFAULT `if-no-files-found` behavior, which is
+        # actions/upload-artifact v4's DEFAULT `if-no-files-found` behavior, which is
         # `warn` — NOT `ignore`, but also NOT `error`: canary observed primary fail to
         # write an audit at all, yet this step still concluded `success` (a warning
         # annotation, not a job failure). `if-no-files-found: error` below is the actual
         # fail-closed setting; "no if-no-files-found: ignore" alone was never sufficient.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/primary-review-audit.json
@@ -529,7 +529,7 @@ jobs:
     # for checkout, Jobs API lookup, event upload, and PR comment persistence.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: matrix.reviewer != '__none__'
         with: { fetch-depth: 1 }
 
@@ -750,7 +750,7 @@ jobs:
 
       - name: Upload advisory review event
         if: always() && matrix.reviewer != '__none__'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shadow-events/advisory
@@ -789,7 +789,7 @@ jobs:
       # this "reusable workflow checks out its own source" case (Contexts
       # reference, "Example usage of job context workflow identity").
       - name: Checkout gate-aggregator at this workflow's own commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -864,7 +864,7 @@ jobs:
       - name: Download canonical primary audit (best effort — may not exist)
         if: ${{ needs.primary.result != 'skipped' && steps.resolve-audit-artifact.outputs.artifact_id != '' }}
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ steps.resolve-audit-artifact.outputs.artifact_id }}
           merge-multiple: true
@@ -916,7 +916,7 @@ jobs:
       - name: Upload gate terminal envelope
         if: always()
         id: upload-gate-terminal
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-terminal.json
@@ -960,7 +960,7 @@ jobs:
 
       - name: Upload gate status panel delivery diagnostic
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-status-panel-delivery.json
@@ -978,7 +978,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout ledger action at this workflow's own commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -1048,7 +1048,7 @@ jobs:
           PY
 
       - name: Download v2 review ledger inputs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}
           merge-multiple: true
@@ -1056,7 +1056,7 @@ jobs:
 
       - name: Download canonical primary audit for ledger
         if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
           merge-multiple: true
@@ -1077,7 +1077,7 @@ jobs:
           expected-reusable-workflow-sha: ${{ job.workflow_sha }}
 
       - name: Upload v2 review effectiveness ledger
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: codex-review-ledger-v2
           path: ${{ runner.temp }}/review-ledger/ledger.jsonl
