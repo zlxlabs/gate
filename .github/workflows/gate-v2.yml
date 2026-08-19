@@ -454,6 +454,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload primary review diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/primary-review-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
   resolve_advisory:
     # Same primary-shaped guard as `primary`: draft/fork/hosted callers must
