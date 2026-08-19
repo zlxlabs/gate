@@ -344,16 +344,29 @@ def test_sticky_comment_sends_scrubbed_body(monkeypatch):
     }
     writes = []
 
-    def fake_request(token, method, url, payload=None):
-        if method == "GET" and "/pulls/" in url:
-            return {"head": {"sha": result["head_sha"]}}
-        if method == "GET":
-            return []
-        writes.append(payload)
-        return None
+    class Response:
+        def __init__(self, payload=b""):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def fake_urlopen(request, timeout):
+        if request.get_method() == "GET" and "/pulls/" in request.full_url:
+            return Response(json.dumps({"head": {"sha": result["head_sha"]}}).encode())
+        if request.get_method() == "GET":
+            return Response(b"[]")
+        writes.append(json.loads(request.data.decode()))
+        return Response(b"{}")
 
     monkeypatch.setenv("RUNNER_NAME", "runner-secret")
-    monkeypatch.setattr(module, "_request", fake_request)
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
 
     module.post_sticky_comment(result, token="token", repository="org/repo", pr_number=7)
 

@@ -711,9 +711,27 @@ def test_sticky_comment_sends_scrubbed_body(monkeypatch):
     entry["review"]["reviewer"] = "runner-secret"
     writes = []
 
+    class Response:
+        def __init__(self, payload=b""):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def fake_urlopen(request, timeout):
+        if request.get_method() == "GET":
+            return Response(b'{"head":{"sha":"head"}}')
+        writes.append(json.loads(request.data.decode()))
+        return Response(b"{}")
+
     monkeypatch.setenv("RUNNER_NAME", "runner-secret")
-    monkeypatch.setattr(module, "_api_json", lambda *args, **kwargs: {"head": {"sha": "head"}})
-    monkeypatch.setattr(module, "_api_request", lambda *args, **kwargs: writes.append(kwargs["payload"]))
+    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
 
     module.post_state_comment("token", "org/repo", 7, "head", [entry], entry, [])
 

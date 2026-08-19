@@ -910,7 +910,10 @@ def test_status_panel_sends_scrubbed_body(monkeypatch):
     monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
     monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
     monkeypatch.setattr(AGG, "render_status_panel", lambda *args, **kwargs: "runner-secret 10.0.0.1")
-    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda request, timeout: operations.append(json.loads(request.data.decode())) or _FakeResponse(),
+    )
 
     AGG._post_status_panel_fail_open(
         current=_panel_terminal_row(1, 1, "pass", "a" * 40),
@@ -918,10 +921,11 @@ def test_status_panel_sends_scrubbed_body(monkeypatch):
     )
 
     assert len(operations) == 1
-    assert "runner-secret" not in operations[0]
-    assert "10.0.0.1" not in operations[0]
-    assert "[REDACTED:RUNNER_NAME]" in operations[0]
-    assert "[REDACTED:PRIVATE_IP]" in operations[0]
+    body = operations[0]["body"]
+    assert "runner-secret" not in body
+    assert "10.0.0.1" not in body
+    assert "[REDACTED:RUNNER_NAME]" in body
+    assert "[REDACTED:PRIVATE_IP]" in body
 
 
 def test_aggregate_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
