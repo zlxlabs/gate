@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
@@ -292,6 +294,98 @@ def test_summary_quotes_paths_with_backticks_without_code_span(tmp_path):
 
     summary_text = summary.read_text()
     assert '"reports/final`v1`.pdf" — rule `R2`, raw patch 8 lines' in summary_text
+
+
+def test_sticky_comment_scrub_failure_prevents_github_write(monkeypatch):
+    module = _module()
+    result = {
+        "classification": "warning",
+        "reviewable_lines": 12000,
+        "diff_lines": 12000,
+        "raw_patch_lines": 12000,
+        "changed_lines": 12000,
+        "changed_files": 1,
+        "additions": 12000,
+        "deletions": 0,
+        "head_sha": "head",
+        "review_plan": "sharded",
+        "excluded_files": [],
+        "thresholds": {"single_turn_lines": 4000, "warn_lines": 8000, "hard_lines": 32000},
+    }
+    writes = []
+
+    def fail_scrub(*args, **kwargs):
+        raise RuntimeError("scrub failed")
+
+    monkeypatch.setattr(module, "scrub_for_publish", fail_scrub)
+    monkeypatch.setattr(module, "_request", lambda *args, **kwargs: writes.append((args, kwargs)))
+
+    with pytest.raises(RuntimeError, match="scrub failed"):
+        module.post_sticky_comment(result, token="token", repository="org/repo", pr_number=7)
+
+    assert writes == []
+
+
+def test_sticky_comment_sends_scrubbed_body(monkeypatch):
+    module = _module()
+    result = {
+        "classification": "warning",
+        "reviewable_lines": 12000,
+        "diff_lines": 12000,
+        "raw_patch_lines": 12000,
+        "changed_lines": 12000,
+        "changed_files": 1,
+        "additions": 12000,
+        "deletions": 0,
+        "head_sha": "10.0.0.1",
+        "review_plan": "sharded",
+        "excluded_files": [],
+        "thresholds": {"single_turn_lines": 4000, "warn_lines": 8000, "hard_lines": 32000},
+    }
+    writes = []
+
+    def fake_request(token, method, url, payload=None):
+        if method == "GET" and "/pulls/" in url:
+            return {"head": {"sha": result["head_sha"]}}
+        if method == "GET":
+            return []
+        writes.append(payload)
+        return None
+
+    monkeypatch.setenv("RUNNER_NAME", "runner-secret")
+    monkeypatch.setattr(module, "_request", fake_request)
+
+    module.post_sticky_comment(result, token="token", repository="org/repo", pr_number=7)
+
+    assert len(writes) == 1
+    body = writes[0]["body"]
+    assert "10.0.0.1" not in body
+    assert "[REDACTED:PRIVATE_IP]" in body
+
+
+def test_step_summary_scrub_failure_leaves_existing_bytes_untouched(monkeypatch, tmp_path):
+    module = _module()
+    result = {
+        "classification": "single",
+        "reviewable_lines": 1,
+        "diff_lines": 1,
+        "raw_patch_lines": 1,
+        "changed_lines": 1,
+        "additions": 1,
+        "deletions": 0,
+        "changed_files": 1,
+        "review_plan": "single",
+        "excluded_files": [],
+    }
+    summary = tmp_path / "summary.md"
+    summary.write_text("existing\n")
+
+    monkeypatch.setattr(module, "scrub_for_publish", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("scrub failed")))
+
+    with pytest.raises(RuntimeError, match="scrub failed"):
+        module._append_summary(result, str(summary))
+
+    assert summary.read_text() == "existing\n"
 
 
 def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, monkeypatch):

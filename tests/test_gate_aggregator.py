@@ -888,6 +888,59 @@ def test_status_panel_publisher_creates_once_then_patches(monkeypatch):
     assert sum(operation[0] == "POST" for operation in operations) == 1
 
 
+def test_status_panel_scrub_failure_prevents_github_write(monkeypatch):
+    operations = []
+    monkeypatch.setattr(AGG, "scrub_for_publish", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("scrub failed")))
+    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs))
+
+    with pytest.raises(RuntimeError, match="scrub failed"):
+        AGG._post_status_panel_fail_open(
+            current=_panel_terminal_row(1, 1, "pass", "a" * 40),
+            repository="org/repo", repository_id=123, pr_number=7, identity=IDENTITY,
+        )
+
+    assert operations == []
+
+
+def test_status_panel_sends_scrubbed_body(monkeypatch):
+    operations = []
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setenv("RUNNER_NAME", "runner-secret")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: {"id": 99, "login": "workflow-bot"})
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG, "render_status_panel", lambda *args, **kwargs: "runner-secret 10.0.0.1")
+    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
+
+    AGG._post_status_panel_fail_open(
+        current=_panel_terminal_row(1, 1, "pass", "a" * 40),
+        repository="org/repo", repository_id=123, pr_number=7, identity=IDENTITY,
+    )
+
+    assert len(operations) == 1
+    assert "runner-secret" not in operations[0]
+    assert "10.0.0.1" not in operations[0]
+    assert "[REDACTED:RUNNER_NAME]" in operations[0]
+    assert "[REDACTED:PRIVATE_IP]" in operations[0]
+
+
+def test_aggregate_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("RUNNER_NAME", "runner-secret")
+    outcome = AGG.Outcome(
+        ok=True,
+        notes=["runner-secret"],
+        classification="code_pass",
+        reason_code="primary_pass",
+        gate_result="pass",
+    )
+
+    assert AGG._finish(outcome, str(summary)) == 0
+    text = summary.read_text()
+    assert "runner-secret" not in text
+    assert "[REDACTED:RUNNER_NAME]" in text
+
+
 @pytest.mark.parametrize("status", [403, 404])
 def test_installation_token_identity_403_or_404_falls_back_and_publishes(monkeypatch, status):
     current = _panel_terminal_row(5, 1, "pass", "e" * 40)

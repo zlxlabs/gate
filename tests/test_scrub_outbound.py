@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.scrub_outbound import scrub_outbound_text
+from scripts.scrub_outbound import scrub_for_publish, scrub_outbound_text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,3 +113,8 @@ def test_cli_scrubs_runner_and_private_ip_using_environment():
         "0123456789abcdef0123456789abcdef01234567"
     )
     assert completed.stderr == "scrub_outbound: redacted PRIVATE_IP, RUNNER_NAME\n"
+
+
+def test_scrub_for_publish_preserves_clean_text():
+    text = "review summary uses repository-relative paths only"
+    assert scrub_for_publish(text) == text
