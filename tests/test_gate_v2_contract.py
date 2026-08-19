@@ -301,7 +301,7 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     diagnostics_index = next(
         i for i, step in enumerate(steps) if step.get("name") == "Upload primary review diagnostics"
     )
-    assert audit_index < diagnostics_index
+    assert diagnostics_index == audit_index + 1
     assert steps[diagnostics_index] == {
         "name": "Upload primary review diagnostics",
         "if": "always()",
