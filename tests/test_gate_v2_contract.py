@@ -31,6 +31,11 @@ ARTIFACT_PREFIX_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-"
 )
+DIAGNOSTICS_NAME_EXPR = (
+    "primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+    "-${{ github.run_id }}-${{ github.run_attempt }}"
+)
+DIAGNOSTICS_PATH = "${{ runner.temp }}/primary-review-diagnostics/"
 PANEL_DELIVERY_NAME_EXPR = (
     "gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -285,6 +290,29 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     # alone was never sufficient fail-closed enforcement.
     assert "continue-on-error" not in upload
     assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["path"] == "${{ runner.temp }}/primary-review-audit.json"
+    assert upload["with"]["retention-days"] == 30
+
+
+def test_primary_uploads_review_diagnostics_after_canonical_audit():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["primary"]["steps"]
+    audit_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload canonical primary audit")
+    diagnostics_index = next(
+        i for i, step in enumerate(steps) if step.get("name") == "Upload primary review diagnostics"
+    )
+    assert audit_index < diagnostics_index
+    assert steps[diagnostics_index] == {
+        "name": "Upload primary review diagnostics",
+        "if": "always()",
+        "uses": UPLOAD_ARTIFACT_ACTION,
+        "with": {
+            "name": DIAGNOSTICS_NAME_EXPR,
+            "path": DIAGNOSTICS_PATH,
+            "if-no-files-found": "ignore",
+            "retention-days": 30,
+        },
+    }
 
     gate_steps = raw["jobs"]["gate"]["steps"]
     resolver = next(s for s in gate_steps if s.get("name") == "Resolve canonical primary audit artifact")
