@@ -624,6 +624,7 @@ jobs:
             echo "::error::outbound scrub produced an empty advisory comment"
             exit 1
           fi
+          rm "$raw_body_path" "$comment_path"
           jq -n --rawfile body "$body_path" '{body: $body}' | python3 "_gate-scrub-src/scripts/scrub_outbound.py" > "$payload_path" || exit 1
 
           publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
