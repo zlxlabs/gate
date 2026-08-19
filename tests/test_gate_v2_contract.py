@@ -692,7 +692,7 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
         "repository": "${{ job.workflow_repository }}",
         "ref": "${{ job.workflow_sha }}",
         "path": "_gate-action-src",
-        "sparse-checkout": ".github/actions",
+        "sparse-checkout": ".github/actions\nscripts/scrub_outbound.py\n",
     }
     names = [step.get("name") for step in steps]
     assert names.index(checkout["name"]) < names.index("PR size preflight")
@@ -779,7 +779,53 @@ def test_quality_action_sparse_checkout_excludes_tests_tree():
     if isinstance(sparse_paths, str):
         sparse_paths = sparse_paths.splitlines()
     assert ".github/actions" in sparse_paths
+    assert "scripts/scrub_outbound.py" in sparse_paths
+    assert not any(path == "scripts" or path.startswith("scripts/") and path != "scripts/scrub_outbound.py" for path in sparse_paths)
     assert not any(path == "tests" or path.startswith("tests/") for path in sparse_paths)
+
+
+def test_every_scrub_import_has_checkout_coverage_for_action_and_module():
+    raw, _ = _load_workflow()
+    for job_name, job in raw["jobs"].items():
+        for step in job.get("steps", []):
+            uses = step.get("uses", "")
+            if not uses.startswith("./_") or "/.github/actions/" not in uses:
+                continue
+            action_root, action_relative = uses[2:].split("/.github/actions/", 1)
+            action_dir = REPO_ROOT / ".github" / "actions" / action_relative
+            import_files = [
+                path for path in action_dir.rglob("*.py")
+                if "from scripts.scrub_outbound import" in path.read_text()
+            ]
+            if not import_files:
+                continue
+
+            checkouts = [
+                candidate for candidate in job["steps"]
+                if candidate.get("uses", "").startswith(CHECKOUT_ACTION)
+                and candidate.get("with", {}).get("path") == action_root
+            ]
+            assert len(checkouts) == 1, f"{job_name}: expected one checkout for {action_root}"
+            checkout = checkouts[0]
+            sparse = checkout["with"].get("sparse-checkout")
+            sparse_paths = None if sparse is None else (
+                sparse.splitlines() if isinstance(sparse, str) else sparse
+            )
+
+            def covered(path):
+                return sparse_paths is None or any(
+                    path == prefix or path.startswith(f"{prefix.rstrip('/')}/")
+                    for prefix in sparse_paths
+                )
+
+            for import_file in import_files:
+                relative_import = import_file.relative_to(REPO_ROOT).as_posix()
+                assert covered(relative_import), (
+                    f"{job_name}: checkout for {uses} misses {relative_import}"
+                )
+                assert covered("scripts/scrub_outbound.py"), (
+                    f"{job_name}: checkout for {uses} misses scripts/scrub_outbound.py"
+                )
 
 
 def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():

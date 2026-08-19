@@ -152,7 +152,9 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: _gate-action-src
-          sparse-checkout: .github/actions
+          sparse-checkout: |
+            .github/actions
+            scripts/scrub_outbound.py
 
       - name: PR size preflight
         uses: ./_gate-action-src/.github/actions/pr-size-preflight
