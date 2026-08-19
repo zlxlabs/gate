@@ -108,6 +108,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+GATE_ROOT = Path(__file__).resolve().parents[3]
+if str(GATE_ROOT) not in sys.path:
+    sys.path.insert(0, str(GATE_ROOT))
+
+from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
+
+
 # Mirrors gate-hub's scripts/review/contracts.py PRIMARY_VERDICTS / IDENTITY_FIELDS
 # (see module docstring for why this is a hand-kept mirror, not an import).
 PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable", "not_expected", "waived")
@@ -1274,7 +1281,10 @@ def _post_status_panel_fail_open_with_budget(
     pr_number: Optional[int], identity: Optional[Identity], budget: _PublishBudget,
 ) -> tuple[str, dict[str, Any]]:
     """Publish the one marker-located status panel without affecting verdict."""
-    body = render_status_panel([current])
+    body = scrub_for_publish(
+        render_status_panel([current]),
+        runtime_values=runtime_values_from_environment(),
+    )
     identity_source: Optional[str] = None
     try:
         if not repository or pr_number is None:
@@ -1340,9 +1350,12 @@ def _post_status_panel_fail_open_with_budget(
                 "artifact history does not contain cached rows: "
                 + ", ".join(f"{row['run_id']}/{row['run_attempt']}" for row in cache_only)
             )
-        body = render_status_panel(
-            _merge_panel_rows(current, [*history.rows, *cached_rows]),
-            history_reasons=incomplete_reasons if incomplete_reasons else None,
+        body = scrub_for_publish(
+            render_status_panel(
+                _merge_panel_rows(current, [*history.rows, *cached_rows]),
+                history_reasons=incomplete_reasons if incomplete_reasons else None,
+            ),
+            runtime_values=runtime_values_from_environment(),
         )
         self_heal_errors: list[str] = []
         if existing:
@@ -1552,7 +1565,13 @@ def _publish_only(args: argparse.Namespace) -> int:
             repository=args.repository,
             identity=identity,
         )
-        body = render_status_panel([current], history_warning=f"terminal artifact unavailable: {type(exc).__name__}: {exc}")
+        body = scrub_for_publish(
+            render_status_panel(
+                [current],
+                history_warning=f"terminal artifact unavailable: {type(exc).__name__}: {exc}",
+            ),
+            runtime_values=runtime_values_from_environment(),
+        )
         receipt = _build_panel_delivery(
             body=body, repository=args.repository, pr_number=args.pr_number, identity=identity,
             delivery="not_created", reason_code="terminal_unavailable", error_category="configuration",
@@ -1601,6 +1620,10 @@ def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any
         diagnostic += "- Comment self-heal: `partial`\n"
         for error in receipt["self_heal_errors"]:
             diagnostic += f"  - `{error}`\n"
+    diagnostic = scrub_for_publish(
+        diagnostic,
+        runtime_values=runtime_values_from_environment(),
+    )
     try:
         print(diagnostic)
     except Exception:
@@ -1622,7 +1645,10 @@ def _finish(
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
     ::notice::/::error:: annotations, and map ok -> exit code."""
-    summary = render_summary(outcome, repository=repository, identity=identity, is_draft=is_draft, runner=runner)
+    summary = scrub_for_publish(
+        render_summary(outcome, repository=repository, identity=identity, is_draft=is_draft, runner=runner),
+        runtime_values=runtime_values_from_environment(),
+    )
     print(summary)
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as handle:

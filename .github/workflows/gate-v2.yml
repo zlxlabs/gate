@@ -582,6 +582,15 @@ jobs:
           REVIEWER: ${{ matrix.reviewer }}
         run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" "$PR_NUMBER" "$REVIEWER"
 
+      - name: Checkout outbound scrub at this workflow's own commit
+        if: always() && matrix.reviewer != '__none__'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-scrub-src
+          sparse-checkout: scripts/scrub_outbound.py
+
       - name: Post advisory PR comment
         if: always() && matrix.reviewer != '__none__'
         env:
@@ -593,6 +602,9 @@ jobs:
           OCR_PUBLISH_BUDGET_SECONDS: 120
         run: |
           set -euo pipefail
+          append_scrubbed_summary() {
+            python3 "_gate-scrub-src/scripts/scrub_outbound.py"
+          }
           comment_path="$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md"
           if [ ! -f "$comment_path" ]; then
             echo "::error::advisory comment file missing: $comment_path"
@@ -603,10 +615,17 @@ jobs:
             exit 0
           fi
           marker="<!-- gate-v2-ocr-advisory:${REVIEWER}:v1 -->"
+          raw_body_path="$REVIEW_SHADOW_EVENT_DIR/advisory-sticky-${REVIEWER}.raw.md"
           body_path="$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-sticky-${REVIEWER}.md"
           payload_path="$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-sticky-${REVIEWER}.json"
-          { printf '%s\n\n' "$marker"; cat "$comment_path"; } > "$body_path"
-          jq -n --rawfile body "$body_path" '{body: $body}' > "$payload_path"
+          { printf '%s\n\n' "$marker"; cat "$comment_path"; } > "$raw_body_path"
+          python3 "_gate-scrub-src/scripts/scrub_outbound.py" < "$raw_body_path" > "$body_path"
+          if [ ! -s "$body_path" ]; then
+            echo "::error::outbound scrub produced an empty advisory comment"
+            exit 1
+          fi
+          rm "$raw_body_path" "$comment_path"
+          jq -n --rawfile body "$body_path" '{body: $body}' | python3 "_gate-scrub-src/scripts/scrub_outbound.py" > "$payload_path" || exit 1
 
           publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
           gh_api() {
@@ -644,8 +663,8 @@ jobs:
               *)
                 jq -n --arg http_status "$http_status" \
                   '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: $http_status, identity_source: null, permission_category: "permission_or_rate_limit"}' \
-                  > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-                printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: permission_or_rate_limit" "- Reason: workflow_identity_lookup_failed" >> "$GITHUB_STEP_SUMMARY"
+                  | python3 "_gate-scrub-src/scripts/scrub_outbound.py" > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json" || exit 1
+                printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: permission_or_rate_limit" "- Reason: workflow_identity_lookup_failed" | append_scrubbed_summary >> "$GITHUB_STEP_SUMMARY" || exit 1
                 echo "::warning::OCR advisory sticky identity lookup failed; HTTP status=$http_status; permission category=permission_or_rate_limit"
                 exit 0
                 ;;
@@ -657,8 +676,8 @@ jobs:
             workflow_login_status=$?
             if [ "$workflow_id_status" -ne 0 ] || [ "$workflow_login_status" -ne 0 ]; then
               jq -n '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: "not_created", operation: "IDENTITY", http_status: null, identity_source: null, permission_category: "configuration"}' \
-                > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-              printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: unavailable" "- Permission category: configuration" "- Reason: workflow_identity_invalid" >> "$GITHUB_STEP_SUMMARY"
+              | python3 "_gate-scrub-src/scripts/scrub_outbound.py" > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json" || exit 1
+              printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: unavailable" "- Permission category: configuration" "- Reason: workflow_identity_invalid" | append_scrubbed_summary >> "$GITHUB_STEP_SUMMARY" || exit 1
               echo "::warning::OCR advisory sticky identity response was invalid"
               exit 0
             fi
@@ -679,8 +698,8 @@ jobs:
             case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
             jq -n --arg delivery "not_created" --arg operation "LOOKUP" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" \
               '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category}' \
-              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" >> "$GITHUB_STEP_SUMMARY"
+              | python3 "_gate-scrub-src/scripts/scrub_outbound.py" > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json" || exit 1
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" | append_scrubbed_summary >> "$GITHUB_STEP_SUMMARY" || exit 1
             echo "::warning::OCR advisory sticky lookup failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
           fi
@@ -701,8 +720,8 @@ jobs:
             case "$http_status" in 401|403|429) permission_category="permission_or_rate_limit";; 5[0-9][0-9]) permission_category="server_error";; esac
             jq -n --arg delivery "not_created" --arg operation "$operation" --arg http_status "$http_status" --arg permission_category "$permission_category" --arg identity_source "$IDENTITY_SOURCE" \
               '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: $http_status, identity_source: $identity_source, permission_category: $permission_category}' \
-              > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
-            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Operation: $operation" >> "$GITHUB_STEP_SUMMARY"
+              | python3 "_gate-scrub-src/scripts/scrub_outbound.py" > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json" || exit 1
+            printf '%s\n' "### OCR advisory sticky delivery diagnostic" "" "- Delivery: not_created" "- HTTP status: $http_status" "- Permission category: $permission_category" "- Operation: $operation" | append_scrubbed_summary >> "$GITHUB_STEP_SUMMARY" || exit 1
             echo "::warning::OCR advisory sticky $operation failed; HTTP status=$http_status; permission category=$permission_category"
             exit 0
           fi
@@ -750,9 +769,9 @@ jobs:
           fi
           jq -n --arg delivery "$delivery" --arg operation "$operation" --arg identity_source "$IDENTITY_SOURCE" --arg self_heal_error "$self_heal_error" \
             '{schema_version: 1, kind: "gate_v2_ocr_advisory_delivery", reviewer: env.REVIEWER, delivery: $delivery, operation: $operation, http_status: null, identity_source: $identity_source, permission_category: null, self_heal_error: (if $self_heal_error == "" then null else $self_heal_error end)}' \
-            > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json"
+            | python3 "_gate-scrub-src/scripts/scrub_outbound.py" > "$REVIEW_SHADOW_EVENT_DIR/advisory/advisory-delivery-${REVIEWER}.json" || exit 1
           if [ -n "$self_heal_error" ]; then
-            printf '%s\n' "" "- Self-heal: $self_heal_error" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "" "- Self-heal: $self_heal_error" | append_scrubbed_summary >> "$GITHUB_STEP_SUMMARY" || exit 1
             echo "::warning::OCR advisory sticky self-heal was partial: $self_heal_error"
           fi
           echo "OCR advisory sticky $operation succeeded for reviewer $REVIEWER"

@@ -19,6 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+GATE_ROOT = Path(__file__).resolve().parents[3]
+if str(GATE_ROOT) not in sys.path:
+    sys.path.insert(0, str(GATE_ROOT))
+
+from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
+
 
 DISPOSITION_RE = re.compile(
     r"^Codex finding disposition:\s*([a-z0-9][a-z0-9._-]*)\s*=\s*"
@@ -594,13 +600,16 @@ def post_state_comment(
     current: dict[str, Any],
     comments: list[dict[str, Any]],
 ) -> None:
+    body = scrub_for_publish(
+        render_state_comment(entries, current),
+        runtime_values=runtime_values_from_environment(),
+    )
     api = f"https://api.github.com/repos/{repository}"
     pull = _api_json(token, f"{api}/pulls/{pr_number}")
     if pull.get("head", {}).get("sha") != head_sha:
         print("::notice::skip stale review ledger state; PR head advanced")
         return
     existing = next((comment for comment in comments if STATE_MARKER in comment.get("body", "")), None)
-    body = render_state_comment(entries, current)
     if existing:
         _api_request(token, f"{api}/issues/comments/{existing['id']}", method="PATCH", payload={"body": body})
     else:
@@ -620,43 +629,44 @@ def _truthy(value: str) -> bool:
 def _append_summary(entry: dict[str, Any], path: str) -> None:
     review = entry["review"]
     comparison = entry["comparison"]
-    with open(path, "a", encoding="utf-8") as summary:
-        reviewer = review.get("reviewer") or "none"
-        failover = "yes" if review.get("failover") else "no"
-        summary.write(
-            "### Review effectiveness ledger\n\n"
-            f"- Round: {entry['review_round']} (`{comparison['kind']}`)\n"
-            f"- Review status: `{review['status']}`\n"
-            f"- Reviewer: `{reviewer}` (failover={failover})\n"
-            f"- Findings: {review['finding_count']}\n"
-            f"- False positives recorded: {entry['false_positive_count']}\n"
+    reviewer = review.get("reviewer") or "none"
+    failover = "yes" if review.get("failover") else "no"
+    summary_text = (
+        "### Review effectiveness ledger\n\n"
+        f"- Round: {entry['review_round']} (`{comparison['kind']}`)\n"
+        f"- Review status: `{review['status']}`\n"
+        f"- Reviewer: `{reviewer}` (failover={failover})\n"
+        f"- Findings: {review['finding_count']}\n"
+        f"- False positives recorded: {entry['false_positive_count']}\n"
+    )
+    attempts = review.get("attempts") or []
+    if attempts:
+        chain = " -> ".join(
+            f"{a.get('reviewer')}(exit {a.get('exit_code')}"
+            + (f", {a.get('reason')}" if a.get("reason") else "")
+            + (f", {a.get('duration_s')}s" if isinstance(a.get("duration_s"), int) else "")
+            + ")"
+            for a in attempts
         )
-        attempts = review.get("attempts") or []
-        if attempts:
-            chain = " -> ".join(
-                f"{a.get('reviewer')}(exit {a.get('exit_code')}"
-                + (f", {a.get('reason')}" if a.get("reason") else "")
-                + (f", {a.get('duration_s')}s" if isinstance(a.get("duration_s"), int) else "")
-                + ")"
-                for a in attempts
-            )
-            summary.write(f"- Chain: `{chain}`\n")
-        if comparison["kind"] == "new_head":
-            summary.write(
-                f"- Persistent / resolved / new: {len(comparison['persistent_finding_ids'])} / "
-                f"{len(comparison['resolved_finding_ids'])} / {len(comparison['new_finding_ids'])}\n"
-            )
-        elif comparison["kind"] == "same_head_rerun":
-            summary.write(
-                f"- Same-head stable / missing / appeared: {len(comparison['persistent_finding_ids'])} / "
-                f"{len(comparison['missing_finding_ids'])} / {len(comparison['appeared_finding_ids'])}\n"
-            )
-        install = entry.get("install")
-        if install:
-            summary.write(
-                f"- Install: `{install.get('ecosystem')}` status={install.get('status')} "
-                f"duration={install.get('duration_s')}s cache_hit={install.get('cache_hit')}\n"
-            )
+        summary_text += f"- Chain: `{chain}`\n"
+    if comparison["kind"] == "new_head":
+        summary_text += (
+            f"- Persistent / resolved / new: {len(comparison['persistent_finding_ids'])} / "
+            f"{len(comparison['resolved_finding_ids'])} / {len(comparison['new_finding_ids'])}\n"
+        )
+    elif comparison["kind"] == "same_head_rerun":
+        summary_text += (
+            f"- Same-head stable / missing / appeared: {len(comparison['persistent_finding_ids'])} / "
+            f"{len(comparison['missing_finding_ids'])} / {len(comparison['appeared_finding_ids'])}\n"
+        )
+    install = entry.get("install")
+    if install:
+        summary_text += (
+            f"- Install: `{install.get('ecosystem')}` status={install.get('status')} "
+            f"duration={install.get('duration_s')}s cache_hit={install.get('cache_hit')}\n"
+        )
+    with open(path, "a", encoding="utf-8") as summary:
+        summary.write(scrub_for_publish(summary_text, runtime_values=runtime_values_from_environment()))
 
 
 def main() -> int:

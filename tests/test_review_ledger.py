@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "review-ledger" / "build_ledger.py"
@@ -678,6 +680,82 @@ def test_v2_state_marker_does_not_restore_the_legacy_epoch():
     assert "codex-review-ledger-state:v2:" in body
     assert "codex-review-ledger-state:v1:" not in body
     assert "codex-review-ledger-v2" in body
+
+
+def test_sticky_comment_scrub_failure_prevents_github_write(monkeypatch):
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[], dispositions={},
+    )
+    calls = []
+
+    monkeypatch.setattr(module, "scrub_for_publish", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("scrub failed")))
+    monkeypatch.setattr(module, "_api_json", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(module, "_api_request", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    with pytest.raises(RuntimeError, match="scrub failed"):
+        module.post_state_comment(
+            "token", "org/repo", 7, "head", [entry], entry, [],
+        )
+
+    assert calls == []
+
+
+def test_sticky_comment_sends_scrubbed_body(monkeypatch):
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[], dispositions={},
+    )
+    entry["review"]["reviewer"] = "runner-secret"
+    writes = []
+
+    class Response:
+        def __init__(self, payload=b""):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def fake_urlopen(request, timeout):
+        if request.get_method() == "GET":
+            return Response(b'{"head":{"sha":"head"}}')
+        writes.append(json.loads(request.data.decode()))
+        return Response(b"{}")
+
+    monkeypatch.setenv("RUNNER_NAME", "runner-secret")
+    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
+
+    module.post_state_comment("token", "org/repo", 7, "head", [entry], entry, [])
+
+    assert len(writes) == 1
+    body = writes[0]["body"]
+    assert "runner-secret" not in body
+    assert "[REDACTED:RUNNER_NAME]" in body
+
+
+def test_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[], dispositions={},
+    )
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("RUNNER_NAME", "runner-secret")
+    entry["review"]["reviewer"] = "runner-secret"
+
+    module._append_summary(entry, str(summary))
+
+    text = summary.read_text()
+    assert "runner-secret" not in text
+    assert "[REDACTED:RUNNER_NAME]" in text
 
 
 def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():

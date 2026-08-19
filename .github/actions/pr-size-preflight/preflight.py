@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+GATE_ROOT = Path(__file__).resolve().parents[3]
+if str(GATE_ROOT) not in sys.path:
+    sys.path.insert(0, str(GATE_ROOT))
+
+from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
+
 
 MARKER = "<!-- pr-size-preflight -->"
 SIZE_FILTER_CONTRACT = "v1"
@@ -247,6 +253,10 @@ def _request(token: str, method: str, url: str, payload: dict[str, Any] | None =
 
 
 def post_sticky_comment(result: dict[str, Any], *, token: str, repository: str, pr_number: int) -> None:
+    body = scrub_for_publish(
+        render_comment(result),
+        runtime_values=runtime_values_from_environment(),
+    )
     api = f"https://api.github.com/repos/{repository}"
     current = _request(token, "GET", f"{api}/pulls/{pr_number}")
     if current["head"]["sha"] != result["head_sha"]:
@@ -256,7 +266,6 @@ def post_sticky_comment(result: dict[str, Any], *, token: str, repository: str, 
     existing = next((comment for comment in comments if MARKER in comment.get("body", "")), None)
     if result["classification"] == "single" and existing is None:
         return
-    body = render_comment(result)
     if existing:
         _request(token, "PATCH", f"{api}/issues/comments/{existing['id']}", {"body": body})
     else:
@@ -265,26 +274,25 @@ def post_sticky_comment(result: dict[str, Any], *, token: str, repository: str, 
 
 def _append_summary(result: dict[str, Any], path: str) -> None:
     status = {"single": "single", "sharded": "sharded", "warning": "warning", "blocked": "blocked"}[result["classification"]]
+    summary_text = (
+        "### PR size preflight\n\n"
+        f"- Status: `{status}`\n- Review patch: {result['diff_lines']} lines\n"
+        f"- Reviewable text: {result['reviewable_lines']} lines\n"
+        f"- Raw patch: {result['raw_patch_lines']} lines\n"
+        f"- Changed: {result.get('changed_lines', result['additions'] + result['deletions'])} lines "
+        f"(+{result['additions']} / -{result['deletions']})\n"
+        f"- Files: {result['changed_files']}\n- Plan: `{result['review_plan']}`\n"
+    )
+    excluded_files = result["excluded_files"]
+    if excluded_files:
+        summary_text += "- Excluded files:\n"
+        for item in excluded_files:
+            path_value = json.dumps(item["path"], ensure_ascii=False)
+            summary_text += f"  - {path_value} — rule `{item['rule']}`, raw patch {item['raw_lines']} lines\n"
+    else:
+        summary_text += "- Excluded files: none\n"
     with open(path, "a", encoding="utf-8") as summary:
-        summary.write(
-            "### PR size preflight\n\n"
-            f"- Status: `{status}`\n- Review patch: {result['diff_lines']} lines\n"
-            f"- Reviewable text: {result['reviewable_lines']} lines\n"
-            f"- Raw patch: {result['raw_patch_lines']} lines\n"
-            f"- Changed: {result.get('changed_lines', result['additions'] + result['deletions'])} lines "
-            f"(+{result['additions']} / -{result['deletions']})\n"
-            f"- Files: {result['changed_files']}\n- Plan: `{result['review_plan']}`\n"
-        )
-        excluded_files = result["excluded_files"]
-        if excluded_files:
-            summary.write("- Excluded files:\n")
-            for item in excluded_files:
-                path = json.dumps(item["path"], ensure_ascii=False)
-                summary.write(
-                    f"  - {path} — rule `{item['rule']}`, raw patch {item['raw_lines']} lines\n"
-                )
-        else:
-            summary.write("- Excluded files: none\n")
+        summary.write(scrub_for_publish(summary_text, runtime_values=runtime_values_from_environment()))
 
 
 def _append_action_outputs(result: dict[str, Any], path: str) -> None:
