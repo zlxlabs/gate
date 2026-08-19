@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from scripts.scrub_outbound import scrub_for_publish, scrub_outbound_text
+from scripts.scrub_outbound import (
+    runtime_values_from_environment,
+    scrub_for_publish,
+    scrub_outbound_text,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +99,33 @@ def test_short_runtime_values_are_reported_but_not_replaced():
     assert completed.returncode == 0
     assert completed.stdout == "USER=ab abcde"
     assert completed.stderr == "scrub_outbound: runtime value USER too short to scrub safely, skipped\n"
+
+
+def test_hosted_runner_username_collision_preserves_product_word(monkeypatch):
+    for key in ("USERNAME", "USER", "LOGNAME"):
+        monkeypatch.setenv(key, "runner")
+
+    text = "runner=self; runner=hosted; runner input"
+    scrubbed, categories = scrub_outbound_text(
+        text,
+        runtime_values=runtime_values_from_environment(),
+    )
+
+    assert scrubbed == text
+    assert categories == []
+
+
+def test_distinct_username_is_still_scrubbed(monkeypatch):
+    for key in ("USERNAME", "USER", "LOGNAME"):
+        monkeypatch.setenv(key, "alice")
+
+    scrubbed, categories = scrub_outbound_text(
+        "reviewer=alice",
+        runtime_values=runtime_values_from_environment(),
+    )
+
+    assert scrubbed == "reviewer=[REDACTED:USERNAME]"
+    assert categories == ["USERNAME"]
 
 
 def test_cli_scrubs_runner_and_private_ip_using_environment():

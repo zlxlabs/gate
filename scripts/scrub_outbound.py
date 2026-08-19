@@ -85,7 +85,11 @@ def _marker(category: str) -> str:
 def _runtime_patterns(runtime_values: Mapping[str, str]) -> list[tuple[str, re.Pattern[str]]]:
     patterns: list[tuple[str, re.Pattern[str]]] = []
     for key, value in sorted(runtime_values.items(), key=lambda item: len(item[1]), reverse=True):
-        if not isinstance(value, str) or len(value) < 3:
+        if (
+            not isinstance(value, str)
+            or len(value) < 3
+            or value.casefold() in {"runner", "self", "hosted"}
+        ):
             continue
         category = _RUNTIME_CATEGORY_BY_KEY.get(key.upper(), "RUNTIME_VALUE")
         patterns.append(
