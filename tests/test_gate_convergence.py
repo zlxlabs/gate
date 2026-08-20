@@ -199,7 +199,7 @@ def test_unavailable_budget_is_independent_and_bounded():
 def test_scope_digest_change_starts_zero_generation():
     state = _round(CONV.initial_state(SCOPE), run_id=1, digest="1").state
     changed = replace(SCOPE, diff_digest="e" * 64)
-    result = _round(state, changed, run_id=2, digest="2")
+    result = _round(state, changed, run_id=1, run_attempt=1, digest="2")
     assert result.state.epoch == CONV.derive_epoch(changed)
     assert (result.clean_streak, result.eligible_rounds) == (1, 1)
 
