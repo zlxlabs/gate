@@ -46,3 +46,66 @@ FAIL
 | 11 | 成立（代码检查；专门禁清单测试不足） | `.github/actions/review-ledger/build_ledger.py:112-150` comment 只渲染 commit/round/status/comparison；新增 projection 不进入 comment 的机器判定输入 | `test_state_comment_folds_machine_details_behind_human_navigation` 只部分锁 comment 形态；未找到逐项禁止清单测试 |
 | 12 | 成立（增量 1 规则未被重写） | `.github/actions/gate-aggregator/convergence.py:1331-1427` 仅把当前 round 的剩余 P1 接入既有计数，epoch/idempotency/index 逻辑仍在 `:1224-1307,1566-1621` | `test_all_state_event_cells_are_callable`；`test_duplicate_round_is_idempotent_and_conflicting_payload_fails_closed`；`test_scope_digest_change_starts_zero_generation` |
 
+## Findings
+
+### F-1 — P1：control workflow 使用了不存在的 canonical audit artifact 名称
+
+- 严重级别：P1
+- 文件：`.github/workflows/gate-v2-disposition.yml:63-66`；真实 producer 名称为 `.github/workflows/gate-v2.yml:454`
+- 违反 spec：§2.3 轴 C“签发申请/绑定”及增量 2“签发与证据契约”第 2 条；不变式 4（目标 primary run/attempt 必须绑定）。
+- 具体失败场景：合法 primary run `77/1` 已上传 `primary-audit-v2-<repo>-<head>-77-1`，control job 执行 `gh run download 77 --name primary-audit-v2-<repo>-<head>`。`gh run download --help` 明确 `--name` 按名称匹配，短名不会匹配带 run/attempt 后缀的 artifact；`set -euo pipefail` 使 job 在签发前退出，不能生成任何 receipt。
+- 建议修法：按目标 run/attempt 构造完整 artifact name，或用 API listing 过滤 exact repository/PR/head/run/attempt 后按 artifact id 下载；下载后仍须保留 source attempt 和原始 bytes digest。
+
+### F-2 — P1：正常 canonical audit 缺少 `.epoch` 时，工作流会签发不可消费的 receipt
+
+- 严重级别：P1
+- 文件：`.github/workflows/gate-v2-disposition.yml:71-77`；`.github/actions/gate-disposition/issue_receipt.py:118-120`；`.github/actions/gate-aggregator/convergence.py:577-579,640-652,726-730`
+- 违反 spec：增量 2“签发与证据契约”第 2 条（重新获取并绑定当前 policy scope）；不变式 4、8。
+- 具体失败场景：当前仓 canonical primary audit 的既有 schema 没有 `epoch` 字段；本轮探针对 `tests/data/primary_review_v1_missing_runtime.json` 得到 `audit_has_epoch=False`、`workflow_jq_epoch=null`。workflow 把字符串 `null` 写进 receipt；producer 的 `_safe_component` 接受它。随后 reducer 对当前 `Scope` 重算出的 64 位 epoch，返回 `validate_reason=epoch_mismatch_stale`、`consume_fail_closed=True`。control job 可能显示签发成功，但该 exact false-positive 永远不能解除当前 P1，反而把状态推入 fail-closed。
+- 建议修法：control job 必须独立获取并校验 base/head/diff/policy/tier scope，调用同一 canonical `derive_epoch(scope)`；缺字段或 scope 不一致直接拒绝签发，不从 audit 中盲读可选 `.epoch`。
+
+### F-3 — P1：evidence ref 没有被读取或验证，任意字符串即可成为可消费授权
+
+- 严重级别：P1
+- 文件：`.github/workflows/gate-v2-disposition.yml:79-89`；`.github/actions/gate-disposition/issue_receipt.py:154-163`
+- 违反 spec：增量 2“签发与证据契约”第 3 条；不变式 1、4、9。
+- 具体失败场景：输入 `--evidence-ref not-an-immutable-reference`，producer 仅将字符串加入 list 并计算 list 的 SHA-256，从不读取引用、确认 blob/commit/artifact 是否存在，也不校验引用对应的内容摘要。本轮真实 subprocess 探针输出：`returncode=0`、`evidence_refs=['not-an-immutable-reference']`；将生成的 payload 转成 `DispositionReceipt` 后，reducer 输出 `status=(True, True, True, 'active_false_positive')`、`remaining_p1_ids=()`、`fail_closed=False`。因此没有证据的 P1 也能改变 required decision。
+- 建议修法：把 evidence manifest 规范化为带类型、不可变定位符和内容 digest 的记录；control job 对每一项执行 allowlisted read/存在性/bytes digest 校验，任一缺失、不可读或摘要不一致都不得生成可消费 receipt。
+
+### F-4 — P2：approval ref 与 issuer provenance 只是可伪造字符串
+
+- 严重级别：P2
+- 文件：`.github/workflows/gate-v2-disposition.yml:79-94`；`.github/actions/gate-disposition/issue_receipt.py:129-132`
+- 违反 spec：增量 2“签发与证据契约”第 1、4 条；不变式 9。
+- 具体失败场景：PR author 为 `alice`、dispatch actor 也是 `alice` 时，输入 `approval_ref=maintainer:fake` 即可通过唯一的自批检查；代码没有查询该 ref，也没有证明它属于另一名 maintainer。对非 PR author 的 committer/reviewer/普通有写权限用户，代码甚至不做角色检查。receipt 最终只记录 actor 字符串和未经验证的 approval ref，无法证明 protected environment 的实际批准人就是另一名 maintainer。环境审批仍可能阻止部分未授权 run，但不能弥补 artifact 内缺失的 provenance。
+- 建议修法：从 GitHub protected environment/deployment 或经 API 校验的 approval ref 取得实际 approver login/user id/时间，要求 approver 是 maintainer 且与 PR author/committer/reviewer/dispatch actor 按契约区分；receipt digest 绑定该已验证记录。不要用 `maintainer:` 前缀作授权判断。
+
+### F-5 — P2：receipt digest 不承载完整 scope，control job 也未独立证明 scope
+
+- 严重级别：P2
+- 文件：`.github/actions/gate-aggregator/convergence.py:194-218,437-443`；`.github/actions/gate-disposition/issue_receipt.py:164-184`
+- 违反 spec：§2.3 轴 C“绑定与输出”；增量 2“签发与证据契约”第 2 条；不变式 4。
+- 具体失败场景：同一 head 下 PR base、policy version/digest、tier 或 classifier 发生变化时，control job 只从 audit/dispatch 取 `diff_digest` 和 `epoch`，producer 仍能写出一个自洽的 `receipt_digest`；receipt payload 本身没有 base/policy/tier/classifier 等完整 scope 字段。后续 reducer 只能在拿到当前 scope 时用 opaque epoch 判 mismatch，结果是 stale/manual/fail-closed，不能把签发时绑定的完整 scope 作为可审计事实重算。
+- 建议修法：control job 先形成唯一 canonical Scope 并重算 epoch；receipt payload/digest 明确携带 scope 或 scope digest 的全部字段，消费端验证 receipt 的 scope 与当前 scope 完全相等。补齐 base/policy/tier/classifier 变更矩阵测试。
+
+## Backlog（不计入本轮 P1）
+
+### 存量/既有边界
+
+- 本仓未声明 `risk-tier`（open issue #75），按任务卡已采用 internal；不属于本次 diff 的实现 finding。
+- 现有 artifact/ledger 历史检索的 retention、浅 checkout 等问题（open issue #38、#63）不在冻结 diff 内，本轮不计 P1。
+
+### 增量 3 前置项
+
+- `.github/actions/gate-aggregator/aggregate.py:666-673` 仍传 `waiver_receipts=()`；真实 Required Check 尚未从 GitHub artifact 下载 protected receipt 并交给 reducer。
+- `.github/actions/gate-aggregator/convergence.py:1570-1617` 的 `replay_receipts` 只重放 canonical primary receipts，未定义 disposition artifact 的下载、解析、排序与传入方式；增量 3 必须补齐，且不得把 ledger projection 当恢复源。
+- artifact listing 必须按 exact repository/PR/head/epoch/digest 过滤并保留 artifact id；同名 artifact 不能按 name 去重。旧 epoch artifact 只保留 stale 诊断，不得交给 `consume_dispositions` 触发当前 epoch 的 fail-closed；缺 receipt 才是 active P1 的普通 blocked。
+- 需要真实 dispatch/canary 证明：签发、撤销、同 nonce 同 payload 重放、同 nonce 异 payload 冲突、expiry、evidence revoke、new epoch，以及 `gate/gate` 的 red/manual/green 终态。以上是增量 3 的“真实入口”验收，不把本轮 contract test 当作已通电。
+
+## 越界意见
+
+没有把“尚未通电的 aggregator artifact 下载、真实 `gate/gate` 变绿、state 外部重放、control workflow canary”列为本轮 finding；它们按设计文档 §3 的串行拆卡约束保留在增量 3 backlog。F-1 至 F-3 是当前 diff 内 control/producer 代码本身即可确定的失败路径，不依赖真实 workflow run。
+
+## 探针与测试说明
+
+本卡未运行测试套件，符合任务卡要求；只运行了只读/临时探针：`gh run download --help`（确认 `--name` 是按名称匹配）、canonical audit fixture 的 `.epoch` 检查，以及真实 subprocess producer/consumer 探针。临时文件仅位于 `/tmp`，不纳入提交。
