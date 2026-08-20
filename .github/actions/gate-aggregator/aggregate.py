@@ -93,6 +93,7 @@ from __future__ import annotations
 import argparse
 import contextvars
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -115,6 +116,16 @@ if str(GATE_ROOT) not in sys.path:
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
+_CONVERGENCE_SPEC = importlib.util.spec_from_file_location(
+    "gate_convergence_from_aggregate",
+    Path(__file__).with_name("convergence.py"),
+)
+assert _CONVERGENCE_SPEC and _CONVERGENCE_SPEC.loader
+_CONVERGENCE = importlib.util.module_from_spec(_CONVERGENCE_SPEC)
+sys.modules[_CONVERGENCE_SPEC.name] = _CONVERGENCE
+_CONVERGENCE_SPEC.loader.exec_module(_CONVERGENCE)
+
+
 # Mirrors gate-hub's scripts/review/contracts.py PRIMARY_VERDICTS / IDENTITY_FIELDS
 # (see module docstring for why this is a hand-kept mirror, not an import).
 PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable", "not_expected", "waived")
@@ -132,6 +143,8 @@ TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expect
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
 PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
+CONVERGENCE_ENVELOPE_SCHEMA_VERSION = 1
+CONVERGENCE_ENVELOPE_KIND = "gate_convergence_round"
 GITHUB_API_TIMEOUT_SECONDS = 15
 DEFAULT_PUBLISH_BUDGET_SECONDS = 120
 PUBLISH_BUDGET_ENV = "GATE_PUBLISH_BUDGET_SECONDS"
@@ -241,6 +254,7 @@ class Outcome:
     audit_available: bool = False
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
+    convergence_envelope: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -350,6 +364,51 @@ def build_terminal_envelope(
     }
 
 
+def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
+    """Project only canonical P1 evidence; never infer severity from prose."""
+    result = audit.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
+        return None
+    p1_ids: list[str] = []
+    for finding in result["findings"]:
+        if not isinstance(finding, dict):
+            return None
+        severity = finding.get("severity")
+        if not isinstance(severity, str) or severity not in _CONVERGENCE.KNOWN_SEVERITIES:
+            return None
+        if severity not in _CONVERGENCE.P1_SEVERITIES:
+            continue
+        finding_id = finding.get("id")
+        if not isinstance(finding_id, str) or not finding_id:
+            return None
+        p1_ids.append(finding_id)
+    return tuple(sorted(p1_ids))
+
+
+def build_convergence_envelope(
+    *, scope: Any, decision: Any, audit_digest: str,
+    source_attempt: Optional[int], artifact_name: Optional[str],
+) -> dict[str, Any]:
+    """Build the additive, explicitly versioned one-round convergence envelope."""
+    if not isinstance(scope, _CONVERGENCE.Scope):
+        raise ValueError("convergence envelope requires a convergence Scope")
+    if not isinstance(decision, _CONVERGENCE.RoundDecision):
+        raise ValueError("convergence envelope requires a RoundDecision")
+    if not isinstance(audit_digest, str) or len(audit_digest) != 64:
+        raise ValueError("convergence envelope requires the raw audit SHA-256 digest")
+    return {
+        "schema_version": CONVERGENCE_ENVELOPE_SCHEMA_VERSION,
+        "kind": CONVERGENCE_ENVELOPE_KIND,
+        "scope": scope.as_dict(),
+        "epoch": decision.state.epoch,
+        "audit_digest": audit_digest,
+        "source_attempt": source_attempt,
+        "artifact_name": artifact_name,
+        "decision": decision.decision,
+        "state": decision.state.as_dict(),
+    }
+
+
 def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
     """Independent, minimal-but-strict structural check — NOT a
     re-implementation of gate-hub's validate_primary_record (that full schema
@@ -454,6 +513,9 @@ def evaluate(
     identity: Identity,
     audit_source_attempt: Optional[int] = None,
     audit_artifact_name: Optional[str] = None,
+    scope: Optional[Any] = None,
+    audit_digest: Optional[str] = None,
+    convergence_state: Optional[Any] = None,
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -482,6 +544,7 @@ def evaluate(
     quality_reason = None if quality_result == "success" else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
     primary_classification = primary_reason = None
     audit_available = False
+    convergence_eligible = False
     audit_source = artifact_name = None
 
     if quality_result == "success":
@@ -526,11 +589,13 @@ def evaluate(
                 primary_classification, primary_reason = "integration_error", "audit_source_mismatch"
             else:
                 audit_available = verdict in ("pass", "fail", "unavailable")
+                convergence_eligible = audit_available
                 artifact_name = audit_artifact_name if isinstance(audit_artifact_name, str) and audit_artifact_name else None
                 notes.append(f"primary audit source run_attempt={audit_source} (current run_attempt={identity.run_attempt})")
                 if verdict == "pass":
                     if primary_result != "success":
                         audit_available = False
+                        convergence_eligible = False
                         audit_source = artifact_name = None
                         problems.append(
                             f"primary audit verdict is 'pass' but the job result is {primary_result!r} — inconsistent, fail-closed"
@@ -547,6 +612,7 @@ def evaluate(
                     primary_classification, primary_reason = "review_unavailable", "primary_unavailable"
                 else:
                     audit_available = False
+                    convergence_eligible = False
                     audit_source = artifact_name = None
                     problems.append(
                         f"primary audit verdict {verdict!r} is not accepted: canary-stage primary never legitimately writes "
@@ -555,6 +621,7 @@ def evaluate(
                     primary_classification, primary_reason = "integration_error", "audit_invalid"
                 if primary_result == "success" and verdict in ("fail", "unavailable"):
                     audit_available = False
+                    convergence_eligible = False
                     audit_source = artifact_name = None
                     primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
 
@@ -565,11 +632,53 @@ def evaluate(
     else:
         classification, reason_code = primary_classification, primary_reason
     gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[classification]
-    return Outcome(
+    outcome = Outcome(
         ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,
         classification=classification, reason_code=reason_code, gate_result=gate_result,
         audit_available=audit_available, audit_source_attempt=audit_source, audit_artifact_name=artifact_name,
     )
+    # This is deliberately the only convergence hand-off in the single-round
+    # evaluator.  It runs only after the existing audit identity/job verdict
+    # checks have succeeded; the old Outcome fields remain single-round facts.
+    if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
+        p1_ids = _canonical_p1_ids(audit)
+        if p1_ids is None:
+            outcome.ok = False
+            outcome.classification = "integration_error"
+            outcome.reason_code = "audit_invalid"
+            outcome.gate_result = "unavailable"
+            outcome.problems.append("canonical finding severity is missing, unknown, or malformed — fail-closed")
+            return outcome
+        primary = _CONVERGENCE.CanonicalPrimary(
+            schema_version=1,
+            repository_id=identity.repository_id,
+            pr_number=identity.pr,
+            head_sha=identity.head_sha,
+            run_id=identity.run_id,
+            run_attempt=identity.run_attempt,
+            verdict=audit["verdict"],
+            p1_ids=p1_ids,
+        )
+        processing_key = _CONVERGENCE.ProcessingKey(
+            identity.repository_id, identity.pr, identity.run_id, identity.run_attempt,
+        )
+        state = convergence_state or _CONVERGENCE.initial_state(scope)
+        round_decision = _CONVERGENCE.evaluate_round(
+            state=state,
+            scope=scope,
+            primary=primary,
+            audit_digest=audit_digest,
+            waiver_receipts=(),
+            processing_key=processing_key,
+        )
+        outcome.convergence_envelope = build_convergence_envelope(
+            scope=scope,
+            decision=round_decision,
+            audit_digest=audit_digest,
+            source_attempt=audit_source,
+            artifact_name=artifact_name,
+        )
+    return outcome
 
 
 def find_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str]]:

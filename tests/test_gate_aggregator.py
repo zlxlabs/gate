@@ -49,6 +49,28 @@ AGG = _module()
 IDENTITY = AGG.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=1, pr=42)
 
 
+def test_single_round_gate_outcome_is_not_convergence_state():
+    outcome = AGG.evaluate(
+        quality_result="success",
+        primary_result="success",
+        runner="self",
+        is_draft=False,
+        review_expected=True,
+        audit={
+            **_valid_primary_record(),
+            "result": {"findings": []},
+        },
+        audit_error=None,
+        identity=IDENTITY,
+        audit_source_attempt=1,
+        audit_artifact_name="primary-audit-v2-1",
+    )
+    assert outcome.gate_result == "pass"
+    assert not hasattr(outcome, "clean_streak")
+    assert not hasattr(outcome, "epoch")
+    assert outcome.convergence_envelope is None
+
+
 def _valid_primary_record(**overrides):
     record = {
         "kind": "primary_review",
