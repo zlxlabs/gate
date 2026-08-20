@@ -199,13 +199,19 @@ def test_only_false_positive_resolves_matching_current_finding():
 
 def test_rejected_disposition_cannot_advance_streak():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
-    accepted = _disposition(primary=primary, disposition="accepted")
-    result = CONV.evaluate_round(
-        state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
-        audit_digest="a" * 64, waiver_receipts=(accepted,),
-        processing_key=_key(run_id=7, run_attempt=2),
-    )
-    assert (result.clean_streak, result.eligible_rounds, result.decision) == (0, 1, "collecting")
+    for disposition in ("accepted", "wont-fix", "garbage", ""):
+        receipt = _disposition(primary=primary, disposition=disposition)
+        result = CONV.evaluate_round(
+            state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
+            audit_digest="a" * 64, waiver_receipts=(receipt,),
+            processing_key=_key(run_id=7, run_attempt=2),
+        )
+        assert (
+            result.clean_streak,
+            result.eligible_rounds,
+            result.decision,
+            result.reason,
+        ) == (0, 0, "fail_closed", "invalid disposition: unknown_disposition")
 
 
 def test_duplicate_disposition_is_idempotent():
@@ -422,7 +428,7 @@ def test_partial_disposition_stays_blocked():
     assert (result.clean_streak, result.decision) == (0, "collecting")
 
 
-def test_rejected_disposition_cannot_advance_streak():
+def test_empty_disposition_receipt_cannot_advance_streak():
     result = _round(CONV.initial_state(SCOPE), run_id=31, digest="3", p1_ids=("a",), waiver=(CONV.DispositionReceipt(),))
     assert result.clean_streak == 0
 
