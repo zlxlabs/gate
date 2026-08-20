@@ -637,6 +637,105 @@ def disposition_status(
     )
 
 
+_DISPOSITION_FAIL_CLOSED_REASONS = frozenset(
+    {
+        "malformed_receipt", "schema_version_mismatch", "unknown_disposition",
+        "malformed_pr_number", "malformed_primary_attempt", "repository_mismatch",
+        "pr_mismatch", "epoch_mismatch_stale", "head_sha_mismatch",
+        "diff_digest_mismatch", "primary_run_id_mismatch",
+        "primary_run_attempt_mismatch", "audit_digest_mismatch",
+        "finding_target_not_exact", "finding_not_current_p1",
+        "evidence_manifest_malformed", "issuer_unprotected", "malformed_timestamps",
+        "issued_in_future", "receipt_digest_mismatch", "malformed_scope",
+        "malformed_primary", "malformed_now", "malformed_revocation_index",
+        "malformed_revocation", "nonce_conflict",
+    }
+)
+
+
+def _current_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def consume_dispositions(
+    p1_ids: Sequence[str],
+    receipts: Sequence[DispositionReceipt],
+    *,
+    scope: Scope,
+    primary: CanonicalPrimary,
+    audit_digest: str,
+    now: str,
+    revocations: Sequence[DispositionRevocation],
+) -> DispositionConsumption:
+    """Apply only active exact false-positive receipts to this P1 projection."""
+
+    if not isinstance(p1_ids, Sequence) or isinstance(p1_ids, (str, bytes)):
+        return DispositionConsumption((), (), (), True, ())
+    remaining = list(p1_ids)
+    if any(not _nonempty_text(finding_id) for finding_id in remaining):
+        return DispositionConsumption(tuple(remaining), (), (), True, ())
+    if not isinstance(receipts, Sequence) or isinstance(receipts, (str, bytes)):
+        return DispositionConsumption(tuple(remaining), (), (), True, ())
+    statuses: list[DispositionStatus] = []
+    consumed: list[DispositionReceipt] = []
+    rejected: list[tuple[DispositionReceipt, str]] = []
+    fail_closed = False
+    by_nonce: dict[str, DispositionReceipt] = {}
+    seen_payloads: set[str] = set()
+    for receipt in receipts:
+        if not isinstance(receipt, DispositionReceipt):
+            status = validate_disposition_receipt(
+                receipt, scope=scope, primary=primary, audit_digest=audit_digest,
+                now=now, revocations=revocations,
+            )
+            statuses.append(status)
+            rejected.append((receipt, status.reason))
+            fail_closed = True
+            continue
+        if _legacy_disposition_stub(receipt):
+            statuses.append(_disposition_status(receipt, valid=False, active=False, consumable=False, reason="absent_legacy_stub"))
+            continue
+        payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if receipt.nonce in by_nonce:
+            prior = by_nonce[receipt.nonce]
+            prior_signature = json.dumps(prior.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if payload_signature != prior_signature:
+                rejected.append((receipt, "nonce_conflict"))
+                fail_closed = True
+                statuses.append(_disposition_status(receipt, valid=False, active=False, consumable=False, reason="nonce_conflict"))
+            else:
+                statuses.append(_disposition_status(receipt, valid=True, active=True, consumable=False, reason="duplicate_nonce_noop"))
+            continue
+        if receipt.nonce:
+            by_nonce[receipt.nonce] = receipt
+        if payload_signature in seen_payloads:
+            statuses.append(_disposition_status(receipt, valid=True, active=True, consumable=False, reason="duplicate_receipt_noop"))
+            continue
+        seen_payloads.add(payload_signature)
+        status = validate_disposition_receipt(
+            receipt, scope=scope, primary=primary, audit_digest=audit_digest,
+            now=now, revocations=revocations,
+        )
+        statuses.append(status)
+        if status.consumable:
+            if receipt.finding_id in remaining:
+                remaining.remove(receipt.finding_id)
+                consumed.append(receipt)
+            else:
+                rejected.append((receipt, "finding_already_consumed"))
+        elif status.reason != "absent_legacy_stub":
+            rejected.append((receipt, status.reason))
+            if status.reason in _DISPOSITION_FAIL_CLOSED_REASONS:
+                fail_closed = True
+    return DispositionConsumption(
+        remaining_p1_ids=tuple(remaining),
+        consumed_receipts=tuple(consumed),
+        rejected_receipts=tuple(rejected),
+        fail_closed=fail_closed,
+        statuses=tuple(statuses),
+    )
+
+
 def _strict_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -1062,12 +1161,13 @@ def evaluate_round(
     audit_digest: str,
     waiver_receipts: Sequence[DispositionReceipt],
     processing_key: ProcessingKey,
+    now: str | None = None,
+    revocations: Sequence[DispositionRevocation] = (),
 ) -> RoundDecision:
     """Consume exactly one canonical primary observation.
 
     A clean round is defined solely by an eligible canonical primary whose
-    current P1 projection is empty.  The disposition argument is present now
-    for the increment-2 contract, but no receipt can resolve a finding here.
+    current P1 projection is empty after protected disposition consumption.
     """
 
     scope_errors = _scope_errors(scope) if isinstance(scope, Scope) else ["scope must be Scope"]
@@ -1206,8 +1306,18 @@ def evaluate_round(
             no_op=True,
         )
 
-    if any(receipt.valid for receipt in waiver_receipts):
-        failed = _fail_closed_state(working, "disposition semantics are not enabled in increment 1")
+    disposition_result = consume_dispositions(
+        primary.p1_ids,
+        waiver_receipts,
+        scope=scope,
+        primary=primary,
+        audit_digest=audit_digest,
+        now=now or _current_utc_iso(),
+        revocations=revocations,
+    )
+    if disposition_result.fail_closed:
+        reasons = ", ".join(reason for _, reason in disposition_result.rejected_receipts)
+        failed = _fail_closed_state(working, f"invalid protected disposition: {reasons or 'malformed_receipt'}")
         return _decision(
             failed,
             processing_key=processing_key,
@@ -1245,7 +1355,7 @@ def evaluate_round(
             round_key=round_key,
             event_id=event_id,
             fingerprint=fingerprint,
-            verdict=primary.verdict, p1_ids=primary.p1_ids, effect="terminal",
+            verdict=primary.verdict, p1_ids=disposition_result.remaining_p1_ids, effect="terminal",
         )
         terminal = _state_with(recorded, terminal_decision="manual_required", reason="new round after convergence requires manual review")
         return _decision(
@@ -1264,7 +1374,7 @@ def evaluate_round(
         round_key=round_key,
         event_id=event_id,
         fingerprint=fingerprint,
-        verdict=primary.verdict, p1_ids=primary.p1_ids,
+        verdict=primary.verdict, p1_ids=disposition_result.remaining_p1_ids,
         effect="unavailable" if primary.verdict == "unavailable" else "eligible",
     )
     if primary.verdict == "unavailable":
@@ -1287,7 +1397,7 @@ def evaluate_round(
         )
 
     eligible = recorded.eligible_rounds + 1
-    streak = recorded.clean_streak + 1 if not primary.p1_ids else 0
+    streak = recorded.clean_streak + 1 if not disposition_result.remaining_p1_ids else 0
     # The threshold is deliberately checked before the eligible cap.
     if streak >= policy.clean_rounds:
         terminal = "converged"
