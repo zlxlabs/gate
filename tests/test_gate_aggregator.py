@@ -432,49 +432,56 @@ def test_as_bool_raises_on_anything_else_instead_of_defaulting_to_false(bogus):
         AGG.as_bool(bogus)
 
 
-# ── find_audit_file IO edge cases ────────────────────────────────────────
+# ── _read_audit_file IO edge cases ───────────────────────────────────────
 
-def test_find_audit_file_missing_directory(tmp_path):
-    record, error = AGG.find_audit_file(tmp_path / "does-not-exist")
+def test_read_audit_file_missing_directory(tmp_path):
+    record, error, raw = AGG._read_audit_file(tmp_path / "does-not-exist")
     assert record is None
     assert "not present" in error
+    assert raw is None
 
 
-def test_find_audit_file_empty_directory(tmp_path):
-    record, error = AGG.find_audit_file(tmp_path)
+def test_read_audit_file_empty_directory(tmp_path):
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert record is None
     assert "no *.json" in error
+    assert raw is None
 
 
-def test_find_audit_file_multiple_files(tmp_path):
+def test_read_audit_file_multiple_files(tmp_path):
     (tmp_path / "a.json").write_text("{}")
     (tmp_path / "b.json").write_text("{}")
-    record, error = AGG.find_audit_file(tmp_path)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert record is None
     assert "found 2" in error
+    assert raw is None
 
 
-def test_find_audit_file_invalid_json(tmp_path):
+def test_read_audit_file_invalid_json(tmp_path):
     (tmp_path / "a.json").write_text("{not valid json")
-    record, error = AGG.find_audit_file(tmp_path)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert record is None
     assert "could not parse" in error
+    assert raw is None
 
 
-def test_find_audit_file_valid_json_roundtrips(tmp_path):
+def test_read_audit_file_valid_json_roundtrips(tmp_path):
     payload = _valid_primary_record()
-    (tmp_path / "primary-review-audit.json").write_text(json.dumps(payload))
-    record, error = AGG.find_audit_file(tmp_path)
+    raw_payload = json.dumps(payload).encode()
+    (tmp_path / "primary-review-audit.json").write_bytes(raw_payload)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert error is None
     assert record == payload
+    assert raw == raw_payload
 
 
-def test_find_audit_file_non_dict_json_roundtrips_as_is(tmp_path):
-    # find_audit_file itself doesn't judge shape — that's evaluate()'s job.
+def test_read_audit_file_non_dict_json_roundtrips_as_is(tmp_path):
+    # _read_audit_file itself doesn't judge shape — that's evaluate()'s job.
     (tmp_path / "weird.json").write_text(json.dumps([1, 2, 3]))
-    record, error = AGG.find_audit_file(tmp_path)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert error is None
     assert record == [1, 2, 3]
+    assert raw == b"[1, 2, 3]"
 
 
 # ── CLI end-to-end (exit codes + step summary) ───────────────────────────

@@ -738,17 +738,6 @@ def _read_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str], Opt
         return None, f"could not parse {candidates[0].name}: {exc}", None
 
 
-def find_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str]]:
-    """Locate and parse the single downloaded canonical-audit JSON file.
-
-    Returns (value_or_None, error_or_None). The producer bytes are retained by
-    the CLI path separately so convergence can bind its receipt to the bytes
-    that crossed the process boundary.
-    """
-    audit, error, _ = _read_audit_file(audit_dir)
-    return audit, error
-
-
 def _write_convergence_receipt(path: str, receipt: Any) -> None:
     """Write one canonical receipt payload before any terminal publication."""
     _CONVERGENCE.validate_receipt(receipt, receipt.scope)
