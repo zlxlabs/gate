@@ -388,8 +388,7 @@ def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
 
 _CONVERGENCE_SCOPE_FIELDS = (
     "base_sha", "diff_digest", "policy_version", "policy_digest", "tier",
-    "effective_tier", "infra_classifier_version", "infra_diff", "caller_sha",
-    "reusable_workflow_sha",
+    "caller_sha", "reusable_workflow_sha",
 )
 
 
@@ -411,9 +410,6 @@ def _convergence_scope_from_audit(
         policy_version=audit["policy_version"],
         policy_digest=audit["policy_digest"],
         tier=audit["tier"],
-        effective_tier=audit["effective_tier"],
-        infra_classifier_version=audit["infra_classifier_version"],
-        infra_diff=audit["infra_diff"],
         caller_sha=audit["caller_sha"],
         reusable_workflow_sha=audit["reusable_workflow_sha"],
     ), ()

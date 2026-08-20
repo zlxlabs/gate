@@ -36,7 +36,6 @@ _POLICY_BY_TIER = {
     "internal": (2, 5),
     "saas": (2, 8),
 }
-_TIER_UPGRADE = {"personal": "internal", "internal": "saas", "saas": "saas"}
 
 
 class ConvergenceError(ValueError):
@@ -65,9 +64,6 @@ class Scope:
     policy_version: str
     policy_digest: str
     tier: str
-    effective_tier: str
-    infra_classifier_version: str
-    infra_diff: bool
     caller_sha: str
     reusable_workflow_sha: str
 
@@ -81,9 +77,6 @@ class Scope:
             "policy_version": self.policy_version,
             "policy_digest": self.policy_digest,
             "tier": self.tier,
-            "effective_tier": self.effective_tier,
-            "infra_classifier_version": self.infra_classifier_version,
-            "infra_diff": self.infra_diff,
             "caller_sha": self.caller_sha,
             "reusable_workflow_sha": self.reusable_workflow_sha,
         }
@@ -92,7 +85,6 @@ class Scope:
 @dataclass(frozen=True)
 class Policy:
     tier: str
-    effective_tier: str
     clean_rounds: int
     max_rounds: int
     unavailable_budget: int
@@ -568,25 +560,13 @@ def _scope_errors(scope: Scope) -> list[str]:
         "diff_digest",
         "policy_version",
         "policy_digest",
-        "infra_classifier_version",
         "caller_sha",
         "reusable_workflow_sha",
     ):
         if not _nonempty_text(getattr(scope, name)):
             errors.append(f"{name} must be a non-empty string")
-    if type(scope.infra_diff) is not bool:
-        errors.append("infra_diff must be a genuine bool")
     if scope.tier not in SUPPORTED_TIERS:
         errors.append(f"unknown tier {scope.tier!r}")
-    if scope.effective_tier not in SUPPORTED_TIERS:
-        errors.append(f"unknown effective_tier {scope.effective_tier!r}")
-    elif scope.tier in SUPPORTED_TIERS:
-        expected = _TIER_UPGRADE[scope.tier] if scope.infra_diff else scope.tier
-        if scope.effective_tier != expected:
-            errors.append(
-                f"effective_tier {scope.effective_tier!r} does not match "
-                f"tier={scope.tier!r}, infra_diff={scope.infra_diff!r}"
-            )
     return errors
 
 
@@ -611,12 +591,11 @@ def policy_for(scope: Scope) -> Policy:
     """Resolve the frozen tier matrix for a validated Scope."""
 
     validate_scope(scope)
-    clean, maximum = _POLICY_BY_TIER[scope.effective_tier]
+    clean, maximum = _POLICY_BY_TIER[scope.tier]
     if not _strict_int(clean) or not _strict_int(maximum) or not 1 <= clean <= maximum:
         raise ConvergenceError("invalid policy cap: require 1 <= N <= max_rounds")
     return Policy(
         tier=scope.tier,
-        effective_tier=scope.effective_tier,
         clean_rounds=clean,
         max_rounds=maximum,
         unavailable_budget=maximum,

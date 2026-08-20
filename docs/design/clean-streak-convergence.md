@@ -38,7 +38,7 @@ canonical primary audit 已通过 schema / identity / scope 校验
 
 ### 1.2 固定术语和唯一 source of truth
 
-- `scope`：本次判定的完整身份，至少包括 `repository_id`、`pr_number`、`base_sha`、`head_sha`、`diff_digest`、`policy_version`、`policy_digest`、`tier`、`effective_tier`、`infra_classifier_version`、`infra_diff`、`caller_sha`、`reusable_workflow_sha`。
+- `scope`：本次判定的完整身份，至少包括 `repository_id`、`pr_number`、`base_sha`、`head_sha`、`diff_digest`、`policy_version`、`policy_digest`、`tier`、`caller_sha`、`reusable_workflow_sha`。
 - `epoch`：`sha256(canonical_json(scope))`。scope 中任何字段变化都生成新 epoch；它是 generation 的不可变守卫值，不是评论游标。
 - `audit_digest`：canonical primary audit 文件原始 UTF-8 字节的 SHA-256；先校验 JSON/schema，再将该 digest 绑定到 receipt 和 disposition。不得用 findings 子集 digest 代替。
 - `processing_key`：`(repository_id, pr_number, run_id, run_attempt)`，同一 key 的重放必须幂等。
@@ -48,13 +48,13 @@ canonical primary audit 已通过 schema / identity / scope 校验
 
 ### 1.3 policy 矩阵
 
-`N` 和 eligible `max_rounds` 必须由同一版本化 policy 计算，并验证 `1 ≤ N ≤ max_rounds`。`infra_diff=true` 只允许把 effective tier 向上提升一档；unknown tier、unknown classifier result、无效 cap 都 fail-closed。
+`N` 和 eligible `max_rounds` 必须由同一版本化 policy 计算，并验证 `1 ≤ N ≤ max_rounds`。`tier` 直接选择对应的收敛档位；unknown tier、无效 cap 都 fail-closed。
 
-| 输入 tier | 普通 diff：`N / max_rounds` | infra diff：effective tier 与 `N / max_rounds` |
-|---|---:|---:|
-| `personal` | `1 / 3` | `internal`，`2 / 5` |
-| `internal` | `2 / 5` | `saas`，`2 / 8` |
-| `saas` | `2 / 8` | `saas`，`2 / 8` |
+| 输入 tier | `N / max_rounds` |
+|---|---:|
+| `personal` | `1 / 3` |
+| `internal` | `2 / 5` |
+| `saas` | `2 / 8` |
 
 `max_rounds` 只限制 eligible round；不可用事件使用同一 scope 的独立有限预算 `K_unavailable=max_rounds`，不增加 `eligible_rounds`，也不把 outage 变成 clean。policy 版本变化会改变 epoch，不能在旧 epoch 中途改 N/K。
 
@@ -182,7 +182,7 @@ hosted、primary skipped 或 audit 不可用等没有 canonical primary 的轮�
 
 **目标**
 
-在 gate 仓增加一个无 I/O、可重放的 canonical evaluator，使 `aggregate.py` 从“本轮 primary 是否 pass”升级为“当前 epoch 是否达到 N 个连续 clean round”。同一 evaluator 负责 tier/infra policy、canonical P1 投影、generation reset、attempt/round 幂等、unavailable budget 和 fail-closed parsing。
+在 gate 仓增加一个无 I/O、可重放的 canonical evaluator，使 `aggregate.py` 从“本轮 primary 是否 pass”升级为“当前 epoch 是否达到 N 个连续 clean round”。同一 evaluator 负责 tier policy、canonical P1 投影、generation reset、attempt/round 幂等、unavailable budget 和 fail-closed parsing。
 
 **实现边界**
 
@@ -202,7 +202,7 @@ hosted、primary skipped 或 audit 不可用等没有 canonical primary 的轮�
 **验收与测试**
 
 - `tests/test_gate_convergence.py` 必须包含轴 A 的完整参数矩阵：`test_state_event_matrix_is_exhaustive`、`test_nonempty_p1_resets_streak_even_when_finding_ids_repeat`、`test_clean_threshold_wins_over_max_rounds_on_same_event`、`test_unavailable_budget_is_independent_and_bounded`、`test_scope_digest_change_starts_zero_generation`、`test_duplicate_round_is_idempotent_and_conflicting_payload_fails_closed`、`test_manual_reinitialize_is_explicit_and_zero_based`。
-- 同文件锁 tier × infra 六格策略（含 unknown tier/cap）、`line=null` 当前 finding、failover/shard 仍只形成一个 canonical round、terminal replay 不消费预算，以及 `not_expected`/reviewer `waived` 不计 clean。
+- 同文件锁三个 tier 档位（含 unknown tier/cap）、`line=null` 当前 finding、failover/shard 仍只形成一个 canonical round、terminal replay 不消费预算，以及 `not_expected`/reviewer `waived` 不计 clean。
 - `tests/test_gate_aggregator.py` 增加 `test_single_round_gate_outcome_is_not_convergence_state`，确保既有 `evaluate()` 的质量/审计语义不被 streak 改写；既有 terminal envelope golden tests 必须继续通过。
 - 跨边界 producer fixture 先在 `tests/test_gate_convergence_artifact.py` 固定，断言未来实际写出的 JSON 字节、argv/env 和 raw audit digest，不接受只在进程内拼 dict 的替代测试。
 

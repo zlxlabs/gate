@@ -95,15 +95,19 @@ def _valid_scoped_primary_record(**overrides):
         "policy_version": "policy-v1",
         "policy_digest": "p" * 64,
         "tier": "personal",
-        "effective_tier": "personal",
-        "infra_classifier_version": "infra-v1",
-        "infra_diff": False,
         "caller_sha": "c" * 40,
         "reusable_workflow_sha": "w" * 40,
         "result": {"findings": []},
     }
     record.update(overrides)
     return record
+
+
+def test_convergence_scope_contract_has_seven_audit_fields():
+    assert AGG._CONVERGENCE_SCOPE_FIELDS == (
+        "base_sha", "diff_digest", "policy_version", "policy_digest", "tier",
+        "caller_sha", "reusable_workflow_sha",
+    )
 
 
 def _base_kwargs(**overrides):
@@ -563,7 +567,7 @@ def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):
 
 def test_cli_missing_one_scope_field_names_it_without_receipt(tmp_path):
     audit = _valid_scoped_primary_record()
-    del audit["infra_diff"]
+    del audit["tier"]
 
     rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
 
@@ -572,13 +576,13 @@ def test_cli_missing_one_scope_field_names_it_without_receipt(tmp_path):
     summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
     assert (
         "Convergence receipt: not produced (reason: canonical primary audit is missing "
-        "scope field(s): `infra_diff`)."
+        "scope field(s): `tier`)."
     ) in summary
 
 
 def test_cli_missing_multiple_scope_fields_names_all_in_sorted_order(tmp_path):
     audit = _valid_scoped_primary_record()
-    for field in ("tier", "infra_diff", "effective_tier"):
+    for field in ("tier", "caller_sha"):
         del audit[field]
 
     rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
@@ -588,7 +592,7 @@ def test_cli_missing_multiple_scope_fields_names_all_in_sorted_order(tmp_path):
     summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
     assert (
         "Convergence receipt: not produced (reason: canonical primary audit is missing "
-        "scope field(s): `effective_tier, infra_diff, tier`)."
+        "scope field(s): `caller_sha, tier`)."
     ) in summary
 
 
@@ -603,7 +607,7 @@ def test_cli_missing_scope_field_preserves_exit_and_receipt_semantics(
         verdict=verdict,
         result={"findings": []} if verdict == "pass" else {"findings": [{"id": "p1", "severity": "major"}]},
     )
-    del audit["infra_diff"]
+    del audit["caller_sha"]
 
     rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result=primary_result)
 

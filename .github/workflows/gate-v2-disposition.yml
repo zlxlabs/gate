@@ -86,7 +86,6 @@ jobs:
           pr_number = int(sys.argv[4])
           required = (
               "diff_digest", "policy_version", "policy_digest", "tier",
-              "effective_tier", "infra_classifier_version", "infra_diff",
               "caller_sha", "reusable_workflow_sha", "base_sha", "head_sha",
           )
           missing = [field for field in required if field not in audit]
@@ -109,9 +108,6 @@ jobs:
               policy_version=audit["policy_version"],
               policy_digest=audit["policy_digest"],
               tier=audit["tier"],
-              effective_tier=audit["effective_tier"],
-              infra_classifier_version=audit["infra_classifier_version"],
-              infra_diff=audit["infra_diff"],
               caller_sha=audit["caller_sha"],
               reusable_workflow_sha=audit["reusable_workflow_sha"],
           )
