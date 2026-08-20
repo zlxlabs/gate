@@ -114,6 +114,35 @@ def test_same_head_rerun_is_recorded_as_stability_not_as_a_fix():
     assert "resolved_finding_ids" not in current["comparison"]
 
 
+def test_convergence_projection_is_observational_only():
+    module = _module()
+    disposition = {
+        "disposition": "false-positive",
+        "reason": "locked upstream behavior",
+        "status": "active_false_positive",
+    }
+    projected = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=_audit("head", ["a"]),
+        prior_entries=[], dispositions={"a": disposition},
+    )
+    without_projection = dict(projected)
+    without_projection.pop("convergence_projection")
+    assert projected["convergence_projection"] == {
+        "source": "disposition-observation",
+        "required_gate_effect": "none",
+        "statuses": {
+            "a": {
+                "status": "active_false_positive",
+                "reason": "locked upstream behavior",
+            },
+        },
+    }
+    assert without_projection["review"] == projected["review"]
+    assert without_projection["comparison"] == projected["comparison"]
+    assert projected["false_positive_count"] == 1
+
+
 def test_install_metrics_flow_through_when_present_and_default_to_none():
     module = _module()
     with_install = module.build_entry(

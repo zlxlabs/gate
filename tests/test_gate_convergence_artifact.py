@@ -14,6 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 AGGREGATE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+DISPOSITION_PRODUCER = ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py"
 
 
 def _aggregate():
@@ -119,6 +120,72 @@ def test_audit_digest_is_raw_bytes_digest():
     raw = b'{"z":1,"a":2}\n'
     parsed = json.loads(raw)
     assert hashlib.sha256(raw).hexdigest() != hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_path):
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
+        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
+        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
+        "tier": SCOPE.tier, "effective_tier": SCOPE.effective_tier,
+        "infra_classifier_version": SCOPE.infra_classifier_version, "infra_diff": SCOPE.infra_diff,
+        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "run_id": 77, "run_attempt": 1,
+        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+    }
+    audit_bytes = json.dumps(audit, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+    audit_path = tmp_path / "canonical-audit.json"
+    audit_path.write_bytes(audit_bytes)
+    output_dir = tmp_path / "artifacts"
+    epoch = CONV.derive_epoch(SCOPE)
+    digest = hashlib.sha256(audit_bytes).hexdigest()
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue",
+        "--output-dir", str(output_dir), "--audit-path", str(audit_path),
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--finding-id", "p1",
+        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+        "--reason", "locked upstream behavior",
+    ]
+    producer_env = {"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-77", "GITHUB_ACTOR": "maintainer"}
+    first = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
+    assert first.args == argv
+    result = json.loads(first.stdout)
+    artifact_path = Path(result["path"])
+    payload_bytes = artifact_path.read_bytes()
+    payload = json.loads(payload_bytes)
+    assert result["artifact"] == f"gate-disposition-receipt-v1-{epoch}-{digest[:12]}-p1"
+    assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert payload["kind"] == "gate-disposition-receipt-v1"
+    assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__)
+    assert payload["audit_digest"] == digest and payload["finding_id"] == "p1"
+    receipt = CONV.DispositionReceipt(**{
+        field: payload[field]
+        for field in CONV.DispositionReceipt.__dataclass_fields__
+        if field in payload
+    })
+    assert receipt.as_dict() == {field: payload[field] for field in receipt.__dataclass_fields__}
+    second = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
+    assert json.loads(second.stdout)["written"] is False
+    assert artifact_path.read_bytes() == payload_bytes
+
+
+def test_disposition_producer_rejects_non_p1_finding(tmp_path):
+    audit = {
+        "result": {"findings": [{"id": "minor", "severity": "minor"}]},
+    }
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit, sort_keys=True))
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue", "--output-dir", str(tmp_path),
+        "--audit-path", str(audit_path), "--repository-id", "123", "--pr-number", "42",
+        "--head-sha", SCOPE.head_sha, "--finding-id", "minor", "--reason", "reason",
+        "--scope-json", json.dumps(SCOPE.as_dict()),
+    ]
+    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert failed.returncode == 1
+    assert "finding_id must identify a P1 finding" in failed.stderr
 
 
 def test_aggregate_envelope_preserves_scope_attempt_artifact_and_raw_digest():

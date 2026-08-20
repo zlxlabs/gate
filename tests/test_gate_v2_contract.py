@@ -17,6 +17,7 @@ from _gha_lint import find_arithmetic_gha_expression_offenders
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
+DISPOSITION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2-disposition.yml"
 CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-v2.yml"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 
@@ -66,6 +67,12 @@ def _load_caller():
     return raw, trigger
 
 
+def _load_disposition_workflow():
+    raw = yaml.safe_load(DISPOSITION_WORKFLOW.read_text())
+    trigger = raw.get("on", raw.get(True))
+    return raw, trigger
+
+
 def _fromjson_label_sets(runs_on: str) -> list[set[str]]:
     """Parse each fromJSON('[...]') label array in a runs-on expression into a set."""
     out: list[set[str]] = []
@@ -89,6 +96,48 @@ def test_is_workflow_call_named_gate():
     raw, trigger = _load_workflow()
     assert "workflow_call" in trigger
     assert raw["name"] == "gate"
+
+
+def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
+    raw, trigger = _load_disposition_workflow()
+    assert raw["name"] == "gate-v2 disposition control"
+    assert "workflow_dispatch" in trigger
+    assert raw["permissions"] == {"actions": "write", "contents": "read", "pull-requests": "read"}
+    control = raw["jobs"]["control"]
+    assert control["environment"] == {"name": "gate-disposition"}
+    assert "operation" not in trigger["workflow_dispatch"]["inputs"]
+    assert "repository_id" not in trigger["workflow_dispatch"]["inputs"]
+    assert "epoch" not in trigger["workflow_dispatch"]["inputs"]
+    assert set(trigger["workflow_dispatch"]["inputs"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
+    }
+    text = DISPOSITION_WORKFLOW.read_text()
+    assert "issue_receipt.py issue" in text
+    assert "issue_receipt.py revoke" not in text
+    assert "evidence" not in text.lower()
+    assert "GITHUB_ACTOR" not in text
+    assert "pull-requests: write" not in text
+    assert "checks: write" not in text
+    assert "statuses: write" not in text
+    assert "gate/gate" not in text
+    assert "check-runs" not in text
+    upload = next(step for step in control["steps"] if step.get("name") == "Upload immutable disposition artifact")
+    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
+    assert upload["with"]["if-no-files-found"] == "error"
+    resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
+    assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
+    assert 'gh run download "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
+    issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
+    assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
+
+
+def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
+    text = DISPOSITION_WORKFLOW.read_text()
+    producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()
+    assert "gate-disposition-receipt-v1-" in producer
+    assert "steps.disposition.outputs.artifact_name" in text
+    assert "CURRENT_AUDIT_DIGEST" in text
+    assert 'digest_prefix = fields["audit_digest"][:12]' in producer
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():

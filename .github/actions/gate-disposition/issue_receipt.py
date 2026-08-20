@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Issue immutable disposition artifacts from a canonical primary audit."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+P1_SEVERITIES = frozenset({"major", "blocker"})
+SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_json(value: Any) -> str:
+    return _sha256_bytes(_canonical_json(value))
+
+
+def _derive_epoch(scope: dict[str, Any]) -> str:
+    return _sha256_json(scope)
+
+
+def _read_stdin_envelope(enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {}
+    raw = sys.stdin.buffer.read()
+    envelope = json.loads(raw.decode("utf-8"))
+    if not isinstance(envelope, dict):
+        raise ValueError("stdin envelope must be a JSON object")
+    return envelope
+
+
+def _value(args: argparse.Namespace, envelope: dict[str, Any], name: str, env_name: str | None = None) -> Any:
+    value = getattr(args, name, None)
+    if value is not None:
+        return value
+    if name in envelope:
+        return envelope[name]
+    if env_name:
+        return os.environ.get(env_name)
+    return None
+
+
+def _required(args: argparse.Namespace, envelope: dict[str, Any], name: str, env_name: str | None = None) -> Any:
+    value = _value(args, envelope, name, env_name)
+    if value is None or (isinstance(value, str) and not value):
+        raise ValueError(f"{name} is required")
+    return value
+
+
+def _safe_component(name: str, field: str) -> str:
+    if not isinstance(name, str) or not SAFE_COMPONENT.fullmatch(name):
+        raise ValueError(f"{field} must be a safe artifact-name component")
+    return name
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _audit_findings(audit: Any) -> list[dict[str, Any]]:
+    if not isinstance(audit, dict) or not isinstance(audit.get("result"), dict):
+        raise ValueError("canonical audit result is missing")
+    findings = audit["result"].get("findings")
+    if not isinstance(findings, list) or not all(isinstance(finding, dict) for finding in findings):
+        raise ValueError("canonical audit findings must be an array of objects")
+    return findings
+
+
+def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repository_id: str, pr_number: int, head_sha: str) -> dict[str, Any]:
+    raw_scope = _required(args, envelope, "scope_json", "DISPOSITION_SCOPE_JSON")
+    scope = json.loads(raw_scope) if isinstance(raw_scope, str) else raw_scope
+    required = {
+        "repository_id", "pr_number", "base_sha", "head_sha", "diff_digest",
+        "policy_version", "policy_digest", "tier", "effective_tier",
+        "infra_classifier_version", "infra_diff", "caller_sha", "reusable_workflow_sha",
+    }
+    if not isinstance(scope, dict) or set(scope) != required:
+        raise ValueError("scope_json must contain the complete canonical Scope fields")
+    if scope["repository_id"] != int(repository_id) or scope["pr_number"] != pr_number:
+        raise ValueError("scope repository/PR does not match current control target")
+    if scope["head_sha"] != head_sha:
+        raise ValueError("scope head does not match current control target")
+    if type(scope["infra_diff"]) is not bool:
+        raise ValueError("scope infra_diff must be a bool")
+    return scope
+
+
+def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[str, Any]:
+    audit_path = Path(_required(args, envelope, "audit_path", "DISPOSITION_AUDIT_PATH"))
+    raw_audit = audit_path.read_bytes()
+    audit_digest = _sha256_bytes(raw_audit)
+    audit = json.loads(raw_audit.decode("utf-8"))
+
+    repository_id = str(_required(args, envelope, "repository_id", "GITHUB_REPOSITORY_ID"))
+    pr_number = _positive_int(_required(args, envelope, "pr_number", "PR_NUMBER"), "pr_number")
+    head_sha = str(_required(args, envelope, "head_sha", "DISPOSITION_HEAD_SHA"))
+    finding_id = str(_required(args, envelope, "finding_id", "DISPOSITION_FINDING_ID"))
+    reason = str(_required(args, envelope, "reason", "DISPOSITION_REASON"))
+    if not reason.strip():
+        raise ValueError("reason must be non-empty")
+    if not head_sha:
+        raise ValueError("head_sha must be non-empty")
+    scope = _read_scope(
+        args, envelope, repository_id=repository_id, pr_number=pr_number,
+        head_sha=head_sha,
+    )
+    matching = [finding for finding in _audit_findings(audit) if finding.get("id") == finding_id]
+    if len(matching) != 1:
+        raise ValueError("finding_id must identify exactly one canonical audit finding")
+    if matching[0].get("severity") not in P1_SEVERITIES:
+        raise ValueError("finding_id must identify a P1 finding")
+    fields = {
+        "schema_version": SCHEMA_VERSION,
+        "disposition": "false-positive",
+        "repository_id": repository_id,
+        "pr_number": pr_number,
+        "epoch": _derive_epoch(scope),
+        "head_sha": head_sha,
+        "audit_digest": audit_digest,
+        "finding_id": finding_id,
+        "reason": reason,
+    }
+    return fields
+
+
+def _write_immutable(path: Path, payload: bytes) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_bytes() != payload:
+            raise ValueError(f"immutable artifact conflict: {path.name}")
+        return False
+    with path.open("xb") as output:
+        output.write(payload)
+    return True
+
+
+def issue(args: argparse.Namespace, envelope: dict[str, Any]) -> int:
+    fields = _receipt_fields(args, envelope)
+    payload = {
+        **fields,
+        "kind": "gate-disposition-receipt-v1",
+    }
+    epoch = _safe_component(fields["epoch"], "epoch")
+    digest_prefix = fields["audit_digest"][:12]
+    finding = _safe_component(fields["finding_id"], "finding_id")
+    name = f"gate-disposition-receipt-v1-{epoch}-{digest_prefix}-{finding}"
+    output = Path(_required(args, envelope, "output_dir", "DISPOSITION_OUTPUT_DIR")) / name
+    changed = _write_immutable(output, _canonical_json(payload))
+    print(json.dumps({"artifact": name, "path": str(output), "written": changed}, sort_keys=True))
+    return 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True).add_parser("issue")
+    sub.add_argument("--input-stdin", action="store_true")
+    sub.add_argument("--output-dir")
+    sub.add_argument("--reason")
+    sub.add_argument("--audit-path")
+    for name in (
+        "repository-id", "pr-number", "head-sha", "finding-id", "scope-json",
+    ):
+        sub.add_argument(f"--{name}", dest=name.replace("-", "_"))
+    return parser
+
+
+def main() -> int:
+    args = _parser().parse_args()
+    envelope = _read_stdin_envelope(args.input_stdin)
+    return issue(args, envelope)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -109,6 +109,23 @@ def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="1", verdict="pass"
     return receipt
 
 
+def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
+    primary = primary or _primary(scope, run_id=7, run_attempt=2, p1_ids=("p1",))
+    audit_digest = audit_digest or "a" * 64
+    receipt = CONV.DispositionReceipt(
+        schema_version=1,
+        disposition="false-positive",
+        repository_id=str(scope.repository_id),
+        pr_number=scope.pr_number,
+        epoch=CONV.derive_epoch(scope),
+        head_sha=scope.head_sha,
+        audit_digest=audit_digest,
+        finding_id=primary.p1_ids[0],
+        reason="locked upstream behavior",
+    )
+    return replace(receipt, **changes)
+
+
 def _state_for(name):
     state = CONV.initial_state(SCOPE)
     if name == "C":
@@ -130,6 +147,116 @@ def test_derive_epoch_is_canonical_and_scope_changes_are_guards():
     assert CONV.derive_epoch(SCOPE) == CONV.derive_epoch(replace(SCOPE))
     assert CONV.derive_epoch(SCOPE) != CONV.derive_epoch(replace(SCOPE, head_sha="x" * 40))
     assert CONV.derive_epoch(SCOPE) != CONV.derive_epoch(replace(SCOPE, infra_diff=True, effective_tier="internal"))
+
+
+def test_disposition_receipt_is_bound_to_the_current_round():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+
+
+def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    changed_scope = replace(SCOPE, head_sha="x" * 40)
+    assert CONV.validate_disposition_receipt(
+        receipt, scope=changed_scope, primary=replace(primary, head_sha=changed_scope.head_sha),
+        audit_digest="a" * 64,
+    ).reason == "epoch_mismatch_stale"
+    assert CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="b" * 64,
+    ).reason == "audit_digest_mismatch"
+    assert CONV.validate_disposition_receipt(
+        replace(receipt, finding_id="other"), scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "finding_not_current_p1"
+
+
+def test_only_false_positive_resolves_matching_current_finding():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("a", "b"))
+    receipt = _disposition(primary=primary)
+    receipt = replace(receipt, finding_id="b")
+    result = CONV.evaluate_round(
+        state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64, waiver_receipts=(receipt,),
+        processing_key=_key(run_id=7, run_attempt=2),
+    )
+    assert result.decision == "collecting" and result.clean_streak == 0
+    assert result.state.event_records[-1][2][2] == ("a",)
+    # A second receipt cannot clear the already-consumed round; a new primary
+    # round with its own exact receipt can clear its only current P1.
+    next_primary = _primary(run_id=8, run_attempt=1, p1_ids=("b",))
+    next_receipt = _disposition(primary=next_primary, audit_digest="b" * 64, finding_id="b")
+    next_result = CONV.evaluate_round(
+        state=result.state, scope=SCOPE, primary=next_primary,
+        audit_digest="b" * 64, waiver_receipts=(next_receipt,),
+        processing_key=_key(run_id=8),
+    )
+    assert next_result.clean_streak == 1 and next_result.decision == "converged"
+
+
+def test_rejected_disposition_cannot_advance_streak():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    for disposition in ("accepted", "wont-fix", "garbage", ""):
+        receipt = _disposition(primary=primary, disposition=disposition)
+        result = CONV.evaluate_round(
+            state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
+            audit_digest="a" * 64, waiver_receipts=(receipt,),
+            processing_key=_key(run_id=7, run_attempt=2),
+        )
+        assert (
+            result.clean_streak,
+            result.eligible_rounds,
+            result.decision,
+            result.reason,
+        ) == (0, 0, "fail_closed", "invalid disposition: unknown_disposition")
+
+    empty_result = _round(
+        CONV.initial_state(SCOPE),
+        run_id=31,
+        digest="3",
+        p1_ids=("a",),
+        waiver=(CONV.DispositionReceipt(),),
+    )
+    assert empty_result.clean_streak == 0
+
+
+def test_duplicate_disposition_is_idempotent():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    first = CONV.consume_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64,
+    )
+    replay = CONV.consume_dispositions(
+        primary.p1_ids, (receipt, receipt), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64,
+    )
+    assert len(first.consumed_receipts) == 1 and not first.fail_closed
+    assert len(replay.consumed_receipts) == 1 and not replay.fail_closed
+
+
+def test_malformed_disposition_input_preserves_typed_rejection():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    malformed = {"finding_id": "p1"}
+    result = CONV.consume_dispositions(
+        primary.p1_ids, (malformed,), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64,
+    )
+    assert result.fail_closed
+    assert result.rejected_receipts == ((CONV.DispositionReceipt(), "malformed_receipt"),)
+
+
+def test_comment_alone_cannot_change_required_decision():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    result = CONV.evaluate_round(
+        state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64, waiver_receipts=(),
+        processing_key=_key(run_id=7, run_attempt=2),
+    )
+    assert result.decision == "collecting" and result.clean_streak == 0
 
 
 @pytest.mark.parametrize(
@@ -310,11 +437,6 @@ def test_partial_disposition_stays_blocked():
     assert (result.clean_streak, result.decision) == (0, "collecting")
 
 
-def test_rejected_disposition_cannot_advance_streak():
-    result = _round(CONV.initial_state(SCOPE), run_id=31, digest="3", p1_ids=("a",), waiver=(CONV.DispositionReceipt(),))
-    assert result.clean_streak == 0
-
-
 def test_duplicate_unavailable_receipt_is_idempotent():
     receipt = _receipt(run_id=32, digest="3", verdict="unavailable")
     state = CONV.replay_receipts(scope=SCOPE, receipts=[receipt, receipt])
@@ -344,7 +466,7 @@ def test_terminal_replay_consumes_only_matching_disposition():
 
 
 def test_terminal_replay_rejects_invalid_disposition():
-    result = _round(_state_for("T"), run_id=36, digest="6", p1_ids=("f",), waiver=(CONV.DispositionReceipt(valid=True),))
+    result = _round(_state_for("T"), run_id=36, digest="6", p1_ids=("f",), waiver=(_disposition(primary=_primary(run_id=36, p1_ids=("f",)), disposition="accepted"),))
     assert result.decision == "fail_closed"
 
 
@@ -395,7 +517,7 @@ def test_fail_closed_never_treats_missing_as_clean():
 
 
 def test_fail_closed_rejects_waiver():
-    result = _round(_state_for("F"), run_id=44, digest="a", waiver=(CONV.DispositionReceipt(valid=True),))
+    result = _round(_state_for("F"), run_id=44, digest="a", waiver=(_disposition(primary=_primary(run_id=44, p1_ids=("f",)), disposition="accepted"),))
     assert result.decision == "fail_closed"
 
 
