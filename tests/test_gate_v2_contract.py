@@ -116,6 +116,9 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     upload = next(step for step in control["steps"] if step.get("name") == "Upload immutable disposition artifact")
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
     assert upload["with"]["if-no-files-found"] == "error"
+    resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
+    assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
+    assert 'gh run download "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
 
 
 def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
