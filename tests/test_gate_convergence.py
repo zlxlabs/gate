@@ -133,6 +133,7 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
         nonce="nonce-100",
         evidence_manifest_digest="e" * 64,
         receipt_digest="",
+        scope=scope.as_dict(),
     )
     receipt = replace(receipt, **changes)
     if receipt.receipt_digest == "":
@@ -197,18 +198,42 @@ def test_disposition_binding_rejects_head_generation_and_digest_mismatch():
     assert CONV.validate_disposition_receipt(
         receipt, scope=changed_scope, primary=replace(primary, head_sha=changed_scope.head_sha),
         audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
-    ).reason == "epoch_mismatch_stale"
+    ).reason == "scope_mismatch"
     assert CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="b" * 64,
         now="2026-08-20T09:00:00Z", revocations=(),
     ).reason == "audit_digest_mismatch"
 
 
+def test_disposition_binding_rejects_complete_scope_matrix_changes():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    changes = [
+        {"base_sha": "x" * 40},
+        {"policy_version": "policy-v2"},
+        {"policy_digest": "q" * 64},
+        {"tier": "internal", "effective_tier": "internal"},
+        {"effective_tier": "internal", "tier": "internal"},
+        {"infra_classifier_version": "infra-v2"},
+        {"infra_diff": True, "effective_tier": "internal"},
+        {"caller_sha": "x" * 40},
+        {"reusable_workflow_sha": "x" * 40},
+    ]
+    for change in changes:
+        changed_scope = replace(SCOPE, **change)
+        changed_primary = replace(primary, head_sha=changed_scope.head_sha)
+        status = CONV.validate_disposition_receipt(
+            receipt, scope=changed_scope, primary=changed_primary, audit_digest="a" * 64,
+            now="2026-08-20T09:00:00Z", revocations=(),
+        )
+        assert status.reason == "scope_mismatch", change
+
+
 def test_only_false_positive_resolves_matching_current_finding():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("a", "b"))
     receipt = _disposition(primary=primary)
     # Recompute the receipt digest after changing the exact finding target.
-    receipt = replace(receipt, finding_id="a", receipt_digest="")
+    receipt = replace(receipt, finding_id="b", receipt_digest="")
     receipt = replace(receipt, receipt_digest=CONV.disposition_receipt_digest(receipt))
     result = CONV.evaluate_round(
         state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
@@ -216,7 +241,7 @@ def test_only_false_positive_resolves_matching_current_finding():
         processing_key=_key(run_id=7, run_attempt=2), now="2026-08-20T09:00:00Z",
     )
     assert result.decision == "collecting" and result.clean_streak == 0
-    assert result.state.event_records[-1][2][2] == ("b",)
+    assert result.state.event_records[-1][2][2] == ("a",)
     # A second receipt cannot clear the already-consumed round; a new primary
     # round with its own exact receipt can clear its only current P1.
     next_primary = _primary(run_id=8, run_attempt=1, p1_ids=("b",))

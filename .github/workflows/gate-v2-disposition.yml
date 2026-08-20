@@ -42,7 +42,9 @@ jobs:
       - name: Checkout disposition producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          sparse-checkout: .github/actions/gate-disposition/issue_receipt.py
+          sparse-checkout: |
+            .github/actions/gate-disposition/issue_receipt.py
+            .github/actions/gate-aggregator/convergence.py
           fetch-depth: 1
 
       - name: Resolve current PR head and canonical primary audit
@@ -51,15 +53,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
+          PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
         run: |
           set -euo pipefail
           test -n "$PRIMARY_RUN_ID"
+          test -n "$PRIMARY_RUN_ATTEMPT"
           pr_json="$RUNNER_TEMP/current-pr.json"
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$pr_json"
           jq -e --arg repo "$GITHUB_REPOSITORY" --argjson id "$GITHUB_REPOSITORY_ID" \
             '.head.sha and .base.sha and (.head.repo.full_name == $repo) and ($id > 0)' \
             "$pr_json" > /dev/null
           head_sha="$(jq -r '.head.sha' "$pr_json")"
+          author_login="$(jq -r '.user.login' "$pr_json")"
           audit_dir="$RUNNER_TEMP/current-primary-audit"
           mkdir -p "$audit_dir"
           audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
@@ -67,15 +72,76 @@ jobs:
           audit_path="$(find "$audit_dir" -type f -name '*.json' -print -quit)"
           test -n "$audit_path"
           audit_digest="$(sha256sum "$audit_path" | cut -d' ' -f1)"
-          jq -e --arg head "$head_sha" --argjson pr "$PR_NUMBER" \
-            '.head_sha == $head and (.pr == $pr or .pr_number == $pr)' "$audit_path" > /dev/null
+          jq -e --arg head "$head_sha" --argjson pr "$PR_NUMBER" --argjson run "$PRIMARY_RUN_ID" --argjson attempt "$PRIMARY_RUN_ATTEMPT" \
+            '.head_sha == $head and (.pr == $pr or .pr_number == $pr) and .run_id == $run and .run_attempt == $attempt' "$audit_path" > /dev/null
           {
             echo "AUDIT_PATH=$audit_path"
+            echo "CURRENT_PR_PATH=$pr_json"
+            echo "CURRENT_PR_AUTHOR=$author_login"
             echo "CURRENT_HEAD_SHA=$head_sha"
             echo "CURRENT_AUDIT_DIGEST=$audit_digest"
             echo "CURRENT_DIFF_DIGEST=$(jq -r '.diff_digest' "$audit_path")"
             echo "CURRENT_SOURCE_ATTEMPT=$PRIMARY_RUN_ATTEMPT"
           } >> "$GITHUB_ENV"
+
+      - name: Construct canonical scope and derive epoch
+        if: ${{ inputs.operation == 'issue' }}
+        env:
+          AUDIT_PATH: ${{ runner.temp }}/current-primary-audit/primary-review-audit.json
+          PR_PATH: ${{ runner.temp }}/current-pr.json
+          REPOSITORY_ID: ${{ inputs.repository_id }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          scope_envelope="$(python3 - "$AUDIT_PATH" "$PR_PATH" "$REPOSITORY_ID" "$PR_NUMBER" <<'PY'
+          import importlib.util
+          import json
+          import sys
+          from pathlib import Path
+
+          audit = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          pull = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          repository_id = int(sys.argv[3])
+          pr_number = int(sys.argv[4])
+          required = (
+              "diff_digest", "policy_version", "policy_digest", "tier",
+              "effective_tier", "infra_classifier_version", "infra_diff",
+              "caller_sha", "reusable_workflow_sha", "base_sha", "head_sha",
+          )
+          missing = [field for field in required if field not in audit]
+          if missing:
+              raise SystemExit("canonical audit missing scope fields: " + ",".join(missing))
+          base_sha = pull["base"]["sha"]
+          head_sha = pull["head"]["sha"]
+          if audit["base_sha"] != base_sha or audit["head_sha"] != head_sha:
+              raise SystemExit("canonical audit scope disagrees with current PR base/head")
+          module_path = ".github/actions/gate-aggregator/convergence.py"
+          spec = importlib.util.spec_from_file_location("gate_convergence_scope", module_path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          scope = module.Scope(
+              repository_id=repository_id,
+              pr_number=pr_number,
+              base_sha=base_sha,
+              head_sha=head_sha,
+              diff_digest=audit["diff_digest"],
+              policy_version=audit["policy_version"],
+              policy_digest=audit["policy_digest"],
+              tier=audit["tier"],
+              effective_tier=audit["effective_tier"],
+              infra_classifier_version=audit["infra_classifier_version"],
+              infra_diff=audit["infra_diff"],
+              caller_sha=audit["caller_sha"],
+              reusable_workflow_sha=audit["reusable_workflow_sha"],
+          )
+          module.validate_scope(scope)
+          print(json.dumps({"scope": scope.as_dict(), "epoch": module.derive_epoch(scope)}, sort_keys=True, separators=(",", ":")))
+          PY
+          )"
+          scope_json="$(printf '%s' "$scope_envelope" | jq -c '.scope')"
+          epoch="$(printf '%s' "$scope_envelope" | jq -r '.epoch')"
+          echo "CURRENT_SCOPE_JSON=$scope_json" >> "$GITHUB_ENV"
+          echo "CURRENT_EPOCH=$epoch" >> "$GITHUB_ENV"
 
       - name: Enforce protected issuer and exact evidence input
         if: ${{ inputs.operation == 'issue' }}
@@ -131,7 +197,9 @@ jobs:
               --primary-run-attempt "$PRIMARY_RUN_ATTEMPT" --finding-id "$FINDING_ID" \
               --disposition "$DISPOSITION_KIND" --issuer-login "$GITHUB_ACTOR" \
               --issuer-user-id "$GITHUB_ACTOR_ID" --control-run-id "$GITHUB_RUN_ID" \
-              --approval-ref "$DISPOSITION_APPROVAL_REF" --issued-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --pr-author-login "$CURRENT_PR_AUTHOR" \
+              --approval-ref "issuer-not-pr-author:$CURRENT_PR_AUTHOR" \
+              --scope-json "$CURRENT_SCOPE_JSON" --issued-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               --expires-at "$DISPOSITION_EXPIRES_AT" --nonce "$DISPOSITION_NONCE" \
               --reason "$DISPOSITION_REASON" --evidence-ref "$DISPOSITION_EVIDENCE_REFS" \
               --audit-digest "$CURRENT_AUDIT_DIGEST")"

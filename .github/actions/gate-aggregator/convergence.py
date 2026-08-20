@@ -189,6 +189,7 @@ class DispositionReceipt:
     nonce: str = ""
     evidence_manifest_digest: str = ""
     receipt_digest: str = ""
+    scope: Mapping[str, Any] | None = None
     valid: bool = False
 
     def as_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
@@ -212,6 +213,7 @@ class DispositionReceipt:
             "expires_at": self.expires_at,
             "nonce": self.nonce,
             "evidence_manifest_digest": self.evidence_manifest_digest,
+            "scope": self.scope.as_dict() if isinstance(self.scope, Scope) else self.scope,
         }
         if include_digest:
             payload["receipt_digest"] = self.receipt_digest
@@ -483,6 +485,7 @@ def _legacy_disposition_stub(receipt: DispositionReceipt) -> bool:
         and receipt.nonce == ""
         and receipt.evidence_manifest_digest == ""
         and receipt.receipt_digest == ""
+        and receipt.scope is None
     )
 
 
@@ -574,6 +577,9 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="repository_mismatch")
     if receipt.pr_number != scope.pr_number:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="pr_mismatch")
+    receipt_scope = receipt.scope.as_dict() if isinstance(receipt.scope, Scope) else receipt.scope
+    if not isinstance(receipt_scope, Mapping) or dict(receipt_scope) != scope.as_dict():
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="scope_mismatch")
     expected_epoch = derive_epoch(scope)
     if receipt.epoch != expected_epoch:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="epoch_mismatch_stale")
@@ -649,6 +655,7 @@ _DISPOSITION_FAIL_CLOSED_REASONS = frozenset(
         "issued_in_future", "receipt_digest_mismatch", "malformed_scope",
         "malformed_primary", "malformed_now", "malformed_revocation_index",
         "malformed_revocation", "nonce_conflict",
+        "scope_mismatch",
     }
 )
 
