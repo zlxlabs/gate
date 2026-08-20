@@ -117,7 +117,11 @@ jobs:
           set -euo pipefail
           mkdir -p "$OUTPUT_DIR"
           if [ "$OPERATION" = issue ]; then
-            test -n "$AUDIT_PATH" "$CURRENT_HEAD_SHA" "$CURRENT_AUDIT_DIGEST" "$CURRENT_DIFF_DIGEST" "$CURRENT_EPOCH"
+            test -n "$AUDIT_PATH"
+            test -n "$CURRENT_HEAD_SHA"
+            test -n "$CURRENT_AUDIT_DIGEST"
+            test -n "$CURRENT_DIFF_DIGEST"
+            test -n "$CURRENT_EPOCH"
             output="$(python3 .github/actions/gate-disposition/issue_receipt.py issue \
               --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
               --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
