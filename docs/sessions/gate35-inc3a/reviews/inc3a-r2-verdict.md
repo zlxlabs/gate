@@ -2,7 +2,7 @@ VERDICT: pass
 
 # gate#35 增量 3a 独立评审 R2
 
-审查范围固定为 `1ea66b7..a501b7a1d43092efd77c10488efefceaf3630c04`；只审本次 diff。项目风险等级为 personal。本轮 P1=0（截至实验一）。
+审查范围固定为 `1ea66b7..a501b7a1d43092efd77c10488efefceaf3630c04`；只审本次 diff。项目风险等级为 personal。本轮 P1=0。
 
 ## 新证据与实验一：base 红验抽查
 
@@ -154,9 +154,79 @@ CONCURRENT attempt=5 p1_rc=0 p2_rc=1 target_exists=True target_len=1284 json_val
 
 结论：同一 run identity 的顺序重入字节完全一致；原子 replace 未暴露半截 target。非真实单进程入口的并发竞争可让一个 writer 在共享固定 `.tmp` 名称上失败，但已成功 writer 留下完整 JSON，按 personal 档记 P2/backlog。
 
+## 运行时不变式锁定
+
+实际命令：
+
+```sh
+uv run --with pytest,PyYAML python -m pytest -q \
+  "$test_dir/tests/test_gate_convergence.py::test_receipt_for_round_copies_decision_identity_and_validates" \
+  "$test_dir/tests/test_gate_convergence_artifact.py::test_aggregate_cli_receipt_bytes_validate_and_replay" \
+  "$test_dir/tests/test_gate_v2_contract.py::test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggregate_rc"
+```
+
+真实输出：
+
+```text
+...                                                                      [100%]
+3 passed in 0.41s
+TARGETED_RC=0
+```
+
+这三条测试分别锁定 `RoundDecision` 三元身份复制、subprocess producer/consumer receipt replay，以及 workflow 输出/原始退出码契约。
+
 ## 对抗清单
 
-待四组运行时证据完成后逐条填写。
+- 有没有办法让 `gate/gate` 变绿，而本轮的 receipt 没有成功上传？不能在本轮真实单进程路径中证明存在。实验二的完整 receipt/零退出码组合为 `shell_rc=0` 且 `github_output='convergence-receipt=present\n'`；H0 workflow 结构探针输出 `ORDER receipt=4 terminal=5 panel=6`、`continue_on_error=None`、`if_no_files_found='error'`，所以 receipt upload 失败会使 job 失败，且上传排在 terminal/status panel 前。
+
+  证据命令/输出：
+
+  ```text
+  CASE write=full termination=zero shell_rc=0 github_output='convergence-receipt=present\n' target=b'FULL' stderr=''
+  ORDER receipt=4 terminal=5 panel=6
+  RECEIPT_UPLOAD continue_on_error=None if="always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'" if_no_files_found='error'
+  ```
+
+- 有没有办法让某一轮真实发生过的判定不产生 receipt，从而在账本里凭空消失？本轮矩阵不能证明存在。合法 canonical `pass/fail/unavailable` 都实际产生 receipt；quality 失败时仍产生；只有 audit 缺失/损坏、来源不匹配和 draft/fork/异常 skip 等非 eligible 或 fail-closed 轮不产出，并在 Summary 写明原因。
+
+  证据命令/输出：
+
+  ```text
+  CASE verdict-pass exit=0 receipt=present ... summary='Convergence receipt: produced (`convergence-receipt.json`).'
+  CASE verdict-fail exit=1 receipt=present ... summary='Convergence receipt: produced (`convergence-receipt.json`).'
+  CASE verdict-unavailable exit=1 receipt=present ... summary='Convergence receipt: produced (`convergence-receipt.json`).'
+  CASE quality-failure-valid-pass exit=1 receipt=present ... summary='Convergence receipt: produced (`convergence-receipt.json`).'
+  CASE audit-missing-primary-failure exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_missing`).'
+  CASE source-attempt-mismatch exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_source_mismatch`).'
+  CASE draft-primary-skipped exit=0 receipt=<absent> summary='Convergence receipt: not produced (reason: `review_not_expected`).'
+  ```
+
+- 有没有办法让 aggregate 的真实退出码被吞掉或改写，使红轮被当成绿轮？不能。默认 shell 实验中 stub 的 7 和 SIGTERM 都原样成为 `shell_rc=7` 与 `shell_rc=143`，同时 `set +e` 仍继续写 output；`exit "$rc"` 没有吞掉原码。
+
+  证据命令/输出：
+
+  ```text
+  CASE write=full termination=nonzero shell_rc=7 github_output='convergence-receipt=present\n' target=b'FULL' stderr=''
+  CASE write=full termination=signal shell_rc=143 github_output='convergence-receipt=present\n' target=b'FULL' stderr='Terminated'
+  ```
+
+- receipt 文件写到一半进程被杀，留下的残缺文件会被 upload 传出去吗？真实 producer 路径不会把半截写到目标路径。模拟 `_write_convergence_receipt` 在 temp 写半后 SIGKILL 的 subprocess 输出是 `target_exists=False`、仅 temp 存在；workflow 检查的是目标 `convergence-receipt.json`，因此该状态不会被标记为 present。对照 shell stub 的 direct-half 结果确实是 `present`，说明若未来破坏原子写入才会触发上传候选，但当前生产实现未走该路径。
+
+  证据命令/输出：
+
+  ```text
+  KILLED_WRITE rc=-9 target_exists=False temp_exists=True temp_len=57 stderr=''
+  CASE write=half termination=zero shell_rc=0 github_output='convergence-receipt=present\n' target=b'HALF' stderr=''
+  ```
+
+- `GITHUB_OUTPUT` 的写入本身失败（磁盘满、变量未设）时，行为是 fail-loud 还是静默？fail-loud。未定义变量或目标是目录都会让 echo 重定向返回 1；即使 receipt 已存在，step 也不会以 0 结束。
+
+  证据命令/输出：
+
+  ```text
+  GITHUB_OUTPUT=unset shell_rc=1 receipt_exists=True stderr='bash: line 23: : No such file or directory'
+  GITHUB_OUTPUT=directory shell_rc=1 receipt_exists=True stderr='bash: line 23: /tmp/gate35-output-79pu6ou1/directory/github-output: Is a directory'
+  ```
 
 ## Findings
 
@@ -168,3 +238,4 @@ CONCURRENT attempt=5 p1_rc=0 p2_rc=1 target_exists=True target_len=1284 json_val
 
 - OCR 前置扫描：第一次背景文件为空，工具返回 `status=skipped` 与 `caller_error:background_empty`；第二次使用 6000 字节冻结 diff 背景运行约两分钟后中止，未取得 reviewed envelope，不能表述为“扫过且干净”。
 - 不审刻意未通电的 3b 路径：历史 receipt 读回、artifact 分页下载/消歧、disposition receipt 消费、convergence envelope 落盘、真实 canary、外部 state 可信根。
+- 并发竞争是本轮额外探针发现的 P2：实际 workflow 的 aggregate step 是单进程，未将该非真实入口升级为 P1。
