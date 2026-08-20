@@ -223,7 +223,7 @@ def test_duplicate_disposition_is_idempotent():
     assert len(replay.consumed_receipts) == 1 and not replay.fail_closed
 
 
-def test_malformed_disposition_input_preserves_typed_rejections_and_raw_diagnostic():
+def test_malformed_disposition_input_preserves_typed_rejection():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     malformed = {"finding_id": "p1"}
     result = CONV.consume_dispositions(

@@ -477,7 +477,7 @@ def disposition_status(
 _DISPOSITION_FAIL_CLOSED_REASONS = frozenset(
     {
         "malformed_receipt", "schema_version_mismatch", "unknown_disposition",
-        "malformed_pr_number", "malformed_primary_attempt", "repository_mismatch",
+        "malformed_pr_number", "repository_mismatch",
         "pr_mismatch", "epoch_mismatch_stale", "head_sha_mismatch",
         "audit_digest_mismatch",
         "finding_target_not_exact", "finding_not_current_p1",
@@ -1125,7 +1125,7 @@ def evaluate_round(
     )
     if disposition_result.fail_closed:
         reasons = ", ".join(reason for _, reason in disposition_result.rejected_receipts)
-        failed = _fail_closed_state(working, f"invalid protected disposition: {reasons or 'malformed_receipt'}")
+        failed = _fail_closed_state(working, f"invalid disposition: {reasons or 'malformed_receipt'}")
         return _decision(
             failed,
             processing_key=processing_key,

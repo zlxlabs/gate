@@ -20,8 +20,7 @@ concurrency:
 
 jobs:
   control:
-    # The gate-disposition environment is configured with required reviewers;
-    # the environment approval is the protected issuer boundary.
+    # Keep the environment so any future protection can be configured in GitHub.
     environment:
       name: gate-disposition
     runs-on: ubuntu-latest
