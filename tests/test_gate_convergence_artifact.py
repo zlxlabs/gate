@@ -146,6 +146,7 @@ def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
 
     payload_bytes = receipt_path.read_bytes()
     payload = json.loads(payload_bytes)
+    assert payload["audit_digest"] == hashlib.sha256(audit_bytes).hexdigest()
     assert payload_bytes == json.dumps(
         payload, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
