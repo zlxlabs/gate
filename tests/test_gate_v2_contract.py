@@ -119,6 +119,15 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
     assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
     assert 'gh run download "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
+    evidence = next(step for step in control["steps"] if step.get("name") == "Resolve and verify immutable evidence blobs")
+    assert "only blob:<git-sha> is allowlisted" in evidence["run"]
+    assert 'git/blobs/$blob_sha' in evidence["run"]
+    assert 'git hash-object "$evidence_path"' in evidence["run"]
+    issue = next(step for step in control["steps"] if step.get("name") == "Issue or revoke immutable disposition artifact")
+    assert "--evidence-manifest-path \"$EVIDENCE_MANIFEST_PATH\"" in issue["run"]
+    issuer = next(step for step in control["steps"] if step.get("name") == "Enforce protected issuer and exact evidence input")
+    assert "PR author cannot issue a disposition receipt" in issuer["run"]
+    assert "maintainer:" not in issuer["run"]
 
 
 def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():

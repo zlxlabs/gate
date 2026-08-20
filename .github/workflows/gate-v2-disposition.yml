@@ -17,7 +17,6 @@ on:
       disposition: { description: "protected disposition kind", required: false, default: false-positive, type: choice, options: [false-positive, accepted, wont-fix, fixed] }
       reason: { description: "evidence-backed reason or revocation reason", required: true, type: string }
       evidence_refs: { description: "one immutable evidence ref per line", required: false, type: string }
-      approval_ref: { description: "protected approval reference", required: false, type: string }
       nonce: { description: "single-use immutable nonce", required: true, type: string }
       expires_at: { description: "receipt expiry in UTC", required: false, type: string }
 
@@ -143,20 +142,66 @@ jobs:
           echo "CURRENT_SCOPE_JSON=$scope_json" >> "$GITHUB_ENV"
           echo "CURRENT_EPOCH=$epoch" >> "$GITHUB_ENV"
 
-      - name: Enforce protected issuer and exact evidence input
+      - name: Resolve and verify immutable evidence blobs
         if: ${{ inputs.operation == 'issue' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          APPROVAL_REF: ${{ inputs.approval_ref }}
           EVIDENCE_REFS: ${{ inputs.evidence_refs }}
         run: |
           set -euo pipefail
-          test -n "$APPROVAL_REF"
+          refs_path="$RUNNER_TEMP/disposition-evidence-refs.txt"
+          records_path="$RUNNER_TEMP/disposition-evidence-records.tsv"
+          manifest_path="$RUNNER_TEMP/disposition-evidence-manifest.json"
+          printf '%s\n' "$EVIDENCE_REFS" > "$refs_path"
+          : > "$records_path"
+          while IFS= read -r evidence_ref || [ -n "$evidence_ref" ]; do
+            test -n "$evidence_ref"
+            case "$evidence_ref" in
+              blob:*)
+                blob_sha="${evidence_ref#blob:}"
+                if ! [[ "$blob_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "evidence ref is not an immutable Git blob SHA" >&2
+                  exit 1
+                fi
+                response_path="$RUNNER_TEMP/evidence-$blob_sha.json"
+                evidence_path="$RUNNER_TEMP/evidence-$blob_sha.bin"
+                gh api "repos/$GITHUB_REPOSITORY/git/blobs/$blob_sha" > "$response_path"
+                jq -e --arg sha "$blob_sha" '.sha == $sha and .encoding == "base64" and (.content | type == "string")' "$response_path" > /dev/null
+                jq -r '.content' "$response_path" | tr -d '\n\r' | base64 --decode > "$evidence_path"
+                content_sha256="$(sha256sum "$evidence_path" | cut -d' ' -f1)"
+                test "$(git hash-object "$evidence_path")" = "$blob_sha"
+                printf '%s\t%s\t%s\n' "$evidence_ref" "$evidence_path" "$content_sha256" >> "$records_path"
+                ;;
+              *)
+                echo "unsupported evidence ref; only blob:<git-sha> is allowlisted" >&2
+                exit 1
+                ;;
+            esac
+          done < "$refs_path"
+          python3 - "$records_path" "$manifest_path" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          records = []
+          for line in Path(sys.argv[1]).read_text().splitlines():
+              ref, path, sha256 = line.split("\t")
+              records.append({"type": "blob", "ref": ref, "path": path, "sha256": sha256})
+          if not records:
+              raise SystemExit("evidence manifest must contain at least one verified blob")
+          Path(sys.argv[2]).write_text(json.dumps(records, sort_keys=True, separators=(",", ":")))
+          PY
+          echo "EVIDENCE_MANIFEST_PATH=$manifest_path" >> "$GITHUB_ENV"
+
+      - name: Enforce protected issuer and exact evidence input
+        if: ${{ inputs.operation == 'issue' }}
+        env:
+          EVIDENCE_REFS: ${{ inputs.evidence_refs }}
+        run: |
+          set -euo pipefail
           test -n "$EVIDENCE_REFS"
-          author="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.user.login')"
-          if [ "$author" = "$GITHUB_ACTOR" ] && ! printf '%s' "$APPROVAL_REF" | grep -q '^maintainer:'; then
-            echo "PR author requires a second maintainer approval reference" >&2
+          if [ "$CURRENT_PR_AUTHOR" = "$GITHUB_ACTOR" ]; then
+            echo "PR author cannot issue a disposition receipt; a distinct protected issuer is required" >&2
             exit 1
           fi
 
@@ -198,10 +243,11 @@ jobs:
               --disposition "$DISPOSITION_KIND" --issuer-login "$GITHUB_ACTOR" \
               --issuer-user-id "$GITHUB_ACTOR_ID" --control-run-id "$GITHUB_RUN_ID" \
               --pr-author-login "$CURRENT_PR_AUTHOR" \
-              --approval-ref "issuer-not-pr-author:$CURRENT_PR_AUTHOR" \
+              --approval-ref "protected-environment:gate-disposition;issuer-not-author:$CURRENT_PR_AUTHOR" \
               --scope-json "$CURRENT_SCOPE_JSON" --issued-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               --expires-at "$DISPOSITION_EXPIRES_AT" --nonce "$DISPOSITION_NONCE" \
               --reason "$DISPOSITION_REASON" --evidence-ref "$DISPOSITION_EVIDENCE_REFS" \
+              --evidence-manifest-path "$EVIDENCE_MANIFEST_PATH" \
               --audit-digest "$CURRENT_AUDIT_DIGEST")"
           elif [ "$OPERATION" = revoke ]; then
             output="$(python3 .github/actions/gate-disposition/issue_receipt.py revoke \
