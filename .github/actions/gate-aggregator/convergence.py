@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
 P1_SEVERITIES = frozenset({"major", "blocker"})
+SEVERITY_P1 = P1_SEVERITIES
 SUPPORTED_TIERS = ("personal", "internal", "saas")
 PRIMARY_VERDICTS = frozenset({"pass", "fail", "unavailable"})
 TERMINAL_DECISIONS = frozenset(
@@ -253,6 +254,14 @@ class ConvergenceState:
     @property
     def decision(self) -> str:
         return self.terminal_decision
+
+    @property
+    def consumed_processing_keys_digest(self) -> str:
+        return self.processing_keys_digest
+
+    @property
+    def consumed_round_keys_digest(self) -> str:
+        return self.round_keys_digest
 
     def as_dict(self) -> dict[str, Any]:
         return {
