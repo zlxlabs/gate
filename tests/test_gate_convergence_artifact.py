@@ -76,6 +76,101 @@ def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="a", verdict="pass"
     )
 
 
+def _scoped_audit(scope=SCOPE, *, run_id=77, run_attempt=1, verdict="pass"):
+    return {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": scope.repository_id, "head_sha": scope.head_sha,
+        "run_id": run_id, "run_attempt": run_attempt, "pr": scope.pr_number,
+        "verdict": verdict, "reviewer": "codex-sub",
+        "base_sha": scope.base_sha, "diff_digest": scope.diff_digest,
+        "policy_version": scope.policy_version, "policy_digest": scope.policy_digest,
+        "tier": scope.tier, "effective_tier": scope.effective_tier,
+        "infra_classifier_version": scope.infra_classifier_version,
+        "infra_diff": scope.infra_diff, "caller_sha": scope.caller_sha,
+        "reusable_workflow_sha": scope.reusable_workflow_sha,
+        "result": {"findings": []},
+    }
+
+
+def _receipt_from_payload(payload):
+    scope = CONV.Scope(**payload["scope"])
+    return CONV.Receipt(
+        schema_version=payload["schema_version"],
+        scope=scope,
+        epoch=payload["epoch"],
+        processing_key=CONV.ProcessingKey(*payload["processing_key"]),
+        round_key=CONV.RoundKey(*payload["round_key"]),
+        event_id=payload["event_id"],
+        run_id=payload["run_id"],
+        run_attempt=payload["run_attempt"],
+        audit_digest=payload["audit_digest"],
+        verdict=payload["verdict"],
+        p1_ids=tuple(payload["p1_ids"]),
+        source_attempt=payload["source_attempt"],
+        artifact_id=payload["artifact_id"],
+        artifact_name=payload["artifact_name"],
+        receipt_kind=payload["receipt_kind"],
+        reported_decision=payload["decision"],
+        reported_clean_streak=payload["clean_streak"],
+        reported_eligible_rounds=payload["eligible_rounds"],
+    )
+
+
+def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
+    audit = _scoped_audit()
+    audit_bytes = json.dumps(audit, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+    audit_dir = tmp_path / "primary-audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_bytes(audit_bytes)
+    summary_path = tmp_path / "summary.md"
+    terminal_path = tmp_path / "gate-terminal.json"
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+    artifact_name = f"primary-audit-v2-{SCOPE.repository_id}-{SCOPE.head_sha}-77-1"
+    argv = [
+        sys.executable, str(AGGREGATE_PATH),
+        "--quality-result", "success", "--primary-result", "success",
+        "--runner", "self", "--is-draft", "false", "--review-expected", "true",
+        "--repository-id", str(SCOPE.repository_id), "--repository", "zlxlabs/gate",
+        "--head-sha", SCOPE.head_sha, "--run-id", "77", "--run-attempt", "1",
+        "--pr-number", str(SCOPE.pr_number), "--audit-source-attempt", "1",
+        "--audit-artifact-name", artifact_name, "--audit-dir", str(audit_dir),
+        "--summary-path", str(summary_path), "--terminal-path", str(terminal_path),
+        "--convergence-receipt-path", str(receipt_path),
+    ]
+
+    completed = subprocess.run(argv, check=True, env=os.environ.copy())
+    stdout, stderr = capfd.readouterr()
+    assert completed.args == argv
+    assert "Convergence receipt: produced" in stdout
+    assert stderr == ""
+
+    payload_bytes = receipt_path.read_bytes()
+    payload = json.loads(payload_bytes)
+    assert payload_bytes == json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    receipt = _receipt_from_payload(payload)
+    CONV.validate_receipt(receipt, SCOPE)
+
+    audit_digest = hashlib.sha256(audit_bytes).hexdigest()
+    primary = CONV.CanonicalPrimary(
+        schema_version=1, repository_id=SCOPE.repository_id,
+        pr_number=SCOPE.pr_number, head_sha=SCOPE.head_sha,
+        run_id=77, run_attempt=1, verdict="pass", p1_ids=(),
+    )
+    decision = CONV.evaluate_round(
+        state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
+        audit_digest=audit_digest, waiver_receipts=(),
+        processing_key=CONV.ProcessingKey(SCOPE.repository_id, SCOPE.pr_number, 77, 1),
+    )
+    replayed = CONV.replay_receipts(scope=SCOPE, receipts=(receipt,))
+    assert (replayed.clean_streak, replayed.eligible_rounds, replayed.unavailable_streak) == (
+        decision.state.clean_streak,
+        decision.state.eligible_rounds,
+        decision.state.unavailable_streak,
+    )
+
+
 def test_producer_payload_preserves_all_attempt_guards(tmp_path):
     audit = {
         "kind": "primary_review", "schema_version": 1,
