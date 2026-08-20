@@ -196,48 +196,42 @@ def evaluate_round(
 
 实现约 550 行，纯函数测试与 fixture 约 750 行，合计约 1,300 行，低于本增量 3,500 行上限；不新增 retry/fallback/防御性吞错。
 
-### 增量 2：protected、digest-bound false-positive disposition
+### 增量 2：绑定当前轮次的 false-positive disposition
+
+**范围裁决（2026-08-20，owner）**
+
+本节原设计包含 protected issuer provenance、evidence manifest 密码学校验、nonce 一次性、
+append-only revocation、expiry 与完整 scope 绑定。经第一性原理复核：本仓是个人自用的多
+Agent 开发门禁，write 权限只有 owner 与其派出的 agent，**上述机制防的「有预谋的内部
+攻击者」在本项目中不存在**，属过度设计，已全部删除。判定依据与实测见
+`docs/sessions/gate35-inc2/reviews/inc2-r1-verdict.md`、`inc2-r2-verdict.md`。
 
 **目标**
 
-建立 gate-owned 的受保护 disposition control plane，令 gate-hub#335 要求的 evidence-backed false positive 能解除**当前 canonical audit 中的 exact finding**，并把签发、绑定、消费、撤销和过期完整记录到 immutable artifact。普通评论、label、空 commit、admin bypass 均不改变 required gate。
+让 owner 能对**当前这一轮 canonical audit 中的 exact finding** 声明 false-positive，
+使该 finding 不再阻塞 required gate，并留下三个月后仍读得懂的理由。
 
-**签发与证据契约**
+**保留的绑定（与安全无关，与正确性有关）**
 
-1. 维护者通过新增的 `.github/workflows/gate-v2-disposition.yml`（受保护 workflow dispatch）提交 `repository_id`、PR、目标 primary `run_id/run_attempt`、exact `finding_id`、`false-positive`、非空 reason 和 evidence manifest。workflow 记录 dispatch actor login/user id、control run id、approval ref、issued/expiry 和 nonce。
-2. control job 在签发前重新获取当前 PR head/base/diff/policy scope 和目标 canonical primary audit；不得相信 dispatch 参数中的 digest。它验证 `finding_id` 精确存在且 P1 severity 与 policy 相符，再用 audit 原始 UTF-8 bytes 重算 `audit_digest`。
-3. evidence manifest 至少有一个不可变引用和对应摘要：例如 shoplazza case 的锁定 Starlette 1.6 源码引用、回归测试的 commit/blob 引用、以及本地 multipart probe 的 artifact/run 引用。reason/evidence ref 缺失、引用无法读取、manifest digest 变化，都不能签发可消费 receipt。评论内容可作为引用材料，但评论本身不是授权。
-4. receipt 写入名为 `gate-disposition-receipt-v1-*` 的 immutable artifact，不 PATCH PR 评论、不写 clean counter、不直接返回 gate pass。它是 protected control-plane receipt，不宣称由普通 reviewer 或 PR author 签名；信任依据是 workflow 权限、actor 记录和可重算 digest。
+豁免绑定 `head_sha + audit_digest + epoch + finding_id`。换 head、换 audit 或换 epoch 即失效。
+理由：门禁主审存在「挤牙膏」行为（每轮只报一条不代表只剩一条），一次豁免若能跨轮永久生效，
+clean streak 就不再反映真实收敛。这条不是防攻击，是防自欺。
 
-**消费、审计与失效**
+**receipt 形状**
 
-- `.github/actions/gate-aggregator/convergence.py` 增加 `validate_disposition_receipt`、`consume_dispositions`、`disposition_status`。只有当前 epoch + 当前完整 audit digest + 当前 exact finding id 的合法 `false-positive` 能从 P1 集合移除一项；每个新 primary round 都必须新签 receipt。
-- `accepted`/`wont-fix` 只进入 ledger/人类摘要，不能清 required；`fixed` 只能由下一轮真实 primary 的空 P1 证明，不能由 disposition 直接清红。
-- `.github/actions/review-ledger/build_ledger.py` 只新增 receipt id、disposition status、reason/evidence ref 的 additive projection；它继续是 fail-open 观测面，不能成为 evaluator 的输入或恢复源。
-- 撤销通过同一 protected control plane 产出 `gate-disposition-revocation-v1-*` append-only artifact，记录 nonce、原因、操作者、时间、evidence ref。新 head/base/diff/policy/tier/classifier、audit digest 变化、expiry、evidence 撤销、issuer 权限撤销、nonce 已消费或同 nonce 异文都会使 receipt inactive/冲突；原 receipt 不删除。
-- 当前 PR 有一个明确 targeting 该 PR/epoch/digest 的 malformed/mismatched receipt 时，aggregator fail-closed/manual；旧 epoch artifact 则不参与新 epoch，但在诊断中保留 stale reason。缺 receipt 是 active P1 blocked，不是异常 fail-open。
+`schema_version`、`disposition`（只允许 `false-positive`）、`repository_id`、`pr_number`、
+`epoch`、`head_sha`、`audit_digest`、`finding_id`、`reason`。
 
-**shoplazza-capabilities#12 走通道实例**
+**唯一的准入约束**
 
-当前事实是：PR #12 在 HEAD `c7fea8b` 的 primary 报 `reliability-multipart-tempfile-leak`；维护者评论中的证据指出锁定的 Starlette 1.6 `MultiPartParser.parse` 会在 `BaseException` 后关闭 `_files_to_close_on_error`，回归测试和 local multi-part probe 都验证了关闭行为。
+签发入口是人工 `workflow_dispatch`。agent 在 CI 中够不到该入口——这已满足本仓唯一的威胁模型
+（agent 不应能给自己开绿灯）。不做签发人身份校验：本仓只有一个人类。
 
-正确路径如下：
+**若将来变成多人协作**
 
-1. 这条评论被收录为 evidence ref，但此刻 gate 仍然红；`build_ledger.py` 可以记录 `finding_id`、作者、理由和链接，不能把它当作 active waiver。
-2. 受保护 control workflow 由合格 maintainer 针对 PR #12 的那一轮 exact primary run/attempt 发起，重新下载 audit，确认该 finding id 存在、计算完整 audit digest，并核验上述源码/回归测试/probe evidence manifest；若发起人就是 PR author，则要求另一名 maintainer。
-3. control workflow 上传绑定 `epoch + head_sha + diff_digest + primary_run_id + attempt + audit_digest + reliability-multipart-tempfile-leak` 的 disposition receipt。下一次真实 v2 `gate` run 下载并校验它，发现当前唯一 P1 被合法 false-positive 覆盖，于是按该 tier 的 N 规则消费一个 clean round，并在 Required Check/摘要/ledger 中显示“哪个 finding、哪个 reason、哪些 evidence”。不需要空 commit，也不需要 administrator bypass。
-4. 如果该 round 还有别的 P1，只有这一项被移除，gate 仍红；如果 push 新 head、Starlette 版本/证据 digest 改变、receipt 过期或被撤销，receipt 不再消费，必须新审计并重新签发。这样“证据能解除对应 required 红”成立，但不会变成永久忽略规则。
-
-**验收与测试**
-
-- `tests/test_gate_convergence.py` 锁 `test_disposition_requires_protected_issuer_and_exact_digest_binding`、`test_disposition_binding_rejects_head_generation_and_digest_mismatch`、`test_only_false_positive_resolves_matching_current_finding`、`test_rejected_disposition_cannot_advance_streak`、`test_disposition_nonce_is_idempotent_and_conflict_safe`、`test_disposition_lifecycle_invalidates_on_head_digest_expiry_and_revocation`、`test_comment_alone_cannot_change_required_decision`。
-- `tests/test_gate_convergence_artifact.py` 锁 control producer 的实际文件 bytes、workflow actor/argv/env、raw audit digest 和 revocation artifact；验证同 nonce 异 payload fail-closed。
-- `tests/test_review_ledger.py` 增加 `test_convergence_projection_is_observational_only`，确认 ledger 记录 receipt/disposition 但删除或篡改 ledger 不会制造 clean。
-- `tests/test_gate_v2_contract.py` 增加 `test_disposition_workflow_is_protected_and_cannot_publish_gate_result` 与 `test_gate_disposition_receipt_names_include_epoch_and_audit_digest`。
-
-**行数预算**
-
-control/wiring 约 700 行，校验、撤销和 contract/fixture 测试约 900 行，合计约 1,600 行，低于 3,500 行上限；不引入 label 旁路、评论 PATCH CAS 或第二 evaluator。
+需要重新引入的是：issuer provenance（从 GitHub environment 的真实审批记录取 approver）与
+canonical audit 的 run provenance 校验（核验 run 的 workflow identity/ref/event/conclusion，
+而非只信 artifact 自报字段）。重开条件是**本仓出现第二个人类 write 用户**，不是「觉得更严谨」。
 
 ### 增量 3：workflow 接线与 canary 实证
 

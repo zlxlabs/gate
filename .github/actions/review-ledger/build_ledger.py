@@ -28,7 +28,7 @@ from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_pu
 
 DISPOSITION_RE = re.compile(
     r"^Codex finding disposition:\s*([a-z0-9][a-z0-9._-]*)\s*=\s*"
-    r"(false-positive|accepted|fixed|wont-fix)\s*(?:[-—:]\s*(.+))?$",
+    r"(false-positive)\s*(?:[-—:]\s*(.+))?$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -485,16 +485,10 @@ def build_entry(
     convergence_projection = {
         "source": "disposition-observation",
         "required_gate_effect": "none",
-        "receipt_digests": sorted({
-            value.get("receipt_digest")
-            for value in relevant_dispositions.values()
-            if isinstance(value, dict) and isinstance(value.get("receipt_digest"), str)
-        }),
         "statuses": {
             finding_id: {
                 "status": value.get("status", value.get("disposition", "unknown")),
                 "reason": value.get("reason", ""),
-                "evidence_manifest_digest": value.get("evidence_manifest_digest"),
             }
             for finding_id, value in relevant_dispositions.items()
             if isinstance(value, dict)

@@ -120,8 +120,6 @@ def test_convergence_projection_is_observational_only():
         "disposition": "false-positive",
         "reason": "locked upstream behavior",
         "status": "active_false_positive",
-        "receipt_digest": "r" * 64,
-        "evidence_manifest_digest": "e" * 64,
     }
     projected = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
@@ -133,12 +131,10 @@ def test_convergence_projection_is_observational_only():
     assert projected["convergence_projection"] == {
         "source": "disposition-observation",
         "required_gate_effect": "none",
-        "receipt_digests": ["r" * 64],
         "statuses": {
             "a": {
                 "status": "active_false_positive",
                 "reason": "locked upstream behavior",
-                "evidence_manifest_digest": "e" * 64,
             },
         },
     }
