@@ -32,8 +32,7 @@ def _module():
 CONV = _module()
 
 
-def _scope(*, tier="personal", infra_diff=False, **changes):
-    effective = CONV._TIER_UPGRADE[tier] if infra_diff else tier
+def _scope(*, tier="personal", **changes):
     values = dict(
         repository_id=123,
         pr_number=42,
@@ -43,9 +42,6 @@ def _scope(*, tier="personal", infra_diff=False, **changes):
         policy_version="policy-v1",
         policy_digest="p" * 64,
         tier=tier,
-        effective_tier=effective,
-        infra_classifier_version="infra-v1",
-        infra_diff=infra_diff,
         caller_sha="c" * 40,
         reusable_workflow_sha="w" * 40,
     )
@@ -175,7 +171,6 @@ def _state_for(name):
 def test_derive_epoch_is_canonical_and_scope_changes_are_guards():
     assert CONV.derive_epoch(SCOPE) == CONV.derive_epoch(replace(SCOPE))
     assert CONV.derive_epoch(SCOPE) != CONV.derive_epoch(replace(SCOPE, head_sha="x" * 40))
-    assert CONV.derive_epoch(SCOPE) != CONV.derive_epoch(replace(SCOPE, infra_diff=True, effective_tier="internal"))
 
 
 def test_disposition_receipt_is_bound_to_the_current_round():
@@ -288,30 +283,24 @@ def test_comment_alone_cannot_change_required_decision():
     assert result.decision == "collecting" and result.clean_streak == 0
 
 
-@pytest.mark.parametrize(
-    "tier,infra,effective,n,max_rounds",
-    [
-        ("personal", False, "personal", 1, 3),
-        ("personal", True, "internal", 2, 5),
-        ("internal", False, "internal", 2, 5),
-        ("internal", True, "saas", 2, 8),
-        ("saas", False, "saas", 2, 8),
-        ("saas", True, "saas", 2, 8),
-    ],
-)
-def test_policy_matrix_is_frozen(tier, infra, effective, n, max_rounds):
-    scope = _scope(tier=tier, infra_diff=infra, effective_tier=effective)
-    policy = CONV.policy_for(scope)
-    assert (policy.effective_tier, policy.clean_rounds, policy.max_rounds, policy.unavailable_budget) == (effective, n, max_rounds, max_rounds)
+def test_policy_for_personal_tier():
+    policy = CONV.policy_for(_scope(tier="personal"))
+    assert (policy.tier, policy.clean_rounds, policy.max_rounds, policy.unavailable_budget) == ("personal", 1, 3, 3)
 
 
-@pytest.mark.parametrize("field", ["tier", "effective_tier"])
-def test_unknown_tier_fails_closed(field):
-    values = {field: "unknown"}
-    if field == "effective_tier":
-        values["tier"] = "personal"
+def test_policy_for_internal_tier():
+    policy = CONV.policy_for(_scope(tier="internal"))
+    assert (policy.tier, policy.clean_rounds, policy.max_rounds, policy.unavailable_budget) == ("internal", 2, 5, 5)
+
+
+def test_policy_for_saas_tier():
+    policy = CONV.policy_for(_scope(tier="saas"))
+    assert (policy.tier, policy.clean_rounds, policy.max_rounds, policy.unavailable_budget) == ("saas", 2, 8, 8)
+
+
+def test_unknown_tier_fails_closed():
     with pytest.raises(CONV.ScopeValidationError):
-        CONV.validate_scope(replace(SCOPE, **values))
+        CONV.validate_scope(replace(SCOPE, tier="unknown"))
 
 
 def test_invalid_policy_cap_fails_closed():
