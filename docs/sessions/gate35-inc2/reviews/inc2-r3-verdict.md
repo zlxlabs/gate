@@ -48,3 +48,104 @@ FAIL
 - `e06e868:AGENTS.md:1-9` 声明 `risk-tier: personal`、唯一威胁模型和仅人工控制入口；设计文档“增量 2”在 `docs/design/clean-streak-convergence.md:199-234` 明确删除 issuer/evidence/nonce/revocation/expiry/完整 scope 机制，只保留 `head_sha + audit_digest + epoch + finding_id`，与当前 `.github/actions/gate-aggregator/convergence.py:28,410-457` 及 workflow `:3-10` 对齐。
 - 但同一设计文档 `:94,131-139,147,156,302` 仍要求 accepted/wont-fix/fixed、protected issuer、evidence ref/manifest、expiry、nonce、revocation、receipt digest 等已删除机制，并继续引用已删除的生命周期/撤销测试。该矛盾不会直接改变当前代码结果，但会把下一轮实现和验收重新导向已裁决的过度设计。
 
+## B. personal 档最小充分性
+
+### B-1. 四种绑定变化是否分别使豁免失效
+
+结论：四种变化均失效，没有发现会让 clean streak 虚假的漏绑。
+
+只读探针以当前 Scope、一个 `false-positive` receipt 和一个 P1 finding 为基线，输出如下：
+
+```text
+head   False False False epoch_mismatch_stale
+audit  False False False audit_digest_mismatch
+epoch  False False False epoch_mismatch_stale
+finding False False False finding_not_current_p1
+```
+
+- 换 head：当前 Scope 的 epoch 先在 `.github/actions/gate-aggregator/convergence.py:446-450` 重算并与 receipt 比较，因此换 head 返回 `epoch_mismatch_stale`；即使同步替换 primary head，也不会消费旧 receipt。
+- 换 audit：`.github/actions/gate-aggregator/convergence.py:451-452` 检查 audit digest 格式及精确相等，返回 `audit_digest_mismatch`。
+- 换 epoch：`.github/actions/gate-aggregator/convergence.py:446-448` 直接拒绝 receipt epoch 与当前 Scope 派生值不一致的输入，返回 `epoch_mismatch_stale`。
+- 换 finding：`.github/actions/gate-aggregator/convergence.py:453-456` 拒绝 wildcard/category target，并要求 finding id 仍在当前 `primary.p1_ids` 中，返回 `finding_not_current_p1`。
+
+四种情况均在 `validate_disposition_receipt` 层变成不可消费；`consume_dispositions` 只有在 `.github/actions/gate-aggregator/convergence.py:532-536` 成功移除当前 exact finding 后才会影响 streak。
+
+### B-2. agent 能否在 CI 中触发签发
+
+结论：目标 workflow 的唯一触发器是人工 `workflow_dispatch`，没有 `push`、`pull_request`、`schedule` 或其他自动触发路径。
+
+- `.github/workflows/gate-v2-disposition.yml:3-10` 只有 `workflow_dispatch` 及五个手工输入；YAML 解析的触发器键为 `{'workflow_dispatch': ...}`。
+- 签发脚本只在 `.github/workflows/gate-v2-disposition.yml:127-146` 的 control job 中被调用；没有自动 job 或 CI caller。
+- 这满足当前 `AGENTS.md` 和设计文档增量 2 `docs/design/clean-streak-convergence.md:225-228` 的 personal 威胁模型。真实 aggregator 下载 receipt、Required Check 消费和 control workflow canary 不属于本轮，见越界意见。
+
+### B-3. 是否还残留只为不存在对手服务的机制
+
+结论：receipt 的九个保留字段都服务于当前轮正确性或可读性，没有发现必须为多人威胁模型保留的 receipt 字段或校验。
+
+- `repository_id`、`pr_number`、`head_sha`、`epoch`、`audit_digest`、`finding_id` 是当前 PR/轮次/exact finding 的正确性绑定；`schema_version` 和唯一 `false-positive` 是协议形状；`reason` 是三个月后可读的人工理由（`.github/actions/gate-aggregator/convergence.py:161-186`）。
+- workflow 中仍有 `primary_run_id` / `primary_run_attempt`（`.github/workflows/gate-v2-disposition.yml:7-8`），它们用于人工指定并重新下载当前 canonical audit（`:37-61`），不是 issuer/多人字段，也不能从 receipt 消费侧绕过四项绑定。
+- `.github/workflows/gate-v2-disposition.yml:17-19` 的 PR 级 `concurrency` 与 `:22-27` 的 `gate-disposition` environment 声明是个人档下不参与 correctness 的遗留运维钩子；当前没有 required reviewer 配置，代码也不读取 issuer 审批。列为 P3 backlog，不作为 P1/P2 finding，不要求恢复任何已删除安全机制。
+
+### B-4. 序列化、reducer 与字段缺失是否会崩溃
+
+结论：当前已通电的调用点没有发现 `AttributeError` / `KeyError` / `TypeError` 崩溃路径；异常 receipt 会 fail-closed。
+
+- `DispositionReceipt.as_dict()`、`Scope.as_dict()`、`CanonicalPrimary.as_dict()` 和 `ConvergenceState.as_dict()` 的字段均在 `.github/actions/gate-aggregator/convergence.py:74-89,148-158,175-186,321-332` 明确列出。只读探针对四类对象执行 `json.dumps(obj.as_dict())` 均成功，长度分别为 `588/184/352/396`。
+- `validate_disposition_receipt` 在 `.github/actions/gate-aggregator/convergence.py:419-432` 先检查 receipt/primary 类型，再读取字段；`consume_dispositions` 对非 `DispositionReceipt` 在 `:512-518` 生成 typed rejection，不直接访问畸形对象属性。
+- producer 的 JSON 外壳 `kind` 由 `.github/actions/gate-disposition/issue_receipt.py:156-168` 添加；当前 subprocess fixture 在 `tests/test_gate_convergence_artifact.py:145-160` 明确筛选 dataclass 字段后重建 receipt。artifact 下载/解析 adapter 尚未通电，如何剥离 `kind` 属增量 3 前置项，不在本轮判定为 finding。
+
+## Findings
+
+### F-1 — P2：裁减后的唯一枚举与既有测试断言冲突
+
+- 严重级别：P2（personal；阻断测试契约，但不是数据丢失、静默出错或崩溃）。
+- 文件：`tests/test_gate_convergence.py:200-208`；实现依据 `.github/actions/gate-aggregator/convergence.py:28,435-436,477-485,538-541`。
+- 违反 spec：设计文档增量 2 的 receipt 形状与唯一准入约束 `docs/design/clean-streak-convergence.md:220-228`，以及 `AGENTS.md` 的 personal 风险裁决；`DISPOSITION_KINDS` 只允许 `false-positive`。
+- 具体失败场景（已实测）：目标测试 helper 构造 `DispositionReceipt(disposition="accepted")`，然后 `evaluate_round`。当前实现返回 `fail_closed`、`clean_streak=0`、`eligible_rounds=0`、`reason="invalid disposition: unknown_disposition"`；但该测试仍断言 `collecting` 且 `eligible_rounds=1`。也就是说目标 SHA 中这条既有测试的语义没有随 `accepted/wont-fix/fixed` 删除而更新，任务卡给出的“573 passed”与此测试行为不一致。
+- 建议修法：只修测试契约，将该 case 改为构造 malformed/unknown current-target receipt 并断言 fail-closed；不要把 `accepted` 加回实现，也不要把 unknown disposition 变成普通 blocked 后继续计数。
+
+### F-2 — P2：设计文档总览仍要求已裁决删除的多人机制
+
+- 严重级别：P2（personal；文档契约矛盾，不直接改变当前 gate 结果）。
+- 文件：`docs/design/clean-streak-convergence.md:94,131-139,147,156,302`；已改写的裁决在同文件 `:199-234`。
+- 违反 spec：同一设计文档增量 2 的范围裁决（`:201-208`）和最小 receipt/准入契约（`:214-228`）。
+- 具体失败场景：下一轮实现者按 §1.5 `INV-C3`、§2.3 生命周期表或 §2.5 介质表实现/验收时，会重新要求 expiry、evidence manifest、issuer provenance、nonce、revocation、receipt digest 及 `accepted/wont-fix/fixed`；但当前实现只生成九字段 receipt（`.github/actions/gate-disposition/issue_receipt.py:131-142`），且 workflow/测试已删除这些输入。文档还引用 `test_disposition_lifecycle_invalidates_on_head_digest_expiry_and_revocation` 等目标 SHA 中不存在的测试名，导致“代码绿、设计验收红”或反向加回过度设计。
+- 建议修法：仅同步文档：删除/改写旧总不变式、五轴 disposition 表、介质表和最终判据中的多人机制描述，统一写成 personal 的 `workflow_dispatch` + `head_sha/audit_digest/epoch/finding_id`；不新增任何安全机制。
+
+## Backlog
+
+### 存量
+
+- 本轮不审 `.github/actions/gate-aggregator/aggregate.py` 的真实 disposition 消费；当前调用仍是 `waiver_receipts=()`，属于增量 3 接线前置项。
+- workflow artifact 的真实下载、receipt `kind` 外壳剥离、原始字节/artifact id 的解析契约和跨进程 reducer 消费尚未通电；保留为增量 3，不把未通电路径倒灌为本轮 finding。
+- 真实 `gate/gate` Required Check 是否因 disposition 变绿、`ConvergenceState` 外部 replay、control workflow dispatch/canary 均待增量 3 实证。
+
+### 增量 3 前置项
+
+- aggregator 必须从 artifact 下载 receipt 并将九字段映射为 `DispositionReceipt`，保留 `kind` 只作外壳元数据；下载失败、JSON 形状错误或历史不完整必须 fail-closed/manual，不能默认为无 receipt 后 clean。
+- 需要真实验证 current head/audit/epoch/finding 的 receipt 消费，以及缺 receipt、旧 epoch、错误 digest、未知 finding 的 gate 终态；纯函数探针不替代 canary。
+- 需要保留 producer 实际 artifact 名、原始 audit bytes digest 和 control run 元数据的跨进程契约产物；本轮只确认 producer 写入契约，未确认真实下载链路。
+
+## 越界意见
+
+本轮没有把以下事项列为 finding：aggregator 从 artifact 下载 disposition receipt 并交给 reducer；真实 `gate/gate` 因 disposition 变绿；`ConvergenceState` 外部重放；control workflow 的真实 dispatch/canary。它们是设计文档 `docs/design/clean-streak-convergence.md:236-285` 明确归属的增量 3。也没有因个人档缺少 issuer/evidence/nonce/expiry/revocation/完整 scope 字段而要求加回；这些是 owner 已裁决删除的多人安全机制。
+
+## 与前两轮的关系
+
+前两轮共 5 个 P1、2 个 P2；本轮不重报其旧失败场景，裁决如下：
+
+| 前两轮 finding | 本轮裁决 | 依据 |
+|---|---|---|
+| R1-P1：canonical audit artifact 名称错误 | 已修 | 当前 `.github/workflows/gate-v2-disposition.yml:53-56` 按 `repository_id/head/run_id/run_attempt` 构造完整名称，并在 `:55-61` 校验下载内容的 run/attempt/head/PR。 |
+| R1-P1：盲读 audit `.epoch` 导致 receipt 不可消费 | 已修 | 当前 `.github/workflows/gate-v2-disposition.yml:69-125` 从 PR 与 audit scope 构造 `Scope`，调用 `validate_scope`/`derive_epoch`；producer `.github/actions/gate-disposition/issue_receipt.py:88-104,122-140` 只接收完整 scope。 |
+| R1-P1：evidence ref 未读取/验证 | 已随裁减消失 | evidence manifest/ref 及其校验已按 personal 裁决删除；本轮不以“应恢复 evidence”作为意见。 |
+| R1-P2：receipt digest 不承载完整 scope | 已随裁减消失（正确性目标仍由 epoch 保留） | 直接 scope/digest 字段按裁决删除；`.github/actions/gate-aggregator/convergence.py:446-450,603-607` 仍用完整 Scope 派生 epoch 并拒绝旧 epoch。 |
+| R1-P2：approval ref / issuer provenance 可伪造 | 已随裁减消失 | `AGENTS.md` 与设计文档增量 2 规定单一人类 owner、仅 workflow dispatch；issuer provenance 是多人协作重开条件，不属于 personal P1。 |
+| R2-P1：环境无 required reviewer，普通 write 用户可签发 | 已随裁减消失 | personal 威胁模型不包含第二个人类 write 用户；当前准入只需人工 `workflow_dispatch`，不重新要求环境审批或 issuer 字段。 |
+| R2-P1：任意 Actions run/artifact 可伪造 canonical audit provenance | 已随裁减消失 | run provenance 校验被明确列为多人协作重开条件；本轮只审 personal 的 manual dispatch 入口，不把该越权模型升级为 P1。 |
+
+## 评审边界与命令记录
+
+- 未运行测试套件，符合任务卡要求；只运行了冻结 SHA 的 `git show`/`git diff`、`git grep`、YAML 解析和 Python 临时探针。
+- 四项绑定探针输出见 B-1；序列化探针输出见 B-4；`accepted` stale-test 探针输出见 F-1。
+- OCR 前置扫描命令为 `ocr-review --repo <repo> --from 1d6a2f05b756052e77c155cf1f9db8fb156cefde --to e06e868 --audience agent --concurrency 4 --background-file /tmp/gate35-inc2-r3-ocr-bg.md`；约三分钟无最终 envelope，发送中断后进程以 `exit_code=130` 结束，stderr 显示本地 verify funnel 在等待子进程时被 `KeyboardInterrupt`，故不视为已审过。
