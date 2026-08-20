@@ -14,6 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 AGGREGATE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+DISPOSITION_PRODUCER = ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py"
 
 
 def _aggregate():
@@ -119,6 +120,76 @@ def test_audit_digest_is_raw_bytes_digest():
     raw = b'{"z":1,"a":2}\n'
     parsed = json.loads(raw)
     assert hashlib.sha256(raw).hexdigest() != hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def test_disposition_producer_writes_bound_receipt_bytes_from_raw_audit(tmp_path):
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
+        "diff_digest": SCOPE.diff_digest, "run_id": 77, "run_attempt": 1,
+        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+    }
+    audit_bytes = json.dumps(audit, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+    audit_path = tmp_path / "canonical-audit.json"
+    audit_path.write_bytes(audit_bytes)
+    output_dir = tmp_path / "artifacts"
+    epoch = CONV.derive_epoch(SCOPE)
+    digest = hashlib.sha256(audit_bytes).hexdigest()
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue",
+        "--output-dir", str(output_dir), "--audit-path", str(audit_path),
+        "--repository-id", "123", "--pr-number", "42", "--epoch", epoch,
+        "--head-sha", SCOPE.head_sha, "--diff-digest", SCOPE.diff_digest,
+        "--primary-run-id", "77", "--primary-run-attempt", "1", "--audit-digest", digest,
+        "--finding-id", "p1", "--issuer-login", "maintainer", "--issuer-user-id", "9001",
+        "--control-run-id", "control-77", "--approval-ref", "approval-77",
+        "--issued-at", "2026-08-20T08:00:00Z", "--expires-at", "2099-08-20T08:00:00Z",
+        "--nonce", "nonce-77", "--reason", "locked upstream behavior",
+        "--evidence-ref", "git:repo/blob/commit#test", "--evidence-ref", "artifact:probe-77",
+    ]
+    producer_env = {"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-77", "GITHUB_ACTOR": "maintainer"}
+    first = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
+    assert first.args == argv
+    result = json.loads(first.stdout)
+    artifact_path = Path(result["path"])
+    payload_bytes = artifact_path.read_bytes()
+    payload = json.loads(payload_bytes)
+    assert result["artifact"] == f"gate-disposition-receipt-v1-{epoch}-{digest[:12]}-nonce-77"
+    assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert payload["kind"] == "gate-disposition-receipt-v1"
+    assert payload["audit_digest"] == digest
+    assert payload["finding_id"] == "p1"
+    assert payload["evidence_refs"] == ["git:repo/blob/commit#test", "artifact:probe-77"]
+    receipt = CONV.DispositionReceipt(**{
+        field: payload[field]
+        for field in CONV.DispositionReceipt.__dataclass_fields__
+        if field in payload
+    })
+    assert payload["receipt_digest"] == CONV.disposition_receipt_digest(receipt)
+    second = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
+    assert json.loads(second.stdout)["written"] is False
+    assert artifact_path.read_bytes() == payload_bytes
+
+
+def test_disposition_revocation_producer_is_append_only(tmp_path):
+    epoch = CONV.derive_epoch(SCOPE)
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "revoke",
+        "--output-dir", str(tmp_path), "--epoch", epoch, "--nonce", "nonce-77",
+        "--reason", "evidence withdrawn", "--actor", "maintainer",
+        "--revoked-at", "2026-08-20T09:00:00Z", "--evidence-ref", "artifact:withdrawal-1",
+    ]
+    first = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    artifact_path = Path(json.loads(first.stdout)["path"])
+    original = artifact_path.read_bytes()
+    second = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert json.loads(second.stdout)["written"] is False
+    assert artifact_path.read_bytes() == original
+    conflict = argv.copy()
+    conflict[conflict.index("evidence withdrawn")] = "different reason"
+    failed = subprocess.run(conflict, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert failed.returncode != 0
+    assert artifact_path.read_bytes() == original
 
 
 def test_aggregate_envelope_preserves_scope_attempt_artifact_and_raw_digest():
