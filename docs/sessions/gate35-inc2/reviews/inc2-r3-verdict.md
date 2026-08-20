@@ -2,8 +2,8 @@ FAIL
 
 审查对象：`1d6a2f05b756052e77c155cf1f9db8fb156cefde..e06e868`；减法增量：`ff796e400fae82acb5c5db1967e110012bbb1f28..e06e868`
 
-审查时间：2026-08-20（Asia/Shanghai）  
-执行器与模型：Codex / GPT-5（`delegate --class big`，dispatch `dlg-20260820-120152-8d269d`）  
+审查时间：2026-08-20（Asia/Shanghai）
+执行器与模型：Codex / GPT-5（`delegate --class big`，dispatch `dlg-20260820-120152-8d269d`）
 采用风险等级：`personal`。本仓唯一威胁模型是 agent 不应能给自己开绿灯；P1 只按数据丢失、静默出错、崩溃定级。
 
 本轮新证据：对冻结 SHA 中的删除后调用方、生产者参数、测试实际改动和设计文档全文做了独立核对；用只读 Python 探针验证四种 disposition 绑定变化；用 YAML 解析确认 disposition workflow 只有 `workflow_dispatch`。`ocr-review` 已启动但约三分钟未返回最终 envelope，停止时记录为未完成/不可判定，未当作“扫过且干净”。本卡未运行测试套件。
