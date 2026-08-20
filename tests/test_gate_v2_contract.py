@@ -322,9 +322,15 @@ def test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggre
     set_plus_index = run.index("set +e")
     rc_index = run.index("rc=$?", python_index)
     set_minus_index = run.index("set -e", rc_index)
+    condition = 'if [ -f "$CONVERGENCE_RECEIPT_PATH" ]; then'
+    condition_index = run.index(condition, set_minus_index)
     output_index = run.index('echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"')
+    else_index = run.index("else", condition_index)
+    absent_index = run.index('echo "convergence-receipt=absent" >> "$GITHUB_OUTPUT"', else_index)
+    fi_index = run.index("fi", absent_index)
     exit_index = run.index('exit "$rc"')
-    assert set_plus_index < python_index < rc_index < set_minus_index < output_index < exit_index
+    assert set_plus_index < python_index < rc_index < set_minus_index < condition_index
+    assert condition_index < output_index < else_index < absent_index < fi_index < exit_index
     assert "|| true" not in run
     assert "continue-on-error" not in aggregate
 
