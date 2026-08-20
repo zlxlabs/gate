@@ -8,9 +8,9 @@ FAIL
 - H0：`e9fed77adf1e0f9cb61221adef8f05544b8b4c02`
 - H1：`ff796e400fae82acb5c5db1967e110012bbb1f28`
 
-审查时间：2026-08-20（Asia/Shanghai）  
-执行器与模型：Codex / GPT-5（`delegate --class big`）  
-风险等级：仓库未声明 `risk-tier`，按 internal；本 diff 属 infra/状态机类，按 saas 档收敛。  
+审查时间：2026-08-20（Asia/Shanghai）
+执行器与模型：Codex / GPT-5（`delegate --class big`）
+风险等级：仓库未声明 `risk-tier`，按 internal；本 diff 属 infra/状态机类，按 saas 档收敛。
 本轮新证据：GitHub API 实测 `gh api repos/zlxlabs/gate/environments` 返回环境总数 0、名称为空；H1 producer/consumer 跨进程探针实测普通 `ordinary-write` actor 可写出 receipt，consumer 返回 `active_false_positive`；同 receipt 重放、换 primary run、撤销及 2099 远期过期时间均按代码结果验证。OCR 前置扫描运行约 190 秒后无 envelope，手动中止并按 timeout/skipped 记录，未把它当作已审过。
 
 ## A. 修复增量审四问（H0..H1）
