@@ -109,6 +109,49 @@ def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="1", verdict="pass"
     return receipt
 
 
+def test_receipt_for_round_copies_decision_identity_and_validates():
+    primary = _primary(run_id=11, run_attempt=2, p1_ids=())
+    decision = CONV.evaluate_round(
+        state=CONV.initial_state(SCOPE),
+        scope=SCOPE,
+        primary=primary,
+        audit_digest="a" * 64,
+        waiver_receipts=(),
+        processing_key=_key(run_id=11, run_attempt=2),
+    )
+    receipt = CONV.receipt_for_round(
+        scope=SCOPE,
+        primary=primary,
+        audit_digest="a" * 64,
+        decision=decision,
+        source_attempt=1,
+        artifact_id="artifact-123",
+    )
+
+    CONV.validate_receipt(receipt, SCOPE)
+    assert receipt.event_id == decision.event_id
+    assert receipt.processing_key == decision.processing_key
+    assert receipt.round_key == decision.round_key
+    assert receipt.schema_version == CONV.RECEIPT_SCHEMA_VERSION
+    assert receipt.receipt_kind == CONV.RECEIPT_KIND
+    assert receipt.source_attempt == 1
+    assert receipt.artifact_id == "artifact-123"
+
+
+def test_receipt_for_round_supplies_valid_default_artifact_metadata():
+    primary = _primary(run_id=12, run_attempt=1)
+    decision = _round(CONV.initial_state(SCOPE), run_id=12)
+    receipt = CONV.receipt_for_round(
+        scope=SCOPE,
+        primary=primary,
+        audit_digest="1" * 64,
+        decision=decision,
+    )
+
+    CONV.validate_receipt(receipt, SCOPE)
+    assert receipt.artifact_name == "canonical-primary"
+
+
 def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
     primary = primary or _primary(scope, run_id=7, run_attempt=2, p1_ids=("p1",))
     audit_digest = audit_digest or "a" * 64

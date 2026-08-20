@@ -1235,6 +1235,47 @@ def evaluate_round(
     )
 
 
+def receipt_for_round(
+    *,
+    scope: Scope,
+    primary: CanonicalPrimary,
+    audit_digest: str,
+    decision: RoundDecision,
+    source_attempt: int | None = None,
+    artifact_id: str | None = None,
+    artifact_name: str | None = None,
+) -> Receipt:
+    """Build the immutable replay receipt for exactly one round.
+
+    The evaluator is the sole owner of round identity.  In particular, the
+    three idempotency guards are copied verbatim from ``decision`` rather than
+    re-derived here; a producer and a future replay consumer must observe the
+    same keys even if their surrounding metadata differs.
+    """
+    if artifact_id is None and artifact_name is None:
+        artifact_name = "canonical-primary"
+    return Receipt(
+        schema_version=RECEIPT_SCHEMA_VERSION,
+        scope=scope,
+        epoch=decision.state.epoch,
+        processing_key=decision.processing_key,
+        round_key=decision.round_key,
+        event_id=decision.event_id,
+        run_id=primary.run_id,
+        run_attempt=primary.run_attempt,
+        audit_digest=audit_digest,
+        verdict=primary.verdict,
+        p1_ids=primary.p1_ids,
+        source_attempt=primary.run_attempt if source_attempt is None else source_attempt,
+        artifact_id=artifact_id,
+        artifact_name=artifact_name,
+        receipt_kind=RECEIPT_KIND,
+        reported_decision=decision.decision,
+        reported_clean_streak=decision.clean_streak,
+        reported_eligible_rounds=decision.eligible_rounds,
+    )
+
+
 def _receipt_round_fingerprint(receipt: Receipt) -> str:
     return _sha256(
         {
