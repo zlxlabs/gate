@@ -6,7 +6,10 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -189,3 +192,22 @@ def test_replay_uses_receipt_bytes_not_reported_counters():
     receipt = CONV.Receipt(**{**receipt.__dict__, "reported_clean_streak": 999, "reported_eligible_rounds": 999})
     state = CONV.replay_receipts(scope=SCOPE, receipts=[receipt])
     assert (state.clean_streak, state.eligible_rounds) == (1, 1)
+
+
+def test_scope_change_excludes_old_epoch_receipts_from_replay():
+    changed = _scope(head_sha="n" * 40)
+    old = _receipt(SCOPE, run_id=7, digest="7")
+    current = _receipt(changed, run_id=8, digest="8")
+    state = CONV.replay_receipts(scope=changed, receipts=[old, current])
+    assert state.epoch == CONV.derive_epoch(changed)
+    assert (state.clean_streak, state.eligible_rounds) == (1, 1)
+
+
+def test_receipt_source_attempt_artifact_and_epoch_guards_fail_closed_together():
+    receipt = _receipt(run_id=9, digest="9", source_attempt=1)
+    with pytest.raises(CONV.ReceiptValidationError):
+        CONV.validate_receipt(replace(receipt, source_attempt=2), SCOPE)
+    with pytest.raises(CONV.ReceiptValidationError):
+        CONV.validate_receipt(replace(receipt, artifact_name=receipt.artifact_id, artifact_id="other"), SCOPE)
+    with pytest.raises(CONV.ReceiptValidationError):
+        CONV.validate_receipt(replace(receipt, epoch="0" * 64), SCOPE)
