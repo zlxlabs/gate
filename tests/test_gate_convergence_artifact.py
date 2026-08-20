@@ -158,7 +158,7 @@ def test_disposition_producer_writes_bound_receipt_bytes_from_raw_audit(tmp_path
         "--primary-run-id", "77", "--primary-run-attempt", "1", "--audit-digest", digest,
         "--finding-id", "p1", "--issuer-login", "maintainer", "--issuer-user-id", "9001",
         "--pr-author-login", "author",
-        "--control-run-id", "control-77", "--approval-ref", "approval-77",
+        "--control-run-id", "control-77", "--approval-ref", "issuer-not-pr-author:author",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
         "--evidence-manifest-path", str(manifest_path),
         "--issued-at", "2026-08-20T08:00:00Z", "--expires-at", "2099-08-20T08:00:00Z",
@@ -193,6 +193,11 @@ def test_disposition_producer_writes_bound_receipt_bytes_from_raw_audit(tmp_path
     wrong = subprocess.run(wrong_digest, capture_output=True, text=True, env=producer_env)
     assert wrong.returncode == 1
     assert "dispatch audit_digest does not match raw audit bytes" in wrong.stderr
+    self_issue = argv.copy()
+    self_issue[self_issue.index("maintainer")] = "author"
+    self_failed = subprocess.run(self_issue, capture_output=True, text=True, env=producer_env)
+    assert self_failed.returncode == 1
+    assert "issuer must differ from PR author" in self_failed.stderr
 
 
 def test_disposition_producer_rejects_unverifiable_evidence_ref(tmp_path):
@@ -218,7 +223,7 @@ def test_disposition_producer_rejects_unverifiable_evidence_ref(tmp_path):
         "--head-sha", SCOPE.head_sha, "--diff-digest", SCOPE.diff_digest,
         "--primary-run-id", "77", "--primary-run-attempt", "1", "--audit-digest", digest,
         "--finding-id", "p1", "--issuer-login", "maintainer", "--issuer-user-id", "9001",
-        "--pr-author-login", "author", "--control-run-id", "control-77", "--approval-ref", "approval-77",
+        "--pr-author-login", "author", "--control-run-id", "control-77", "--approval-ref", "issuer-not-pr-author:author",
         "--issued-at", "2026-08-20T08:00:00Z", "--expires-at", "2099-08-20T08:00:00Z",
         "--nonce", "nonce-invalid", "--reason", "reason", "--evidence-ref", "not-an-immutable-reference",
         "--evidence-manifest-path", str(manifest_path),
@@ -245,7 +250,8 @@ def test_disposition_revocation_producer_is_append_only(tmp_path):
     conflict = argv.copy()
     conflict[conflict.index("evidence withdrawn")] = "different reason"
     failed = subprocess.run(conflict, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-    assert failed.returncode != 0
+    assert failed.returncode == 1
+    assert "immutable artifact conflict" in failed.stderr
     assert artifact_path.read_bytes() == original
 
 

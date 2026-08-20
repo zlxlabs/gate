@@ -218,7 +218,6 @@ jobs:
           DISPOSITION_KIND: ${{ inputs.disposition }}
           DISPOSITION_REASON: ${{ inputs.reason }}
           DISPOSITION_EVIDENCE_REFS: ${{ inputs.evidence_refs }}
-          DISPOSITION_APPROVAL_REF: ${{ inputs.approval_ref }}
           DISPOSITION_NONCE: ${{ inputs.nonce }}
           DISPOSITION_EXPIRES_AT: ${{ inputs.expires_at }}
           GITHUB_ACTOR_ID: ${{ github.actor_id }}
@@ -243,7 +242,7 @@ jobs:
               --disposition "$DISPOSITION_KIND" --issuer-login "$GITHUB_ACTOR" \
               --issuer-user-id "$GITHUB_ACTOR_ID" --control-run-id "$GITHUB_RUN_ID" \
               --pr-author-login "$CURRENT_PR_AUTHOR" \
-              --approval-ref "protected-environment:gate-disposition;issuer-not-author:$CURRENT_PR_AUTHOR" \
+              --approval-ref "issuer-not-pr-author:$CURRENT_PR_AUTHOR" \
               --scope-json "$CURRENT_SCOPE_JSON" --issued-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               --expires-at "$DISPOSITION_EXPIRES_AT" --nonce "$DISPOSITION_NONCE" \
               --reason "$DISPOSITION_REASON" --evidence-ref "$DISPOSITION_EVIDENCE_REFS" \

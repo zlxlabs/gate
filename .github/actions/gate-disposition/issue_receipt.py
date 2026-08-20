@@ -206,6 +206,9 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> tuple
         raise ValueError("issuer must differ from PR author; protected approver was not available")
     control_run_id = str(_required(args, envelope, "control_run_id", "GITHUB_RUN_ID"))
     approval_ref = str(_required(args, envelope, "approval_ref", "DISPOSITION_APPROVAL_REF"))
+    expected_approval_ref = f"issuer-not-pr-author:{pr_author_login}"
+    if approval_ref != expected_approval_ref:
+        raise ValueError("approval_ref must record the enforced issuer-not-pr-author provenance")
     issued_at = str(_required(args, envelope, "issued_at", "DISPOSITION_ISSUED_AT"))
     expires_at = str(_required(args, envelope, "expires_at", "DISPOSITION_EXPIRES_AT"))
     nonce = _safe_component(str(_required(args, envelope, "nonce", "DISPOSITION_NONCE")), "nonce")
