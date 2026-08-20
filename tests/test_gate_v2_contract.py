@@ -41,6 +41,11 @@ PANEL_DELIVERY_NAME_EXPR = (
     "gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
 )
+CONVERGENCE_RECEIPT_NAME_EXPR = (
+    "gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+    "-${{ github.run_id }}-${{ github.run_attempt }}"
+)
+CONVERGENCE_RECEIPT_PATH = "${{ runner.temp }}/convergence-receipt"
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -273,6 +278,37 @@ def test_gate_status_panel_publish_happens_after_terminal_upload():
     publish = steps[publish_index]
     assert "steps.upload-gate-terminal.outcome == 'success'" in str(publish.get("if"))
     assert "--publish-only" in publish["run"]
+
+
+def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    aggregate_index = names.index("Aggregate required verdict")
+    receipt_index = names.index("Upload convergence receipt")
+    terminal_index = names.index("Upload gate terminal envelope")
+    panel_index = names.index("Publish gate status panel")
+    assert aggregate_index < receipt_index < terminal_index < panel_index
+
+    aggregate = steps[aggregate_index]
+    assert aggregate["id"] == "aggregate-required-verdict"
+    assert "--convergence-receipt-path \"$CONVERGENCE_RECEIPT_PATH\"" in aggregate["run"]
+    assert 'echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"' in aggregate["run"]
+    assert aggregate["env"]["CONVERGENCE_RECEIPT_PATH"] == (
+        "${{ runner.temp }}/convergence-receipt/convergence-receipt.json"
+    )
+
+    upload = steps[receipt_index]
+    assert upload["if"] == "steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
+    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
+    assert "always()" not in str(upload["if"])
+    assert "continue-on-error" not in upload
+    assert upload["with"] == {
+        "name": CONVERGENCE_RECEIPT_NAME_EXPR,
+        "path": CONVERGENCE_RECEIPT_PATH,
+        "if-no-files-found": "error",
+        "retention-days": 30,
+    }
 
 
 # ── gate aggregator job: required-check identity + always() ─────────────────

@@ -901,6 +901,7 @@ jobs:
           path: ${{ runner.temp }}/primary-audit
 
       - name: Aggregate required verdict
+        id: aggregate-required-verdict
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           PRIMARY_RESULT: ${{ needs.primary.result }}
@@ -923,6 +924,7 @@ jobs:
           AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
           AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
+          CONVERGENCE_RECEIPT_PATH: ${{ runner.temp }}/convergence-receipt/convergence-receipt.json
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
@@ -941,7 +943,22 @@ jobs:
             --audit-artifact-name "$AUDIT_ARTIFACT_NAME" \
             --audit-dir "${{ runner.temp }}/primary-audit" \
             --summary-path "$GITHUB_STEP_SUMMARY" \
-            --terminal-path "$TERMINAL_PATH"
+            --terminal-path "$TERMINAL_PATH" \
+            --convergence-receipt-path "$CONVERGENCE_RECEIPT_PATH"
+          if [ -f "$CONVERGENCE_RECEIPT_PATH" ]; then
+            echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"
+          else
+            echo "convergence-receipt=absent" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload convergence receipt
+        if: steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/convergence-receipt
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload gate terminal envelope
         if: always()
