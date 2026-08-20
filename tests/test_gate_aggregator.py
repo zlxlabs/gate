@@ -558,7 +558,7 @@ def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):
     assert receipt_path.read_bytes() == json.dumps(
         payload, sort_keys=True, separators=(",", ":")
     ).encode()
-    assert "Convergence receipt: produced" in summary_path.read_text()
+    assert "Convergence receipt: produced (`convergence-receipt.json`).\n" in summary_path.read_text()
 
 
 def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path):

@@ -395,10 +395,13 @@ _CONVERGENCE_SCOPE_FIELDS = (
 
 def _convergence_scope_from_audit(
     audit: Any, identity: Identity,
-) -> Optional[Any]:
+) -> tuple[Optional[Any], tuple[str, ...]]:
     """Project the complete immutable Scope carried by a canonical audit."""
-    if not isinstance(audit, dict) or any(field not in audit for field in _CONVERGENCE_SCOPE_FIELDS):
-        return None
+    if not isinstance(audit, dict):
+        return None, ()
+    missing_fields = tuple(sorted(field for field in _CONVERGENCE_SCOPE_FIELDS if field not in audit))
+    if missing_fields:
+        return None, missing_fields
     return _CONVERGENCE.Scope(
         repository_id=identity.repository_id,
         pr_number=identity.pr,
@@ -413,7 +416,7 @@ def _convergence_scope_from_audit(
         infra_diff=audit["infra_diff"],
         caller_sha=audit["caller_sha"],
         reusable_workflow_sha=audit["reusable_workflow_sha"],
-    )
+    ), ()
 
 
 def build_convergence_envelope(
@@ -1795,6 +1798,7 @@ def _finish(
     review_expected: Optional[bool] = None, is_draft: Optional[bool] = None, runner: Optional[str] = None,
     pr_number: Optional[int] = None, panel_delivery_path: Optional[str] = None,
     convergence_receipt_path: Optional[str] = None,
+    convergence_missing_scope_fields: tuple[str, ...] = (),
 ) -> int:
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
@@ -1804,6 +1808,12 @@ def _finish(
         if outcome.convergence_receipt is not None:
             _write_convergence_receipt(convergence_receipt_path, outcome.convergence_receipt)
             convergence_note = "\nConvergence receipt: produced (`convergence-receipt.json`).\n"
+        elif convergence_missing_scope_fields:
+            fields = ", ".join(convergence_missing_scope_fields)
+            convergence_note = (
+                "\nConvergence receipt: not produced (reason: canonical primary audit is missing "
+                f"scope field(s): `{fields}`).\n"
+            )
         else:
             reason = outcome.reason_code or outcome.classification or "canonical primary round was unavailable"
             convergence_note = f"\nConvergence receipt: not produced (reason: `{reason}`).\n"
@@ -1942,7 +1952,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     audit, audit_error, audit_bytes = _read_audit_file(args.audit_dir)
-    scope = _convergence_scope_from_audit(audit, identity)
+    scope, missing_scope_fields = _convergence_scope_from_audit(audit, identity)
     audit_digest = hashlib.sha256(audit_bytes).hexdigest() if audit_bytes is not None else None
 
     outcome = evaluate(
@@ -1974,6 +1984,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         pr_number=identity.pr,
         panel_delivery_path=args.panel_delivery_path,
         convergence_receipt_path=args.convergence_receipt_path,
+        convergence_missing_scope_fields=missing_scope_fields,
     )
 
 
