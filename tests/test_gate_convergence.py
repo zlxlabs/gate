@@ -213,6 +213,15 @@ def test_rejected_disposition_cannot_advance_streak():
             result.reason,
         ) == (0, 0, "fail_closed", "invalid disposition: unknown_disposition")
 
+    empty_result = _round(
+        CONV.initial_state(SCOPE),
+        run_id=31,
+        digest="3",
+        p1_ids=("a",),
+        waiver=(CONV.DispositionReceipt(),),
+    )
+    assert empty_result.clean_streak == 0
+
 
 def test_duplicate_disposition_is_idempotent():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
@@ -426,11 +435,6 @@ def test_waiver_and_unavailable_counters_are_independent():
 def test_partial_disposition_stays_blocked():
     result = _round(CONV.initial_state(SCOPE), run_id=30, digest="3", p1_ids=("a", "b"), waiver=(CONV.DispositionReceipt(),))
     assert (result.clean_streak, result.decision) == (0, "collecting")
-
-
-def test_empty_disposition_receipt_cannot_advance_streak():
-    result = _round(CONV.initial_state(SCOPE), run_id=31, digest="3", p1_ids=("a",), waiver=(CONV.DispositionReceipt(),))
-    assert result.clean_streak == 0
 
 
 def test_duplicate_unavailable_receipt_is_idempotent():
