@@ -87,6 +87,25 @@ def _valid_primary_record(**overrides):
     return record
 
 
+def _valid_scoped_primary_record(**overrides):
+    record = {
+        **_valid_primary_record(),
+        "base_sha": "b" * 40,
+        "diff_digest": "d" * 64,
+        "policy_version": "policy-v1",
+        "policy_digest": "p" * 64,
+        "tier": "personal",
+        "effective_tier": "personal",
+        "infra_classifier_version": "infra-v1",
+        "infra_diff": False,
+        "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "w" * 40,
+        "result": {"findings": []},
+    }
+    record.update(overrides)
+    return record
+
+
 def _base_kwargs(**overrides):
     kwargs = dict(
         quality_result="success",
@@ -413,49 +432,56 @@ def test_as_bool_raises_on_anything_else_instead_of_defaulting_to_false(bogus):
         AGG.as_bool(bogus)
 
 
-# ── find_audit_file IO edge cases ────────────────────────────────────────
+# ── _read_audit_file IO edge cases ───────────────────────────────────────
 
-def test_find_audit_file_missing_directory(tmp_path):
-    record, error = AGG.find_audit_file(tmp_path / "does-not-exist")
+def test_read_audit_file_missing_directory(tmp_path):
+    record, error, raw = AGG._read_audit_file(tmp_path / "does-not-exist")
     assert record is None
     assert "not present" in error
+    assert raw is None
 
 
-def test_find_audit_file_empty_directory(tmp_path):
-    record, error = AGG.find_audit_file(tmp_path)
+def test_read_audit_file_empty_directory(tmp_path):
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert record is None
     assert "no *.json" in error
+    assert raw is None
 
 
-def test_find_audit_file_multiple_files(tmp_path):
+def test_read_audit_file_multiple_files(tmp_path):
     (tmp_path / "a.json").write_text("{}")
     (tmp_path / "b.json").write_text("{}")
-    record, error = AGG.find_audit_file(tmp_path)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert record is None
     assert "found 2" in error
+    assert raw is None
 
 
-def test_find_audit_file_invalid_json(tmp_path):
+def test_read_audit_file_invalid_json(tmp_path):
     (tmp_path / "a.json").write_text("{not valid json")
-    record, error = AGG.find_audit_file(tmp_path)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert record is None
     assert "could not parse" in error
+    assert raw is None
 
 
-def test_find_audit_file_valid_json_roundtrips(tmp_path):
+def test_read_audit_file_valid_json_roundtrips(tmp_path):
     payload = _valid_primary_record()
-    (tmp_path / "primary-review-audit.json").write_text(json.dumps(payload))
-    record, error = AGG.find_audit_file(tmp_path)
+    raw_payload = json.dumps(payload).encode()
+    (tmp_path / "primary-review-audit.json").write_bytes(raw_payload)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert error is None
     assert record == payload
+    assert raw == raw_payload
 
 
-def test_find_audit_file_non_dict_json_roundtrips_as_is(tmp_path):
-    # find_audit_file itself doesn't judge shape — that's evaluate()'s job.
+def test_read_audit_file_non_dict_json_roundtrips_as_is(tmp_path):
+    # _read_audit_file itself doesn't judge shape — that's evaluate()'s job.
     (tmp_path / "weird.json").write_text(json.dumps([1, 2, 3]))
-    record, error = AGG.find_audit_file(tmp_path)
+    record, error, raw = AGG._read_audit_file(tmp_path)
     assert error is None
     assert record == [1, 2, 3]
+    assert raw == b"[1, 2, 3]"
 
 
 # ── CLI end-to-end (exit codes + step summary) ───────────────────────────
@@ -495,6 +521,8 @@ def _cli_args(audit_dir, summary_path, **overrides):
         args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
     if values.get("panel_delivery_path") is not None:
         args.extend(["--panel-delivery-path", values["panel_delivery_path"]])
+    if values.get("convergence_receipt_path") is not None:
+        args.extend(["--convergence-receipt-path", values["convergence_receipt_path"]])
     return args
 
 def test_main_exit_code_zero_on_pass(tmp_path):
@@ -505,6 +533,108 @@ def test_main_exit_code_zero_on_pass(tmp_path):
     rc = AGG.main(_cli_args(audit_dir, summary_path))
     assert rc == 0
     assert "pass" in summary_path.read_text() and json.loads(summary_path.with_name("gate-terminal.json").read_text())["kind"] == "gate_terminal"
+
+
+def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    audit = _valid_scoped_primary_record()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    summary_path = tmp_path / "summary.md"
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+
+    rc = AGG.main(
+        _cli_args(
+            audit_dir,
+            summary_path,
+            convergence_receipt_path=str(receipt_path),
+        )
+    )
+
+    assert rc == 0
+    assert receipt_path.is_file()
+    assert list(receipt_path.parent.iterdir()) == [receipt_path]
+    payload = json.loads(receipt_path.read_text())
+    assert receipt_path.read_bytes() == json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    assert "Convergence receipt: produced" in summary_path.read_text()
+
+
+def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path):
+    summary_path = tmp_path / "summary.md"
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+
+    rc = AGG.main(
+        _cli_args(
+            tmp_path / "missing-audit",
+            summary_path,
+            primary_result="skipped",
+            is_draft="true",
+            review_expected="false",
+            convergence_receipt_path=str(receipt_path),
+        )
+    )
+
+    assert rc == 0
+    assert not receipt_path.exists()
+    summary = summary_path.read_text()
+    assert "Convergence receipt: not produced" in summary
+    assert "review_not_expected" in summary
+
+
+def _run_receipt_cli_case(tmp_path, *, audit, primary_result, is_draft="false", review_expected="true"):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    if audit is not None:
+        (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    summary_path = tmp_path / "summary.md"
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+    overrides = {
+        "primary_result": primary_result,
+        "is_draft": is_draft,
+        "review_expected": review_expected,
+        "convergence_receipt_path": str(receipt_path),
+    }
+    return AGG.main(_cli_args(audit_dir, summary_path, **overrides)), receipt_path
+
+
+def test_cli_exit_zero_with_receipt_for_clean_round(tmp_path):
+    audit = _valid_scoped_primary_record()
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
+
+    assert rc == 0
+    assert receipt_path.is_file()
+    assert json.loads(receipt_path.read_text())["clean_streak"] == 1
+
+
+def test_cli_exit_zero_without_receipt_for_expected_skip(tmp_path):
+    rc, receipt_path = _run_receipt_cli_case(
+        tmp_path, audit=None, primary_result="skipped", is_draft="true", review_expected="false",
+    )
+
+    assert rc == 0
+    assert not receipt_path.exists()
+
+
+@pytest.mark.parametrize("verdict", ["fail", "unavailable"])
+def test_cli_exit_nonzero_with_zero_streak_receipt_for_red_or_unavailable_round(tmp_path, verdict):
+    audit = _valid_scoped_primary_record(
+        verdict=verdict,
+        result={"findings": [{"id": "p1", "severity": "major"}]},
+    )
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="failure")
+
+    assert rc != 0
+    assert receipt_path.is_file()
+    assert json.loads(receipt_path.read_text())["clean_streak"] == 0
+
+
+def test_cli_exit_nonzero_without_receipt_for_fail_closed_audit(tmp_path):
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=None, primary_result="failure")
+
+    assert rc != 0
+    assert not receipt_path.exists()
 
 
 def test_main_summary_and_notice_include_cross_attempt_source(capsys, tmp_path):

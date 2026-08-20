@@ -41,6 +41,11 @@ PANEL_DELIVERY_NAME_EXPR = (
     "gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
 )
+CONVERGENCE_RECEIPT_NAME_EXPR = (
+    "gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+    "-${{ github.run_id }}-${{ github.run_attempt }}"
+)
+CONVERGENCE_RECEIPT_PATH = "${{ runner.temp }}/convergence-receipt"
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -273,6 +278,68 @@ def test_gate_status_panel_publish_happens_after_terminal_upload():
     publish = steps[publish_index]
     assert "steps.upload-gate-terminal.outcome == 'success'" in str(publish.get("if"))
     assert "--publish-only" in publish["run"]
+
+
+def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    aggregate_index = names.index("Aggregate required verdict")
+    receipt_index = names.index("Upload convergence receipt")
+    terminal_index = names.index("Upload gate terminal envelope")
+    panel_index = names.index("Publish gate status panel")
+    assert aggregate_index < receipt_index < terminal_index < panel_index
+
+    aggregate = steps[aggregate_index]
+    assert aggregate["id"] == "aggregate-required-verdict"
+    assert "--convergence-receipt-path \"$CONVERGENCE_RECEIPT_PATH\"" in aggregate["run"]
+    assert 'echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"' in aggregate["run"]
+    assert aggregate["env"]["CONVERGENCE_RECEIPT_PATH"] == (
+        "${{ runner.temp }}/convergence-receipt/convergence-receipt.json"
+    )
+
+    upload = steps[receipt_index]
+    assert upload["if"] == "always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
+    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
+    assert "always()" in str(upload["if"])
+    assert "continue-on-error" not in upload
+    assert upload["with"] == {
+        "name": CONVERGENCE_RECEIPT_NAME_EXPR,
+        "path": CONVERGENCE_RECEIPT_PATH,
+        "if-no-files-found": "error",
+        "retention-days": 30,
+    }
+
+
+def test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggregate_rc():
+    raw, _ = _load_workflow()
+    aggregate = next(
+        step for step in raw["jobs"]["gate"]["steps"]
+        if step.get("name") == "Aggregate required verdict"
+    )
+    run = aggregate["run"]
+    python_index = run.index("python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py")
+    set_plus_index = run.index("set +e")
+    rc_index = run.index("rc=$?", python_index)
+    set_minus_index = run.index("set -e", rc_index)
+    condition = 'if [ -f "$CONVERGENCE_RECEIPT_PATH" ]; then'
+    condition_index = run.index(condition, set_minus_index)
+    output_index = run.index('echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"')
+    else_index = run.index("else", condition_index)
+    absent_index = run.index('echo "convergence-receipt=absent" >> "$GITHUB_OUTPUT"', else_index)
+    fi_index = run.index("fi", absent_index)
+    exit_index = run.index('exit "$rc"')
+    assert set_plus_index < python_index < rc_index < set_minus_index < condition_index
+    assert condition_index < output_index < else_index < absent_index < fi_index < exit_index
+    assert "|| true" not in run
+    assert "continue-on-error" not in aggregate
+
+    upload = next(
+        step for step in raw["jobs"]["gate"]["steps"]
+        if step.get("name") == "Upload convergence receipt"
+    )
+    assert upload["if"] == "always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
+    assert "continue-on-error" not in upload
 
 
 # ── gate aggregator job: required-check identity + always() ─────────────────

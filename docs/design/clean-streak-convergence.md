@@ -160,9 +160,23 @@ def evaluate_round(
 
 绝不放进 PR 评论的状态清单：`clean_streak`、`eligible_rounds`、`unavailable_streak`、`last_run_id`、`last_run_attempt`、`epoch` 的唯一游标、`state_hash`、`round_key` 去重表、waiver nonce 的 consumed 标记、任何“当前有效 waiver”布尔值，以及用于 PATCH/If-Match 的版本号。评论可以展示这些值的**本 run 派生摘要**，但机器不能读回它们作判定。
 
-## 3. 三增量拆卡草案
+## 3. 四张实现卡拆分草案
 
-三张实现卡严格串行：增量 1 先冻结纯 reducer 和 state contract；增量 2 在该 contract 上接 protected disposition；增量 3 才接 workflow、artifact 检索和真实 Required Check。任何增量都不能在 gate-hub 侧新增 evaluator。
+四张实现卡严格串行：增量 1 先冻结纯 reducer 和 state contract；增量 2 在该 contract 上接 protected disposition；增量 3 拆成 3a 写出侧和 3b 读回侧。任何增量都不能在 gate-hub 侧新增 evaluator。
+
+### 增量 3a：convergence receipt 写出侧（本卡）
+
+本卡只把 producer 侧通电：canonical primary 经过当前轮 `evaluate_round()` 后，写出一条
+`Receipt.as_dict()` 的 canonical JSON（固定文件名 `convergence-receipt.json`），并以不可忽略
+失败的 artifact upload 作为 `gate/gate` 的写出 barrier。receipt upload 位于 aggregate 之后、
+`gate-terminal.json` upload 和 PR status panel 发布之前；upload 失败使 job 失败。draft、fork、
+hosted、primary skipped 或 audit 不可用等没有 canonical primary 的轮次不写占位 receipt，
+只在 Step Summary 记录未产出原因并跳过该 upload。
+
+3a 不做 artifact 分页/下载/历史 replay，不消费 `convergence_state` 或 disposition receipt，
+也不落盘 convergence envelope；当前判定仍保持首轮 `initial_state(scope)` 语义。3a 的跨进程
+验收必须读取 aggregate CLI 实际写出的字节，再喂给 `validate_receipt()` 和
+`replay_receipts()`；跨 run 检索与真实 canary 留在 3b。
 
 ### 增量 1：aggregator canonical clean-streak evaluator
 
@@ -233,16 +247,16 @@ clean streak 就不再反映真实收敛。这条不是防攻击，是防自欺�
 canonical audit 的 run provenance 校验（核验 run 的 workflow identity/ref/event/conclusion，
 而非只信 artifact 自报字段）。重开条件是**本仓出现第二个人类 write 用户**，不是「觉得更严谨」。
 
-### 增量 3：workflow 接线与 canary 实证
+### 增量 3b：workflow 读回、replay 接线与 canary 实证
 
 **目标**
 
-把增量 1/2 接到 pinned reusable workflow 的 `gate` job，使真实 Required Check `gate / gate`（API context `gate/gate`）消费 replay 结果；用 artifact 生产、跨 run 检索和 canary run 证明 clean streak、finding、waiver、unavailable/manual、new generation 全路径，而不是只跑 contract test 或 advisory projection。
+在 3a 的真实 receipt producer 之上，把增量 1/2 接到 pinned reusable workflow 的 `gate` job，使真实 Required Check `gate / gate`（API context `gate/gate`）消费 replay 结果；用 artifact 生产、跨 run 检索和 canary run 证明 clean streak、finding、waiver、unavailable/manual、new generation 全路径，而不是只跑 contract test 或 advisory projection。
 
 **接线边界**
 
 - `.github/workflows/gate-v2.yml` 的 `gate` job 继续是唯一 required-check producer：在调用 aggregator 前解析当前 canonical primary；分页列出并下载当前 PR/epoch 的 convergence receipts 和 protected disposition receipts；把原始文件目录、source attempt、artifact id、caller/workflow SHA 传给 `aggregate.py`。
-- `aggregate.py` 负责先验证 producer 实际字节和 guard，再调用 `replay_receipts`/`evaluate_round`，生成当前 terminal envelope 和一条本 run immutable convergence receipt。receipt upload 必须在发布绿色 terminal/check 前成功；任一步失败都 fail-loud，不能静默降级成 first run。
+- `aggregate.py` 负责先验证历史 producer 实际字节和 guard，再调用 `replay_receipts`/`evaluate_round`，生成当前 terminal envelope；3a 已完成的本 run receipt 只作为 replay 输入，不在 3b 重新定义写出格式。receipt listing/download/replay 任一步失败都 fail-loud，不能静默降级成 first run。
 - workflow 只允许一个 `gate` job 发布 `gate/gate`；quality/OCR/shadow/ledger 的结果只能出现在输入或观测投影。现有 `ledger` 的 repository-level queue 不得被误当作 convergence writer lock；如果实现选择 workflow concurrency，必须把其作用写进 receipt，且正确性仍由 immutable replay 保证。
 - `.github/actions/review-ledger/build_ledger.py` 在本增量只消费本 run convergence receipt 做 additive report；它不能读取 PR 评论来恢复 counters。PR comment/Step Summary 只渲染当前 run 的人类 action、exact disposition 和直达 evidence。
 - `templates/caller-gate-v2.yml` 和 `tests/test_check_pinned_uses.py` 只更新/锁 reusable workflow 的完整 SHA 与 source checkout contract；不重开已由 PR #46/#47 和 #31/#44 解决的可见性/可用性前置。
