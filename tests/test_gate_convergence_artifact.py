@@ -193,6 +193,12 @@ def test_disposition_producer_writes_bound_receipt_bytes_from_raw_audit(tmp_path
     wrong = subprocess.run(wrong_digest, capture_output=True, text=True, env=producer_env)
     assert wrong.returncode == 1
     assert "dispatch audit_digest does not match raw audit bytes" in wrong.stderr
+    missing_epoch = argv.copy()
+    epoch_index = missing_epoch.index("--epoch")
+    del missing_epoch[epoch_index:epoch_index + 2]
+    missing_epoch_result = subprocess.run(missing_epoch, capture_output=True, text=True, env=producer_env)
+    assert missing_epoch_result.returncode == 1
+    assert "epoch is required" in missing_epoch_result.stderr
     self_issue = argv.copy()
     self_issue[self_issue.index("maintainer")] = "author"
     self_failed = subprocess.run(self_issue, capture_output=True, text=True, env=producer_env)
@@ -231,6 +237,18 @@ def test_disposition_producer_rejects_unverifiable_evidence_ref(tmp_path):
     failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
     assert failed.returncode == 1
     assert "only blob:<git-sha> is allowlisted" in failed.stderr
+    evidence_bytes = b"actual immutable evidence\n"
+    evidence_path = tmp_path / "evidence-mismatch.txt"
+    evidence_path.write_bytes(evidence_bytes)
+    blob_sha = hashlib.sha1(f"blob {len(evidence_bytes)}\0".encode() + evidence_bytes).hexdigest()
+    manifest_path.write_text(json.dumps([{
+        "type": "blob", "ref": f"blob:{blob_sha}", "path": str(evidence_path), "sha256": "0" * 64,
+    }]))
+    mismatch = argv.copy()
+    mismatch[mismatch.index("not-an-immutable-reference")] = f"blob:{blob_sha}"
+    mismatch_result = subprocess.run(mismatch, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert mismatch_result.returncode == 1
+    assert "evidence content digest mismatch" in mismatch_result.stderr
 
 
 def test_disposition_revocation_producer_is_append_only(tmp_path):

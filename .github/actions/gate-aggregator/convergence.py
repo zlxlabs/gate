@@ -274,6 +274,7 @@ class DispositionConsumption:
     rejected_receipts: tuple[tuple[DispositionReceipt, str], ...]
     fail_closed: bool
     statuses: tuple[DispositionStatus, ...] = ()
+    malformed_inputs: tuple[Any, ...] = ()
 
     @property
     def p1_ids(self) -> tuple[str, ...]:
@@ -686,6 +687,7 @@ def consume_dispositions(
     statuses: list[DispositionStatus] = []
     consumed: list[DispositionReceipt] = []
     rejected: list[tuple[DispositionReceipt, str]] = []
+    malformed_inputs: list[Any] = []
     fail_closed = False
     by_nonce: dict[str, DispositionReceipt] = {}
     seen_payloads: set[str] = set()
@@ -696,7 +698,8 @@ def consume_dispositions(
                 now=now, revocations=revocations,
             )
             statuses.append(status)
-            rejected.append((receipt, status.reason))
+            rejected.append((status.receipt, status.reason))
+            malformed_inputs.append(receipt)
             fail_closed = True
             continue
         if _legacy_disposition_stub(receipt):
@@ -740,6 +743,7 @@ def consume_dispositions(
         rejected_receipts=tuple(rejected),
         fail_closed=fail_closed,
         statuses=tuple(statuses),
+        malformed_inputs=tuple(malformed_inputs),
     )
 
 

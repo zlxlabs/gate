@@ -127,7 +127,7 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
         issuer_login="maintainer",
         issuer_user_id="9001",
         control_run_id="control-100",
-        approval_ref="approval-100",
+        approval_ref="issuer-not-pr-author:author",
         issued_at="2026-08-20T08:00:00Z",
         expires_at="2099-08-20T08:00:00Z",
         nonce="nonce-100",
@@ -183,12 +183,18 @@ def test_disposition_requires_protected_issuer_and_exact_digest_binding():
 def test_disposition_requires_protected_issuer_and_evidence():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     receipt = _disposition(primary=primary)
-    missing_evidence = replace(receipt, evidence_manifest_digest="", receipt_digest="")
-    status = CONV.validate_disposition_receipt(
+    missing_evidence = replace(receipt, evidence_manifest_digest="")
+    missing_evidence_status = CONV.validate_disposition_receipt(
         missing_evidence, scope=SCOPE, primary=primary, audit_digest="a" * 64,
         now="2026-08-20T09:00:00Z", revocations=(),
     )
-    assert not status.valid and status.reason == "malformed_receipt"
+    assert not missing_evidence_status.valid and missing_evidence_status.reason == "malformed_receipt"
+    missing_digest = replace(receipt, receipt_digest="")
+    missing_digest_status = CONV.validate_disposition_receipt(
+        missing_digest, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        now="2026-08-20T09:00:00Z", revocations=(),
+    )
+    assert not missing_digest_status.valid and missing_digest_status.reason == "malformed_receipt"
 
 
 def test_disposition_binding_rejects_head_generation_and_digest_mismatch():
@@ -285,6 +291,18 @@ def test_disposition_nonce_is_idempotent_and_conflict_safe():
         audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
     )
     assert result.fail_closed and result.rejected_receipts[-1][1] == "nonce_conflict"
+
+
+def test_malformed_disposition_input_preserves_typed_rejections_and_raw_diagnostic():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    malformed = {"finding_id": "p1", "nonce": "nonce-bad"}
+    result = CONV.consume_dispositions(
+        primary.p1_ids, (malformed,), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
+    )
+    assert result.fail_closed
+    assert result.rejected_receipts == ((CONV.DispositionReceipt(), "malformed_receipt"),)
+    assert result.malformed_inputs == (malformed,)
 
 
 def test_disposition_lifecycle_invalidates_on_head_digest_expiry_and_revocation():
