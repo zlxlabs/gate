@@ -292,6 +292,28 @@ def test_comment_alone_cannot_change_required_decision():
     assert result.decision == "collecting" and result.clean_streak == 0
 
 
+def test_revocation_is_append_only_and_recomputed():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    original = CONV.consume_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
+    )
+    revocation = CONV.DispositionRevocation(
+        schema_version=1, nonce=receipt.nonce, reason="withdrawn",
+        actor="maintainer", revoked_at="2026-08-20T09:01:00Z", evidence_ref="evidence-2",
+    )
+    revoked = CONV.consume_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64, now="2026-08-20T09:02:00Z", revocations=(revocation,),
+    )
+    assert original.consumed_receipts == (receipt,)
+    assert revoked.consumed_receipts == ()
+    assert revoked.remaining_p1_ids == ("p1",)
+    assert revocation.as_dict()["nonce"] == receipt.nonce
+    assert receipt.receipt_digest == CONV.disposition_receipt_digest(receipt)
+
+
 @pytest.mark.parametrize(
     "tier,infra,effective,n,max_rounds",
     [
