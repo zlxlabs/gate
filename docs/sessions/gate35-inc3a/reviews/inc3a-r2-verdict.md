@@ -42,11 +42,88 @@ RED_TEST_RC=1
 
 ## 实验二：workflow shell 真实语义
 
-待执行；将从 H0 提取 `Aggregate required verdict` 的 `run`，在默认 bash `-e -o pipefail` 下用 stub 穷举 receipt/退出码/信号/半写组合。
+实际命令（YAML 由 H0 解析，`${{ runner.temp }}` 在实验目录中按 Actions 渲染结果替换）：
+
+```sh
+uv run --with PyYAML python - <<'PY'
+workflow = subprocess.check_output(["git", "show", "a501b7a1d43092efd77c10488efefceaf3630c04:.github/workflows/gate-v2.yml"], text=True)
+raw = yaml.safe_load(workflow)
+run_template = next(step["run"] for step in raw["jobs"]["gate"]["steps"] if step.get("name") == "Aggregate required verdict")
+subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", run], ...)
+PY
+```
+
+stub 对 `STUB_WRITE` 穷举 `none/full/half`，对 `STUB_TERM` 穷举 `zero/nonzero/signal`，共 9 组。真实提取的 shell 起始/收尾为：
+
+```text
+set +e
+python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
+  ... --convergence-receipt-path "$CONVERGENCE_RECEIPT_PATH"
+rc=$?
+set -e
+if [ -f "$CONVERGENCE_RECEIPT_PATH" ]; then
+  echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"
+else
+  echo "convergence-receipt=absent" >> "$GITHUB_OUTPUT"
+fi
+exit "$rc"
+```
+
+真实输出：
+
+```text
+CASE write=none termination=zero shell_rc=0 github_output='convergence-receipt=absent\n' target=b'<missing>' stderr=''
+CASE write=none termination=nonzero shell_rc=7 github_output='convergence-receipt=absent\n' target=b'<missing>' stderr=''
+CASE write=none termination=signal shell_rc=143 github_output='convergence-receipt=absent\n' target=b'<missing>' stderr='Terminated'
+CASE write=full termination=zero shell_rc=0 github_output='convergence-receipt=present\n' target=b'FULL' stderr=''
+CASE write=full termination=nonzero shell_rc=7 github_output='convergence-receipt=present\n' target=b'FULL' stderr=''
+CASE write=full termination=signal shell_rc=143 github_output='convergence-receipt=present\n' target=b'FULL' stderr='Terminated'
+CASE write=half termination=zero shell_rc=0 github_output='convergence-receipt=present\n' target=b'HALF' stderr=''
+CASE write=half termination=nonzero shell_rc=7 github_output='convergence-receipt=present\n' target=b'HALF' stderr=''
+CASE write=half termination=signal shell_rc=143 github_output='convergence-receipt=present\n' target=b'HALF' stderr='Terminated'
+```
+
+结论：receipt 标志只看本轮目标文件是否存在，与 aggregate 退出码无关；shell 捕获并原样返回 0、7、143。半写 stub 的 `present` 只证明 shell 语义，生产写入的原子性在实验四验证。
 
 ## 实验三：CLI 形态穷举
 
-待执行；将通过真实 subprocess 调用 H0 `aggregate.py`，记录退出码、receipt 存在性与内容。
+实际命令以 H0 detached worktree 中的真实脚本运行：
+
+```sh
+git worktree add --detach "$cli_dir" a501b7a1d43092efd77c10488efefceaf3630c04
+uv run --with pytest,PyYAML python - "$cli_dir" <<'PY'
+subprocess.run([sys.executable, str(aggregate), ...,
+                "--convergence-receipt-path", str(receipt)], ...)
+PY
+git worktree remove --force "$cli_dir"
+```
+
+审查矩阵覆盖合法 verdict、四种已知 severity、未知 severity、质量失败、文件缺失/多个/非 UTF-8/JSON 非对象、source attempt 不匹配、draft/fork/expected 与 unexpected primary skip。真实输出摘录（`receipt` 后的字段来自实际落盘 JSON）：
+
+```text
+CASE verdict-pass exit=0 receipt=present {"decision":"converged","clean_streak":1,"eligible_rounds":1,"p1_ids":[],"receipt_kind":"canonical_primary","schema_version":1} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE verdict-fail exit=1 receipt=present {"decision":"converged","clean_streak":1,"eligible_rounds":1,"p1_ids":[],"verdict":"fail"} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE verdict-unavailable exit=1 receipt=present {"decision":"collecting","clean_streak":0,"eligible_rounds":0,"verdict":"unavailable"} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE verdict-not_expected exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_invalid`).'
+CASE verdict-waived exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_invalid`).'
+CASE finding-major exit=0 receipt=present {"decision":"collecting","clean_streak":0,"eligible_rounds":1,"p1_ids":["f1"]} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE finding-blocker exit=0 receipt=present {"decision":"collecting","clean_streak":0,"eligible_rounds":1,"p1_ids":["f1"]} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE finding-minor exit=0 receipt=present {"decision":"converged","clean_streak":1,"eligible_rounds":1,"p1_ids":[]} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE finding-nit exit=0 receipt=present {"decision":"converged","clean_streak":1,"eligible_rounds":1,"p1_ids":[]} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE finding-unknown exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_invalid`).'
+CASE quality-failure-valid-pass exit=1 receipt=present {"decision":"converged","clean_streak":1,"eligible_rounds":1,"verdict":"pass"} summary='Convergence receipt: produced (`convergence-receipt.json`).'
+CASE audit-missing-primary-failure exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_missing`).'
+CASE audit-missing-primary-success exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_missing`).'
+CASE audit-multiple-json exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_missing`).'
+CASE audit-non-utf8 exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_missing`).'
+CASE audit-json-list exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_invalid`).'
+CASE source-attempt-mismatch exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `audit_source_mismatch`).'
+CASE draft-primary-skipped exit=0 receipt=<absent> summary='Convergence receipt: not produced (reason: `review_not_expected`).'
+CASE fork-primary-skipped exit=0 receipt=<absent> summary='Convergence receipt: not produced (reason: `review_not_expected`).'
+CASE unexpected-primary-skipped exit=1 receipt=<absent> summary='Convergence receipt: not produced (reason: `unexpected_primary_skip`).'
+```
+
+结论：可产出 receipt 的 canonical round 即使 aggregate 因 quality/primary 结果返回非 0 也保留 receipt；缺失、损坏、来源不匹配和非 eligible skip 均不产生 receipt，并在 Summary 给出原因。
 
 ## 实验四：并发与重入
 
