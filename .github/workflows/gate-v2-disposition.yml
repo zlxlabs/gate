@@ -51,12 +51,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          TARGET_REPOSITORY_ID: ${{ inputs.repository_id }}
           PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
           PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
         run: |
           set -euo pipefail
           test -n "$PRIMARY_RUN_ID"
           test -n "$PRIMARY_RUN_ATTEMPT"
+          test "$TARGET_REPOSITORY_ID" = "$GITHUB_REPOSITORY_ID"
           pr_json="$RUNNER_TEMP/current-pr.json"
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$pr_json"
           jq -e --arg repo "$GITHUB_REPOSITORY" --argjson id "$GITHUB_REPOSITORY_ID" \
@@ -88,7 +90,7 @@ jobs:
         env:
           AUDIT_PATH: ${{ runner.temp }}/current-primary-audit/primary-review-audit.json
           PR_PATH: ${{ runner.temp }}/current-pr.json
-          REPOSITORY_ID: ${{ inputs.repository_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
@@ -209,7 +211,7 @@ jobs:
         id: disposition
         env:
           OPERATION: ${{ inputs.operation }}
-          REPOSITORY_ID: ${{ inputs.repository_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
           PR_NUMBER: ${{ inputs.pr_number }}
           DISPOSITION_EPOCH: ${{ inputs.epoch }}
           PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}

@@ -125,8 +125,9 @@ def _verify_audit_identity(
         present = next((candidate for candidate in candidates if candidate in audit), None)
         if present is None:
             raise ValueError(f"audit missing required binding field {field}")
-        if audit[present] != expected_value:
-            raise ValueError(f"audit {present} does not match requested binding")
+        for candidate in candidates:
+            if candidate in audit and audit[candidate] != expected_value:
+                raise ValueError(f"audit {candidate} does not match requested binding")
 
 
 def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repository_id: str, pr_number: int, head_sha: str, diff_digest: str) -> dict[str, Any]:
