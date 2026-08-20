@@ -90,8 +90,7 @@ def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repositor
     scope = json.loads(raw_scope) if isinstance(raw_scope, str) else raw_scope
     required = {
         "repository_id", "pr_number", "base_sha", "head_sha", "diff_digest",
-        "policy_version", "policy_digest", "tier", "effective_tier",
-        "infra_classifier_version", "infra_diff", "caller_sha", "reusable_workflow_sha",
+        "policy_version", "policy_digest", "tier", "caller_sha", "reusable_workflow_sha",
     }
     if not isinstance(scope, dict) or set(scope) != required:
         raise ValueError("scope_json must contain the complete canonical Scope fields")
@@ -99,8 +98,6 @@ def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repositor
         raise ValueError("scope repository/PR does not match current control target")
     if scope["head_sha"] != head_sha:
         raise ValueError("scope head does not match current control target")
-    if type(scope["infra_diff"]) is not bool:
-        raise ValueError("scope infra_diff must be a bool")
     return scope
 
 
