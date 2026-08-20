@@ -751,8 +751,6 @@ def find_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str]]:
 
 def _write_convergence_receipt(path: str, receipt: Any) -> None:
     """Write one canonical receipt payload before any terminal publication."""
-    if not isinstance(receipt, _CONVERGENCE.Receipt):
-        raise ValueError("convergence receipt output requires a Receipt")
     _CONVERGENCE.validate_receipt(receipt, receipt.scope)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
