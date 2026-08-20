@@ -229,6 +229,39 @@ def test_tampered_derived_state_is_fail_closed():
     assert result.state.clean_streak == 1
 
 
+@pytest.mark.parametrize("bad_p1", [[["nested"]], {"nested": []}, [{"deep": {"value": []}}]])
+def test_unhashable_p1_ids_are_controlled_fail_closed(bad_p1):
+    state = CONV.initial_state(SCOPE)
+    result = CONV.evaluate_round(
+        state=state,
+        scope=SCOPE,
+        primary=_primary(run_id=12, p1_ids=(bad_p1,)),
+        audit_digest="c" * 64,
+        waiver_receipts=(),
+        processing_key=_key(run_id=12),
+    )
+    assert (result.decision, result.accepted, result.no_op) == ("fail_closed", False, False)
+    assert (result.state.clean_streak, result.state.eligible_rounds, result.state.unavailable_streak) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("processing_keys", ((1, 2, 3, 4), ("heterogeneous",))),
+        ("round_keys", (("epoch", 1, "a" * 64), (1, "heterogeneous"))),
+    ],
+)
+def test_heterogeneous_state_indexes_are_controlled_fail_closed(field, value):
+    state = replace(CONV.initial_state(SCOPE), **{field: value})
+    result = _round(state, run_id=13, digest="d")
+    assert (result.decision, result.accepted, result.no_op) == ("fail_closed", False, False)
+    assert (result.state.clean_streak, result.state.eligible_rounds, result.state.unavailable_streak) == (
+        state.clean_streak,
+        state.eligible_rounds,
+        state.unavailable_streak,
+    )
+
+
 @pytest.mark.parametrize("bad_state,bad_key", [(None, _key()), (object(), _key()), (CONV.initial_state(SCOPE), object())])
 def test_untrusted_round_inputs_are_controlled_fail_closed(bad_state, bad_key):
     result = CONV.evaluate_round(state=bad_state, scope=SCOPE, primary=_primary(), audit_digest="c" * 64, waiver_receipts=(), processing_key=bad_key)

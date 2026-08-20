@@ -404,6 +404,44 @@ def _keys_digest(keys: Sequence[tuple[Any, ...]]) -> str:
     return _sha256(sorted(keys))
 
 
+def _valid_processing_key_tuple(value: Any) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 4
+        and all(_strict_int(item) and item > 0 for item in value)
+    )
+
+
+def _valid_round_key_tuple(value: Any) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 3
+        and _nonempty_text(value[0])
+        and _strict_int(value[1])
+        and value[1] > 0
+        and _nonempty_text(value[2])
+    )
+
+
+def _state_index_errors(state: ConvergenceState) -> list[str]:
+    errors: list[str] = []
+    processing_valid = isinstance(state.processing_keys, tuple) and all(
+        _valid_processing_key_tuple(key) for key in state.processing_keys
+    )
+    if not processing_valid:
+        errors.append("processing key index has invalid element shape")
+    elif state.processing_keys_digest != _keys_digest(state.processing_keys):
+        errors.append("processing key digest does not match its consumed set")
+    round_valid = isinstance(state.round_keys, tuple) and all(
+        _valid_round_key_tuple(key) for key in state.round_keys
+    )
+    if not round_valid:
+        errors.append("round key index has invalid element shape")
+    elif state.round_keys_digest != _keys_digest(state.round_keys):
+        errors.append("round key digest does not match its consumed set")
+    return errors
+
+
 def initial_state(scope: Scope) -> ConvergenceState:
     """Create an explicit zero-based state for a validated scope."""
 
@@ -434,10 +472,7 @@ def _state_errors(state: ConvergenceState) -> list[str]:
             errors.append(f"state {name} must be a non-negative int")
     if state.terminal_decision not in TERMINAL_DECISIONS:
         errors.append(f"unknown terminal decision {state.terminal_decision!r}")
-    if state.processing_keys_digest != _keys_digest(state.processing_keys):
-        errors.append("processing key digest does not match its consumed set")
-    if state.round_keys_digest != _keys_digest(state.round_keys):
-        errors.append("round key digest does not match its consumed set")
+    errors.extend(_state_index_errors(state))
     recorded_processing: list[tuple[int, int, int, int]] = []
     recorded_rounds: list[tuple[str, int, str]] = []
     for record in state.event_records:
@@ -445,7 +480,12 @@ def _state_errors(state: ConvergenceState) -> list[str]:
             errors.append("event record has invalid shape")
             continue
         keys, event_id, evidence = record
-        if not isinstance(keys, tuple) or len(keys) != 2 or not isinstance(keys[0], tuple) or not isinstance(keys[1], tuple):
+        if (
+            not isinstance(keys, tuple)
+            or len(keys) != 2
+            or not _valid_processing_key_tuple(keys[0])
+            or not _valid_round_key_tuple(keys[1])
+        ):
             errors.append("event record key pair has invalid shape")
         else:
             recorded_processing.append(keys[0])
@@ -456,10 +496,16 @@ def _state_errors(state: ConvergenceState) -> list[str]:
         fingerprint, verdict, p1_ids, effect = evidence
         if not _nonempty_text(fingerprint) or not isinstance(verdict, str) or verdict not in PRIMARY_VERDICTS or not isinstance(p1_ids, tuple) or not isinstance(effect, str) or effect not in {"eligible", "unavailable", "terminal"}:
             errors.append("event record evidence is not canonical")
-    if tuple(sorted(recorded_processing)) != tuple(sorted(state.processing_keys)):
-        errors.append("processing key index does not match event evidence")
-    if tuple(sorted(recorded_rounds)) != tuple(sorted(state.round_keys)):
-        errors.append("round key index does not match event evidence")
+    if isinstance(state.processing_keys, tuple) and all(
+        _valid_processing_key_tuple(key) for key in state.processing_keys
+    ):
+        if tuple(sorted(recorded_processing)) != tuple(sorted(state.processing_keys)):
+            errors.append("processing key index does not match event evidence")
+    if isinstance(state.round_keys, tuple) and all(
+        _valid_round_key_tuple(key) for key in state.round_keys
+    ):
+        if tuple(sorted(recorded_rounds)) != tuple(sorted(state.round_keys)):
+            errors.append("round key index does not match event evidence")
     return errors
 
 
@@ -526,6 +572,18 @@ def _fail_closed_state(state: ConvergenceState, reason: str) -> ConvergenceState
             unavailable_streak=0, processing_keys_digest=_empty_key_digest(),
             round_keys_digest=_empty_key_digest(), terminal_decision="fail_closed", reason=reason,
         )
+    if _state_index_errors(state):
+        return ConvergenceState(
+            schema_version=SCHEMA_VERSION,
+            epoch=state.epoch if _nonempty_text(state.epoch) else "",
+            clean_streak=state.clean_streak if _strict_int(state.clean_streak) and state.clean_streak >= 0 else 0,
+            eligible_rounds=state.eligible_rounds if _strict_int(state.eligible_rounds) and state.eligible_rounds >= 0 else 0,
+            unavailable_streak=state.unavailable_streak if _strict_int(state.unavailable_streak) and state.unavailable_streak >= 0 else 0,
+            processing_keys_digest=_empty_key_digest(),
+            round_keys_digest=_empty_key_digest(),
+            terminal_decision="fail_closed",
+            reason=reason,
+        )
     return _state_with(state, terminal_decision="fail_closed", reason=reason)
 
 
@@ -554,9 +612,10 @@ def _primary_errors(*, scope: Scope, primary: CanonicalPrimary) -> list[str]:
     else:
         seen: set[str] = set()
         for finding_id in primary.p1_ids:
-            if not _nonempty_text(finding_id):
+            if not isinstance(finding_id, str) or not finding_id:
                 errors.append("primary p1 finding ids must be non-empty strings")
-            elif finding_id in seen:
+                continue
+            if finding_id in seen:
                 errors.append(f"primary p1 finding id repeated: {finding_id!r}")
             seen.add(finding_id)
     return errors
