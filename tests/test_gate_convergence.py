@@ -1,4 +1,12 @@
-"""Pure reducer contract tests for canonical clean-streak convergence."""
+"""Pure reducer contract tests for canonical clean-streak convergence.
+
+Input credibility matrix (the dispatch report has the full table): state
+None/non-state/tampered/legal -> fail-closed/fail-closed/fail-closed/replay;
+processing keys with bad shape/old epoch/legal -> fail-closed/fail-closed/
+new epoch/legal; audit digests conflicting/new/replayed -> fail-closed/new/
+no-op; findings with missing, non-string, unknown, known non-P1, P1 severity
+-> fail-closed/fail-closed/fail-closed/ignore/reset.
+"""
 
 import importlib.util
 import sys
@@ -172,10 +180,10 @@ def test_clean_threshold_wins_over_max_rounds_on_same_event():
     state = CONV.initial_state(scope)
     state = _round(state, scope, run_id=1, digest="1", p1_ids=("f",)).state
     state = _round(state, scope, run_id=2, digest="2", p1_ids=("f",)).state
-    result = _round(state, scope, run_id=3, digest="3")
-    assert (result.clean_streak, result.eligible_rounds, result.decision) == (1, 3, "collecting")
-    result = _round(result.state, scope, run_id=4, digest="4")
-    assert (result.clean_streak, result.eligible_rounds, result.decision) == (2, 4, "converged")
+    state = _round(state, scope, run_id=3, digest="3", p1_ids=("f",)).state
+    state = _round(state, scope, run_id=4, digest="4").state
+    result = _round(state, scope, run_id=5, digest="5")
+    assert (result.clean_streak, result.eligible_rounds, result.decision) == (2, 5, "converged")
 
 
 def test_unavailable_budget_is_independent_and_bounded():
@@ -205,6 +213,31 @@ def test_duplicate_round_is_idempotent_and_conflicting_payload_fails_closed():
     conflicting = _receipt(run_id=11, run_attempt=1, digest="b", p1_ids=("new",))
     replayed = CONV.replay_receipts(scope=SCOPE, receipts=[one, conflicting])
     assert replayed.decision == "fail_closed"
+
+
+def test_same_processing_key_with_new_audit_fails_closed_without_counting():
+    first = _round(CONV.initial_state(SCOPE), run_id=10, run_attempt=1, digest="a")
+    conflict = _round(first.state, run_id=10, run_attempt=1, digest="b")
+    assert (conflict.decision, conflict.accepted, conflict.no_op) == ("fail_closed", False, False)
+    assert (conflict.state.clean_streak, conflict.state.eligible_rounds, conflict.state.unavailable_streak) == (first.clean_streak, first.eligible_rounds, first.unavailable_streak)
+
+
+def test_tampered_derived_state_is_fail_closed():
+    forged = replace(CONV.initial_state(SCOPE), clean_streak=1)
+    result = _round(forged, run_id=11, digest="b")
+    assert (result.decision, result.accepted, result.no_op) == ("fail_closed", False, False)
+    assert result.state.clean_streak == 1
+
+
+@pytest.mark.parametrize("bad_state,bad_key", [(None, _key()), (object(), _key()), (CONV.initial_state(SCOPE), object())])
+def test_untrusted_round_inputs_are_controlled_fail_closed(bad_state, bad_key):
+    result = CONV.evaluate_round(state=bad_state, scope=SCOPE, primary=_primary(), audit_digest="c" * 64, waiver_receipts=(), processing_key=bad_key)
+    assert result.decision == "fail_closed" and not result.accepted and not result.no_op
+
+
+def test_duplicate_status_rejects_untrusted_state_and_key_shapes():
+    state = replace(CONV.initial_state(SCOPE), event_records=(("broken", "event", "fingerprint"),))
+    assert CONV._duplicate_status(state, processing_key=object(), round_key=object(), event_id="", fingerprint="") == (False, True)
 
 
 def test_manual_reinitialize_is_explicit_and_zero_based():
@@ -372,7 +405,7 @@ def test_replay_ignores_reported_derived_counters():
 
 
 def test_all_state_event_cells_are_callable():
-    """Each cell is callable; transition behavior is asserted by named tests."""
+    """Every cell asserts exact counters and flags; named tests add scenario detail."""
     cells = [
         (state, event)
         for state in "CUTMF"
@@ -384,15 +417,25 @@ def test_all_state_event_cells_are_callable():
         state = _state_for(state_name)
         waiver = (CONV.DispositionReceipt(),) if "waiver" in event else ()
         if event == "rerun":
-            run_id, digest = (900, "9") if state_name in "UT" else (1, "1")
-            first = _round(state, run_id=run_id, digest=digest, waiver=waiver)
+            run_id, digest = (900, "9") if state_name in "UT" else ((902, "2") if state_name == "M" else (1, "1"))
+            verdict = "unavailable" if state_name == "U" else "pass"
+            rerun_p1 = ("f-902",) if state_name == "M" else ()
+            first = _round(state, run_id=run_id, digest=digest, verdict=verdict, p1_ids=rerun_p1, waiver=waiver)
             result = _round(first.state, run_id=run_id, run_attempt=2, digest=digest, waiver=waiver)
-            assert result.no_op or result.decision in {"manual_required", "fail_closed"}
         elif event == "new_digest":
             changed = replace(SCOPE, head_sha=f"{state_name.lower()}" * 40)
             result = _round(state, changed, run_id=800, digest="8", waiver=waiver)
-            assert result.decision in {"converged", "manual_required", "fail_closed"}
         else:
             p1 = (f"{state_name}-finding",) if event in {"major", "waiver_pass", "waiver_reject"} else ()
             result = _round(state, run_id=800, digest="8", p1_ids=p1, waiver=waiver)
-            assert result.decision in {"collecting", "converged", "manual_required", "fail_closed"}
+        expected = {
+            "C": {"major": ("collecting", 0, 1, 0, True, False), "clean": ("converged", 1, 1, 0, True, False), "waiver_pass": ("collecting", 0, 1, 0, True, False), "waiver_reject": ("collecting", 0, 1, 0, True, False), "rerun": ("converged", 1, 1, 0, True, True), "new_digest": ("converged", 1, 1, 0, True, False)},
+            "U": {"major": ("collecting", 0, 1, 0, True, False), "clean": ("converged", 1, 1, 0, True, False), "waiver_pass": ("collecting", 0, 1, 0, True, False), "waiver_reject": ("collecting", 0, 1, 0, True, False), "rerun": ("collecting", 0, 0, 1, True, True), "new_digest": ("converged", 1, 1, 0, True, False)},
+            "T": {event: ("manual_required", 1, 1, 0, True, False) for event in ("major", "clean", "waiver_pass", "waiver_reject")},
+            "M": {event: ("manual_required", 0, 3, 0, False, True) for event in ("major", "clean", "waiver_pass", "waiver_reject", "rerun")},
+            "F": {event: ("fail_closed", 0, 0, 0, False, True) for event in ("major", "clean", "waiver_pass", "waiver_reject", "rerun")},
+        }
+        expected["T"].update({"rerun": ("converged", 1, 1, 0, True, True), "new_digest": ("converged", 1, 1, 0, True, False)})
+        expected["M"].update({"rerun": ("manual_required", 0, 3, 0, True, True), "new_digest": ("fail_closed", 0, 3, 0, False, False)})
+        expected["F"]["new_digest"] = ("fail_closed", 0, 0, 0, False, False)
+        assert (result.decision, result.clean_streak, result.eligible_rounds, result.unavailable_streak, result.accepted, result.no_op) == expected[state_name][event]

@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
 P1_SEVERITIES = frozenset({"major", "blocker"})
+KNOWN_SEVERITIES = frozenset({"major", "blocker", "minor", "nit"})
 SEVERITY_P1 = P1_SEVERITIES
 SUPPORTED_TIERS = ("personal", "internal", "saas")
 PRIMARY_VERDICTS = frozenset({"pass", "fail", "unavailable"})
@@ -248,7 +249,7 @@ class ConvergenceState:
     terminal_decision: str
     processing_keys: tuple[tuple[int, int, int, int], ...] = ()
     round_keys: tuple[tuple[str, int, str], ...] = ()
-    event_records: tuple[tuple[tuple[Any, ...], str, str], ...] = ()
+    event_records: tuple[tuple[tuple[Any, ...], str, tuple[Any, ...]], ...] = ()
     reason: str = ""
 
     @property
@@ -437,15 +438,53 @@ def _state_errors(state: ConvergenceState) -> list[str]:
         errors.append("processing key digest does not match its consumed set")
     if state.round_keys_digest != _keys_digest(state.round_keys):
         errors.append("round key digest does not match its consumed set")
+    recorded_processing: list[tuple[int, int, int, int]] = []
+    recorded_rounds: list[tuple[str, int, str]] = []
     for record in state.event_records:
         if not isinstance(record, tuple) or len(record) != 3:
             errors.append("event record has invalid shape")
             continue
-        keys, event_id, fingerprint = record
-        if not isinstance(keys, tuple) or len(keys) != 2:
+        keys, event_id, evidence = record
+        if not isinstance(keys, tuple) or len(keys) != 2 or not isinstance(keys[0], tuple) or not isinstance(keys[1], tuple):
             errors.append("event record key pair has invalid shape")
-        if not _nonempty_text(event_id) or not _nonempty_text(fingerprint):
+        else:
+            recorded_processing.append(keys[0])
+            recorded_rounds.append(keys[1])
+        if not _nonempty_text(event_id) or not isinstance(evidence, tuple) or len(evidence) != 4:
             errors.append("event record identity/fingerprint is empty")
+            continue
+        fingerprint, verdict, p1_ids, effect = evidence
+        if not _nonempty_text(fingerprint) or not isinstance(verdict, str) or verdict not in PRIMARY_VERDICTS or not isinstance(p1_ids, tuple) or not isinstance(effect, str) or effect not in {"eligible", "unavailable", "terminal"}:
+            errors.append("event record evidence is not canonical")
+    if tuple(sorted(recorded_processing)) != tuple(sorted(state.processing_keys)):
+        errors.append("processing key index does not match event evidence")
+    if tuple(sorted(recorded_rounds)) != tuple(sorted(state.round_keys)):
+        errors.append("round key index does not match event evidence")
+    return errors
+
+
+def _state_evidence_errors(state: ConvergenceState, policy: Policy) -> list[str]:
+    clean = eligible = unavailable = 0
+    terminal = "collecting"
+    for _, _, evidence in state.event_records:
+        _, verdict, p1_ids, effect = evidence
+        if effect == "terminal":
+            if terminal != "converged":
+                return ["terminal event does not follow a converged state"]
+            terminal = "manual_required"
+        elif effect == "unavailable":
+            unavailable += 1
+            terminal = "manual_required" if unavailable >= policy.unavailable_budget else "collecting"
+        else:
+            eligible += 1
+            clean = clean + 1 if not p1_ids else 0
+            unavailable = 0
+            terminal = "converged" if clean >= policy.clean_rounds else "manual_required" if eligible >= policy.max_rounds else "collecting"
+    errors = []
+    if (clean, eligible, unavailable) != (state.clean_streak, state.eligible_rounds, state.unavailable_streak):
+        errors.append("state counters do not match event evidence")
+    if state.terminal_decision != "fail_closed" and terminal != state.terminal_decision:
+        errors.append("state terminal decision does not match event evidence")
     return errors
 
 
@@ -459,7 +498,7 @@ def _state_with(
     terminal_decision: str | None = None,
     processing_keys: tuple[tuple[int, int, int, int], ...] | None = None,
     round_keys: tuple[tuple[str, int, str], ...] | None = None,
-    event_records: tuple[tuple[tuple[Any, ...], str, str], ...] | None = None,
+    event_records: tuple[tuple[tuple[Any, ...], str, tuple[Any, ...]], ...] | None = None,
     reason: str | None = None,
 ) -> ConvergenceState:
     new_processing = state.processing_keys if processing_keys is None else processing_keys
@@ -481,6 +520,12 @@ def _state_with(
 
 
 def _fail_closed_state(state: ConvergenceState, reason: str) -> ConvergenceState:
+    if not isinstance(state, ConvergenceState):
+        return ConvergenceState(
+            schema_version=SCHEMA_VERSION, epoch="", clean_streak=0, eligible_rounds=0,
+            unavailable_streak=0, processing_keys_digest=_empty_key_digest(),
+            round_keys_digest=_empty_key_digest(), terminal_decision="fail_closed", reason=reason,
+        )
     return _state_with(state, terminal_decision="fail_closed", reason=reason)
 
 
@@ -569,10 +614,14 @@ def _record_event(
     round_key: RoundKey,
     event_id: str,
     fingerprint: str,
+    verdict: str,
+    p1_ids: tuple[str, ...],
+    effect: str,
 ) -> ConvergenceState:
     processing = (*state.processing_keys, processing_key.as_tuple())
     rounds = (*state.round_keys, round_key.as_tuple())
-    records = (*state.event_records, ((processing_key.as_tuple(), round_key.as_tuple()), event_id, fingerprint))
+    evidence = (fingerprint, verdict, p1_ids, effect)
+    records = (*state.event_records, ((processing_key.as_tuple(), round_key.as_tuple()), event_id, evidence))
     return _state_with(state, processing_keys=processing, round_keys=rounds, event_records=records)
 
 
@@ -586,6 +635,9 @@ def _duplicate_status(
 ) -> tuple[bool, bool]:
     """Return (is_duplicate, is_conflict) for a previously consumed round."""
 
+    if not isinstance(state, ConvergenceState) or not isinstance(processing_key, ProcessingKey) or not isinstance(round_key, RoundKey) or not _nonempty_text(event_id) or not _nonempty_text(fingerprint) or _state_errors(state):
+        return (False, True)
+
     processing_tuple = processing_key.as_tuple()
     round_tuple = round_key.as_tuple()
     matches = [
@@ -596,9 +648,11 @@ def _duplicate_status(
     if not matches:
         key_seen = processing_tuple in state.processing_keys or round_tuple in state.round_keys
         return (key_seen, key_seen)
-    if any(record[1] == event_id and record[2] != fingerprint for record in matches):
+    if any(record[1] == event_id and record[2][0] != fingerprint for record in matches):
         return (False, True)
-    if any(record[0] == (processing_tuple, round_tuple) and record[2] != fingerprint for record in matches):
+    if any(record[0][0] == processing_tuple and record[2][0] != fingerprint for record in matches):
+        return (False, True)
+    if any(record[0] == (processing_tuple, round_tuple) and record[2][0] != fingerprint for record in matches):
         return (False, True)
     return (True, False)
 
@@ -692,6 +746,11 @@ def evaluate_round(
             accepted=False,
             no_op=False,
         )
+    if state.epoch == epoch:
+        evidence_errors = _state_evidence_errors(state, policy)
+        if evidence_errors:
+            failed = _fail_closed_state(state, "; ".join(evidence_errors))
+            return _decision(failed, processing_key=processing_key, round_key=RoundKey(epoch, 0, ""), event_id="", reason=failed.reason, accepted=False, no_op=False)
     audit_errors = _audit_digest_errors(audit_digest)
     primary_errors = _primary_errors(scope=scope, primary=primary)
     processing_errors = _processing_errors(scope=scope, primary=primary, key=processing_key)
@@ -700,21 +759,36 @@ def evaluate_round(
             state,
             "; ".join(audit_errors + primary_errors + processing_errors),
         )
-        round_key = RoundKey(epoch=epoch, run_id=processing_key.run_id, audit_digest=audit_digest)
+        safe_run_id = processing_key.run_id if isinstance(processing_key, ProcessingKey) else 0
+        safe_run_attempt = processing_key.run_attempt if isinstance(processing_key, ProcessingKey) else 0
+        safe_digest = audit_digest if isinstance(audit_digest, str) else ""
+        round_key = RoundKey(epoch=epoch, run_id=safe_run_id, audit_digest=safe_digest)
         return _decision(
             failed,
             processing_key=processing_key,
             round_key=round_key,
             event_id=_event_id(
                 epoch=epoch,
-                run_id=processing_key.run_id,
-                run_attempt=processing_key.run_attempt,
-                audit_digest=audit_digest,
+                run_id=safe_run_id,
+                run_attempt=safe_run_attempt,
+                audit_digest=safe_digest,
             ),
             reason=failed.reason,
             accepted=False,
             no_op=False,
         )
+    if not isinstance(waiver_receipts, Sequence) or any(not isinstance(receipt, DispositionReceipt) for receipt in waiver_receipts):
+        failed = _fail_closed_state(state, "waiver receipts have an invalid shape")
+        return _decision(failed, processing_key=processing_key, round_key=RoundKey(epoch, primary.run_id, audit_digest), event_id="", reason=failed.reason, accepted=False, no_op=False)
+    # Epoch boundaries precede all idempotency checks. Old indexes cannot
+    # consume a round in the new generation.
+    if state.epoch != epoch:
+        if state.terminal_decision in {"fail_closed", "manual_required"}:
+            failed = _fail_closed_state(state, "untrusted state cannot auto-reset on scope change")
+            return _decision(failed, processing_key=processing_key, round_key=RoundKey(epoch, primary.run_id, audit_digest), event_id="", reason=failed.reason, accepted=False, no_op=False)
+        working = initial_state(scope)
+    else:
+        working = state
     round_key = _round_key(epoch=epoch, run_id=primary.run_id, audit_digest=audit_digest)
     event_id = _event_id(
         epoch=epoch,
@@ -729,14 +803,14 @@ def evaluate_round(
         processing_key=processing_key,
     )
     duplicate, conflict = _duplicate_status(
-        state,
+        working,
         processing_key=processing_key,
         round_key=round_key,
         event_id=event_id,
         fingerprint=fingerprint,
     )
     if conflict:
-        failed = _fail_closed_state(state, "conflicting payload for a consumed processing/round/event key")
+        failed = _fail_closed_state(working, "conflicting payload for a consumed processing/round/event key")
         return _decision(
             failed,
             processing_key=processing_key,
@@ -748,7 +822,7 @@ def evaluate_round(
         )
     if duplicate:
         return _decision(
-            state,
+            working,
             processing_key=processing_key,
             round_key=round_key,
             event_id=event_id,
@@ -757,8 +831,8 @@ def evaluate_round(
             no_op=True,
         )
 
-    if any(getattr(receipt, "valid", False) for receipt in waiver_receipts):
-        failed = _fail_closed_state(state, "disposition semantics are not enabled in increment 1")
+    if any(receipt.valid for receipt in waiver_receipts):
+        failed = _fail_closed_state(working, "disposition semantics are not enabled in increment 1")
         return _decision(
             failed,
             processing_key=processing_key,
@@ -768,25 +842,6 @@ def evaluate_round(
             accepted=False,
             no_op=False,
         )
-
-    # A scope change is a new generation.  A damaged/manual old generation is
-    # not silently reinitialized; only a trusted collecting/converged state can
-    # be evaluated from a zero-based new epoch in this increment.
-    if state.epoch != epoch:
-        if state.terminal_decision in {"fail_closed", "manual_required"}:
-            failed = _fail_closed_state(state, "untrusted state cannot auto-reset on scope change")
-            return _decision(
-                failed,
-                processing_key=processing_key,
-                round_key=round_key,
-                event_id=event_id,
-                reason=failed.reason,
-                accepted=False,
-                no_op=False,
-            )
-        working = initial_state(scope)
-    else:
-        working = state
 
     if working.terminal_decision == "fail_closed":
         return _decision(
@@ -815,6 +870,7 @@ def evaluate_round(
             round_key=round_key,
             event_id=event_id,
             fingerprint=fingerprint,
+            verdict=primary.verdict, p1_ids=primary.p1_ids, effect="terminal",
         )
         terminal = _state_with(recorded, terminal_decision="manual_required", reason="new round after convergence requires manual review")
         return _decision(
@@ -833,6 +889,8 @@ def evaluate_round(
         round_key=round_key,
         event_id=event_id,
         fingerprint=fingerprint,
+        verdict=primary.verdict, p1_ids=primary.p1_ids,
+        effect="unavailable" if primary.verdict == "unavailable" else "eligible",
     )
     if primary.verdict == "unavailable":
         unavailable = recorded.unavailable_streak + 1
@@ -910,7 +968,10 @@ def validate_receipt(receipt: Receipt, scope: Scope) -> None:
 
     if not isinstance(receipt, Receipt):
         raise ReceiptValidationError(f"receipt must be Receipt, got {type(receipt).__name__}")
-    validate_scope(scope)
+    try:
+        validate_scope(scope)
+    except ScopeValidationError as exc:
+        raise ReceiptValidationError(f"evaluator scope is invalid: {exc}") from exc
     try:
         validate_scope(receipt.scope)
     except ScopeValidationError as exc:
@@ -978,6 +1039,12 @@ def dedupe_receipts(receipts: Sequence[Receipt]) -> tuple[Receipt, ...]:
     fail-closed state.
     """
 
+    if not isinstance(receipts, Sequence):
+        raise ReceiptValidationError("receipts must be a Sequence")
+    for receipt in receipts:
+        if not isinstance(receipt, Receipt):
+            raise ReceiptValidationError(f"receipt must be Receipt, got {type(receipt).__name__}")
+        validate_receipt(receipt, receipt.scope)
     ordered = sorted(
         receipts,
         key=lambda receipt: (receipt.run_id, receipt.run_attempt, receipt.event_id),
@@ -987,8 +1054,6 @@ def dedupe_receipts(receipts: Sequence[Receipt]) -> tuple[Receipt, ...]:
     by_event: dict[str, str] = {}
     unique: list[Receipt] = []
     for receipt in ordered:
-        if not isinstance(receipt, Receipt):
-            raise ReceiptValidationError(f"receipt must be Receipt, got {type(receipt).__name__}")
         event_fingerprint = _receipt_event_fingerprint(receipt)
         round_fingerprint = _receipt_round_fingerprint(receipt)
         processing_key = receipt.processing_key.as_tuple()
