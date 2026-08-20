@@ -576,6 +576,60 @@ def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path)
     assert "review_not_expected" in summary
 
 
+def _run_receipt_cli_case(tmp_path, *, audit, primary_result, is_draft="false", review_expected="true"):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    if audit is not None:
+        (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    summary_path = tmp_path / "summary.md"
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+    overrides = {
+        "primary_result": primary_result,
+        "is_draft": is_draft,
+        "review_expected": review_expected,
+        "convergence_receipt_path": str(receipt_path),
+    }
+    return AGG.main(_cli_args(audit_dir, summary_path, **overrides)), receipt_path
+
+
+def test_cli_exit_zero_with_receipt_for_clean_round(tmp_path):
+    audit = _valid_scoped_primary_record()
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
+
+    assert rc == 0
+    assert receipt_path.is_file()
+    assert json.loads(receipt_path.read_text())["clean_streak"] == 1
+
+
+def test_cli_exit_zero_without_receipt_for_expected_skip(tmp_path):
+    rc, receipt_path = _run_receipt_cli_case(
+        tmp_path, audit=None, primary_result="skipped", is_draft="true", review_expected="false",
+    )
+
+    assert rc == 0
+    assert not receipt_path.exists()
+
+
+@pytest.mark.parametrize("verdict", ["fail", "unavailable"])
+def test_cli_exit_nonzero_with_zero_streak_receipt_for_red_or_unavailable_round(tmp_path, verdict):
+    audit = _valid_scoped_primary_record(
+        verdict=verdict,
+        result={"findings": [{"id": "p1", "severity": "major"}]},
+    )
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="failure")
+
+    assert rc != 0
+    assert receipt_path.is_file()
+    assert json.loads(receipt_path.read_text())["clean_streak"] == 0
+
+
+def test_cli_exit_nonzero_without_receipt_for_fail_closed_audit(tmp_path):
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=None, primary_result="failure")
+
+    assert rc != 0
+    assert not receipt_path.exists()
+
+
 def test_main_summary_and_notice_include_cross_attempt_source(capsys, tmp_path):
     audit_dir = tmp_path / "audit"
     audit_dir.mkdir()

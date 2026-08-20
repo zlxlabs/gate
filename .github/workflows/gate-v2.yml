@@ -927,6 +927,7 @@ jobs:
           CONVERGENCE_RECEIPT_PATH: ${{ runner.temp }}/convergence-receipt/convergence-receipt.json
           GH_TOKEN: ${{ github.token }}
         run: |
+          set +e
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
             --primary-result "$PRIMARY_RESULT" \
@@ -945,14 +946,17 @@ jobs:
             --summary-path "$GITHUB_STEP_SUMMARY" \
             --terminal-path "$TERMINAL_PATH" \
             --convergence-receipt-path "$CONVERGENCE_RECEIPT_PATH"
+          rc=$?
+          set -e
           if [ -f "$CONVERGENCE_RECEIPT_PATH" ]; then
             echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"
           else
             echo "convergence-receipt=absent" >> "$GITHUB_OUTPUT"
           fi
+          exit "$rc"
 
       - name: Upload convergence receipt
-        if: steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'
+        if: always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

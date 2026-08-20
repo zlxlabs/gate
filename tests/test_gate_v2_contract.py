@@ -299,9 +299,9 @@ def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication(
     )
 
     upload = steps[receipt_index]
-    assert upload["if"] == "steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
+    assert upload["if"] == "always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
-    assert "always()" not in str(upload["if"])
+    assert "always()" in str(upload["if"])
     assert "continue-on-error" not in upload
     assert upload["with"] == {
         "name": CONVERGENCE_RECEIPT_NAME_EXPR,
@@ -309,6 +309,31 @@ def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication(
         "if-no-files-found": "error",
         "retention-days": 30,
     }
+
+
+def test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggregate_rc():
+    raw, _ = _load_workflow()
+    aggregate = next(
+        step for step in raw["jobs"]["gate"]["steps"]
+        if step.get("name") == "Aggregate required verdict"
+    )
+    run = aggregate["run"]
+    python_index = run.index("python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py")
+    set_plus_index = run.index("set +e")
+    rc_index = run.index("rc=$?", python_index)
+    set_minus_index = run.index("set -e", rc_index)
+    output_index = run.index('echo "convergence-receipt=present" >> "$GITHUB_OUTPUT"')
+    exit_index = run.index('exit "$rc"')
+    assert set_plus_index < python_index < rc_index < set_minus_index < output_index < exit_index
+    assert "|| true" not in run
+    assert "continue-on-error" not in aggregate
+
+    upload = next(
+        step for step in raw["jobs"]["gate"]["steps"]
+        if step.get("name") == "Upload convergence receipt"
+    )
+    assert upload["if"] == "always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
+    assert "continue-on-error" not in upload
 
 
 # ── gate aggregator job: required-check identity + always() ─────────────────
