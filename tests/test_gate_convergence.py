@@ -119,26 +119,11 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
         pr_number=scope.pr_number,
         epoch=CONV.derive_epoch(scope),
         head_sha=scope.head_sha,
-        diff_digest=scope.diff_digest,
-        primary_run_id=str(primary.run_id),
-        primary_run_attempt=primary.run_attempt,
         audit_digest=audit_digest,
         finding_id=primary.p1_ids[0],
-        issuer_login="maintainer",
-        issuer_user_id="9001",
-        control_run_id="control-100",
-        approval_ref="issuer-not-pr-author:author",
-        issued_at="2026-08-20T08:00:00Z",
-        expires_at="2099-08-20T08:00:00Z",
-        nonce="nonce-100",
-        evidence_manifest_digest="e" * 64,
-        receipt_digest="",
-        scope=scope.as_dict(),
+        reason="locked upstream behavior",
     )
-    receipt = replace(receipt, **changes)
-    if receipt.receipt_digest == "":
-        receipt = replace(receipt, receipt_digest=CONV.disposition_receipt_digest(receipt))
-    return receipt
+    return replace(receipt, **changes)
 
 
 def _state_for(name):
@@ -164,98 +149,50 @@ def test_derive_epoch_is_canonical_and_scope_changes_are_guards():
     assert CONV.derive_epoch(SCOPE) != CONV.derive_epoch(replace(SCOPE, infra_diff=True, effective_tier="internal"))
 
 
-def test_disposition_requires_protected_issuer_and_exact_digest_binding():
+def test_disposition_receipt_is_bound_to_the_current_round():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     receipt = _disposition(primary=primary)
     status = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
-        now="2026-08-20T09:00:00Z", revocations=(),
     )
     assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
-    unprotected = replace(receipt, issuer_user_id="", receipt_digest="")
-    assert CONV.validate_disposition_receipt(
-        replace(unprotected, receipt_digest=CONV.disposition_receipt_digest(unprotected)),
-        scope=SCOPE, primary=primary, audit_digest="a" * 64,
-        now="2026-08-20T09:00:00Z", revocations=(),
-    ).reason == "issuer_unprotected"
 
 
-def test_disposition_requires_protected_issuer_and_evidence():
-    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
-    receipt = _disposition(primary=primary)
-    missing_evidence = replace(receipt, evidence_manifest_digest="")
-    missing_evidence_status = CONV.validate_disposition_receipt(
-        missing_evidence, scope=SCOPE, primary=primary, audit_digest="a" * 64,
-        now="2026-08-20T09:00:00Z", revocations=(),
-    )
-    assert not missing_evidence_status.valid and missing_evidence_status.reason == "malformed_receipt"
-    missing_digest = replace(receipt, receipt_digest="")
-    missing_digest_status = CONV.validate_disposition_receipt(
-        missing_digest, scope=SCOPE, primary=primary, audit_digest="a" * 64,
-        now="2026-08-20T09:00:00Z", revocations=(),
-    )
-    assert not missing_digest_status.valid and missing_digest_status.reason == "malformed_receipt"
-
-
-def test_disposition_binding_rejects_head_generation_and_digest_mismatch():
+def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     receipt = _disposition(primary=primary)
     changed_scope = replace(SCOPE, head_sha="x" * 40)
     assert CONV.validate_disposition_receipt(
         receipt, scope=changed_scope, primary=replace(primary, head_sha=changed_scope.head_sha),
-        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
-    ).reason == "scope_mismatch"
+        audit_digest="a" * 64,
+    ).reason == "epoch_mismatch_stale"
     assert CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="b" * 64,
-        now="2026-08-20T09:00:00Z", revocations=(),
     ).reason == "audit_digest_mismatch"
-
-
-def test_disposition_binding_rejects_complete_scope_matrix_changes():
-    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
-    receipt = _disposition(primary=primary)
-    changes = [
-        {"base_sha": "x" * 40},
-        {"policy_version": "policy-v2"},
-        {"policy_digest": "q" * 64},
-        {"tier": "internal", "effective_tier": "internal"},
-        {"effective_tier": "internal", "tier": "internal"},
-        {"infra_classifier_version": "infra-v2"},
-        {"infra_diff": True, "effective_tier": "internal"},
-        {"caller_sha": "x" * 40},
-        {"reusable_workflow_sha": "x" * 40},
-    ]
-    for change in changes:
-        changed_scope = replace(SCOPE, **change)
-        changed_primary = replace(primary, head_sha=changed_scope.head_sha)
-        status = CONV.validate_disposition_receipt(
-            receipt, scope=changed_scope, primary=changed_primary, audit_digest="a" * 64,
-            now="2026-08-20T09:00:00Z", revocations=(),
-        )
-        assert status.reason == "scope_mismatch", change
+    assert CONV.validate_disposition_receipt(
+        replace(receipt, finding_id="other"), scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "finding_not_current_p1"
 
 
 def test_only_false_positive_resolves_matching_current_finding():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("a", "b"))
     receipt = _disposition(primary=primary)
-    # Recompute the receipt digest after changing the exact finding target.
-    receipt = replace(receipt, finding_id="b", receipt_digest="")
-    receipt = replace(receipt, receipt_digest=CONV.disposition_receipt_digest(receipt))
+    receipt = replace(receipt, finding_id="b")
     result = CONV.evaluate_round(
         state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
         audit_digest="a" * 64, waiver_receipts=(receipt,),
-        processing_key=_key(run_id=7, run_attempt=2), now="2026-08-20T09:00:00Z",
+        processing_key=_key(run_id=7, run_attempt=2),
     )
     assert result.decision == "collecting" and result.clean_streak == 0
     assert result.state.event_records[-1][2][2] == ("a",)
     # A second receipt cannot clear the already-consumed round; a new primary
     # round with its own exact receipt can clear its only current P1.
     next_primary = _primary(run_id=8, run_attempt=1, p1_ids=("b",))
-    next_receipt = _disposition(primary=next_primary, audit_digest="b" * 64, finding_id="b", nonce="nonce-102")
+    next_receipt = _disposition(primary=next_primary, audit_digest="b" * 64, finding_id="b")
     next_result = CONV.evaluate_round(
         state=result.state, scope=SCOPE, primary=next_primary,
         audit_digest="b" * 64, waiver_receipts=(next_receipt,),
-        processing_key=_key(run_id=8), now="2026-08-20T09:00:00Z",
+        processing_key=_key(run_id=8),
     )
     assert next_result.clean_streak == 1 and next_result.decision == "converged"
 
@@ -266,63 +203,35 @@ def test_rejected_disposition_cannot_advance_streak():
     result = CONV.evaluate_round(
         state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
         audit_digest="a" * 64, waiver_receipts=(accepted,),
-        processing_key=_key(run_id=7, run_attempt=2), now="2026-08-20T09:00:00Z",
+        processing_key=_key(run_id=7, run_attempt=2),
     )
     assert (result.clean_streak, result.eligible_rounds, result.decision) == (0, 1, "collecting")
 
 
-def test_disposition_nonce_is_idempotent_and_conflict_safe():
+def test_duplicate_disposition_is_idempotent():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     receipt = _disposition(primary=primary)
     first = CONV.consume_dispositions(
         primary.p1_ids, (receipt,), scope=SCOPE, primary=primary,
-        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
+        audit_digest="a" * 64,
     )
     replay = CONV.consume_dispositions(
         primary.p1_ids, (receipt, receipt), scope=SCOPE, primary=primary,
-        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
+        audit_digest="a" * 64,
     )
     assert len(first.consumed_receipts) == 1 and not first.fail_closed
     assert len(replay.consumed_receipts) == 1 and not replay.fail_closed
-    conflict = replace(receipt, approval_ref="approval-other", receipt_digest="")
-    conflict = replace(conflict, receipt_digest=CONV.disposition_receipt_digest(conflict))
-    result = CONV.consume_dispositions(
-        primary.p1_ids, (receipt, conflict), scope=SCOPE, primary=primary,
-        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
-    )
-    assert result.fail_closed and result.rejected_receipts[-1][1] == "nonce_conflict"
 
 
 def test_malformed_disposition_input_preserves_typed_rejections_and_raw_diagnostic():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
-    malformed = {"finding_id": "p1", "nonce": "nonce-bad"}
+    malformed = {"finding_id": "p1"}
     result = CONV.consume_dispositions(
         primary.p1_ids, (malformed,), scope=SCOPE, primary=primary,
-        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
+        audit_digest="a" * 64,
     )
     assert result.fail_closed
     assert result.rejected_receipts == ((CONV.DispositionReceipt(), "malformed_receipt"),)
-    assert result.malformed_inputs == (malformed,)
-
-
-def test_disposition_lifecycle_invalidates_on_head_digest_expiry_and_revocation():
-    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
-    expired = _disposition(primary=primary, expires_at="2026-08-20T08:30:00Z")
-    status = CONV.disposition_status(
-        expired, scope=SCOPE, primary=primary, audit_digest="a" * 64,
-        now="2026-08-20T09:00:00Z", revocations=(),
-    )
-    assert not status.active and status.reason == "expired"
-    receipt = _disposition(primary=primary)
-    revocation = CONV.DispositionRevocation(
-        schema_version=1, nonce=receipt.nonce, reason="evidence withdrawn",
-        actor="maintainer", revoked_at="2026-08-20T08:30:00Z", evidence_ref="evidence-1",
-    )
-    status = CONV.disposition_status(
-        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
-        now="2026-08-20T09:00:00Z", revocations=(revocation,),
-    )
-    assert not status.active and status.reason == "revoked"
 
 
 def test_comment_alone_cannot_change_required_decision():
@@ -330,31 +239,9 @@ def test_comment_alone_cannot_change_required_decision():
     result = CONV.evaluate_round(
         state=CONV.initial_state(SCOPE), scope=SCOPE, primary=primary,
         audit_digest="a" * 64, waiver_receipts=(),
-        processing_key=_key(run_id=7, run_attempt=2), now="2026-08-20T09:00:00Z",
+        processing_key=_key(run_id=7, run_attempt=2),
     )
     assert result.decision == "collecting" and result.clean_streak == 0
-
-
-def test_revocation_is_append_only_and_recomputed():
-    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
-    receipt = _disposition(primary=primary)
-    original = CONV.consume_dispositions(
-        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary,
-        audit_digest="a" * 64, now="2026-08-20T09:00:00Z", revocations=(),
-    )
-    revocation = CONV.DispositionRevocation(
-        schema_version=1, nonce=receipt.nonce, reason="withdrawn",
-        actor="maintainer", revoked_at="2026-08-20T09:01:00Z", evidence_ref="evidence-2",
-    )
-    revoked = CONV.consume_dispositions(
-        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary,
-        audit_digest="a" * 64, now="2026-08-20T09:02:00Z", revocations=(revocation,),
-    )
-    assert original.consumed_receipts == (receipt,)
-    assert revoked.consumed_receipts == ()
-    assert revoked.remaining_p1_ids == ("p1",)
-    assert revocation.as_dict()["nonce"] == receipt.nonce
-    assert receipt.receipt_digest == CONV.disposition_receipt_digest(receipt)
 
 
 @pytest.mark.parametrize(
@@ -569,7 +456,7 @@ def test_terminal_replay_consumes_only_matching_disposition():
 
 
 def test_terminal_replay_rejects_invalid_disposition():
-    result = _round(_state_for("T"), run_id=36, digest="6", p1_ids=("f",), waiver=(CONV.DispositionReceipt(valid=True),))
+    result = _round(_state_for("T"), run_id=36, digest="6", p1_ids=("f",), waiver=(_disposition(primary=_primary(run_id=36, p1_ids=("f",)), disposition="accepted"),))
     assert result.decision == "fail_closed"
 
 
@@ -620,7 +507,7 @@ def test_fail_closed_never_treats_missing_as_clean():
 
 
 def test_fail_closed_rejects_waiver():
-    result = _round(_state_for("F"), run_id=44, digest="a", waiver=(CONV.DispositionReceipt(valid=True),))
+    result = _round(_state_for("F"), run_id=44, digest="a", waiver=(_disposition(primary=_primary(run_id=44, p1_ids=("f",)), disposition="accepted"),))
     assert result.decision == "fail_closed"
 
 

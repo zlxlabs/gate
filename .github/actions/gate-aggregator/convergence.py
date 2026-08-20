@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 
 SCHEMA_VERSION = 1
@@ -26,9 +25,8 @@ TERMINAL_DECISIONS = frozenset(
     {"collecting", "converged", "manual_required", "fail_closed"}
 )
 RECEIPT_KIND = "canonical_primary"
-DISPOSITION_KINDS = frozenset({"false-positive", "accepted", "wont-fix", "fixed"})
+DISPOSITION_KINDS = frozenset({"false-positive"})
 DISPOSITION_RECEIPT_SCHEMA_VERSION = 1
-DISPOSITION_REVOCATION_SCHEMA_VERSION = 1
 
 # This is intentionally local to the public gate repository.  The private
 # policy source is represented only by Scope.policy_version/policy_digest in
@@ -162,83 +160,29 @@ class CanonicalPrimary:
 
 @dataclass(frozen=True)
 class DispositionReceipt:
-    """Immutable, exact-current-round protected disposition receipt.
+    """Immutable disposition bound to one current canonical audit round."""
 
-    ``valid`` remains a compatibility-only input marker for the increment-1
-    fixture shape.  It is never included in the canonical payload and a true
-    value without the complete protected binding is rejected.
-    """
-
-    schema_version: int = RECEIPT_SCHEMA_VERSION
+    schema_version: int = DISPOSITION_RECEIPT_SCHEMA_VERSION
     disposition: str = "none"
     repository_id: str = ""
     pr_number: int = 0
     epoch: str = ""
     head_sha: str = ""
-    diff_digest: str = ""
-    primary_run_id: str = ""
-    primary_run_attempt: int = 0
     audit_digest: str = ""
     finding_id: str = ""
-    issuer_login: str = ""
-    issuer_user_id: str = ""
-    control_run_id: str = ""
-    approval_ref: str = ""
-    issued_at: str = ""
-    expires_at: str = ""
-    nonce: str = ""
-    evidence_manifest_digest: str = ""
-    receipt_digest: str = ""
-    scope: Mapping[str, Any] | None = None
-    valid: bool = False
+    reason: str = ""
 
-    def as_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+    def as_dict(self) -> dict[str, Any]:
+        return {
             "schema_version": self.schema_version,
             "disposition": self.disposition,
             "repository_id": self.repository_id,
             "pr_number": self.pr_number,
             "epoch": self.epoch,
             "head_sha": self.head_sha,
-            "diff_digest": self.diff_digest,
-            "primary_run_id": self.primary_run_id,
-            "primary_run_attempt": self.primary_run_attempt,
             "audit_digest": self.audit_digest,
             "finding_id": self.finding_id,
-            "issuer_login": self.issuer_login,
-            "issuer_user_id": self.issuer_user_id,
-            "control_run_id": self.control_run_id,
-            "approval_ref": self.approval_ref,
-            "issued_at": self.issued_at,
-            "expires_at": self.expires_at,
-            "nonce": self.nonce,
-            "evidence_manifest_digest": self.evidence_manifest_digest,
-            "scope": self.scope.as_dict() if isinstance(self.scope, Scope) else self.scope,
-        }
-        if include_digest:
-            payload["receipt_digest"] = self.receipt_digest
-        return payload
-
-
-@dataclass(frozen=True)
-class DispositionRevocation:
-    """Append-only protected revocation event."""
-
-    schema_version: int
-    nonce: str
-    reason: str
-    actor: str
-    revoked_at: str
-    evidence_ref: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "nonce": self.nonce,
             "reason": self.reason,
-            "actor": self.actor,
-            "revoked_at": self.revoked_at,
-            "evidence_ref": self.evidence_ref,
         }
 
 
@@ -260,11 +204,6 @@ class DispositionStatus:
     def finding_id(self) -> str:
         return self.receipt.finding_id
 
-    @property
-    def evidence_manifest_digest(self) -> str:
-        return self.receipt.evidence_manifest_digest
-
-
 @dataclass(frozen=True)
 class DispositionConsumption:
     """Pure result of applying protected dispositions to one primary audit."""
@@ -274,7 +213,6 @@ class DispositionConsumption:
     rejected_receipts: tuple[tuple[DispositionReceipt, str], ...]
     fail_closed: bool
     statuses: tuple[DispositionStatus, ...] = ()
-    malformed_inputs: tuple[Any, ...] = ()
 
     @property
     def p1_ids(self) -> tuple[str, ...]:
@@ -437,14 +375,6 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
-def disposition_receipt_digest(receipt: DispositionReceipt) -> str:
-    """Return the digest over the receipt's binding fields, excluding itself."""
-
-    if not isinstance(receipt, DispositionReceipt):
-        raise TypeError("receipt must be DispositionReceipt")
-    return _sha256(receipt.as_dict(include_digest=False))
-
-
 def _disposition_status(
     receipt: DispositionReceipt,
     *,
@@ -465,69 +395,16 @@ def _disposition_status(
 def _legacy_disposition_stub(receipt: DispositionReceipt) -> bool:
     return (
         isinstance(receipt, DispositionReceipt)
-        and not receipt.valid
-        and receipt.schema_version == RECEIPT_SCHEMA_VERSION
+        and receipt.schema_version == DISPOSITION_RECEIPT_SCHEMA_VERSION
         and receipt.disposition == "none"
         and receipt.repository_id == ""
         and receipt.pr_number == 0
         and receipt.epoch == ""
         and receipt.head_sha == ""
-        and receipt.diff_digest == ""
-        and receipt.primary_run_id == ""
-        and receipt.primary_run_attempt == 0
         and receipt.audit_digest == ""
         and receipt.finding_id == ""
-        and receipt.issuer_login == ""
-        and receipt.issuer_user_id == ""
-        and receipt.control_run_id == ""
-        and receipt.approval_ref == ""
-        and receipt.issued_at == ""
-        and receipt.expires_at == ""
-        and receipt.nonce == ""
-        and receipt.evidence_manifest_digest == ""
-        and receipt.receipt_digest == ""
-        and receipt.scope is None
+        and receipt.reason == ""
     )
-
-
-def _utc_timestamp(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc)
-
-
-def _sha256_text(value: Any) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(
-        character in "0123456789abcdefABCDEF" for character in value
-    )
-
-
-def _revocation_error(revocations: Sequence[DispositionRevocation], nonce: str) -> str | None:
-    if not isinstance(revocations, Sequence):
-        return "malformed_revocation_index"
-    for revocation in revocations:
-        if not isinstance(revocation, DispositionRevocation):
-            return "malformed_revocation"
-        if revocation.schema_version != DISPOSITION_REVOCATION_SCHEMA_VERSION:
-            return "malformed_revocation"
-        if not all(
-            _nonempty_text(getattr(revocation, field))
-            for field in ("nonce", "reason", "actor", "revoked_at", "evidence_ref")
-        ):
-            return "malformed_revocation"
-        if revocation.nonce != nonce:
-            continue
-        if _utc_timestamp(revocation.revoked_at) is None:
-            return "malformed_revocation"
-        return "revoked"
-    return None
 
 
 def validate_disposition_receipt(
@@ -536,10 +413,8 @@ def validate_disposition_receipt(
     scope: Scope,
     primary: CanonicalPrimary,
     audit_digest: str,
-    now: str,
-    revocations: Sequence[DispositionRevocation],
 ) -> DispositionStatus:
-    """Validate one protected receipt without using exceptions as control flow."""
+    """Validate one receipt against the current canonical audit round."""
 
     if not isinstance(receipt, DispositionReceipt):
         return _disposition_status(
@@ -555,71 +430,30 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_scope")
     if not isinstance(primary, CanonicalPrimary):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_primary")
-    if not isinstance(now, str) or _utc_timestamp(now) is None:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_now")
-    if not isinstance(revocations, Sequence):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_revocation_index")
     if receipt.schema_version != DISPOSITION_RECEIPT_SCHEMA_VERSION:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="schema_version_mismatch")
     if receipt.disposition not in DISPOSITION_KINDS:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="unknown_disposition")
-    required_text = (
-        "repository_id", "epoch", "head_sha", "diff_digest", "primary_run_id",
-        "audit_digest", "finding_id", "control_run_id", "issued_at", "expires_at", "nonce",
-        "evidence_manifest_digest", "receipt_digest",
-    )
+    required_text = ("repository_id", "epoch", "head_sha", "audit_digest", "finding_id", "reason")
     if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
     if type(receipt.pr_number) is not int or receipt.pr_number <= 0:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_pr_number")
-    if type(receipt.primary_run_attempt) is not int or receipt.primary_run_attempt <= 0:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_primary_attempt")
     if receipt.repository_id != str(scope.repository_id):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="repository_mismatch")
     if receipt.pr_number != scope.pr_number:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="pr_mismatch")
-    receipt_scope = receipt.scope.as_dict() if isinstance(receipt.scope, Scope) else receipt.scope
-    if not isinstance(receipt_scope, Mapping) or dict(receipt_scope) != scope.as_dict():
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="scope_mismatch")
     expected_epoch = derive_epoch(scope)
     if receipt.epoch != expected_epoch:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="epoch_mismatch_stale")
     if receipt.head_sha != scope.head_sha:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="head_sha_mismatch")
-    if receipt.diff_digest != scope.diff_digest:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="diff_digest_mismatch")
-    if receipt.primary_run_id != str(primary.run_id):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="primary_run_id_mismatch")
-    if receipt.primary_run_attempt != primary.run_attempt:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="primary_run_attempt_mismatch")
-    if not _sha256_text(audit_digest) or receipt.audit_digest != audit_digest:
+    if _audit_digest_errors(audit_digest) or receipt.audit_digest != audit_digest:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="audit_digest_mismatch")
     if receipt.finding_id in {"*", "all"} or any(character in receipt.finding_id for character in "?[]"):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_target_not_exact")
     if receipt.finding_id not in primary.p1_ids:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_not_current_p1")
-    if not _sha256_text(receipt.diff_digest) or not _sha256_text(receipt.evidence_manifest_digest):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="evidence_manifest_malformed")
-    if not _nonempty_text(receipt.issuer_login) or not _nonempty_text(receipt.issuer_user_id) or not _nonempty_text(receipt.approval_ref):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="issuer_unprotected")
-    issued = _utc_timestamp(receipt.issued_at)
-    expires = _utc_timestamp(receipt.expires_at)
-    current = _utc_timestamp(now)
-    if issued is None or expires is None or current is None or expires <= issued:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_timestamps")
-    if issued > current:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="issued_in_future")
-    if current >= expires:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="expired")
-    revocation = _revocation_error(revocations, receipt.nonce)
-    if revocation == "revoked":
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="revoked")
-    if revocation is not None:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason=revocation)
-    if receipt.receipt_digest != disposition_receipt_digest(receipt):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="receipt_digest_mismatch")
-    if receipt.disposition != "false-positive":
-        return _disposition_status(receipt, valid=True, active=True, consumable=False, reason="disposition_not_gate_resolving")
     return _disposition_status(receipt, valid=True, active=True, consumable=True, reason="active_false_positive")
 
 
@@ -629,8 +463,6 @@ def disposition_status(
     scope: Scope,
     primary: CanonicalPrimary,
     audit_digest: str,
-    now: str,
-    revocations: Sequence[DispositionRevocation],
 ) -> DispositionStatus:
     """Return the observational status view used by ledger/human summaries."""
 
@@ -639,8 +471,6 @@ def disposition_status(
         scope=scope,
         primary=primary,
         audit_digest=audit_digest,
-        now=now,
-        revocations=revocations,
     )
 
 
@@ -649,20 +479,11 @@ _DISPOSITION_FAIL_CLOSED_REASONS = frozenset(
         "malformed_receipt", "schema_version_mismatch", "unknown_disposition",
         "malformed_pr_number", "malformed_primary_attempt", "repository_mismatch",
         "pr_mismatch", "epoch_mismatch_stale", "head_sha_mismatch",
-        "diff_digest_mismatch", "primary_run_id_mismatch",
-        "primary_run_attempt_mismatch", "audit_digest_mismatch",
+        "audit_digest_mismatch",
         "finding_target_not_exact", "finding_not_current_p1",
-        "evidence_manifest_malformed", "issuer_unprotected", "malformed_timestamps",
-        "issued_in_future", "receipt_digest_mismatch", "malformed_scope",
-        "malformed_primary", "malformed_now", "malformed_revocation_index",
-        "malformed_revocation", "nonce_conflict",
-        "scope_mismatch",
+        "malformed_primary",
     }
 )
-
-
-def _current_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def consume_dispositions(
@@ -672,8 +493,6 @@ def consume_dispositions(
     scope: Scope,
     primary: CanonicalPrimary,
     audit_digest: str,
-    now: str,
-    revocations: Sequence[DispositionRevocation],
 ) -> DispositionConsumption:
     """Apply only active exact false-positive receipts to this P1 projection."""
 
@@ -687,44 +506,27 @@ def consume_dispositions(
     statuses: list[DispositionStatus] = []
     consumed: list[DispositionReceipt] = []
     rejected: list[tuple[DispositionReceipt, str]] = []
-    malformed_inputs: list[Any] = []
     fail_closed = False
-    by_nonce: dict[str, DispositionReceipt] = {}
     seen_payloads: set[str] = set()
     for receipt in receipts:
         if not isinstance(receipt, DispositionReceipt):
             status = validate_disposition_receipt(
                 receipt, scope=scope, primary=primary, audit_digest=audit_digest,
-                now=now, revocations=revocations,
             )
             statuses.append(status)
             rejected.append((status.receipt, status.reason))
-            malformed_inputs.append(receipt)
             fail_closed = True
             continue
         if _legacy_disposition_stub(receipt):
             statuses.append(_disposition_status(receipt, valid=False, active=False, consumable=False, reason="absent_legacy_stub"))
             continue
         payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        if receipt.nonce in by_nonce:
-            prior = by_nonce[receipt.nonce]
-            prior_signature = json.dumps(prior.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            if payload_signature != prior_signature:
-                rejected.append((receipt, "nonce_conflict"))
-                fail_closed = True
-                statuses.append(_disposition_status(receipt, valid=False, active=False, consumable=False, reason="nonce_conflict"))
-            else:
-                statuses.append(_disposition_status(receipt, valid=True, active=True, consumable=False, reason="duplicate_nonce_noop"))
-            continue
-        if receipt.nonce:
-            by_nonce[receipt.nonce] = receipt
         if payload_signature in seen_payloads:
             statuses.append(_disposition_status(receipt, valid=True, active=True, consumable=False, reason="duplicate_receipt_noop"))
             continue
         seen_payloads.add(payload_signature)
         status = validate_disposition_receipt(
             receipt, scope=scope, primary=primary, audit_digest=audit_digest,
-            now=now, revocations=revocations,
         )
         statuses.append(status)
         if status.consumable:
@@ -743,7 +545,6 @@ def consume_dispositions(
         rejected_receipts=tuple(rejected),
         fail_closed=fail_closed,
         statuses=tuple(statuses),
-        malformed_inputs=tuple(malformed_inputs),
     )
 
 
@@ -1172,8 +973,6 @@ def evaluate_round(
     audit_digest: str,
     waiver_receipts: Sequence[DispositionReceipt],
     processing_key: ProcessingKey,
-    now: str | None = None,
-    revocations: Sequence[DispositionRevocation] = (),
 ) -> RoundDecision:
     """Consume exactly one canonical primary observation.
 
@@ -1323,8 +1122,6 @@ def evaluate_round(
         scope=scope,
         primary=primary,
         audit_digest=audit_digest,
-        now=now or _current_utc_iso(),
-        revocations=revocations,
     )
     if disposition_result.fail_closed:
         reasons = ", ".join(reason for _, reason in disposition_result.rejected_receipts)
