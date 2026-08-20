@@ -160,7 +160,7 @@ def evaluate_round(
 
 绝不放进 PR 评论的状态清单：`clean_streak`、`eligible_rounds`、`unavailable_streak`、`last_run_id`、`last_run_attempt`、`epoch` 的唯一游标、`state_hash`、`round_key` 去重表、waiver nonce 的 consumed 标记、任何“当前有效 waiver”布尔值，以及用于 PATCH/If-Match 的版本号。评论可以展示这些值的**本 run 派生摘要**，但机器不能读回它们作判定。
 
-## 3. 三增量拆卡草案
+## 3. 四张实现卡拆分草案
 
 四张实现卡严格串行：增量 1 先冻结纯 reducer 和 state contract；增量 2 在该 contract 上接 protected disposition；增量 3 拆成 3a 写出侧和 3b 读回侧。任何增量都不能在 gate-hub 侧新增 evaluator。
 

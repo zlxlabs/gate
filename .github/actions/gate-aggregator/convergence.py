@@ -1252,8 +1252,6 @@ def receipt_for_round(
     re-derived here; a producer and a future replay consumer must observe the
     same keys even if their surrounding metadata differs.
     """
-    if artifact_id is None and artifact_name is None:
-        artifact_name = "canonical-primary"
     return Receipt(
         schema_version=RECEIPT_SCHEMA_VERSION,
         scope=scope,

@@ -138,20 +138,6 @@ def test_receipt_for_round_copies_decision_identity_and_validates():
     assert receipt.artifact_id == "artifact-123"
 
 
-def test_receipt_for_round_supplies_valid_default_artifact_metadata():
-    primary = _primary(run_id=12, run_attempt=1)
-    decision = _round(CONV.initial_state(SCOPE), run_id=12)
-    receipt = CONV.receipt_for_round(
-        scope=SCOPE,
-        primary=primary,
-        audit_digest="1" * 64,
-        decision=decision,
-    )
-
-    CONV.validate_receipt(receipt, SCOPE)
-    assert receipt.artifact_name == "canonical-primary"
-
-
 def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
     primary = primary or _primary(scope, run_id=7, run_attempt=2, p1_ids=("p1",))
     audit_digest = audit_digest or "a" * 64
