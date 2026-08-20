@@ -371,7 +371,8 @@ def test_replay_ignores_reported_derived_counters():
     assert (state.clean_streak, state.eligible_rounds) == (1, 1)
 
 
-def test_state_event_matrix_is_exhaustive():
+def test_all_state_event_cells_are_callable():
+    """Each cell is callable; transition behavior is asserted by named tests."""
     cells = [
         (state, event)
         for state in "CUTMF"

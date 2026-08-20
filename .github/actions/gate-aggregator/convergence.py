@@ -379,19 +379,11 @@ def derive_epoch(scope: Scope) -> str:
     return _sha256(scope.as_dict())
 
 
-def policy_for(scope: Scope, *, clean_rounds: int | None = None, max_rounds: int | None = None) -> Policy:
-    """Resolve the frozen tier matrix for a validated Scope.
-
-    Optional overrides exist only as a validation seam for contract tests; a
-    caller cannot use them to change the policy selected by Scope.
-    """
+def policy_for(scope: Scope) -> Policy:
+    """Resolve the frozen tier matrix for a validated Scope."""
 
     validate_scope(scope)
     clean, maximum = _POLICY_BY_TIER[scope.effective_tier]
-    if clean_rounds is not None and clean_rounds != clean:
-        raise ConvergenceError("policy clean-round cap does not match frozen policy")
-    if max_rounds is not None and max_rounds != maximum:
-        raise ConvergenceError("policy max-round cap does not match frozen policy")
     if not _strict_int(clean) or not _strict_int(maximum) or not 1 <= clean <= maximum:
         raise ConvergenceError("invalid policy cap: require 1 <= N <= max_rounds")
     return Policy(
