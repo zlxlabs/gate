@@ -87,6 +87,25 @@ def _valid_primary_record(**overrides):
     return record
 
 
+def _valid_scoped_primary_record(**overrides):
+    record = {
+        **_valid_primary_record(),
+        "base_sha": "b" * 40,
+        "diff_digest": "d" * 64,
+        "policy_version": "policy-v1",
+        "policy_digest": "p" * 64,
+        "tier": "personal",
+        "effective_tier": "personal",
+        "infra_classifier_version": "infra-v1",
+        "infra_diff": False,
+        "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "w" * 40,
+        "result": {"findings": []},
+    }
+    record.update(overrides)
+    return record
+
+
 def _base_kwargs(**overrides):
     kwargs = dict(
         quality_result="success",
@@ -495,6 +514,8 @@ def _cli_args(audit_dir, summary_path, **overrides):
         args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
     if values.get("panel_delivery_path") is not None:
         args.extend(["--panel-delivery-path", values["panel_delivery_path"]])
+    if values.get("convergence_receipt_path") is not None:
+        args.extend(["--convergence-receipt-path", values["convergence_receipt_path"]])
     return args
 
 def test_main_exit_code_zero_on_pass(tmp_path):
@@ -505,6 +526,54 @@ def test_main_exit_code_zero_on_pass(tmp_path):
     rc = AGG.main(_cli_args(audit_dir, summary_path))
     assert rc == 0
     assert "pass" in summary_path.read_text() and json.loads(summary_path.with_name("gate-terminal.json").read_text())["kind"] == "gate_terminal"
+
+
+def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    audit = _valid_scoped_primary_record()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    summary_path = tmp_path / "summary.md"
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+
+    rc = AGG.main(
+        _cli_args(
+            audit_dir,
+            summary_path,
+            convergence_receipt_path=str(receipt_path),
+        )
+    )
+
+    assert rc == 0
+    assert receipt_path.is_file()
+    assert list(receipt_path.parent.iterdir()) == [receipt_path]
+    payload = json.loads(receipt_path.read_text())
+    assert receipt_path.read_bytes() == json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    assert "Convergence receipt: produced" in summary_path.read_text()
+
+
+def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path):
+    summary_path = tmp_path / "summary.md"
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+
+    rc = AGG.main(
+        _cli_args(
+            tmp_path / "missing-audit",
+            summary_path,
+            primary_result="skipped",
+            is_draft="true",
+            review_expected="false",
+            convergence_receipt_path=str(receipt_path),
+        )
+    )
+
+    assert rc == 0
+    assert not receipt_path.exists()
+    summary = summary_path.read_text()
+    assert "Convergence receipt: not produced" in summary
+    assert "review_not_expected" in summary
 
 
 def test_main_summary_and_notice_include_cross_attempt_source(capsys, tmp_path):

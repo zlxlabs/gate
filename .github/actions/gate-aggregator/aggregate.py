@@ -255,6 +255,7 @@ class Outcome:
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
     convergence_envelope: Optional[dict[str, Any]] = None
+    convergence_receipt: Optional[Any] = None
 
 
 @dataclass
@@ -383,6 +384,36 @@ def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
             return None
         p1_ids.append(finding_id)
     return tuple(sorted(p1_ids))
+
+
+_CONVERGENCE_SCOPE_FIELDS = (
+    "base_sha", "diff_digest", "policy_version", "policy_digest", "tier",
+    "effective_tier", "infra_classifier_version", "infra_diff", "caller_sha",
+    "reusable_workflow_sha",
+)
+
+
+def _convergence_scope_from_audit(
+    audit: Any, identity: Identity,
+) -> Optional[Any]:
+    """Project the complete immutable Scope carried by a canonical audit."""
+    if not isinstance(audit, dict) or any(field not in audit for field in _CONVERGENCE_SCOPE_FIELDS):
+        return None
+    return _CONVERGENCE.Scope(
+        repository_id=identity.repository_id,
+        pr_number=identity.pr,
+        base_sha=audit["base_sha"],
+        head_sha=identity.head_sha,
+        diff_digest=audit["diff_digest"],
+        policy_version=audit["policy_version"],
+        policy_digest=audit["policy_digest"],
+        tier=audit["tier"],
+        effective_tier=audit["effective_tier"],
+        infra_classifier_version=audit["infra_classifier_version"],
+        infra_diff=audit["infra_diff"],
+        caller_sha=audit["caller_sha"],
+        reusable_workflow_sha=audit["reusable_workflow_sha"],
+    )
 
 
 def build_convergence_envelope(
@@ -678,33 +709,59 @@ def evaluate(
             source_attempt=audit_source,
             artifact_name=artifact_name,
         )
+        if round_decision.accepted and not round_decision.no_op and round_decision.event_id:
+            outcome.convergence_receipt = _CONVERGENCE.receipt_for_round(
+                scope=scope,
+                primary=primary,
+                audit_digest=audit_digest,
+                decision=round_decision,
+                source_attempt=audit_source,
+                artifact_name=artifact_name,
+            )
     return outcome
+
+
+def _read_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str], Optional[bytes]]:
+    """Read the sole downloaded audit and retain the exact producer bytes."""
+    if audit_dir is None or not audit_dir.is_dir():
+        return None, "audit directory not present (download step likely found no artifact)", None
+    candidates = sorted(p for p in audit_dir.iterdir() if p.suffix == ".json")
+    if not candidates:
+        return None, f"no *.json file found under {audit_dir}", None
+    if len(candidates) > 1:
+        names = ", ".join(p.name for p in candidates)
+        return None, f"expected exactly one audit file under {audit_dir}, found {len(candidates)}: {names}", None
+    try:
+        raw = candidates[0].read_bytes()
+        return json.loads(raw.decode("utf-8")), None, raw
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"could not parse {candidates[0].name}: {exc}", None
 
 
 def find_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str]]:
     """Locate and parse the single downloaded canonical-audit JSON file.
 
-    Returns (value_or_None, error_or_None). Never raises — every failure mode
-    (missing directory, empty directory, more than one file, unparsable JSON)
-    becomes a descriptive error string for `evaluate()`/the Step Summary,
-    because a broken download must fail the gate closed, not crash the job
-    with an unhandled exception and leave the check pending. The returned
-    value may be any JSON type (not necessarily an object) — `evaluate()` /
-    `validate_audit_identity` are responsible for rejecting a non-object
-    payload, not this function.
+    Returns (value_or_None, error_or_None). The producer bytes are retained by
+    the CLI path separately so convergence can bind its receipt to the bytes
+    that crossed the process boundary.
     """
-    if audit_dir is None or not audit_dir.is_dir():
-        return None, "audit directory not present (download step likely found no artifact)"
-    candidates = sorted(p for p in audit_dir.iterdir() if p.suffix == ".json")
-    if not candidates:
-        return None, f"no *.json file found under {audit_dir}"
-    if len(candidates) > 1:
-        names = ", ".join(p.name for p in candidates)
-        return None, f"expected exactly one audit file under {audit_dir}, found {len(candidates)}: {names}"
-    try:
-        return json.loads(candidates[0].read_text(encoding="utf-8")), None
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, f"could not parse {candidates[0].name}: {exc}"
+    audit, error, _ = _read_audit_file(audit_dir)
+    return audit, error
+
+
+def _write_convergence_receipt(path: str, receipt: Any) -> None:
+    """Write one canonical receipt payload before any terminal publication."""
+    if not isinstance(receipt, _CONVERGENCE.Receipt):
+        raise ValueError("convergence receipt output requires a Receipt")
+    _CONVERGENCE.validate_receipt(receipt, receipt.scope)
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        receipt.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    temporary_path = target.with_name(f".{target.name}.tmp")
+    temporary_path.write_bytes(payload)
+    temporary_path.replace(target)
 
 
 # Human-readable, per-reason_code explanations rendered into the Step Summary
@@ -1750,14 +1807,24 @@ def _finish(
     identity: Optional[Identity] = None, quality_result: Optional[str] = None, primary_result: Optional[str] = None,
     review_expected: Optional[bool] = None, is_draft: Optional[bool] = None, runner: Optional[str] = None,
     pr_number: Optional[int] = None, panel_delivery_path: Optional[str] = None,
+    convergence_receipt_path: Optional[str] = None,
 ) -> int:
     """Shared tail for both the normal and the malformed-input paths through
     `main()`: render + print + (optionally) persist the Step Summary, emit
     ::notice::/::error:: annotations, and map ok -> exit code."""
+    convergence_note = ""
+    if convergence_receipt_path:
+        if outcome.convergence_receipt is not None:
+            _write_convergence_receipt(convergence_receipt_path, outcome.convergence_receipt)
+            convergence_note = "\nConvergence receipt: produced (`convergence-receipt.json`).\n"
+        else:
+            reason = outcome.reason_code or outcome.classification or "canonical primary round was unavailable"
+            convergence_note = f"\nConvergence receipt: not produced (reason: `{reason}`).\n"
     summary = scrub_for_publish(
         render_summary(outcome, repository=repository, identity=identity, is_draft=is_draft, runner=runner),
         runtime_values=runtime_values_from_environment(),
     )
+    summary += convergence_note
     print(summary)
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as handle:
@@ -1812,6 +1879,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--audit-dir", type=Path, default=None)
     parser.add_argument("--audit-artifact-name", default=None)
     parser.add_argument("--terminal-path", default=None, help="gate-terminal.json output path")
+    parser.add_argument(
+        "--convergence-receipt-path",
+        default=None,
+        help="immutable convergence-receipt.json output path",
+    )
     parser.add_argument("--panel-delivery-path", default=None, help="durable status-panel delivery diagnostic JSON output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
     parser.add_argument("--publish-only", action="store_true", help="publish the panel after terminal artifact upload")
@@ -1882,7 +1954,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             panel_delivery_path=args.panel_delivery_path,
         )
 
-    audit, audit_error = find_audit_file(args.audit_dir)
+    audit, audit_error, audit_bytes = _read_audit_file(args.audit_dir)
+    scope = _convergence_scope_from_audit(audit, identity)
+    audit_digest = hashlib.sha256(audit_bytes).hexdigest() if audit_bytes is not None else None
 
     outcome = evaluate(
         quality_result=args.quality_result,
@@ -1895,6 +1969,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         identity=identity,
         audit_source_attempt=audit_source_attempt,
         audit_artifact_name=args.audit_artifact_name or None,
+        scope=scope,
+        audit_digest=audit_digest,
     )
 
     return _finish(
@@ -1910,6 +1986,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         runner=args.runner,
         pr_number=identity.pr,
         panel_delivery_path=args.panel_delivery_path,
+        convergence_receipt_path=args.convergence_receipt_path,
     )
 
 
