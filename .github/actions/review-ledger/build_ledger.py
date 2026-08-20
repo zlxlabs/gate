@@ -482,6 +482,24 @@ def build_entry(
         finding_id: value for finding_id, value in dispositions.items()
         if finding_id in current_ids or any(finding_id in entry.get("review", {}).get("finding_ids", []) for entry in relevant)
     }
+    convergence_projection = {
+        "source": "disposition-observation",
+        "required_gate_effect": "none",
+        "receipt_digests": sorted({
+            value.get("receipt_digest")
+            for value in relevant_dispositions.values()
+            if isinstance(value, dict) and isinstance(value.get("receipt_digest"), str)
+        }),
+        "statuses": {
+            finding_id: {
+                "status": value.get("status", value.get("disposition", "unknown")),
+                "reason": value.get("reason", ""),
+                "evidence_manifest_digest": value.get("evidence_manifest_digest"),
+            }
+            for finding_id, value in relevant_dispositions.items()
+            if isinstance(value, dict)
+        },
+    }
     return {
         "schema_version": 1,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -501,6 +519,9 @@ def build_entry(
         "review": review,
         "comparison": comparison,
         "finding_dispositions": relevant_dispositions,
+        # Additive observation only: the required evaluator never reads this
+        # field and it deliberately carries no current-waiver boolean/cursor.
+        "convergence_projection": convergence_projection,
         "false_positive_count": sum(
             item.get("disposition") == "false-positive" for item in relevant_dispositions.values()
         ),
