@@ -561,6 +561,56 @@ def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):
     assert "Convergence receipt: produced (`convergence-receipt.json`).\n" in summary_path.read_text()
 
 
+def test_cli_missing_one_scope_field_names_it_without_receipt(tmp_path):
+    audit = _valid_scoped_primary_record()
+    del audit["infra_diff"]
+
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
+
+    assert rc == 0
+    assert not receipt_path.exists()
+    summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
+    assert (
+        "Convergence receipt: not produced (reason: canonical primary audit is missing "
+        "scope field(s): `infra_diff`)."
+    ) in summary
+
+
+def test_cli_missing_multiple_scope_fields_names_all_in_sorted_order(tmp_path):
+    audit = _valid_scoped_primary_record()
+    for field in ("tier", "infra_diff", "effective_tier"):
+        del audit[field]
+
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
+
+    assert rc == 0
+    assert not receipt_path.exists()
+    summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
+    assert (
+        "Convergence receipt: not produced (reason: canonical primary audit is missing "
+        "scope field(s): `effective_tier, infra_diff, tier`)."
+    ) in summary
+
+
+@pytest.mark.parametrize(
+    ("verdict", "primary_result", "expected_rc"),
+    [("pass", "success", 0), ("fail", "failure", 1)],
+)
+def test_cli_missing_scope_field_preserves_exit_and_receipt_semantics(
+    tmp_path, verdict, primary_result, expected_rc,
+):
+    audit = _valid_scoped_primary_record(
+        verdict=verdict,
+        result={"findings": []} if verdict == "pass" else {"findings": [{"id": "p1", "severity": "major"}]},
+    )
+    del audit["infra_diff"]
+
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result=primary_result)
+
+    assert rc == expected_rc
+    assert not receipt_path.exists()
+
+
 def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path):
     summary_path = tmp_path / "summary.md"
     receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
