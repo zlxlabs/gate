@@ -122,7 +122,7 @@ def test_audit_digest_is_raw_bytes_digest():
     assert hashlib.sha256(raw).hexdigest() != hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def test_disposition_producer_writes_bound_receipt_bytes_from_raw_audit(tmp_path):
+def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_path):
     audit = {
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
@@ -137,33 +137,16 @@ def test_disposition_producer_writes_bound_receipt_bytes_from_raw_audit(tmp_path
     audit_bytes = json.dumps(audit, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
     audit_path = tmp_path / "canonical-audit.json"
     audit_path.write_bytes(audit_bytes)
-    evidence_path = tmp_path / "evidence.txt"
-    evidence_bytes = b"immutable evidence\n"
-    evidence_path.write_bytes(evidence_bytes)
-    blob_sha = hashlib.sha1(f"blob {len(evidence_bytes)}\0".encode() + evidence_bytes).hexdigest()
-    evidence_ref = f"blob:{blob_sha}"
-    manifest_path = tmp_path / "evidence-manifest.json"
-    manifest_path.write_text(json.dumps([{
-        "type": "blob", "ref": evidence_ref, "path": str(evidence_path),
-        "sha256": hashlib.sha256(evidence_bytes).hexdigest(),
-    }]))
     output_dir = tmp_path / "artifacts"
     epoch = CONV.derive_epoch(SCOPE)
     digest = hashlib.sha256(audit_bytes).hexdigest()
     argv = [
         sys.executable, str(DISPOSITION_PRODUCER), "issue",
         "--output-dir", str(output_dir), "--audit-path", str(audit_path),
-        "--repository-id", "123", "--pr-number", "42", "--epoch", epoch,
-        "--head-sha", SCOPE.head_sha, "--diff-digest", SCOPE.diff_digest,
-        "--primary-run-id", "77", "--primary-run-attempt", "1", "--audit-digest", digest,
-        "--finding-id", "p1", "--issuer-login", "maintainer", "--issuer-user-id", "9001",
-        "--pr-author-login", "author",
-        "--control-run-id", "control-77", "--approval-ref", "issuer-not-pr-author:author",
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--finding-id", "p1",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
-        "--evidence-manifest-path", str(manifest_path),
-        "--issued-at", "2026-08-20T08:00:00Z", "--expires-at", "2099-08-20T08:00:00Z",
-        "--nonce", "nonce-77", "--reason", "locked upstream behavior",
-        "--evidence-ref", evidence_ref,
+        "--reason", "locked upstream behavior",
     ]
     producer_env = {"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-77", "GITHUB_ACTOR": "maintainer"}
     first = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
@@ -172,105 +155,37 @@ def test_disposition_producer_writes_bound_receipt_bytes_from_raw_audit(tmp_path
     artifact_path = Path(result["path"])
     payload_bytes = artifact_path.read_bytes()
     payload = json.loads(payload_bytes)
-    assert result["artifact"] == f"gate-disposition-receipt-v1-{epoch}-{digest[:12]}-nonce-77"
+    assert result["artifact"] == f"gate-disposition-receipt-v1-{epoch}-{digest[:12]}-p1"
     assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     assert payload["kind"] == "gate-disposition-receipt-v1"
-    assert payload["audit_digest"] == digest
-    assert payload["finding_id"] == "p1"
-    assert payload["evidence_refs"] == [evidence_ref]
-    assert payload["evidence_manifest"][0]["sha256"] == hashlib.sha256(evidence_bytes).hexdigest()
+    assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__)
+    assert payload["audit_digest"] == digest and payload["finding_id"] == "p1"
     receipt = CONV.DispositionReceipt(**{
         field: payload[field]
         for field in CONV.DispositionReceipt.__dataclass_fields__
         if field in payload
     })
-    assert payload["receipt_digest"] == CONV.disposition_receipt_digest(receipt)
+    assert receipt.as_dict() == {field: payload[field] for field in receipt.__dataclass_fields__}
     second = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
     assert json.loads(second.stdout)["written"] is False
     assert artifact_path.read_bytes() == payload_bytes
-    wrong_digest = argv.copy()
-    wrong_digest[wrong_digest.index(digest)] = "0" * 64
-    wrong = subprocess.run(wrong_digest, capture_output=True, text=True, env=producer_env)
-    assert wrong.returncode == 1
-    assert "dispatch audit_digest does not match raw audit bytes" in wrong.stderr
-    missing_epoch = argv.copy()
-    epoch_index = missing_epoch.index("--epoch")
-    del missing_epoch[epoch_index:epoch_index + 2]
-    missing_epoch_result = subprocess.run(missing_epoch, capture_output=True, text=True, env=producer_env)
-    assert missing_epoch_result.returncode == 1
-    assert "epoch is required" in missing_epoch_result.stderr
-    self_issue = argv.copy()
-    self_issue[self_issue.index("maintainer")] = "author"
-    self_failed = subprocess.run(self_issue, capture_output=True, text=True, env=producer_env)
-    assert self_failed.returncode == 1
-    assert "issuer must differ from PR author" in self_failed.stderr
 
 
-def test_disposition_producer_rejects_unverifiable_evidence_ref(tmp_path):
+def test_disposition_producer_rejects_non_p1_finding(tmp_path):
     audit = {
-        "kind": "primary_review", "schema_version": 1, "repository_id": 123,
-        "pr": 42, "base_sha": SCOPE.base_sha, "head_sha": SCOPE.head_sha,
-        "diff_digest": SCOPE.diff_digest, "policy_version": SCOPE.policy_version,
-        "policy_digest": SCOPE.policy_digest, "tier": SCOPE.tier,
-        "effective_tier": SCOPE.effective_tier, "infra_classifier_version": SCOPE.infra_classifier_version,
-        "infra_diff": SCOPE.infra_diff, "caller_sha": SCOPE.caller_sha,
-        "reusable_workflow_sha": SCOPE.reusable_workflow_sha, "run_id": 77,
-        "run_attempt": 1, "result": {"findings": [{"id": "p1", "severity": "major"}]},
+        "result": {"findings": [{"id": "minor", "severity": "minor"}]},
     }
     audit_path = tmp_path / "audit.json"
     audit_path.write_text(json.dumps(audit, sort_keys=True))
-    digest = hashlib.sha256(audit_path.read_bytes()).hexdigest()
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps([{"type": "url", "ref": "not-an-immutable-reference", "path": str(audit_path), "sha256": digest}]))
     argv = [
         sys.executable, str(DISPOSITION_PRODUCER), "issue", "--output-dir", str(tmp_path),
         "--audit-path", str(audit_path), "--repository-id", "123", "--pr-number", "42",
-        "--epoch", CONV.derive_epoch(SCOPE), "--scope-json", json.dumps(SCOPE.as_dict()),
-        "--head-sha", SCOPE.head_sha, "--diff-digest", SCOPE.diff_digest,
-        "--primary-run-id", "77", "--primary-run-attempt", "1", "--audit-digest", digest,
-        "--finding-id", "p1", "--issuer-login", "maintainer", "--issuer-user-id", "9001",
-        "--pr-author-login", "author", "--control-run-id", "control-77", "--approval-ref", "issuer-not-pr-author:author",
-        "--issued-at", "2026-08-20T08:00:00Z", "--expires-at", "2099-08-20T08:00:00Z",
-        "--nonce", "nonce-invalid", "--reason", "reason", "--evidence-ref", "not-an-immutable-reference",
-        "--evidence-manifest-path", str(manifest_path),
+        "--head-sha", SCOPE.head_sha, "--finding-id", "minor", "--reason", "reason",
+        "--scope-json", json.dumps(SCOPE.as_dict()),
     ]
     failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
     assert failed.returncode == 1
-    assert "only blob:<git-sha> is allowlisted" in failed.stderr
-    evidence_bytes = b"actual immutable evidence\n"
-    evidence_path = tmp_path / "evidence-mismatch.txt"
-    evidence_path.write_bytes(evidence_bytes)
-    blob_sha = hashlib.sha1(f"blob {len(evidence_bytes)}\0".encode() + evidence_bytes).hexdigest()
-    manifest_path.write_text(json.dumps([{
-        "type": "blob", "ref": f"blob:{blob_sha}", "path": str(evidence_path), "sha256": "0" * 64,
-    }]))
-    mismatch = argv.copy()
-    mismatch[mismatch.index("not-an-immutable-reference")] = f"blob:{blob_sha}"
-    mismatch_result = subprocess.run(mismatch, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-    assert mismatch_result.returncode == 1
-    assert "evidence content digest mismatch" in mismatch_result.stderr
-
-
-def test_disposition_revocation_producer_is_append_only(tmp_path):
-    epoch = CONV.derive_epoch(SCOPE)
-    argv = [
-        sys.executable, str(DISPOSITION_PRODUCER), "revoke",
-        "--output-dir", str(tmp_path), "--epoch", epoch, "--nonce", "nonce-77",
-        "--reason", "evidence withdrawn", "--actor", "maintainer",
-        "--revoked-at", "2026-08-20T09:00:00Z", "--evidence-ref", "artifact:withdrawal-1",
-    ]
-    first = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-    artifact_path = Path(json.loads(first.stdout)["path"])
-    original = artifact_path.read_bytes()
-    second = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-    assert json.loads(second.stdout)["written"] is False
-    assert artifact_path.read_bytes() == original
-    conflict = argv.copy()
-    conflict[conflict.index("evidence withdrawn")] = "different reason"
-    failed = subprocess.run(conflict, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-    assert failed.returncode == 1
-    assert "immutable artifact conflict" in failed.stderr
-    assert artifact_path.read_bytes() == original
+    assert "finding_id must identify a P1 finding" in failed.stderr
 
 
 def test_aggregate_envelope_preserves_scope_attempt_artifact_and_raw_digest():

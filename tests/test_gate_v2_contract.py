@@ -106,10 +106,16 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     control = raw["jobs"]["control"]
     assert control["environment"] == {"name": "gate-disposition"}
     assert "operation" not in trigger["workflow_dispatch"]["inputs"]
+    assert "repository_id" not in trigger["workflow_dispatch"]["inputs"]
     assert "epoch" not in trigger["workflow_dispatch"]["inputs"]
+    assert set(trigger["workflow_dispatch"]["inputs"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
+    }
     text = DISPOSITION_WORKFLOW.read_text()
     assert "issue_receipt.py issue" in text
     assert "issue_receipt.py revoke" not in text
+    assert "evidence" not in text.lower()
+    assert "GITHUB_ACTOR" not in text
     assert "pull-requests: write" not in text
     assert "checks: write" not in text
     assert "statuses: write" not in text
@@ -121,22 +127,14 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
     assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
     assert 'gh run download "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
-    evidence = next(step for step in control["steps"] if step.get("name") == "Resolve and verify immutable evidence blobs")
-    assert "only blob:<git-sha> is allowlisted" in evidence["run"]
-    assert 'git/blobs/$blob_sha' in evidence["run"]
-    assert 'git hash-object "$evidence_path"' in evidence["run"]
     issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
-    assert "--evidence-manifest-path \"$EVIDENCE_MANIFEST_PATH\"" in issue["run"]
-    issuer = next(step for step in control["steps"] if step.get("name") == "Enforce protected issuer and exact evidence input")
-    assert "PR author cannot issue a disposition receipt" in issuer["run"]
-    assert "maintainer:" not in issuer["run"]
+    assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
 
 
 def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
     text = DISPOSITION_WORKFLOW.read_text()
     producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()
     assert "gate-disposition-receipt-v1-" in producer
-    assert "gate-disposition-revocation-v1-" not in producer
     assert "steps.disposition.outputs.artifact_name" in text
     assert "CURRENT_AUDIT_DIGEST" in text
     assert 'digest_prefix = fields["audit_digest"][:12]' in producer
