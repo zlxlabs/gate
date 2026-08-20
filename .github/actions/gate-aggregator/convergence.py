@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +26,9 @@ TERMINAL_DECISIONS = frozenset(
     {"collecting", "converged", "manual_required", "fail_closed"}
 )
 RECEIPT_KIND = "canonical_primary"
+DISPOSITION_KINDS = frozenset({"false-positive", "accepted", "wont-fix", "fixed"})
+DISPOSITION_RECEIPT_SCHEMA_VERSION = 1
+DISPOSITION_REVOCATION_SCHEMA_VERSION = 1
 
 # This is intentionally local to the public gate repository.  The private
 # policy source is represented only by Scope.policy_version/policy_digest in
@@ -158,19 +162,128 @@ class CanonicalPrimary:
 
 @dataclass(frozen=True)
 class DispositionReceipt:
-    """Increment-1 stub for the protected disposition contract.
+    """Immutable, exact-current-round protected disposition receipt.
 
-    No disposition can make a round clean in this increment.  The fields are
-    intentionally a small immutable shape so increment 2 can extend the
-    producer without changing evaluate_round's signature.
+    ``valid`` remains a compatibility-only input marker for the increment-1
+    fixture shape.  It is never included in the canonical payload and a true
+    value without the complete protected binding is rejected.
     """
 
     schema_version: int = RECEIPT_SCHEMA_VERSION
     disposition: str = "none"
+    repository_id: str = ""
+    pr_number: int = 0
     epoch: str = ""
+    head_sha: str = ""
+    diff_digest: str = ""
+    primary_run_id: str = ""
+    primary_run_attempt: int = 0
     audit_digest: str = ""
     finding_id: str = ""
+    issuer_login: str = ""
+    issuer_user_id: str = ""
+    control_run_id: str = ""
+    approval_ref: str = ""
+    issued_at: str = ""
+    expires_at: str = ""
+    nonce: str = ""
+    evidence_manifest_digest: str = ""
+    receipt_digest: str = ""
     valid: bool = False
+
+    def as_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "disposition": self.disposition,
+            "repository_id": self.repository_id,
+            "pr_number": self.pr_number,
+            "epoch": self.epoch,
+            "head_sha": self.head_sha,
+            "diff_digest": self.diff_digest,
+            "primary_run_id": self.primary_run_id,
+            "primary_run_attempt": self.primary_run_attempt,
+            "audit_digest": self.audit_digest,
+            "finding_id": self.finding_id,
+            "issuer_login": self.issuer_login,
+            "issuer_user_id": self.issuer_user_id,
+            "control_run_id": self.control_run_id,
+            "approval_ref": self.approval_ref,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "nonce": self.nonce,
+            "evidence_manifest_digest": self.evidence_manifest_digest,
+        }
+        if include_digest:
+            payload["receipt_digest"] = self.receipt_digest
+        return payload
+
+
+@dataclass(frozen=True)
+class DispositionRevocation:
+    """Append-only protected revocation event."""
+
+    schema_version: int
+    nonce: str
+    reason: str
+    actor: str
+    revoked_at: str
+    evidence_ref: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "nonce": self.nonce,
+            "reason": self.reason,
+            "actor": self.actor,
+            "revoked_at": self.revoked_at,
+            "evidence_ref": self.evidence_ref,
+        }
+
+
+@dataclass(frozen=True)
+class DispositionStatus:
+    """Read-only disposition diagnostic; it is not convergence state."""
+
+    receipt: DispositionReceipt
+    valid: bool
+    active: bool
+    consumable: bool
+    reason: str
+
+    @property
+    def accepted(self) -> bool:
+        return self.consumable
+
+    @property
+    def finding_id(self) -> str:
+        return self.receipt.finding_id
+
+    @property
+    def evidence_manifest_digest(self) -> str:
+        return self.receipt.evidence_manifest_digest
+
+
+@dataclass(frozen=True)
+class DispositionConsumption:
+    """Pure result of applying protected dispositions to one primary audit."""
+
+    remaining_p1_ids: tuple[str, ...]
+    consumed_receipts: tuple[DispositionReceipt, ...]
+    rejected_receipts: tuple[tuple[DispositionReceipt, str], ...]
+    fail_closed: bool
+    statuses: tuple[DispositionStatus, ...] = ()
+
+    @property
+    def p1_ids(self) -> tuple[str, ...]:
+        return self.remaining_p1_ids
+
+    @property
+    def consumed(self) -> tuple[DispositionReceipt, ...]:
+        return self.consumed_receipts
+
+    @property
+    def rejected(self) -> tuple[tuple[DispositionReceipt, str], ...]:
+        return self.rejected_receipts
 
 
 @dataclass(frozen=True)
@@ -319,6 +432,209 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def disposition_receipt_digest(receipt: DispositionReceipt) -> str:
+    """Return the digest over the receipt's binding fields, excluding itself."""
+
+    if not isinstance(receipt, DispositionReceipt):
+        raise TypeError("receipt must be DispositionReceipt")
+    return _sha256(receipt.as_dict(include_digest=False))
+
+
+def _disposition_status(
+    receipt: DispositionReceipt,
+    *,
+    valid: bool,
+    active: bool,
+    consumable: bool,
+    reason: str,
+) -> DispositionStatus:
+    return DispositionStatus(
+        receipt=receipt,
+        valid=valid,
+        active=active,
+        consumable=consumable,
+        reason=reason,
+    )
+
+
+def _legacy_disposition_stub(receipt: DispositionReceipt) -> bool:
+    return (
+        isinstance(receipt, DispositionReceipt)
+        and not receipt.valid
+        and receipt.schema_version == RECEIPT_SCHEMA_VERSION
+        and receipt.disposition == "none"
+        and receipt.repository_id == ""
+        and receipt.pr_number == 0
+        and receipt.epoch == ""
+        and receipt.head_sha == ""
+        and receipt.diff_digest == ""
+        and receipt.primary_run_id == ""
+        and receipt.primary_run_attempt == 0
+        and receipt.audit_digest == ""
+        and receipt.finding_id == ""
+        and receipt.issuer_login == ""
+        and receipt.issuer_user_id == ""
+        and receipt.control_run_id == ""
+        and receipt.approval_ref == ""
+        and receipt.issued_at == ""
+        and receipt.expires_at == ""
+        and receipt.nonce == ""
+        and receipt.evidence_manifest_digest == ""
+        and receipt.receipt_digest == ""
+    )
+
+
+def _utc_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _sha256_text(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdefABCDEF" for character in value
+    )
+
+
+def _revocation_error(revocations: Sequence[DispositionRevocation], nonce: str) -> str | None:
+    if not isinstance(revocations, Sequence):
+        return "malformed_revocation_index"
+    for revocation in revocations:
+        if not isinstance(revocation, DispositionRevocation):
+            return "malformed_revocation"
+        if revocation.schema_version != DISPOSITION_REVOCATION_SCHEMA_VERSION:
+            return "malformed_revocation"
+        if not all(
+            _nonempty_text(getattr(revocation, field))
+            for field in ("nonce", "reason", "actor", "revoked_at", "evidence_ref")
+        ):
+            return "malformed_revocation"
+        if revocation.nonce != nonce:
+            continue
+        if _utc_timestamp(revocation.revoked_at) is None:
+            return "malformed_revocation"
+        return "revoked"
+    return None
+
+
+def validate_disposition_receipt(
+    receipt: DispositionReceipt,
+    *,
+    scope: Scope,
+    primary: CanonicalPrimary,
+    audit_digest: str,
+    now: str,
+    revocations: Sequence[DispositionRevocation],
+) -> DispositionStatus:
+    """Validate one protected receipt without using exceptions as control flow."""
+
+    if not isinstance(receipt, DispositionReceipt):
+        return _disposition_status(
+            DispositionReceipt(), valid=False, active=False, consumable=False,
+            reason="malformed_receipt",
+        )
+    if _legacy_disposition_stub(receipt):
+        return _disposition_status(
+            receipt, valid=False, active=False, consumable=False,
+            reason="absent_legacy_stub",
+        )
+    if not isinstance(scope, Scope) or _scope_errors(scope):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_scope")
+    if not isinstance(primary, CanonicalPrimary):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_primary")
+    if not isinstance(now, str) or _utc_timestamp(now) is None:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_now")
+    if not isinstance(revocations, Sequence):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_revocation_index")
+    if receipt.schema_version != DISPOSITION_RECEIPT_SCHEMA_VERSION:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="schema_version_mismatch")
+    if receipt.disposition not in DISPOSITION_KINDS:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="unknown_disposition")
+    required_text = (
+        "repository_id", "epoch", "head_sha", "diff_digest", "primary_run_id",
+        "audit_digest", "finding_id", "control_run_id", "issued_at", "expires_at", "nonce",
+        "evidence_manifest_digest", "receipt_digest",
+    )
+    if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+    if type(receipt.pr_number) is not int or receipt.pr_number <= 0:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_pr_number")
+    if type(receipt.primary_run_attempt) is not int or receipt.primary_run_attempt <= 0:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_primary_attempt")
+    if receipt.repository_id != str(scope.repository_id):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="repository_mismatch")
+    if receipt.pr_number != scope.pr_number:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="pr_mismatch")
+    expected_epoch = derive_epoch(scope)
+    if receipt.epoch != expected_epoch:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="epoch_mismatch_stale")
+    if receipt.head_sha != scope.head_sha:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="head_sha_mismatch")
+    if receipt.diff_digest != scope.diff_digest:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="diff_digest_mismatch")
+    if receipt.primary_run_id != str(primary.run_id):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="primary_run_id_mismatch")
+    if receipt.primary_run_attempt != primary.run_attempt:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="primary_run_attempt_mismatch")
+    if not _sha256_text(audit_digest) or receipt.audit_digest != audit_digest:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="audit_digest_mismatch")
+    if receipt.finding_id in {"*", "all"} or any(character in receipt.finding_id for character in "?[]"):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_target_not_exact")
+    if receipt.finding_id not in primary.p1_ids:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_not_current_p1")
+    if not _sha256_text(receipt.diff_digest) or not _sha256_text(receipt.evidence_manifest_digest):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="evidence_manifest_malformed")
+    if not _nonempty_text(receipt.issuer_login) or not _nonempty_text(receipt.issuer_user_id) or not _nonempty_text(receipt.approval_ref):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="issuer_unprotected")
+    issued = _utc_timestamp(receipt.issued_at)
+    expires = _utc_timestamp(receipt.expires_at)
+    current = _utc_timestamp(now)
+    if issued is None or expires is None or current is None or expires <= issued:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_timestamps")
+    if issued > current:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="issued_in_future")
+    if current >= expires:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="expired")
+    revocation = _revocation_error(revocations, receipt.nonce)
+    if revocation == "revoked":
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="revoked")
+    if revocation is not None:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason=revocation)
+    if receipt.receipt_digest != disposition_receipt_digest(receipt):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="receipt_digest_mismatch")
+    if receipt.disposition != "false-positive":
+        return _disposition_status(receipt, valid=True, active=True, consumable=False, reason="disposition_not_gate_resolving")
+    return _disposition_status(receipt, valid=True, active=True, consumable=True, reason="active_false_positive")
+
+
+def disposition_status(
+    receipt: DispositionReceipt,
+    *,
+    scope: Scope,
+    primary: CanonicalPrimary,
+    audit_digest: str,
+    now: str,
+    revocations: Sequence[DispositionRevocation],
+) -> DispositionStatus:
+    """Return the observational status view used by ledger/human summaries."""
+
+    return validate_disposition_receipt(
+        receipt,
+        scope=scope,
+        primary=primary,
+        audit_digest=audit_digest,
+        now=now,
+        revocations=revocations,
+    )
 
 
 def _strict_int(value: Any) -> bool:

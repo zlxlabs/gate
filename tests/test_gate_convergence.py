@@ -109,6 +109,37 @@ def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="1", verdict="pass"
     return receipt
 
 
+def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
+    primary = primary or _primary(scope, run_id=7, run_attempt=2, p1_ids=("p1",))
+    audit_digest = audit_digest or "a" * 64
+    receipt = CONV.DispositionReceipt(
+        schema_version=1,
+        disposition="false-positive",
+        repository_id=str(scope.repository_id),
+        pr_number=scope.pr_number,
+        epoch=CONV.derive_epoch(scope),
+        head_sha=scope.head_sha,
+        diff_digest=scope.diff_digest,
+        primary_run_id=str(primary.run_id),
+        primary_run_attempt=primary.run_attempt,
+        audit_digest=audit_digest,
+        finding_id=primary.p1_ids[0],
+        issuer_login="maintainer",
+        issuer_user_id="9001",
+        control_run_id="control-100",
+        approval_ref="approval-100",
+        issued_at="2026-08-20T08:00:00Z",
+        expires_at="2099-08-20T08:00:00Z",
+        nonce="nonce-100",
+        evidence_manifest_digest="e" * 64,
+        receipt_digest="",
+    )
+    receipt = replace(receipt, **changes)
+    if receipt.receipt_digest == "":
+        receipt = replace(receipt, receipt_digest=CONV.disposition_receipt_digest(receipt))
+    return receipt
+
+
 def _state_for(name):
     state = CONV.initial_state(SCOPE)
     if name == "C":
@@ -130,6 +161,33 @@ def test_derive_epoch_is_canonical_and_scope_changes_are_guards():
     assert CONV.derive_epoch(SCOPE) == CONV.derive_epoch(replace(SCOPE))
     assert CONV.derive_epoch(SCOPE) != CONV.derive_epoch(replace(SCOPE, head_sha="x" * 40))
     assert CONV.derive_epoch(SCOPE) != CONV.derive_epoch(replace(SCOPE, infra_diff=True, effective_tier="internal"))
+
+
+def test_disposition_requires_protected_issuer_and_exact_digest_binding():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        now="2026-08-20T09:00:00Z", revocations=(),
+    )
+    assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+    unprotected = replace(receipt, issuer_user_id="", receipt_digest="")
+    assert CONV.validate_disposition_receipt(
+        replace(unprotected, receipt_digest=CONV.disposition_receipt_digest(unprotected)),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        now="2026-08-20T09:00:00Z", revocations=(),
+    ).reason == "issuer_unprotected"
+
+
+def test_disposition_requires_protected_issuer_and_evidence():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    missing_evidence = replace(receipt, evidence_manifest_digest="", receipt_digest="")
+    status = CONV.validate_disposition_receipt(
+        missing_evidence, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        now="2026-08-20T09:00:00Z", revocations=(),
+    )
+    assert not status.valid and status.reason == "malformed_receipt"
 
 
 @pytest.mark.parametrize(
