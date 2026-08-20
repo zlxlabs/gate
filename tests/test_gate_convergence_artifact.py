@@ -76,60 +76,43 @@ def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="a", verdict="pass"
 
 
 def test_producer_payload_preserves_all_attempt_guards(tmp_path):
-    audit_bytes = b'{"kind":"primary_review","verdict":"pass"}\n'
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "head_sha": SCOPE.head_sha, "run_id": 77,
+        "run_attempt": 1, "pr": 42, "verdict": "pass", "reviewer": "codex",
+        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+    }
+    audit_bytes = json.dumps(audit, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     audit_path = tmp_path / "primary-audit.json"
     output_path = tmp_path / "receipt.json"
     audit_path.write_bytes(audit_bytes)
-    producer = tmp_path / "producer.py"
-    producer.write_text(
-        "import argparse, hashlib, json, os, sys\n"
-        "from pathlib import Path\n"
-        "p=argparse.ArgumentParser()\n"
-        "p.add_argument('--audit-path', required=True)\n"
-        "p.add_argument('--output', required=True)\n"
-        "p.add_argument('--source-attempt', required=True, type=int)\n"
-        "p.add_argument('--artifact-id', required=True)\n"
-        "p.add_argument('--epoch', required=True)\n"
-        "a=p.parse_args()\n"
-        "raw=Path(a.audit_path).read_bytes()\n"
-        "payload={'schema_version': 1, 'kind': 'gate_convergence_receipt',\n"
-        "'epoch': a.epoch, 'source_attempt': a.source_attempt,\n"
-        "'artifact_id': a.artifact_id,\n"
-        "'audit_digest': hashlib.sha256(raw).hexdigest(),\n"
-        "'argv': sys.argv[1:], 'env': {'GATE_TIER': os.environ['GATE_TIER']},\n"
-        "'audit_bytes': raw.decode('utf-8')}\n"
-        "Path(a.output).write_bytes(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8') + b'\\n')\n",
-        encoding="utf-8",
-    )
     epoch = CONV.derive_epoch(SCOPE)
+    runner = (
+        "import hashlib, importlib.util, json, os, sys\n"
+        "from pathlib import Path\n"
+        "spec=importlib.util.spec_from_file_location('gate_aggregate_subprocess', sys.argv[1])\n"
+        "mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod; spec.loader.exec_module(mod)\n"
+        "assert os.environ['GATE_TIER']=='internal' and os.environ['GATE_ARTIFACT']=='primary-audit-v1-1'\n"
+        "raw=Path(sys.argv[2]).read_bytes(); audit=json.loads(raw)\n"
+        "scope=mod._CONVERGENCE.Scope(**json.loads(os.environ['GATE_SCOPE']))\n"
+        "identity=mod.Identity(123, scope.head_sha, 77, 2, 42)\n"
+        "out=mod.evaluate(quality_result='success', primary_result='success', runner='self', is_draft=False, review_expected=True, audit=audit, audit_error=None, identity=identity, audit_source_attempt=1, audit_artifact_name=os.environ['GATE_ARTIFACT'], scope=scope, audit_digest=hashlib.sha256(raw).hexdigest())\n"
+        "Path(sys.argv[3]).write_bytes(json.dumps(out.convergence_envelope, sort_keys=True, separators=(',', ':')).encode() + b'\\n')\n"
+    )
     argv = [
         sys.executable,
-        str(producer),
-        "--audit-path", str(audit_path),
-        "--output", str(output_path),
-        "--source-attempt", "1",
-        "--artifact-id", "primary-audit-v1-1",
-        "--epoch", epoch,
+        "-c", runner, str(AGGREGATE_PATH), str(audit_path), str(output_path),
     ]
-    env = {"PATH": os.environ["PATH"], "GATE_TIER": "internal"}
+    env = {"PATH": os.environ["PATH"], "GATE_TIER": "internal", "GATE_ARTIFACT": "primary-audit-v1-1", "GATE_SCOPE": json.dumps(SCOPE.as_dict(), sort_keys=True)}
     completed = subprocess.run(argv, check=True, capture_output=True, text=True, env=env)
-    expected = {
-        "schema_version": 1,
-        "kind": "gate_convergence_receipt",
-        "epoch": epoch,
-        "source_attempt": 1,
-        "artifact_id": "primary-audit-v1-1",
-        "audit_digest": hashlib.sha256(audit_bytes).hexdigest(),
-        "argv": argv[2:],
-        "env": {"GATE_TIER": "internal"},
-        "audit_bytes": audit_bytes.decode("utf-8"),
-    }
-    expected_bytes = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
-    assert output_path.read_bytes() == expected_bytes
     assert completed.args == argv
-    assert json.loads(output_path.read_bytes())["env"] == {"GATE_TIER": "internal"}
-    receipt = _receipt(artifact="primary-audit-v1-1")
-    CONV.validate_receipt(receipt, SCOPE)
+    payload_bytes = output_path.read_bytes()
+    payload = json.loads(payload_bytes)
+    assert payload_bytes.endswith(b"\n") and payload["scope"] == SCOPE.as_dict()
+    assert (payload["epoch"], payload["source_attempt"], payload["artifact_name"]) == (epoch, 1, "primary-audit-v1-1")
+    assert payload["audit_digest"] == hashlib.sha256(audit_bytes).hexdigest()
+    assert env["GATE_TIER"] == "internal" and env["GATE_ARTIFACT"] == "primary-audit-v1-1"
+    CONV.validate_scope(CONV.Scope(**payload["scope"]))
 
 
 def test_audit_digest_is_raw_bytes_digest():
@@ -161,6 +144,42 @@ def test_aggregate_envelope_preserves_scope_attempt_artifact_and_raw_digest():
     assert envelope["audit_digest"] == digest
     assert (envelope["source_attempt"], envelope["artifact_name"]) == (1, "primary-audit-v1-1")
     assert envelope["state"]["clean_streak"] == 0
+
+
+def _aggregate_case(audit, *, primary_result="success", identity=None):
+    identity = identity or AGG.Identity(repository_id=123, head_sha=SCOPE.head_sha, run_id=77, run_attempt=2, pr=42)
+    raw = json.dumps(audit, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    return AGG.evaluate(
+        quality_result="success", primary_result=primary_result, runner="self",
+        is_draft=False, review_expected=True, audit=audit, audit_error=None,
+        identity=identity, audit_source_attempt=1, audit_artifact_name="primary-audit-v1-1",
+        scope=SCOPE, audit_digest=hashlib.sha256(raw).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize("finding", [{}, {"severity": None}, {"severity": 3}, {"severity": "unknown"}, {"id": "minor", "severity": "minor"}, {"id": "nit", "severity": "nit"}])
+def test_handoff_requires_known_finding_severity_and_verified_identity(finding):
+    audit = {
+        "kind": "primary_review", "schema_version": 1, "repository_id": 123,
+        "head_sha": SCOPE.head_sha, "run_id": 77, "run_attempt": 1, "pr": 42,
+        "verdict": "pass", "reviewer": "codex", "result": {"findings": [finding]},
+    }
+    outcome = _aggregate_case(audit)
+    if finding.get("severity") in ("minor", "nit"):
+        assert outcome.convergence_envelope is not None
+    else:
+        assert outcome.convergence_envelope is None and outcome.reason_code == "audit_invalid"
+
+
+def test_handoff_rejects_identity_and_job_verdict_mismatch():
+    audit = {
+        "kind": "primary_review", "schema_version": 1, "repository_id": 123,
+        "head_sha": SCOPE.head_sha, "run_id": 77, "run_attempt": 1, "pr": 42,
+        "verdict": "pass", "reviewer": "codex", "result": {"findings": []},
+    }
+    bad_identity = dict(audit, repository_id=999)
+    assert _aggregate_case(bad_identity).convergence_envelope is None
+    assert _aggregate_case(dict(audit, verdict="fail"), primary_result="success").convergence_envelope is None
 
 
 def test_multiple_runs_same_head_replay_in_run_id_order():

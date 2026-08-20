@@ -364,20 +364,23 @@ def build_terminal_envelope(
     }
 
 
-def _canonical_p1_ids(audit: dict[str, Any]) -> tuple[str, ...]:
+def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
     """Project only canonical P1 evidence; never infer severity from prose."""
     result = audit.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
-        raise ValueError("canonical primary audit is missing a structured findings list")
+        return None
     p1_ids: list[str] = []
     for finding in result["findings"]:
         if not isinstance(finding, dict):
-            raise ValueError("canonical primary finding is not an object")
-        if finding.get("severity") not in _CONVERGENCE.P1_SEVERITIES:
+            return None
+        severity = finding.get("severity")
+        if not isinstance(severity, str) or severity not in _CONVERGENCE.KNOWN_SEVERITIES:
+            return None
+        if severity not in _CONVERGENCE.P1_SEVERITIES:
             continue
         finding_id = finding.get("id")
         if not isinstance(finding_id, str) or not finding_id:
-            raise ValueError("canonical P1 finding is missing a non-empty id")
+            return None
         p1_ids.append(finding_id)
     return tuple(sorted(p1_ids))
 
@@ -541,6 +544,7 @@ def evaluate(
     quality_reason = None if quality_result == "success" else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
     primary_classification = primary_reason = None
     audit_available = False
+    convergence_eligible = False
     audit_source = artifact_name = None
 
     if quality_result == "success":
@@ -585,11 +589,13 @@ def evaluate(
                 primary_classification, primary_reason = "integration_error", "audit_source_mismatch"
             else:
                 audit_available = verdict in ("pass", "fail", "unavailable")
+                convergence_eligible = audit_available
                 artifact_name = audit_artifact_name if isinstance(audit_artifact_name, str) and audit_artifact_name else None
                 notes.append(f"primary audit source run_attempt={audit_source} (current run_attempt={identity.run_attempt})")
                 if verdict == "pass":
                     if primary_result != "success":
                         audit_available = False
+                        convergence_eligible = False
                         audit_source = artifact_name = None
                         problems.append(
                             f"primary audit verdict is 'pass' but the job result is {primary_result!r} — inconsistent, fail-closed"
@@ -606,6 +612,7 @@ def evaluate(
                     primary_classification, primary_reason = "review_unavailable", "primary_unavailable"
                 else:
                     audit_available = False
+                    convergence_eligible = False
                     audit_source = artifact_name = None
                     problems.append(
                         f"primary audit verdict {verdict!r} is not accepted: canary-stage primary never legitimately writes "
@@ -614,6 +621,7 @@ def evaluate(
                     primary_classification, primary_reason = "integration_error", "audit_invalid"
                 if primary_result == "success" and verdict in ("fail", "unavailable"):
                     audit_available = False
+                    convergence_eligible = False
                     audit_source = artifact_name = None
                     primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
 
@@ -632,7 +640,15 @@ def evaluate(
     # This is deliberately the only convergence hand-off in the single-round
     # evaluator.  It runs only after the existing audit identity/job verdict
     # checks have succeeded; the old Outcome fields remain single-round facts.
-    if scope is not None and audit_available and audit_digest is not None and isinstance(audit, dict):
+    if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
+        p1_ids = _canonical_p1_ids(audit)
+        if p1_ids is None:
+            outcome.ok = False
+            outcome.classification = "integration_error"
+            outcome.reason_code = "audit_invalid"
+            outcome.gate_result = "unavailable"
+            outcome.problems.append("canonical finding severity is missing, unknown, or malformed — fail-closed")
+            return outcome
         primary = _CONVERGENCE.CanonicalPrimary(
             schema_version=1,
             repository_id=identity.repository_id,
@@ -641,7 +657,7 @@ def evaluate(
             run_id=identity.run_id,
             run_attempt=identity.run_attempt,
             verdict=audit["verdict"],
-            p1_ids=_canonical_p1_ids(audit),
+            p1_ids=p1_ids,
         )
         processing_key = _CONVERGENCE.ProcessingKey(
             identity.repository_id, identity.pr, identity.run_id, identity.run_attempt,
