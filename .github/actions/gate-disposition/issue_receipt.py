@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue and revoke immutable protected disposition artifacts.
+"""Issue immutable disposition artifacts.
 
 The workflow owns GitHub authorization and audit/evidence retrieval.  This
 producer deliberately accepts those verified values through argv, environment,
@@ -292,61 +292,31 @@ def issue(args: argparse.Namespace, envelope: dict[str, Any]) -> int:
     return 0
 
 
-def revoke(args: argparse.Namespace, envelope: dict[str, Any]) -> int:
-    epoch = _safe_component(str(_required(args, envelope, "epoch", "DISPOSITION_EPOCH")), "epoch")
-    nonce = _safe_component(str(_required(args, envelope, "nonce", "DISPOSITION_NONCE")), "nonce")
-    fields = {
-        "schema_version": SCHEMA_VERSION,
-        "kind": "gate-disposition-revocation-v1",
-        "nonce": nonce,
-        "reason": str(_required(args, envelope, "reason", "DISPOSITION_REASON")),
-        "actor": str(_required(args, envelope, "actor", "GITHUB_ACTOR")),
-        "revoked_at": str(_required(args, envelope, "revoked_at", "DISPOSITION_REVOKED_AT")),
-        "evidence_ref": str(_required(args, envelope, "evidence_ref", "DISPOSITION_EVIDENCE_REF")),
-    }
-    if not all(fields[field].strip() for field in ("reason", "actor", "revoked_at", "evidence_ref")):
-        raise ValueError("revocation reason, actor, time, and evidence_ref must be non-empty")
-    name = f"gate-disposition-revocation-v1-{epoch}-{nonce}"
-    output = Path(_required(args, envelope, "output_dir", "DISPOSITION_OUTPUT_DIR")) / name
-    changed = _write_immutable(output, _canonical_json(fields))
-    print(json.dumps({"artifact": name, "path": str(output), "written": changed}, sort_keys=True))
-    return 0
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("issue", "revoke"):
-        sub = subparsers.add_parser(command)
-        sub.add_argument("--input-stdin", action="store_true")
-        sub.add_argument("--output-dir")
-        sub.add_argument("--epoch")
-        sub.add_argument("--nonce")
-        sub.add_argument("--reason")
-        if command == "issue":
-            sub.add_argument("--audit-path")
-            for name in (
-                "repository-id", "pr-number", "head-sha", "diff-digest", "primary-run-id",
-                "primary-run-attempt", "finding-id", "issuer-login", "issuer-user-id",
-                "control-run-id", "approval-ref", "issued-at", "expires-at",
-                "audit-digest", "evidence-manifest-digest", "disposition", "scope-json",
-                "pr-author-login", "evidence-manifest-path",
-            ):
-                sub.add_argument(f"--{name}", dest=name.replace("-", "_"))
-            sub.add_argument("--evidence-ref", dest="evidence_refs", action="append")
-        else:
-            sub.add_argument("--actor")
-            sub.add_argument("--revoked-at")
-            sub.add_argument("--evidence-ref", dest="evidence_ref")
+    sub = parser.add_subparsers(dest="command", required=True).add_parser("issue")
+    sub.add_argument("--input-stdin", action="store_true")
+    sub.add_argument("--output-dir")
+    sub.add_argument("--epoch")
+    sub.add_argument("--nonce")
+    sub.add_argument("--reason")
+    sub.add_argument("--audit-path")
+    for name in (
+        "repository-id", "pr-number", "head-sha", "diff-digest", "primary-run-id",
+        "primary-run-attempt", "finding-id", "issuer-login", "issuer-user-id",
+        "control-run-id", "approval-ref", "issued-at", "expires-at",
+        "audit-digest", "evidence-manifest-digest", "disposition", "scope-json",
+        "pr-author-login", "evidence-manifest-path",
+    ):
+        sub.add_argument(f"--{name}", dest=name.replace("-", "_"))
+    sub.add_argument("--evidence-ref", dest="evidence_refs", action="append")
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
     envelope = _read_stdin_envelope(args.input_stdin)
-    if args.command == "issue":
-        return issue(args, envelope)
-    return revoke(args, envelope)
+    return issue(args, envelope)
 
 
 if __name__ == "__main__":

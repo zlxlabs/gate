@@ -3,19 +3,13 @@ name: gate-v2 disposition control
 on:
   workflow_dispatch:
     inputs:
-      operation:
-        description: "issue or revoke an immutable disposition artifact"
-        required: true
-        type: choice
-        options: [issue, revoke]
       repository_id: { description: "numeric repository id", required: true, type: string }
       pr_number: { description: "pull request number", required: true, type: string }
-      epoch: { description: "current epoch for revocation", required: false, type: string }
       primary_run_id: { description: "canonical primary run id", required: false, type: string }
       primary_run_attempt: { description: "canonical primary run attempt", required: false, type: string }
       finding_id: { description: "exact current-audit finding id", required: false, type: string }
       disposition: { description: "protected disposition kind", required: false, default: false-positive, type: choice, options: [false-positive, accepted, wont-fix, fixed] }
-      reason: { description: "evidence-backed reason or revocation reason", required: true, type: string }
+      reason: { description: "reason for the false-positive disposition", required: true, type: string }
       evidence_refs: { description: "one immutable evidence ref per line", required: false, type: string }
       nonce: { description: "single-use immutable nonce", required: true, type: string }
       expires_at: { description: "receipt expiry in UTC", required: false, type: string }
@@ -26,7 +20,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: gate-disposition-${{ inputs.repository_id }}-${{ inputs.pr_number }}-${{ inputs.nonce }}
+  group: gate-disposition-${{ inputs.repository_id }}-${{ inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
@@ -47,7 +41,6 @@ jobs:
           fetch-depth: 1
 
       - name: Resolve current PR head and canonical primary audit
-        if: ${{ inputs.operation == 'issue' }}
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -86,7 +79,6 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Construct canonical scope and derive epoch
-        if: ${{ inputs.operation == 'issue' }}
         env:
           AUDIT_PATH: ${{ runner.temp }}/current-primary-audit/primary-review-audit.json
           PR_PATH: ${{ runner.temp }}/current-pr.json
@@ -145,7 +137,6 @@ jobs:
           echo "CURRENT_EPOCH=$epoch" >> "$GITHUB_ENV"
 
       - name: Resolve and verify immutable evidence blobs
-        if: ${{ inputs.operation == 'issue' }}
         env:
           GH_TOKEN: ${{ github.token }}
           EVIDENCE_REFS: ${{ inputs.evidence_refs }}
@@ -196,7 +187,6 @@ jobs:
           echo "EVIDENCE_MANIFEST_PATH=$manifest_path" >> "$GITHUB_ENV"
 
       - name: Enforce protected issuer and exact evidence input
-        if: ${{ inputs.operation == 'issue' }}
         env:
           EVIDENCE_REFS: ${{ inputs.evidence_refs }}
         run: |
@@ -207,13 +197,11 @@ jobs:
             exit 1
           fi
 
-      - name: Issue or revoke immutable disposition artifact
+      - name: Issue immutable disposition artifact
         id: disposition
         env:
-          OPERATION: ${{ inputs.operation }}
           REPOSITORY_ID: ${{ github.repository_id }}
           PR_NUMBER: ${{ inputs.pr_number }}
-          DISPOSITION_EPOCH: ${{ inputs.epoch }}
           PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
           PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
           FINDING_ID: ${{ inputs.finding_id }}
@@ -229,36 +217,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$OUTPUT_DIR"
-          if [ "$OPERATION" = issue ]; then
-            test -n "$AUDIT_PATH"
-            test -n "$CURRENT_HEAD_SHA"
-            test -n "$CURRENT_AUDIT_DIGEST"
-            test -n "$CURRENT_DIFF_DIGEST"
-            test -n "$CURRENT_EPOCH"
-            output="$(python3 .github/actions/gate-disposition/issue_receipt.py issue \
-              --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
-              --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
-              --epoch "$CURRENT_EPOCH" --head-sha "$CURRENT_HEAD_SHA" \
-              --diff-digest "$CURRENT_DIFF_DIGEST" --primary-run-id "$PRIMARY_RUN_ID" \
-              --primary-run-attempt "$PRIMARY_RUN_ATTEMPT" --finding-id "$FINDING_ID" \
-              --disposition "$DISPOSITION_KIND" --issuer-login "$GITHUB_ACTOR" \
-              --issuer-user-id "$GITHUB_ACTOR_ID" --control-run-id "$GITHUB_RUN_ID" \
-              --pr-author-login "$CURRENT_PR_AUTHOR" \
-              --approval-ref "issuer-not-pr-author:$CURRENT_PR_AUTHOR" \
-              --scope-json "$CURRENT_SCOPE_JSON" --issued-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --expires-at "$DISPOSITION_EXPIRES_AT" --nonce "$DISPOSITION_NONCE" \
-              --reason "$DISPOSITION_REASON" --evidence-ref "$DISPOSITION_EVIDENCE_REFS" \
-              --evidence-manifest-path "$EVIDENCE_MANIFEST_PATH" \
-              --audit-digest "$CURRENT_AUDIT_DIGEST")"
-          elif [ "$OPERATION" = revoke ]; then
-            output="$(python3 .github/actions/gate-disposition/issue_receipt.py revoke \
-              --output-dir "$OUTPUT_DIR" --epoch "$DISPOSITION_EPOCH" --nonce "$DISPOSITION_NONCE" \
-              --reason "$DISPOSITION_REASON" --actor "$GITHUB_ACTOR" \
-              --revoked-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --evidence-ref "$DISPOSITION_EVIDENCE_REFS")"
-          else
-            echo "unsupported operation" >&2
-            exit 1
-          fi
+          test -n "$AUDIT_PATH"
+          test -n "$CURRENT_HEAD_SHA"
+          test -n "$CURRENT_AUDIT_DIGEST"
+          test -n "$CURRENT_DIFF_DIGEST"
+          test -n "$CURRENT_EPOCH"
+          output="$(python3 .github/actions/gate-disposition/issue_receipt.py issue \
+            --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
+            --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
+            --epoch "$CURRENT_EPOCH" --head-sha "$CURRENT_HEAD_SHA" \
+            --diff-digest "$CURRENT_DIFF_DIGEST" --primary-run-id "$PRIMARY_RUN_ID" \
+            --primary-run-attempt "$PRIMARY_RUN_ATTEMPT" --finding-id "$FINDING_ID" \
+            --disposition "$DISPOSITION_KIND" --issuer-login "$GITHUB_ACTOR" \
+            --issuer-user-id "$GITHUB_ACTOR_ID" --control-run-id "$GITHUB_RUN_ID" \
+            --pr-author-login "$CURRENT_PR_AUTHOR" \
+            --approval-ref "issuer-not-pr-author:$CURRENT_PR_AUTHOR" \
+            --scope-json "$CURRENT_SCOPE_JSON" --issued-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --expires-at "$DISPOSITION_EXPIRES_AT" --nonce "$DISPOSITION_NONCE" \
+            --reason "$DISPOSITION_REASON" --evidence-ref "$DISPOSITION_EVIDENCE_REFS" \
+            --evidence-manifest-path "$EVIDENCE_MANIFEST_PATH" \
+            --audit-digest "$CURRENT_AUDIT_DIGEST")"
           artifact_name="$(printf '%s' "$output" | jq -r '.artifact')"
           test -n "$artifact_name" && echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
