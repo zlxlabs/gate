@@ -127,7 +127,32 @@ CASE unexpected-primary-skipped exit=1 receipt=<absent> summary='Convergence rec
 
 ## 实验四：并发与重入
 
-待执行；将比较同一 run identity 的重复输出字节，并验证同一路径并发写入时的可见文件。
+实际命令以 H0 detached worktree 的真实 `aggregate.py` 运行：
+
+```sh
+git worktree add --detach "$conc_dir" a501b7a1d43092efd77c10488efefceaf3630c04
+uv run --with pytest,PyYAML python - "$conc_dir" <<'PY'
+first = subprocess.run(command(..., receipt=first_receipt), ...)
+second = subprocess.run(command(..., receipt=second_receipt), ...)
+p1 = subprocess.Popen(command(..., receipt=shared_receipt), ...)
+p2 = subprocess.Popen(command(..., receipt=shared_receipt), ...)
+PY
+git worktree remove --force "$conc_dir"
+```
+
+真实输出：
+
+```text
+REENTRY first_rc=0 second_rc=0 bytes_equal=True len=1284 sha256_first=01521972630971429706735504e3b2cab9e3efcfbbb3202796987155b17ce6fa sha256_second=01521972630971429706735504e3b2cab9e3efcfbbb3202796987155b17ce6fa
+REENTRY_JSON first_valid=True second_valid=True
+CONCURRENT attempt=1 p1_rc=0 p2_rc=0 target_exists=True target_len=1284 json_valid=True siblings=['convergence-receipt.json'] stderr1='' stderr2=''
+CONCURRENT attempt=2 p1_rc=0 p2_rc=0 target_exists=True target_len=1284 json_valid=True siblings=['convergence-receipt.json'] stderr1='' stderr2=''
+CONCURRENT attempt=3 p1_rc=0 p2_rc=0 target_exists=True target_len=1284 json_valid=True siblings=['convergence-receipt.json'] stderr1='' stderr2=''
+CONCURRENT attempt=4 p1_rc=0 p2_rc=0 target_exists=True target_len=1284 json_valid=True siblings=['convergence-receipt.json'] stderr1='' stderr2=''
+CONCURRENT attempt=5 p1_rc=0 p2_rc=1 target_exists=True target_len=1284 json_valid=True siblings=['convergence-receipt.json'] stderr1='' stderr2='... FileNotFoundError ... .convergence-receipt.json.tmp -> ... convergence-receipt.json'
+```
+
+结论：同一 run identity 的顺序重入字节完全一致；原子 replace 未暴露半截 target。非真实单进程入口的并发竞争可让一个 writer 在共享固定 `.tmp` 名称上失败，但已成功 writer 留下完整 JSON，按 personal 档记 P2/backlog。
 
 ## 对抗清单
 
@@ -135,7 +160,9 @@ CASE unexpected-primary-skipped exit=1 receipt=<absent> summary='Convergence rec
 
 ## Findings
 
-当前无已验证 finding。
+| 级别 | 文件:行 | 违反 spec | 可复现触发命令 | 建议修法 |
+|---|---|---|---|---|
+| P2 | `.github/actions/gate-aggregator/aggregate.py:741-751` | spec 6（原子落盘）在两个进程违反单写者前提、同时复用固定 `.tmp` 名称时，一个 writer 会在 `replace()` 抛 `FileNotFoundError`；真实 workflow 只有一个 aggregate 进程，故不升 P1 | 实验四命令中的两个 `subprocess.Popen(... --convergence-receipt-path "$shared_receipt")`；真实输出为 `p1_rc=0 p2_rc=1`、target `len=1284`、JSON 有效 | 若未来允许同一路径并发写，使用每 writer 唯一临时文件名或显式单写者约束；当前单进程入口可接受不修 |
 
 ## Backlog 与越界项
 
