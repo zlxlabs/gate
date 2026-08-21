@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib.util
 import json
 import urllib.request
@@ -12,6 +13,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "review-ledger" / "build_ledger.py"
+PRIMARY_REVIEW_V2_TIER_SOURCE_URL = (
+    "https://github.com/zlxlabs/fd-satisfaction-survey/actions/runs/32446501755/"
+    "artifacts/9434236632"
+)
 
 
 def _module():
@@ -230,6 +235,67 @@ def test_v2_primary_audit_projects_verdict_and_identity(verdict):
     assert entry["review"]["verdict"] == verdict
     assert entry["primary_identity"] == {key: audit[key] for key in module.PRIMARY_IDENTITY_FIELDS if key in audit}
     if verdict in {"not_expected", "waived"}: assert entry["review"]["result"] is None and entry["review"]["finding_count"] == 0
+
+
+def test_review_ledger_consumes_real_primary_v2_tier_artifact_bytes():
+    module = _module()
+    fixture_bytes = (ROOT / "tests/data/primary_review_v2_with_tier.json").read_bytes()
+    assert hashlib.sha256(fixture_bytes).hexdigest() == (
+        "5f8beb2607fd3cf7a79b0adb539d85a68ee189aed463bd08932835a436f3abb8"
+    )
+    audit = json.loads(fixture_bytes)
+
+    entry = module.build_entry(
+        repository=audit["repository"], pr_number=audit["pr"], run_id=audit["run_id"],
+        run_attempt=audit["run_attempt"], head_sha=audit["head_sha"], preflight=_preflight(),
+        audit=audit, prior_entries=[], dispositions={},
+    )
+
+    assert audit["run_id"] == 32446501755, PRIMARY_REVIEW_V2_TIER_SOURCE_URL
+    assert entry["primary_identity"]["tier"] == "internal"
+
+
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+@pytest.mark.parametrize("verdict", ["pass", "not_expected"])
+def test_primary_v2_tier_accepts_domain_values_for_review_and_no_review(verdict, tier):
+    module = _module()
+    audit = _v2_audit(verdict)
+    audit.update(schema_version=2, tier=tier)
+
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=_preflight(), audit=audit,
+        prior_entries=[], dispositions={},
+    )
+
+    assert entry["primary_identity"]["tier"] == tier
+
+
+@pytest.mark.parametrize("tier", [None, "", 1, True, "enterprise"])
+def test_primary_v2_tier_rejects_invalid_domain_values(tier):
+    module = _module()
+    audit = _v2_audit("pass")
+    audit.update(schema_version=2, tier=tier)
+
+    with pytest.raises(ValueError, match="canonical primary tier"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit,
+            prior_entries=[], dispositions={},
+        )
+
+
+def test_primary_v2_tier_does_not_allow_other_unknown_fields():
+    module = _module()
+    audit = _v2_audit("pass")
+    audit.update(schema_version=2, tier="personal", unexpected_primary_field="value")
+
+    with pytest.raises(ValueError, match="extra=.*unexpected_primary_field"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight=_preflight(), audit=audit,
+            prior_entries=[], dispositions={},
+        )
 
 
 @pytest.mark.parametrize("diff_lines,plan,mode,complete,shards", [(100, "single", "single", True, 1), (5000, "sharded", "sharded+cross-module integration", False, None)])
