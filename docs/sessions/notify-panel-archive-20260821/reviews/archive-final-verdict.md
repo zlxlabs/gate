@@ -40,7 +40,7 @@
 
 | # | 不变式 | 结果 | 证据 |
 |---|--------|------|------|
-| 1 | H0..base 仅新增三份 verdict MD | **PASS** | `git diff --stat base..H0` → 3 files, 445 insertions |
+| 1 | base..H0 仅新增三份 verdict MD | **PASS** | `git diff --stat base..H0` → 3 files, 445 insertions |
 | 2 | 三份 blob 与源 tip 完全相同 | **PASS** | 见下方核验命令；R1/R2/R3 blob 均 diff 为空 |
 | 3 | R1→R2→R3 连续证据，未删减合并 | **PASS** | 三文件独立存在，161/153/131 行，内容未交叉替换 |
 | 4 | 无应用代码/测试/配置改动 | **PASS** | numstat 仅 docs/sessions/.../reviews/*.md |
@@ -54,7 +54,8 @@ H0=e7a097940aee539b7bd9ec72b2cf7b7d5c2e5093
 R1_TIP=2bcbe30dd356fef90080162a2c024b1ecdb3642f
 R2_TIP=a8fdca446380f9905a2436c079fe32b31fdcc056
 R3_TIP=6c3cb95d6be7d87d8b7b2b2f43ecb5ad0903ed40
-REPO=/home/zlx/projects/personal/gate-worktrees/gate-notify-archive-final-review
+REPO=/home/zlx/projects/personal/gate
+# 以下命令可在任意包含上述 refs 的本仓 checkout 执行；该稳定主仓路径仅作示例
 
 # 1) 范围：仅三文件
 git -C "$REPO" diff --stat "$BASE..$H0"
@@ -87,10 +88,10 @@ git -C "$REPO" show e2b81c6 -- .github/actions/gate-aggregator/aggregate.py
 
 ## 轮次关系自洽性（抽查）
 
-- R1 审 `origin/main...origin/card/gate-notify-panel` @ H0=`da5bd4c`，登记 P1×5 + F×3。
-- R2 审 `2729d2a..290bd5e`（H0..H2），引用 R1 verdict，结论「本轮无新增 P1」。
-- R3 审 `2729d2a..290bd5e`（base..H2 冻结），与 R2 同范围但视角不同（反向猎捕 + 用户可感知层），结论「本轮无新增 P1，P2×1 + P3×4」。
-- 三份 SHA/范围引用与 PR #65 冻结头 `290bd5e` 一致；内部结论链 R1 开 P1 → R2 收敛 → R3 换家轮确认，时间序自洽。
+- R1 审 `origin/main...origin/card/gate-notify-panel`，冻结头 H0=`da5bd4c`，登记 P1×5、P2×7、P3×2。
+- R2 审 `2729d2a..290bd5e`（H0..H2），冻结头 H2=`290bd5e`，引用 R1 verdict，结论「本轮无新增 P1」。
+- R3 审 `2729d2a..290bd5e`（base..H2），冻结头 H2=`290bd5e`，与 R2 同范围但视角不同（反向猎捕 + 用户可感知层），结论「本轮无新增 P1，P2×1 + P3×4」。
+- R1 冻结头为 `da5bd4c`，R2/R3 冻结头为 `290bd5e`；内部结论链 R1 开 P1 → R2 收敛 → R3 换家轮确认，时间序自洽。
 
 ## 产物
 
