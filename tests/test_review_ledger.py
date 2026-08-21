@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib.util
 import json
 import urllib.request
@@ -239,6 +240,9 @@ def test_v2_primary_audit_projects_verdict_and_identity(verdict):
 def test_review_ledger_consumes_real_primary_v2_tier_artifact_bytes():
     module = _module()
     fixture_bytes = (ROOT / "tests/data/primary_review_v2_with_tier.json").read_bytes()
+    assert hashlib.sha256(fixture_bytes).hexdigest() == (
+        "5f8beb2607fd3cf7a79b0adb539d85a68ee189aed463bd08932835a436f3abb8"
+    )
     audit = json.loads(fixture_bytes)
 
     entry = module.build_entry(
