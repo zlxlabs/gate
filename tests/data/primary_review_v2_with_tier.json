@@ -1,0 +1,56 @@
+{
+  "kind": "primary_review",
+  "schema_version": 2,
+  "spec_source": "live",
+  "pr_body_digest": "f513ed3434a1",
+  "repository_id": 1326603956,
+  "repository": "zlxlabs/fd-satisfaction-survey",
+  "pr": 138,
+  "base_sha": "34071dea5ba2684717558d36b4cdb9fb2a9c6f33",
+  "head_sha": "f1fd4e7a75737712b3f34e6c49b3dc8244399136",
+  "diff_digest": "c6e11989dd7f0399d3325e1591de72316b8d399f37c73d7e289f98b5049301ea",
+  "policy_version": "v2",
+  "policy_digest": "1cacdb7f790883bd80786b968dc26524f676e595fec7b0e350290b534ccbe7c9",
+  "registry_commit": "c068209344a71fb15eeee56beb36e5a51e45d489",
+  "caller_sha": "ae224d00b2e9beceb3c2e054783b93af2299fabd",
+  "reusable_workflow_sha": "0215f6a79b763ddac900b2e467ef837d00ba01f5",
+  "run_id": 32446501755,
+  "run_attempt": 1,
+  "job_id": 96666984886,
+  "reviewer": "codex-sub",
+  "merge_base_sha": "34071dea5ba2684717558d36b4cdb9fb2a9c6f33",
+  "candidate_commit_sha": "ae224d00b2e9beceb3c2e054783b93af2299fabd",
+  "candidate_tree_sha": "c4e79e1d992a4b615fb6f4ec074c2432e27b871f",
+  "run_mode": "PAYLOAD_ONLY",
+  "verdict": "pass",
+  "attempts": [
+    {
+      "reviewer": "codex-sub",
+      "model": "configured/default (Codex CLI)",
+      "exit_code": 0,
+      "reason": "",
+      "cost_usd": null,
+      "tokens": null,
+      "duration_s": 11.809999704360962,
+      "diag_snippet": null
+    }
+  ],
+  "runtime": {
+    "duration_s": 11.809999704360962
+  },
+  "shadow_mode": "detached",
+  "expected_shadows": [
+    "pi-glm-5-3"
+  ],
+  "result": {
+    "verdict": "pass",
+    "summary": "变更仅向验收账本追加一条合法 JSONL 记录，内容与 PR 所述审查任务、验收结果及 commits 留空原因一致；未发现实质性正确性、安全性或设计偏差问题。",
+    "findings": [],
+    "reviewed_files": [
+      "retro/acceptance-log.jsonl"
+    ]
+  },
+  "cost": null,
+  "tokens": null,
+  "tier": "internal"
+}
