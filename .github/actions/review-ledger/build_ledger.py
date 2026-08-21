@@ -58,7 +58,7 @@ PRIMARY_IDENTITY_FIELDS = (
     "policy_version", "policy_digest", "registry_commit", "caller_sha",
     "reusable_workflow_sha", "run_id", "run_attempt", "job_id", "reviewer",
     "merge_base_sha", "candidate_commit_sha", "candidate_tree_sha", "run_mode",
-    "spec_source", "pr_body_digest",
+    "spec_source", "pr_body_digest", "tier",
 )
 PRIMARY_REQUIRED_IDENTITY_FIELDS = (
     "repository_id", "repository", "pr", "base_sha", "head_sha", "diff_digest",
@@ -289,6 +289,10 @@ def _primary_identity(
         raise ValueError(
             f"invalid canonical primary envelope: extra={sorted(extra)}, missing={sorted(missing)}"
         )
+    if "tier" in audit:
+        tier = audit["tier"]
+        if not (isinstance(tier, str) and tier in {"personal", "internal", "saas"}):
+            raise ValueError("canonical primary tier must be personal, internal, or saas")
     if (
         isinstance(audit["repository_id"], bool) or not isinstance(audit["repository_id"], int)
         or audit["repository_id"] <= 0
