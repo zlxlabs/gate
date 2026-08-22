@@ -431,14 +431,11 @@ jobs:
             exit 1
           fi
           jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
-          api_err="$(mktemp)"
-          if ! api_json="$(gh api "$jobs_api" --paginate 2>"$api_err")"; then
-            err_preview="$(head -c 500 "$api_err" | tr '\n' ' ')"
-            echo "::error::resolve-job-id: Jobs API call failed for ${jobs_api} (exit=$?): ${err_preview}"
-            rm -f "$api_err"
+          if ! api_json="$(gh api "$jobs_api" --paginate)"; then
+            rc=$?
+            echo "::error::resolve-job-id: Jobs API call failed for ${jobs_api} (exit=${rc})"
             exit 1
           fi
-          rm -f "$api_err"
           if [ -z "$api_json" ]; then
             echo "::error::resolve-job-id: Jobs API returned empty body for ${jobs_api}"
             exit 1
@@ -626,14 +623,11 @@ jobs:
           reviewers_json='${{ needs.resolve.outputs.shadow_reviewers }}'
           mapfile -t reviewers < <(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "$reviewers_json")
           jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
-          api_err="$(mktemp)"
-          if ! api_json="$(gh api "$jobs_api" --paginate 2>"$api_err")"; then
-            err_preview="$(head -c 500 "$api_err" | tr '\n' ' ')"
-            echo "::error::gate-shadow summary: Jobs API call failed for ${jobs_api} (exit=$?): ${err_preview}"
-            rm -f "$api_err"
+          if ! api_json="$(gh api "$jobs_api" --paginate)"; then
+            rc=$?
+            echo "::error::gate-shadow summary: Jobs API call failed for ${jobs_api} (exit=${rc})"
             exit 1
           fi
-          rm -f "$api_err"
           success_count=0
           failed_count=0
           cancelled_skipped_count=0
