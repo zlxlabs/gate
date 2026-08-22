@@ -552,6 +552,9 @@ def test_summary_invokes_review_summary_with_events_dir_and_reviewer_args():
     assert "review-summary" in run
     assert "shadow-events-all" in run
     assert '>> "$GITHUB_STEP_SUMMARY"' in run
+    assert "shadow leg(s) failed" in run
+    assert "cancelled or skipped" in run
+    assert run_step["env"]["GH_TOKEN"] == "${{ github.token }}"
     env = run_step["env"]
     assert env["REVIEW_SUMMARY_REPOSITORY_ID"] == "${{ github.repository_id }}"
     assert env["REVIEW_SUMMARY_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
@@ -584,6 +587,27 @@ def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description):
         if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
     )
     assert needle in step["run"], description
+
+
+# ── axis 2: shadow leg outcomes × summary conclusion (contract pins) ─────────
+
+@pytest.mark.parametrize(
+    "needle,description",
+    [
+        ("success_count=0", "tracks successful shadow legs"),
+        ("failed_count", "tracks failed shadow legs"),
+        ("cancelled_skipped_count", "tracks cancelled/skipped legs separately from failures"),
+        ("shadow leg(s) failed", "all-failed path must not pass silently"),
+        ("cancelled or skipped", "all-cancelled/skipped path distinguishable from all-failed"),
+    ],
+)
+def test_summary_step_pins_shadow_leg_outcome_guards(needle, description):
+    raw, _ = _load_workflow()
+    run = next(
+        s for s in raw["jobs"]["summary"]["steps"]
+        if s.get("name") == "Summarize shadow calibration results"
+    )["run"]
+    assert needle in run, description
 
 
 def test_no_job_grants_pull_request_or_issue_write():

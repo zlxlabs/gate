@@ -617,6 +617,7 @@ jobs:
       # `bash`. Confirmed clean, not touched by that fix.
       - name: Summarize shadow calibration results
         env:
+          GH_TOKEN: ${{ github.token }}
           REVIEW_SUMMARY_REPOSITORY_ID: ${{ github.repository_id }}
           REVIEW_SUMMARY_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REVIEW_SUMMARY_JSON_PATH: ${{ runner.temp }}/shadow-summary.json
@@ -624,5 +625,44 @@ jobs:
           set -euo pipefail
           reviewers_json='${{ needs.resolve.outputs.shadow_reviewers }}'
           mapfile -t reviewers < <(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "$reviewers_json")
+          jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
+          api_err="$(mktemp)"
+          if ! api_json="$(gh api "$jobs_api" --paginate 2>"$api_err")"; then
+            err_preview="$(head -c 500 "$api_err" | tr '\n' ' ')"
+            echo "::error::gate-shadow summary: Jobs API call failed for ${jobs_api} (exit=$?): ${err_preview}"
+            rm -f "$api_err"
+            exit 1
+          fi
+          rm -f "$api_err"
+          success_count=0
+          failed_count=0
+          cancelled_skipped_count=0
+          failed_reviewers=()
+          for reviewer in "${reviewers[@]}"; do
+            leg_suffix="shadow ($reviewer)"
+            conclusion="$(printf '%s' "$api_json" | jq -r --arg suffix "$leg_suffix" '
+              first(.jobs[] | select(.name == $suffix or (.name | endswith("/ " + $suffix))) | .conclusion) // "missing"
+            ')"
+            case "$conclusion" in
+              success)
+                success_count=$((success_count + 1))
+                ;;
+              cancelled|skipped)
+                cancelled_skipped_count=$((cancelled_skipped_count + 1))
+                ;;
+              failure|missing|*)
+                failed_count=$((failed_count + 1))
+                failed_reviewers+=("$reviewer")
+                ;;
+            esac
+          done
+          if [ "$success_count" -eq 0 ] && [ "$failed_count" -ge 1 ]; then
+            echo "::error::gate-shadow summary: all ${failed_count} shadow leg(s) failed (${failed_reviewers[*]}); no successful shadow review to summarize"
+            exit 1
+          fi
+          if [ "$success_count" -eq 0 ] && [ "$failed_count" -eq 0 ] && [ "$cancelled_skipped_count" -ge 1 ]; then
+            echo "::error::gate-shadow summary: all shadow legs were cancelled or skipped; no successful shadow review to summarize"
+            exit 1
+          fi
           gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
           python3 "$gate_hub_dir/scripts/review/review-summary" "${{ runner.temp }}/shadow-events-all" "${reviewers[@]}" >> "$GITHUB_STEP_SUMMARY"
