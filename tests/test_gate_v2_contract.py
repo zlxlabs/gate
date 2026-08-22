@@ -218,6 +218,26 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
 
     upload_step = next(s for s in ocr["steps"] if s.get("name") == "Upload advisory review event")
     assert upload_step["with"]["path"] == "${{ runner.temp }}/shadow-events/advisory"
+
+
+def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
+    # Same matrix-leg naming pattern as gate-shadow-v2.yml's shadow job — must pass
+    # JOB_NAME_SUFFIX via jq --arg and fail-loud with categorized diagnostics.
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["ocr"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    assert step["env"]["REVIEWER"] == "${{ matrix.reviewer }}"
+    run = step["run"]
+    assert 'JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
+    assert "jq -r --arg suffix" in run
+    assert "env.JOB_NAME_SUFFIX" not in run
+    assert "matching name is empty because REVIEWER is unset" in run
+    assert "Jobs API call failed" in run
+    assert "no matching job for JOB_NAME_SUFFIX=" in run
+    assert "timeout --foreground" in run
+    assert "${{ matrix.reviewer }}" not in run
     assert raw["jobs"]["gate"]["needs"] == ["quality", "primary"]
 
 
