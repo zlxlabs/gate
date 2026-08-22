@@ -16,7 +16,11 @@ import tempfile
 import pytest
 import yaml
 
-from _gha_lint import find_arithmetic_gha_expression_offenders
+from _gha_lint import (
+    find_arithmetic_gha_expression_offenders,
+    materialize_jobs_api_snippet_for_probe,
+    probe_jobs_api_failure_exit_code,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-shadow-v2.yml"
@@ -574,15 +578,15 @@ def test_summary_invokes_review_summary_with_events_dir_and_reviewer_args():
         ("matching name is empty because REVIEWER is unset", "empty match name: REVIEWER unset", False),
         ("matching name is empty because github.job is unset", "empty match name: github.job unset", False),
         ("Jobs API call failed", "API failure distinct from no-match", False),
+        ("|| rc=$?", "API failure captures gh exit code via || not inverted if", False),
         ("(exit=${rc})", "API failure echoes captured gh exit code", False),
-        ("rc=$?", "API failure captures gh exit code before other branch commands", False),
         ("no matching job for JOB_NAME_SUFFIX=", "no-match lists actual suffix", False),
         ("candidate job names", "no-match lists API candidate names", False),
         ("truncated", "candidate names bounded with truncation note", False),
         ('first(.jobs[] | select(.name == $suffix', "exact or suffix match via --arg", False),
         ("err_preview", "API failure does not echo raw gh stderr", True),
         ("api_err", "API failure does not use stderr scratch file", True),
-        ("(exit=$?)", "API failure does not inline stale $? after branch body commands", True),
+        ("if ! api_json=", "API failure does not use inverted-if exit capture", True),
     ],
 )
 def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description, forbidden):
@@ -598,6 +602,23 @@ def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description, for
         assert needle in run, description
 
 
+def test_shadow_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    snippet = materialize_jobs_api_snippet_for_probe(
+        step["run"],
+        start_prefix="jobs_api=",
+        end_prefix='if [ -z "$api_json" ]',
+    )
+    proc = probe_jobs_api_failure_exit_code(snippet, tmp_path)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    assert "exit=42" in output, output
+
+
 # ── axis 2: shadow leg outcomes × summary conclusion (contract pins) ─────────
 
 @pytest.mark.parametrize(
@@ -609,10 +630,10 @@ def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description, for
         ("shadow leg(s) failed", "all-failed path must not pass silently", False),
         ("cancelled or skipped", "all-cancelled/skipped path distinguishable from all-failed", False),
         ("(exit=${rc})", "summary Jobs API failure echoes captured gh exit code", False),
-        ("rc=$?", "summary Jobs API failure captures gh exit code first in branch", False),
+        ("|| rc=$?", "summary Jobs API failure captures gh exit code via || not inverted if", False),
         ("err_preview", "summary Jobs API failure does not echo raw gh stderr", True),
         ("api_err", "summary Jobs API failure does not use stderr scratch file", True),
-        ("(exit=$?)", "summary Jobs API failure does not inline stale $? after branch body", True),
+        ("if ! api_json=", "summary Jobs API failure does not use inverted-if exit capture", True),
     ],
 )
 def test_summary_step_pins_shadow_leg_outcome_guards(needle, description, forbidden):
@@ -625,6 +646,23 @@ def test_summary_step_pins_shadow_leg_outcome_guards(needle, description, forbid
         assert needle not in run, description
     else:
         assert needle in run, description
+
+
+def test_shadow_summary_jobs_api_failure_probe_reports_exit_42(tmp_path):
+    raw, _ = _load_workflow()
+    run = next(
+        s for s in raw["jobs"]["summary"]["steps"]
+        if s.get("name") == "Summarize shadow calibration results"
+    )["run"]
+    snippet = materialize_jobs_api_snippet_for_probe(
+        run,
+        start_prefix="jobs_api=",
+        end_prefix="success_count=0",
+    )
+    proc = probe_jobs_api_failure_exit_code(snippet, tmp_path)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    assert "exit=42" in output, output
 
 
 def test_no_job_grants_pull_request_or_issue_write():
