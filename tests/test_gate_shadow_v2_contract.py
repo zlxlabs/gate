@@ -455,18 +455,22 @@ def test_shadow_job_id_resolution_accounts_for_matrix_leg_naming():
     # Extends gate-v2.yml's own (non-matrix) "Resolve numeric job id" step: a matrix
     # leg's Jobs-API `name` is rendered as "<job id> (<matrix value>)", optionally
     # prefixed by the calling job's own name — assert the jq selector accounts for this
-    # suffix. `matrix.reviewer` is routed through the `REVIEWER` env var and exported as
-    # `JOB_NAME_SUFFIX` for jq's own `env.JOB_NAME_SUFFIX` builtin to read (P2 hygiene
-    # fix, 2026-07-26 codex review) rather than interpolated directly into the jq filter
-    # source string.
+    # suffix. `matrix.reviewer` is routed through the `REVIEWER` env var and composed
+    # into JOB_NAME_SUFFIX in shell (P2 hygiene fix, 2026-07-26 codex review) then passed
+    # to jq via --arg (never jq env.* — missing env vars silently match nothing).
     raw, _ = _load_workflow()
     steps = raw["jobs"]["shadow"]["steps"]
     step = next(s for s in steps if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID")
     assert step["env"]["REVIEWER"] == "${{ matrix.reviewer }}"
     run = step["run"]
-    assert 'export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
-    assert ".name == env.JOB_NAME_SUFFIX" in run
-    assert 'endswith("/ " + env.JOB_NAME_SUFFIX)' in run
+    assert 'JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
+    assert "jq -r --arg suffix" in run
+    assert 'endswith("/ " + $suffix)' in run
+    assert "env.JOB_NAME_SUFFIX" not in run
+    assert "matching name is empty because REVIEWER is unset" in run
+    assert "Jobs API call failed" in run
+    assert "no matching job for JOB_NAME_SUFFIX=" in run
+    assert "truncated" in run
     assert "${{ matrix.reviewer }}" not in run
 
 
@@ -558,6 +562,30 @@ def test_summary_invokes_review_summary_with_events_dir_and_reviewer_args():
     assert not any(ln.strip().startswith("bash ") for ln in run.splitlines())
 
 
+# ── axis 1: job id resolution input shape × expected behavior (contract pins) ─
+
+@pytest.mark.parametrize(
+    "needle,description",
+    [
+        ("jq -r --arg suffix", "pass suffix via jq --arg, not env builtin"),
+        ("matching name is empty because REVIEWER is unset", "empty match name: REVIEWER unset"),
+        ("matching name is empty because github.job is unset", "empty match name: github.job unset"),
+        ("Jobs API call failed", "API failure distinct from no-match"),
+        ("no matching job for JOB_NAME_SUFFIX=", "no-match lists actual suffix"),
+        ("candidate job names", "no-match lists API candidate names"),
+        ("truncated", "candidate names bounded with truncation note"),
+        ('first(.jobs[] | select(.name == $suffix', "exact or suffix match via --arg"),
+    ],
+)
+def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    assert needle in step["run"], description
+
+
 def test_no_job_grants_pull_request_or_issue_write():
     # Belt-and-suspenders alongside the top-level permissions test: no job in this file
     # declares its own (more permissive) job-level `permissions:` override either.
@@ -572,7 +600,7 @@ def test_no_run_block_directly_interpolates_matrix_reviewer():
     # interpolation of `${{ matrix.reviewer }}` into a `run:` block is the textbook
     # GitHub-Actions script-injection pattern. Every use of the reviewer name inside a
     # `run:` script in this file must go through an `env:`-declared variable instead
-    # (`$REVIEWER` in shell, `env.REVIEWER`/`env.JOB_NAME_SUFFIX` in jq) — scan every
+    # (`$REVIEWER` in shell, jq `--arg suffix` — never jq `env.*`) — scan every
     # step's `run:` field in this workflow (not `if:`/`with:`, which are GitHub Actions'
     # own expression contexts, not shell/jq script text, and carry no equivalent risk).
     raw, _ = _load_workflow()
