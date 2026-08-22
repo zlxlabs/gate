@@ -405,10 +405,9 @@ jobs:
         run: |
           set -euo pipefail
           # JOB_NAME_SUFFIX is computed from $REVIEWER (env, not a direct GHA expression
-          # interpolation) and then EXPORTED so the jq filter below can read it via its
-          # own `env.JOB_NAME_SUFFIX` builtin — `gh api --jq` spawns jq inheriting this
-          # process's environment, so no string ever needs to be interpolated into the
-          # jq filter source itself either.
+          # interpolation) and passed to jq via --arg — never via jq's env.* builtin,
+          # which silently treats a missing variable as null and makes endswith("/ ")
+          # match nothing with exit code 0.
           #
           # P0 FIX (2026-07-26, canary first-run failure): the double-brace expression
           # interpolation syntax (dollar sign, two open braces, ..., two close braces)
@@ -422,12 +421,41 @@ jobs:
           # (empty `referenced_workflows`, immediate `failure` conclusion, no job ever
           # dispatched). This paragraph deliberately describes the syntax in prose instead
           # of reproducing it, precisely so it can explain the bug without retriggering it.
-          export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"
-          job_id="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs" \
-            --paginate --jq '.jobs[] | select(.name == env.JOB_NAME_SUFFIX or (.name | endswith("/ " + env.JOB_NAME_SUFFIX))) | .id' \
-            | head -n1)"
+          JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"
+          if [ -z "${REVIEWER}" ]; then
+            echo "::error::resolve-job-id: matching name is empty because REVIEWER is unset"
+            exit 1
+          fi
+          if [ -z "${{ github.job }}" ]; then
+            echo "::error::resolve-job-id: matching name is empty because github.job is unset"
+            exit 1
+          fi
+          jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
+          rc=0
+          api_json="$(gh api "$jobs_api" --paginate)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::resolve-job-id: Jobs API call failed for ${jobs_api} (exit=${rc})"
+            exit 1
+          fi
+          if [ -z "$api_json" ]; then
+            echo "::error::resolve-job-id: Jobs API returned empty body for ${jobs_api}"
+            exit 1
+          fi
+          MAX_CANDIDATE_NAMES=50
+          job_id="$(printf '%s' "$api_json" | jq -r --arg suffix "$JOB_NAME_SUFFIX" '
+            first(.jobs[] | select(.name == $suffix or (.name | endswith("/ " + $suffix))) | .id) // empty
+          ')"
           if [ -z "$job_id" ]; then
-            echo "::error::could not resolve a numeric job id for job '$JOB_NAME_SUFFIX' via the Jobs API"
+            candidate_info="$(printf '%s' "$api_json" | jq -r --argjson limit "$MAX_CANDIDATE_NAMES" '
+              (.jobs | length) as $total |
+              ([.jobs[].name][:$limit] | join(", ")) as $shown |
+              if $total > $limit then
+                "candidate job names (showing first \($limit) of \($total)): \($shown) ... truncated"
+              else
+                "candidate job names (\($total)): \($shown)"
+              end
+            ')"
+            echo "::error::resolve-job-id: no matching job for JOB_NAME_SUFFIX='${JOB_NAME_SUFFIX}' (${candidate_info})"
             exit 1
           fi
           echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
@@ -587,6 +615,7 @@ jobs:
       # `bash`. Confirmed clean, not touched by that fix.
       - name: Summarize shadow calibration results
         env:
+          GH_TOKEN: ${{ github.token }}
           REVIEW_SUMMARY_REPOSITORY_ID: ${{ github.repository_id }}
           REVIEW_SUMMARY_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REVIEW_SUMMARY_JSON_PATH: ${{ runner.temp }}/shadow-summary.json
@@ -594,5 +623,42 @@ jobs:
           set -euo pipefail
           reviewers_json='${{ needs.resolve.outputs.shadow_reviewers }}'
           mapfile -t reviewers < <(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "$reviewers_json")
+          jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
+          rc=0
+          api_json="$(gh api "$jobs_api" --paginate)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::gate-shadow summary: Jobs API call failed for ${jobs_api} (exit=${rc})"
+            exit 1
+          fi
+          success_count=0
+          failed_count=0
+          cancelled_skipped_count=0
+          failed_reviewers=()
+          for reviewer in "${reviewers[@]}"; do
+            leg_suffix="shadow ($reviewer)"
+            conclusion="$(printf '%s' "$api_json" | jq -r --arg suffix "$leg_suffix" '
+              first(.jobs[] | select(.name == $suffix or (.name | endswith("/ " + $suffix))) | .conclusion) // "missing"
+            ')"
+            case "$conclusion" in
+              success)
+                success_count=$((success_count + 1))
+                ;;
+              cancelled|skipped)
+                cancelled_skipped_count=$((cancelled_skipped_count + 1))
+                ;;
+              failure|missing|*)
+                failed_count=$((failed_count + 1))
+                failed_reviewers+=("$reviewer")
+                ;;
+            esac
+          done
+          if [ "$success_count" -eq 0 ] && [ "$failed_count" -ge 1 ]; then
+            echo "::error::gate-shadow summary: all ${failed_count} shadow leg(s) failed (${failed_reviewers[*]}); no successful shadow review to summarize"
+            exit 1
+          fi
+          if [ "$success_count" -eq 0 ] && [ "$failed_count" -eq 0 ] && [ "$cancelled_skipped_count" -ge 1 ]; then
+            echo "::error::gate-shadow summary: all shadow legs were cancelled or skipped; no successful shadow review to summarize"
+            exit 1
+          fi
           gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
           python3 "$gate_hub_dir/scripts/review/review-summary" "${{ runner.temp }}/shadow-events-all" "${reviewers[@]}" >> "$GITHUB_STEP_SUMMARY"

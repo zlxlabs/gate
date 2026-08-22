@@ -16,7 +16,11 @@ import tempfile
 import pytest
 import yaml
 
-from _gha_lint import find_arithmetic_gha_expression_offenders
+from _gha_lint import (
+    find_arithmetic_gha_expression_offenders,
+    materialize_jobs_api_snippet_for_probe,
+    probe_jobs_api_failure_exit_code,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-shadow-v2.yml"
@@ -455,18 +459,22 @@ def test_shadow_job_id_resolution_accounts_for_matrix_leg_naming():
     # Extends gate-v2.yml's own (non-matrix) "Resolve numeric job id" step: a matrix
     # leg's Jobs-API `name` is rendered as "<job id> (<matrix value>)", optionally
     # prefixed by the calling job's own name — assert the jq selector accounts for this
-    # suffix. `matrix.reviewer` is routed through the `REVIEWER` env var and exported as
-    # `JOB_NAME_SUFFIX` for jq's own `env.JOB_NAME_SUFFIX` builtin to read (P2 hygiene
-    # fix, 2026-07-26 codex review) rather than interpolated directly into the jq filter
-    # source string.
+    # suffix. `matrix.reviewer` is routed through the `REVIEWER` env var and composed
+    # into JOB_NAME_SUFFIX in shell (P2 hygiene fix, 2026-07-26 codex review) then passed
+    # to jq via --arg (never jq env.* — missing env vars silently match nothing).
     raw, _ = _load_workflow()
     steps = raw["jobs"]["shadow"]["steps"]
     step = next(s for s in steps if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID")
     assert step["env"]["REVIEWER"] == "${{ matrix.reviewer }}"
     run = step["run"]
-    assert 'export JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
-    assert ".name == env.JOB_NAME_SUFFIX" in run
-    assert 'endswith("/ " + env.JOB_NAME_SUFFIX)' in run
+    assert 'JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
+    assert "jq -r --arg suffix" in run
+    assert 'endswith("/ " + $suffix)' in run
+    assert "env.JOB_NAME_SUFFIX" not in run
+    assert "matching name is empty because REVIEWER is unset" in run
+    assert "Jobs API call failed" in run
+    assert "no matching job for JOB_NAME_SUFFIX=" in run
+    assert "truncated" in run
     assert "${{ matrix.reviewer }}" not in run
 
 
@@ -548,6 +556,9 @@ def test_summary_invokes_review_summary_with_events_dir_and_reviewer_args():
     assert "review-summary" in run
     assert "shadow-events-all" in run
     assert '>> "$GITHUB_STEP_SUMMARY"' in run
+    assert "shadow leg(s) failed" in run
+    assert "cancelled or skipped" in run
+    assert run_step["env"]["GH_TOKEN"] == "${{ github.token }}"
     env = run_step["env"]
     assert env["REVIEW_SUMMARY_REPOSITORY_ID"] == "${{ github.repository_id }}"
     assert env["REVIEW_SUMMARY_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
@@ -556,6 +567,102 @@ def test_summary_invokes_review_summary_with_events_dir_and_reviewer_args():
     # confirmed this invocation was already correct (never touched by that fix).
     assert 'python3 "$gate_hub_dir/scripts/review/review-summary"' in run
     assert not any(ln.strip().startswith("bash ") for ln in run.splitlines())
+
+
+# ── axis 1: job id resolution input shape × expected behavior (contract pins) ─
+
+@pytest.mark.parametrize(
+    "needle,description,forbidden",
+    [
+        ("jq -r --arg suffix", "pass suffix via jq --arg, not env builtin", False),
+        ("matching name is empty because REVIEWER is unset", "empty match name: REVIEWER unset", False),
+        ("matching name is empty because github.job is unset", "empty match name: github.job unset", False),
+        ("Jobs API call failed", "API failure distinct from no-match", False),
+        ("|| rc=$?", "API failure captures gh exit code via || not inverted if", False),
+        ("(exit=${rc})", "API failure echoes captured gh exit code", False),
+        ("no matching job for JOB_NAME_SUFFIX=", "no-match lists actual suffix", False),
+        ("candidate job names", "no-match lists API candidate names", False),
+        ("truncated", "candidate names bounded with truncation note", False),
+        ('first(.jobs[] | select(.name == $suffix', "exact or suffix match via --arg", False),
+        ("err_preview", "API failure does not echo raw gh stderr", True),
+        ("api_err", "API failure does not use stderr scratch file", True),
+        ("if ! api_json=", "API failure does not use inverted-if exit capture", True),
+    ],
+)
+def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description, forbidden):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+    if forbidden:
+        assert needle not in run, description
+    else:
+        assert needle in run, description
+
+
+def test_shadow_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    snippet = materialize_jobs_api_snippet_for_probe(
+        step["run"],
+        start_prefix="jobs_api=",
+        end_prefix='if [ -z "$api_json" ]',
+    )
+    proc = probe_jobs_api_failure_exit_code(snippet, tmp_path)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    assert "exit=42" in output, output
+
+
+# ── axis 2: shadow leg outcomes × summary conclusion (contract pins) ─────────
+
+@pytest.mark.parametrize(
+    "needle,description,forbidden",
+    [
+        ("success_count=0", "tracks successful shadow legs", False),
+        ("failed_count", "tracks failed shadow legs", False),
+        ("cancelled_skipped_count", "tracks cancelled/skipped legs separately from failures", False),
+        ("shadow leg(s) failed", "all-failed path must not pass silently", False),
+        ("cancelled or skipped", "all-cancelled/skipped path distinguishable from all-failed", False),
+        ("(exit=${rc})", "summary Jobs API failure echoes captured gh exit code", False),
+        ("|| rc=$?", "summary Jobs API failure captures gh exit code via || not inverted if", False),
+        ("err_preview", "summary Jobs API failure does not echo raw gh stderr", True),
+        ("api_err", "summary Jobs API failure does not use stderr scratch file", True),
+        ("if ! api_json=", "summary Jobs API failure does not use inverted-if exit capture", True),
+    ],
+)
+def test_summary_step_pins_shadow_leg_outcome_guards(needle, description, forbidden):
+    raw, _ = _load_workflow()
+    run = next(
+        s for s in raw["jobs"]["summary"]["steps"]
+        if s.get("name") == "Summarize shadow calibration results"
+    )["run"]
+    if forbidden:
+        assert needle not in run, description
+    else:
+        assert needle in run, description
+
+
+def test_shadow_summary_jobs_api_failure_probe_reports_exit_42(tmp_path):
+    raw, _ = _load_workflow()
+    run = next(
+        s for s in raw["jobs"]["summary"]["steps"]
+        if s.get("name") == "Summarize shadow calibration results"
+    )["run"]
+    snippet = materialize_jobs_api_snippet_for_probe(
+        run,
+        start_prefix="jobs_api=",
+        end_prefix="success_count=0",
+    )
+    proc = probe_jobs_api_failure_exit_code(snippet, tmp_path)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    assert "exit=42" in output, output
 
 
 def test_no_job_grants_pull_request_or_issue_write():
@@ -572,7 +679,7 @@ def test_no_run_block_directly_interpolates_matrix_reviewer():
     # interpolation of `${{ matrix.reviewer }}` into a `run:` block is the textbook
     # GitHub-Actions script-injection pattern. Every use of the reviewer name inside a
     # `run:` script in this file must go through an `env:`-declared variable instead
-    # (`$REVIEWER` in shell, `env.REVIEWER`/`env.JOB_NAME_SUFFIX` in jq) — scan every
+    # (`$REVIEWER` in shell, jq `--arg suffix` — never jq `env.*`) — scan every
     # step's `run:` field in this workflow (not `if:`/`with:`, which are GitHub Actions'
     # own expression contexts, not shell/jq script text, and carry no equivalent risk).
     raw, _ = _load_workflow()

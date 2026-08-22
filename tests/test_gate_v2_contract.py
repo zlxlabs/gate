@@ -13,7 +13,11 @@ from pathlib import Path
 
 import yaml
 
-from _gha_lint import find_arithmetic_gha_expression_offenders
+from _gha_lint import (
+    find_arithmetic_gha_expression_offenders,
+    materialize_jobs_api_snippet_for_probe,
+    probe_jobs_api_failure_exit_code,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
@@ -218,7 +222,54 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
 
     upload_step = next(s for s in ocr["steps"] if s.get("name") == "Upload advisory review event")
     assert upload_step["with"]["path"] == "${{ runner.temp }}/shadow-events/advisory"
+
+
+def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
+    # Same matrix-leg naming pattern as gate-shadow-v2.yml's shadow job — must pass
+    # JOB_NAME_SUFFIX via jq --arg and fail-loud with categorized diagnostics.
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["ocr"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    assert step["env"]["REVIEWER"] == "${{ matrix.reviewer }}"
+    run = step["run"]
+    assert 'JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
+    assert "jq -r --arg suffix" in run
+    assert "env.JOB_NAME_SUFFIX" not in run
+    assert "matching name is empty because REVIEWER is unset" in run
+    assert "Jobs API call failed" in run
+    assert "(exit=${rc})" in run
+    assert "|| rc=$?" in run
+    assert "if ! api_json=" not in run
+    assert "err_preview" not in run
+    assert "api_err" not in run
+    assert "no matching job for JOB_NAME_SUFFIX=" in run
+    assert "timeout --foreground" in run
+    assert "${{ matrix.reviewer }}" not in run
     assert raw["jobs"]["gate"]["needs"] == ["quality", "primary"]
+
+
+def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["ocr"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    gh_api_wrapper = (
+        'gh_api() {\n'
+        '  timeout --foreground "${OCR_GITHUB_TIMEOUT_SECONDS}s" gh api "$@"\n'
+        '}'
+    )
+    snippet = gh_api_wrapper + "\n" + materialize_jobs_api_snippet_for_probe(
+        step["run"],
+        start_prefix="jobs_api=",
+        end_prefix='if [ -z "$api_json" ]',
+    )
+    proc = probe_jobs_api_failure_exit_code(snippet, tmp_path, with_timeout_stub=True)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    assert "exit=42" in output, output
 
 
 # ── concurrency contract ─────────────────────────────────────────────────────

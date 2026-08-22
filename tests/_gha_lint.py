@@ -17,7 +17,9 @@ logic a second time.
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -147,3 +149,54 @@ def find_bare_gate_hub_dir_offenders_in_run_blocks(workflow_path: Path) -> list[
                     label = step.get("name") or step.get("id") or "<unnamed step>"
                     offenders.append(f"{job_id}::{label}: {line.strip()!r}")
     return offenders
+
+
+_JOBS_API_GHA_SUBSTITUTIONS = {
+    "${{ github.repository }}": "owner/repo",
+    "${{ github.run_id }}": "1",
+    "${{ github.run_attempt }}": "1",
+}
+
+
+def extract_run_snippet_between(run: str, start_prefix: str, end_prefix: str) -> str:
+    """Return the contiguous `run:` lines from `start_prefix` up to (not including) `end_prefix`."""
+    lines = run.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith(start_prefix))
+    end = next(i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.strip().startswith(end_prefix))
+    return "\n".join(lines[start:end])
+
+
+def materialize_jobs_api_snippet_for_probe(run: str, *, start_prefix: str, end_prefix: str) -> str:
+    snippet = extract_run_snippet_between(run, start_prefix, end_prefix)
+    for old, new in _JOBS_API_GHA_SUBSTITUTIONS.items():
+        snippet = snippet.replace(old, new)
+    return snippet
+
+
+def probe_jobs_api_failure_exit_code(
+    snippet: str,
+    tmp_path: Path,
+    *,
+    gh_exit: int = 42,
+    with_timeout_stub: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Execute a Jobs-API failure snippet with a stub `gh` that exits `gh_exit`."""
+    gh_stub = tmp_path / "gh"
+    gh_stub.write_text(f"#!/bin/sh\nexit {gh_exit}\n")
+    gh_stub.chmod(0o755)
+    path_entries = [str(tmp_path)]
+    if with_timeout_stub:
+        timeout_stub = tmp_path / "timeout"
+        timeout_stub.write_text('#!/bin/sh\nif [ "$1" = "--foreground" ]; then shift 2; fi\nexec "$@"\n')
+        timeout_stub.chmod(0o755)
+    script = f"set -euo pipefail\n{snippet}\n"
+    env = os.environ.copy()
+    env["PATH"] = ":".join(path_entries + [env.get("PATH", "")])
+    env["OCR_GITHUB_TIMEOUT_SECONDS"] = "15"
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
