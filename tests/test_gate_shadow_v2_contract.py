@@ -568,46 +568,63 @@ def test_summary_invokes_review_summary_with_events_dir_and_reviewer_args():
 # ── axis 1: job id resolution input shape × expected behavior (contract pins) ─
 
 @pytest.mark.parametrize(
-    "needle,description",
+    "needle,description,forbidden",
     [
-        ("jq -r --arg suffix", "pass suffix via jq --arg, not env builtin"),
-        ("matching name is empty because REVIEWER is unset", "empty match name: REVIEWER unset"),
-        ("matching name is empty because github.job is unset", "empty match name: github.job unset"),
-        ("Jobs API call failed", "API failure distinct from no-match"),
-        ("no matching job for JOB_NAME_SUFFIX=", "no-match lists actual suffix"),
-        ("candidate job names", "no-match lists API candidate names"),
-        ("truncated", "candidate names bounded with truncation note"),
-        ('first(.jobs[] | select(.name == $suffix', "exact or suffix match via --arg"),
+        ("jq -r --arg suffix", "pass suffix via jq --arg, not env builtin", False),
+        ("matching name is empty because REVIEWER is unset", "empty match name: REVIEWER unset", False),
+        ("matching name is empty because github.job is unset", "empty match name: github.job unset", False),
+        ("Jobs API call failed", "API failure distinct from no-match", False),
+        ("(exit=${rc})", "API failure echoes captured gh exit code", False),
+        ("rc=$?", "API failure captures gh exit code before other branch commands", False),
+        ("no matching job for JOB_NAME_SUFFIX=", "no-match lists actual suffix", False),
+        ("candidate job names", "no-match lists API candidate names", False),
+        ("truncated", "candidate names bounded with truncation note", False),
+        ('first(.jobs[] | select(.name == $suffix', "exact or suffix match via --arg", False),
+        ("err_preview", "API failure does not echo raw gh stderr", True),
+        ("api_err", "API failure does not use stderr scratch file", True),
+        ("(exit=$?)", "API failure does not inline stale $? after branch body commands", True),
     ],
 )
-def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description):
+def test_resolve_job_id_step_pins_fail_loud_diagnostics(needle, description, forbidden):
     raw, _ = _load_workflow()
     step = next(
         s for s in raw["jobs"]["shadow"]["steps"]
         if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
     )
-    assert needle in step["run"], description
+    run = step["run"]
+    if forbidden:
+        assert needle not in run, description
+    else:
+        assert needle in run, description
 
 
 # ── axis 2: shadow leg outcomes × summary conclusion (contract pins) ─────────
 
 @pytest.mark.parametrize(
-    "needle,description",
+    "needle,description,forbidden",
     [
-        ("success_count=0", "tracks successful shadow legs"),
-        ("failed_count", "tracks failed shadow legs"),
-        ("cancelled_skipped_count", "tracks cancelled/skipped legs separately from failures"),
-        ("shadow leg(s) failed", "all-failed path must not pass silently"),
-        ("cancelled or skipped", "all-cancelled/skipped path distinguishable from all-failed"),
+        ("success_count=0", "tracks successful shadow legs", False),
+        ("failed_count", "tracks failed shadow legs", False),
+        ("cancelled_skipped_count", "tracks cancelled/skipped legs separately from failures", False),
+        ("shadow leg(s) failed", "all-failed path must not pass silently", False),
+        ("cancelled or skipped", "all-cancelled/skipped path distinguishable from all-failed", False),
+        ("(exit=${rc})", "summary Jobs API failure echoes captured gh exit code", False),
+        ("rc=$?", "summary Jobs API failure captures gh exit code first in branch", False),
+        ("err_preview", "summary Jobs API failure does not echo raw gh stderr", True),
+        ("api_err", "summary Jobs API failure does not use stderr scratch file", True),
+        ("(exit=$?)", "summary Jobs API failure does not inline stale $? after branch body", True),
     ],
 )
-def test_summary_step_pins_shadow_leg_outcome_guards(needle, description):
+def test_summary_step_pins_shadow_leg_outcome_guards(needle, description, forbidden):
     raw, _ = _load_workflow()
     run = next(
         s for s in raw["jobs"]["summary"]["steps"]
         if s.get("name") == "Summarize shadow calibration results"
     )["run"]
-    assert needle in run, description
+    if forbidden:
+        assert needle not in run, description
+    else:
+        assert needle in run, description
 
 
 def test_no_job_grants_pull_request_or_issue_write():

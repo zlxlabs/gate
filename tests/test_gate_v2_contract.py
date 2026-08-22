@@ -235,6 +235,11 @@ def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
     assert "env.JOB_NAME_SUFFIX" not in run
     assert "matching name is empty because REVIEWER is unset" in run
     assert "Jobs API call failed" in run
+    assert "(exit=${rc})" in run
+    assert "rc=$?" in run
+    assert "err_preview" not in run
+    assert "api_err" not in run
+    assert "(exit=$?)" not in run
     assert "no matching job for JOB_NAME_SUFFIX=" in run
     assert "timeout --foreground" in run
     assert "${{ matrix.reviewer }}" not in run
