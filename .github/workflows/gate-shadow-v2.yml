@@ -431,8 +431,9 @@ jobs:
             exit 1
           fi
           jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
-          if ! api_json="$(gh api "$jobs_api" --paginate)"; then
-            rc=$?
+          rc=0
+          api_json="$(gh api "$jobs_api" --paginate)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
             echo "::error::resolve-job-id: Jobs API call failed for ${jobs_api} (exit=${rc})"
             exit 1
           fi
@@ -623,8 +624,9 @@ jobs:
           reviewers_json='${{ needs.resolve.outputs.shadow_reviewers }}'
           mapfile -t reviewers < <(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "$reviewers_json")
           jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
-          if ! api_json="$(gh api "$jobs_api" --paginate)"; then
-            rc=$?
+          rc=0
+          api_json="$(gh api "$jobs_api" --paginate)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
             echo "::error::gate-shadow summary: Jobs API call failed for ${jobs_api} (exit=${rc})"
             exit 1
           fi

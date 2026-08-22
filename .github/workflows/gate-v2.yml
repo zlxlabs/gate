@@ -566,8 +566,9 @@ jobs:
             exit 1
           fi
           jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
-          if ! api_json="$(gh_api "$jobs_api" --paginate)"; then
-            rc=$?
+          rc=0
+          api_json="$(gh_api "$jobs_api" --paginate)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
             echo "::error::resolve-job-id: Jobs API call failed for ${jobs_api} (exit=${rc})"
             exit 1
           fi
