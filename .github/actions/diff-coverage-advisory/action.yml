@@ -1,0 +1,32 @@
+name: Diff coverage advisory
+description: >-
+  Post a one-line diff-coverage advisory on the PR from the caller workspace's
+  coverage/lcov.info. Never gates; failures degrade to a missing note.
+inputs:
+  base-sha: { required: true }
+  head-sha: { required: true }
+  lcov-path:
+    description: Path to lcov.info relative to the caller workspace root.
+    required: false
+    default: coverage/lcov.info
+  token: { required: true }
+runs:
+  using: composite
+  steps:
+    - name: Measure diff coverage and post advisory note
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        if command -v uv >/dev/null 2>&1; then
+          runner=(uv run --with diff-cover python3)
+        else
+          runner=(python3)
+        fi
+        "${runner[@]}" "$GITHUB_ACTION_PATH/advisory.py" \
+          --base-sha "${{ inputs.base-sha }}" \
+          --head-sha "${{ inputs.head-sha }}" \
+          --lcov-path "${{ inputs.lcov-path }}"
