@@ -31,7 +31,7 @@ P1 红线只有数据丢失、静默出错、崩溃。
 
 全量测试（与 CI 一致，见 `.github/workflows/ci.yml`）：
 
-    uv run --with pytest,PyYAML python -m pytest -q
+    uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q
 
 workflow pin 检查：
 

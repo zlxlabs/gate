@@ -82,8 +82,8 @@ on:
 # actions: read   — Jobs API (resolve this run's numeric job id for the
 #                    primary/OCR jobs' REVIEW_JOB_ID) + actions/download-artifact
 #                    in the gate job.
-# pull-requests: write — the quality job's PR-size preflight action, the OCR
-#                    advisory job, and the gate job's Stage 4 PR-comment
+# pull-requests: write — the quality job's PR-size preflight action, diff-coverage
+#                    advisory, the OCR advisory job, and the gate job's Stage 4 PR-comment
 #                    receipt (fail-open email-visible mirror of the Step
 #                    Summary — see the gate job) post PR comments; primary
 #                    never comments (Step Summary only).
@@ -283,6 +283,29 @@ jobs:
             elif command -v pytest >/dev/null; then pytest -q
             else echo "no python test runner on this runner — skipping (runs on self-hosted)"; fi
           else echo "no tests detected"; fi
+
+      - name: Checkout gate actions for diff-coverage advisory
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-action-src
+          sparse-checkout: |
+            .github/actions
+            scripts/scrub_outbound.py
+
+      - name: Diff coverage advisory
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 10
+        uses: ./_gate-action-src/.github/actions/diff-coverage-advisory
+        with:
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          token: ${{ github.token }}
 
       - name: Prune uv cache before persistence
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
