@@ -64,10 +64,8 @@ def _repo_with_code_change(tmp_path: Path, *, covered: bool) -> tuple[Path, str,
     lcov_path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
-            "uv",
-            "run",
-            "--with",
-            "coverage,pytest",
+            sys.executable,
+            "-m",
             "coverage",
             "run",
             "-m",
@@ -79,7 +77,7 @@ def _repo_with_code_change(tmp_path: Path, *, covered: bool) -> tuple[Path, str,
         check=True,
     )
     subprocess.run(
-        ["uv", "run", "--with", "coverage", "coverage", "lcov", "-o", str(lcov_path)],
+        [sys.executable, "-m", "coverage", "lcov", "-o", str(lcov_path)],
         cwd=repo,
         check=True,
     )
