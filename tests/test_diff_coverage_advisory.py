@@ -223,6 +223,43 @@ def test_post_sticky_comment_uses_marker_and_prefix(module, monkeypatch):
     assert "diff-coverage: 100% (2/2 changed lines)" in posted["body"]
 
 
+def test_post_sticky_comment_patches_existing_marker_comment(module, monkeypatch):
+    patched: dict[str, str] = {}
+    posted = False
+
+    def fake_request(_token, method, url, payload=None):
+        nonlocal posted
+        if method == "GET" and url.endswith("/pulls/42"):
+            return {"head": {"sha": "abc123"}}
+        if method == "GET" and "/issues/42/comments" in url:
+            return [{"id": 99, "body": f"{module.MARKER}\n\nold note\n"}]
+        if method == "PATCH" and url.endswith("/issues/comments/99"):
+            patched["body"] = payload["body"]
+            return {"id": 99}
+        if method == "POST":
+            posted = True
+            return {"id": 100}
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr(module, "_request", fake_request)
+    module.post_sticky_comment(
+        {
+            "state": "covered",
+            "percent_covered": 50,
+            "covered_lines": 1,
+            "total_lines": 2,
+            "head_sha": "abc123",
+        },
+        token="token",
+        repository="owner/repo",
+        pr_number=42,
+    )
+
+    assert not posted
+    assert module.MARKER in patched["body"]
+    assert "diff-coverage: 50% (1/2 changed lines)" in patched["body"]
+
+
 def test_post_sticky_comment_finds_marker_on_second_page(module, monkeypatch):
     patched: dict[str, str] = {}
     posted = False
