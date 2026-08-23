@@ -286,6 +286,7 @@ jobs:
 
       - name: Checkout gate actions for diff-coverage advisory
         if: always()
+        continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ job.workflow_repository }}

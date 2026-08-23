@@ -1120,6 +1120,7 @@ def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error()
 
     checkout = steps[checkout_index]
     assert checkout["if"] == "always()"
+    assert checkout["continue-on-error"] is True
     assert checkout["uses"] == CHECKOUT_ACTION
     assert checkout["with"] == {
         "repository": "${{ job.workflow_repository }}",
