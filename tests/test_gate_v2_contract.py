@@ -973,26 +973,26 @@ def test_every_scrub_import_has_checkout_coverage_for_action_and_module():
                 and candidate.get("with", {}).get("path") == action_root
             ]
             assert checkouts, f"{job_name}: expected at least one checkout for {action_root}"
-            checkout = checkouts[0]
-            sparse = checkout["with"].get("sparse-checkout")
-            sparse_paths = None if sparse is None else (
-                sparse.splitlines() if isinstance(sparse, str) else sparse
-            )
-
-            def covered(path):
-                return sparse_paths is None or any(
-                    path == prefix or path.startswith(f"{prefix.rstrip('/')}/")
-                    for prefix in sparse_paths
+            for checkout in checkouts:
+                sparse = checkout["with"].get("sparse-checkout")
+                sparse_paths = None if sparse is None else (
+                    sparse.splitlines() if isinstance(sparse, str) else sparse
                 )
 
-            for import_file in import_files:
-                relative_import = import_file.relative_to(REPO_ROOT).as_posix()
-                assert covered(relative_import), (
-                    f"{job_name}: checkout for {uses} misses {relative_import}"
-                )
-                assert covered("scripts/scrub_outbound.py"), (
-                    f"{job_name}: checkout for {uses} misses scripts/scrub_outbound.py"
-                )
+                def covered(path):
+                    return sparse_paths is None or any(
+                        path == prefix or path.startswith(f"{prefix.rstrip('/')}/")
+                        for prefix in sparse_paths
+                    )
+
+                for import_file in import_files:
+                    relative_import = import_file.relative_to(REPO_ROOT).as_posix()
+                    assert covered(relative_import), (
+                        f"{job_name}: checkout for {uses} misses {relative_import}"
+                    )
+                    assert covered("scripts/scrub_outbound.py"), (
+                        f"{job_name}: checkout for {uses} misses scripts/scrub_outbound.py"
+                    )
 
 
 def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():
@@ -1121,6 +1121,7 @@ def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error()
     checkout = steps[checkout_index]
     assert checkout["if"] == "always()"
     assert checkout["continue-on-error"] is True
+    assert checkout["timeout-minutes"] == 5
     assert checkout["uses"] == CHECKOUT_ACTION
     assert checkout["with"] == {
         "repository": "${{ job.workflow_repository }}",
@@ -1132,6 +1133,7 @@ def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error()
     advisory = steps[advisory_index]
     assert advisory["if"] == "always()"
     assert advisory["continue-on-error"] is True
+    assert advisory["timeout-minutes"] == 10
     assert advisory["uses"] == "./_gate-action-src/.github/actions/diff-coverage-advisory"
     assert advisory["with"] == {
         "base-sha": "${{ github.event.pull_request.base.sha }}",
