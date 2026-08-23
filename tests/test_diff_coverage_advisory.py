@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import diff_cover  # noqa: F401 — CI must install diff-cover; missing dep must fail, not skip
 import pytest
 
 
@@ -101,7 +102,6 @@ def _docs_only_repo(tmp_path: Path) -> tuple[Path, str, str]:
 
 @pytest.fixture(scope="module")
 def module():
-    pytest.importorskip("diff_cover")
     return _module()
 
 
@@ -179,7 +179,6 @@ def test_ensure_review_commits_fetches_missing_objects(module, monkeypatch):
 
 
 def test_main_never_returns_nonzero_on_measure_failure(tmp_path, monkeypatch):
-    pytest.importorskip("diff_cover")
     module = _module()
     repo = tmp_path / "broken"
     repo.mkdir()
