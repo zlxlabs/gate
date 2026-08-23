@@ -216,7 +216,18 @@ def post_sticky_comment(
         print("::notice::skip stale diff-coverage result; head advanced")
         return
 
-    comments = _request(token, "GET", f"{api}/issues/{pr_number}/comments?per_page=100")
+    comments: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        batch = _request(
+            token,
+            "GET",
+            f"{api}/issues/{pr_number}/comments?per_page=100&page={page}",
+        )
+        comments.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
     existing = next((comment for comment in comments if MARKER in comment.get("body", "")), None)
     if existing:
         _request(token, "PATCH", f"{api}/issues/comments/{existing['id']}", {"body": body})
