@@ -2054,3 +2054,241 @@ def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
     assert body.index("| [2]") < body.index("| [3]")
     assert body.index("| [2]") < body.index("| [2]") + 1
     assert "主审未跑，绿≠过审" in body
+
+
+# ── false-positive disposition consumption (required verdict) ─────────────
+
+CONV = AGG._CONVERGENCE
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
+
+
+def _failing_scoped_audit(*, finding_id="p1", severity="major"):
+    return _valid_scoped_primary_record(
+        verdict="fail",
+        result={"findings": [{"id": finding_id, "severity": severity}]},
+    )
+
+
+def _scope_for(audit):
+    scope, missing = AGG._convergence_scope_from_audit(audit, IDENTITY)
+    assert not missing and scope is not None
+    return scope
+
+
+def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", **changes):
+    fields = dict(
+        schema_version=1,
+        disposition="false-positive",
+        repository_id=str(IDENTITY.repository_id),
+        pr_number=IDENTITY.pr,
+        epoch=CONV.derive_epoch(scope),
+        head_sha=IDENTITY.head_sha,
+        audit_digest=audit_digest,
+        finding_id=finding_id,
+        reason="locked upstream behavior",
+    )
+    fields.update(changes)
+    return CONV.DispositionReceipt(**fields)
+
+
+def _evaluate_failing_primary(audit, *, audit_digest=_DIGEST_A, waiver_receipts=()):
+    return AGG.evaluate(
+        **_base_kwargs(
+            primary_result="failure",
+            audit=audit,
+            scope=_scope_for(audit),
+            audit_digest=audit_digest,
+            waiver_receipts=waiver_receipts,
+        )
+    )
+
+
+def _zip_receipt_bytes(payload):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as bundle:
+        bundle.writestr("receipt.json", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("severity", ["major", "blocker"])
+def test_valid_disposition_receipt_resolves_p1_and_turns_required_gate_pass(severity):
+    audit = _failing_scoped_audit(severity=severity)
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope)
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    resolved = f"finding p1 resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+    assert outcome.gate_result == "pass"
+    assert outcome.ok is True
+    assert outcome.classification == "code_pass"
+    assert outcome.reason_code == "primary_pass"
+    assert outcome.resolved_findings == [resolved]
+    assert outcome.convergence_envelope["resolved_findings"] == [
+        {"finding_id": "p1", "receipt": CONV.disposition_receipt_artifact_name(receipt)}
+    ]
+    summary = AGG.render_summary(outcome)
+    assert resolved in summary
+    assert "**Result: pass**" in summary
+    assert "blocking findings were resolved by disposition receipts" in summary
+
+
+def test_digest_mismatch_keeps_finding_active_and_gate_fail():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope, audit_digest=_DIGEST_B)
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    assert outcome.gate_result == "fail"
+    assert outcome.reason_code == "primary_findings"
+    assert outcome.resolved_findings == []
+    assert "resolved_findings" not in (outcome.convergence_envelope or {})
+
+
+def test_finding_id_mismatch_keeps_finding_active_and_gate_fail():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope, finding_id="other-finding")
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    assert outcome.gate_result == "fail"
+    assert outcome.reason_code == "primary_findings"
+    assert outcome.resolved_findings == []
+
+
+def test_missing_reason_keeps_finding_active_and_gate_fail():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope, reason="")
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    assert outcome.gate_result == "fail"
+    assert outcome.reason_code == "primary_findings"
+    assert outcome.resolved_findings == []
+
+
+def test_duplicate_disposition_receipt_is_idempotent_pass():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope)
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt, receipt))
+    assert outcome.gate_result == "pass"
+    assert outcome.resolved_findings == [
+        f"finding p1 resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+    ]
+
+
+def test_no_receipts_keeps_required_fail_byte_identical_to_baseline():
+    audit = _failing_scoped_audit()
+    without = _evaluate_failing_primary(audit, waiver_receipts=())
+    explicit_empty = _evaluate_failing_primary(audit)
+    assert without.gate_result == "fail"
+    assert without.resolved_findings == []
+    assert AGG.render_summary(without) == AGG.render_summary(explicit_empty)
+    assert without.convergence_envelope == explicit_empty.convergence_envelope
+    assert "resolved_findings" not in without.convergence_envelope
+
+
+def test_partial_disposition_leaves_remaining_finding_blocking():
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        result={
+            "findings": [
+                {"id": "keep", "severity": "major"},
+                {"id": "drop", "severity": "blocker"},
+            ]
+        },
+    )
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope, finding_id="drop")
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    assert outcome.gate_result == "fail"
+    assert outcome.reason_code == "primary_findings"
+    assert outcome.resolved_findings == [
+        f"finding drop resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+    ]
+
+
+def test_main_fail_primary_plus_matching_receipt_marks_resolved(monkeypatch, tmp_path):
+    audit = _failing_scoped_audit()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    raw = json.dumps(audit, indent=2).encode("utf-8") + b"\n"
+    (audit_dir / "primary-review-audit.json").write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope, audit_digest=digest)
+    payload = {**receipt.as_dict(), "kind": "gate-disposition-receipt-v1"}
+    artifact_name = CONV.disposition_receipt_artifact_name(receipt)
+    zip_bytes = _zip_receipt_bytes(payload)
+
+    def fake_github_json(*, token, url, **kwargs):
+        assert "actions/artifacts" in url
+        return {
+            "artifacts": [
+                {
+                    "name": artifact_name,
+                    "expired": False,
+                    "archive_download_url": "https://api.github.com/artifacts/1/zip",
+                }
+            ]
+        }
+
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: zip_bytes)
+
+    summary_path = tmp_path / "summary.md"
+    rc = AGG.main(
+        _cli_args(audit_dir, summary_path, primary_result="failure")
+    )
+    text = summary_path.read_text()
+    resolved = f"finding p1 resolved by receipt {artifact_name}"
+    assert rc == 0
+    assert "**Result: pass**" in text
+    assert "Resolved:" in text
+    assert resolved in text
+    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text())
+    assert terminal["gate_result"] == "pass"
+    assert terminal["reason_code"] == "primary_pass"
+
+
+def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
+    scope = _scope_for(_failing_scoped_audit())
+    mine = _false_positive_receipt(scope)
+    other = _false_positive_receipt(scope, pr_number=99)
+    payloads = {
+        "https://api.github.com/artifacts/mine/zip": _zip_receipt_bytes(
+            {**mine.as_dict(), "kind": "gate-disposition-receipt-v1"}
+        ),
+        "https://api.github.com/artifacts/other/zip": _zip_receipt_bytes(
+            {**other.as_dict(), "kind": "gate-disposition-receipt-v1"}
+        ),
+    }
+
+    def fake_github_json(*, token, url, **kwargs):
+        return {
+            "artifacts": [
+                {
+                    "name": CONV.disposition_receipt_artifact_name(mine),
+                    "expired": False,
+                    "archive_download_url": "https://api.github.com/artifacts/mine/zip",
+                },
+                {
+                    "name": CONV.disposition_receipt_artifact_name(other),
+                    "expired": False,
+                    "archive_download_url": "https://api.github.com/artifacts/other/zip",
+                },
+                {
+                    "name": "gate-disposition-receipt-v1-expired",
+                    "expired": True,
+                    "archive_download_url": "https://api.github.com/artifacts/expired/zip",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    monkeypatch.setattr(
+        AGG, "_download_terminal_zip",
+        lambda **kwargs: payloads[kwargs["url"]],
+    )
+    receipts = AGG._fetch_disposition_receipts(
+        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
+    )
+    assert receipts == (mine,)

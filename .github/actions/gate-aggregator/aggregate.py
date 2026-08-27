@@ -107,7 +107,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 GATE_ROOT = Path(__file__).resolve().parents[3]
 if str(GATE_ROOT) not in sys.path:
@@ -153,6 +153,7 @@ HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
 MAX_REPO_WIDE_HISTORY_PAGES = 5
 MAX_TARGETED_HISTORY_RUNS = 50
 MAX_HISTORY_WARNING_CHARS = 500
+DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v1-"
 PUBLISH_OPERATION_ORDER = (
     "IDENTITY",
     "COMMENT_LOOKUP",
@@ -256,6 +257,7 @@ class Outcome:
     audit_artifact_name: Optional[str] = None
     convergence_envelope: Optional[dict[str, Any]] = None
     convergence_receipt: Optional[Any] = None
+    resolved_findings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -426,7 +428,7 @@ def build_convergence_envelope(
         raise ValueError("convergence envelope requires a RoundDecision")
     if not isinstance(audit_digest, str) or len(audit_digest) != 64:
         raise ValueError("convergence envelope requires the raw audit SHA-256 digest")
-    return {
+    envelope = {
         "schema_version": CONVERGENCE_ENVELOPE_SCHEMA_VERSION,
         "kind": CONVERGENCE_ENVELOPE_KIND,
         "scope": scope.as_dict(),
@@ -437,6 +439,16 @@ def build_convergence_envelope(
         "decision": decision.decision,
         "state": decision.state.as_dict(),
     }
+    consumption = getattr(decision, "disposition", None)
+    if consumption is not None and consumption.consumed_receipts:
+        envelope["resolved_findings"] = [
+            {
+                "finding_id": receipt.finding_id,
+                "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
+            }
+            for receipt in consumption.consumed_receipts
+        ]
+    return envelope
 
 
 def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
@@ -546,6 +558,7 @@ def evaluate(
     scope: Optional[Any] = None,
     audit_digest: Optional[str] = None,
     convergence_state: Optional[Any] = None,
+    waiver_receipts: Sequence[Any] = (),
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -692,13 +705,23 @@ def evaluate(
         processing_key = _CONVERGENCE.ProcessingKey(
             identity.repository_id, identity.pr, identity.run_id, identity.run_attempt,
         )
+        consumption = _CONVERGENCE.consume_dispositions(
+            p1_ids,
+            waiver_receipts,
+            scope=scope,
+            primary=primary,
+            audit_digest=audit_digest,
+        )
+        # Historical / invalid receipts must not fail-close this round's
+        # convergence; only receipts that already consumed a current finding
+        # are forwarded to the evaluator.
         state = convergence_state or _CONVERGENCE.initial_state(scope)
         round_decision = _CONVERGENCE.evaluate_round(
             state=state,
             scope=scope,
             primary=primary,
             audit_digest=audit_digest,
-            waiver_receipts=(),
+            waiver_receipts=consumption.consumed_receipts,
             processing_key=processing_key,
         )
         outcome.convergence_envelope = build_convergence_envelope(
@@ -717,6 +740,22 @@ def evaluate(
                 source_attempt=audit_source,
                 artifact_name=artifact_name,
             )
+        resolved_lines = list(_CONVERGENCE.required_disposition_lines(consumption))
+        if resolved_lines:
+            outcome.resolved_findings = resolved_lines
+            if (
+                outcome.classification == "code_fail"
+                and outcome.reason_code == "primary_findings"
+                and not consumption.remaining_p1_ids
+            ):
+                outcome.ok = True
+                outcome.classification = "code_pass"
+                outcome.reason_code = "primary_pass"
+                outcome.gate_result = "pass"
+                outcome.problems = [
+                    problem for problem in outcome.problems
+                    if problem != "primary review verdict is 'fail'"
+                ]
     return outcome
 
 
@@ -801,6 +840,10 @@ def _action_sentence(
         run_url = f"https://github.com/{repository}/actions/runs/{identity.run_id}"
     gate_result = outcome.gate_result
     if gate_result == "pass":
+        if outcome.resolved_findings:
+            return (
+                "No action needed — blocking findings were resolved by disposition receipts; the gate is green."
+            )
         return "No action needed — quality passed and the primary reviewer approved this change; the gate is green."
     if gate_result == "skipped":
         if is_draft:
@@ -866,6 +909,11 @@ def render_summary(
         lines.append("Accepted:")
         for note in outcome.notes:
             lines.append(f"- {note}")
+        lines.append("")
+    if outcome.resolved_findings:
+        lines.append("Resolved:")
+        for line in outcome.resolved_findings:
+            lines.append(f"- {line}")
         lines.append("")
     if outcome.problems:
         lines.append("Problems:")
@@ -1291,6 +1339,67 @@ def _fetch_terminal_history(
         ):
             break
     return result
+
+
+def _read_disposition_zip(raw: bytes) -> dict[str, Any]:
+    with zipfile.ZipFile(io.BytesIO(raw)) as bundle:
+        names = [name for name in bundle.namelist() if not name.endswith("/")]
+        if len(names) != 1:
+            raise ValueError(
+                f"disposition artifact must contain exactly one file, found {len(names)}"
+            )
+        payload = json.loads(bundle.read(names[0]))
+    if not isinstance(payload, dict):
+        raise ValueError("disposition receipt payload must be a JSON object")
+    return payload
+
+
+def _fetch_disposition_receipts(
+    *, token: str, repository: str, repository_id: int, pr_number: int,
+) -> tuple[Any, ...]:
+    """Bounded same-repo artifact scan; errors fail-open to an empty tuple."""
+
+    artifacts: list[dict[str, Any]] = []
+    page = 1
+    try:
+        while page <= MAX_REPO_WIDE_HISTORY_PAGES:
+            payload = _github_json(
+                token=token,
+                url=(
+                    f"https://api.github.com/repos/{repository}/actions/artifacts"
+                    f"?per_page=100&page={page}"
+                ),
+            )
+            if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
+                break
+            page_artifacts = payload["artifacts"]
+            artifacts.extend(
+                artifact for artifact in page_artifacts
+                if isinstance(artifact, dict)
+                and isinstance(artifact.get("name"), str)
+                and artifact["name"].startswith(DISPOSITION_ARTIFACT_PREFIX)
+                and artifact.get("expired") is not True
+            )
+            if len(page_artifacts) < 100:
+                break
+            page += 1
+    except Exception:
+        return ()
+
+    receipts: list[Any] = []
+    for artifact in artifacts:
+        archive_url = artifact.get("archive_download_url")
+        if not isinstance(archive_url, str) or not archive_url:
+            continue
+        try:
+            payload = _read_disposition_zip(_download_terminal_zip(token=token, url=archive_url))
+            receipt = _CONVERGENCE.parse_disposition_receipt(payload)
+        except Exception:
+            continue
+        if receipt.pr_number != pr_number or receipt.repository_id != str(repository_id):
+            continue
+        receipts.append(receipt)
+    return tuple(receipts)
 
 
 def _merge_panel_rows(current: dict[str, Any], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1824,6 +1933,8 @@ def _finish(
             handle.write(summary)
     for note in outcome.notes:
         print(f"::notice::{note}")
+    for resolved in outcome.resolved_findings:
+        print(f"::notice::{resolved}")
     for problem in outcome.problems:
         print(f"::error::{problem}")
     # Terminal-state annotation carrying the machine codes, so the checks list
@@ -1951,6 +2062,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     scope, missing_scope_fields = _convergence_scope_from_audit(audit, identity)
     audit_digest = hashlib.sha256(audit_bytes).hexdigest() if audit_bytes is not None else None
 
+    waiver_receipts: tuple[Any, ...] = ()
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token and scope is not None:
+        try:
+            waiver_receipts = _fetch_disposition_receipts(
+                token=token,
+                repository=args.repository,
+                repository_id=identity.repository_id,
+                pr_number=identity.pr,
+            )
+        except Exception:
+            waiver_receipts = ()
+
     outcome = evaluate(
         quality_result=args.quality_result,
         primary_result=args.primary_result,
@@ -1964,6 +2088,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit_artifact_name=args.audit_artifact_name or None,
         scope=scope,
         audit_digest=audit_digest,
+        waiver_receipts=waiver_receipts,
     )
 
     return _finish(
