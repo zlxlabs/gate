@@ -141,14 +141,15 @@ def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
 
     payload_bytes = receipt_path.read_bytes()
     payload = json.loads(payload_bytes)
-    assert payload["audit_digest"] == hashlib.sha256(audit_bytes).hexdigest()
+    expected_digest = CONV.canonical_audit_digest(audit)
+    assert payload["audit_digest"] == expected_digest
     assert payload_bytes == json.dumps(
         payload, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     receipt = _receipt_from_payload(payload)
     CONV.validate_receipt(receipt, SCOPE)
 
-    audit_digest = hashlib.sha256(audit_bytes).hexdigest()
+    audit_digest = expected_digest
     primary = CONV.CanonicalPrimary(
         schema_version=1, repository_id=SCOPE.repository_id,
         pr_number=SCOPE.pr_number, head_sha=SCOPE.head_sha,
@@ -207,10 +208,15 @@ def test_producer_payload_preserves_all_attempt_guards(tmp_path):
     CONV.validate_scope(CONV.Scope(**payload["scope"]))
 
 
-def test_audit_digest_is_raw_bytes_digest():
-    raw = b'{"z":1,"a":2}\n'
-    parsed = json.loads(raw)
-    assert hashlib.sha256(raw).hexdigest() != hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+def test_audit_digest_is_canonical_not_raw_bytes():
+    first = _scoped_audit()
+    first["duration_ms"] = 1
+    second = dict(first)
+    second["duration_ms"] = 999
+    first_bytes = json.dumps(first, indent=2).encode()
+    second_bytes = json.dumps(second, indent=2).encode()
+    assert CONV.canonical_audit_digest(first) == CONV.canonical_audit_digest(second)
+    assert hashlib.sha256(first_bytes).hexdigest() != hashlib.sha256(second_bytes).hexdigest()
 
 
 def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_path):
@@ -229,7 +235,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     audit_path.write_bytes(audit_bytes)
     output_dir = tmp_path / "artifacts"
     epoch = CONV.derive_epoch(SCOPE)
-    digest = hashlib.sha256(audit_bytes).hexdigest()
+    digest = CONV.canonical_audit_digest(audit)
     argv = [
         sys.executable, str(DISPOSITION_PRODUCER), "issue",
         "--output-dir", str(output_dir), "--audit-path", str(audit_path),
@@ -278,7 +284,92 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
     assert "finding_id must identify a P1 finding" in failed.stderr
 
 
-def test_aggregate_envelope_preserves_scope_attempt_artifact_and_raw_digest():
+def _failing_runtime_audit(*, duration_ms, run_attempt, findings=None):
+    findings = findings or [{"id": "p1", "severity": "major", "file": "lock.py", "line": 12}]
+    return {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": SCOPE.repository_id, "pr": SCOPE.pr_number,
+        "head_sha": SCOPE.head_sha, "base_sha": SCOPE.base_sha,
+        "diff_digest": SCOPE.diff_digest, "policy_version": SCOPE.policy_version,
+        "policy_digest": SCOPE.policy_digest, "tier": SCOPE.tier,
+        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "run_id": 77, "run_attempt": run_attempt, "verdict": "fail", "reviewer": "codex-sub",
+        "duration_ms": duration_ms, "total_tokens": duration_ms * 3,
+        "started_at": f"2026-08-27T0{run_attempt}:00:00Z",
+        "result": {"findings": findings},
+    }
+
+
+def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_path):
+    first = _failing_runtime_audit(duration_ms=11, run_attempt=2)
+    second = _failing_runtime_audit(duration_ms=99, run_attempt=4)
+    assert CONV.canonical_audit_digest(first) == CONV.canonical_audit_digest(second)
+    assert hashlib.sha256(json.dumps(first).encode()).hexdigest() != hashlib.sha256(
+        json.dumps(second).encode()
+    ).hexdigest()
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_bytes(json.dumps(first, indent=2).encode() + b"\n")
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue",
+        "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--finding-id", "p1", "--reason", "locked upstream behavior",
+        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+    ]
+    produced = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    payload = json.loads(Path(json.loads(produced.stdout)["path"]).read_bytes())
+    receipt = CONV.parse_disposition_receipt(payload)
+    identity = AGG.Identity(123, SCOPE.head_sha, 77, 4, 42)
+    digest = CONV.canonical_audit_digest(second)
+    outcome = AGG.evaluate(
+        quality_result="success", primary_result="failure", runner="self",
+        is_draft=False, review_expected=True, audit=second, audit_error=None,
+        identity=identity, audit_source_attempt=4, audit_artifact_name="primary-audit-v2-4",
+        scope=SCOPE, audit_digest=digest, waiver_receipts=(receipt,),
+    )
+    assert outcome.gate_result == "pass"
+    assert outcome.resolved_findings
+    other = _failing_runtime_audit(
+        duration_ms=99, run_attempt=4,
+        findings=[{"id": "p2", "severity": "major", "file": "lock.py", "line": 12}],
+    )
+    mismatched = AGG.evaluate(
+        quality_result="success", primary_result="failure", runner="self",
+        is_draft=False, review_expected=True, audit=other, audit_error=None,
+        identity=identity, audit_source_attempt=4, audit_artifact_name="primary-audit-v2-4",
+        scope=SCOPE, audit_digest=CONV.canonical_audit_digest(other),
+        waiver_receipts=(receipt,),
+    )
+    assert mismatched.gate_result == "fail"
+    assert mismatched.resolved_findings == []
+
+
+def test_legacy_raw_bytes_receipt_still_consumes_same_audit_file():
+    audit = _failing_runtime_audit(duration_ms=11, run_attempt=2)
+    raw = json.dumps(audit, indent=2).encode() + b"\n"
+    legacy = hashlib.sha256(raw).hexdigest()
+    canonical = CONV.canonical_audit_digest(audit)
+    assert canonical != legacy
+    receipt = CONV.DispositionReceipt(
+        schema_version=1, disposition="false-positive",
+        repository_id=str(SCOPE.repository_id), pr_number=SCOPE.pr_number,
+        epoch=CONV.derive_epoch(SCOPE), head_sha=SCOPE.head_sha,
+        audit_digest=legacy, finding_id="p1", reason="locked upstream behavior",
+    )
+    identity = AGG.Identity(123, SCOPE.head_sha, 77, 2, 42)
+    kwargs = dict(
+        quality_result="success", primary_result="failure", runner="self",
+        is_draft=False, review_expected=True, audit=audit, audit_error=None,
+        identity=identity, audit_source_attempt=2, audit_artifact_name="primary-audit-v2-2",
+        scope=SCOPE, audit_digest=canonical, waiver_receipts=(receipt,),
+    )
+    without_legacy = AGG.evaluate(**kwargs)
+    with_legacy = AGG.evaluate(**kwargs, legacy_raw_audit_digest=legacy)
+    assert without_legacy.gate_result == "fail"
+    assert with_legacy.gate_result == "pass"
+
+
+def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():
     identity = AGG.Identity(repository_id=123, head_sha=SCOPE.head_sha, run_id=77, run_attempt=2, pr=42)
     audit = {
         "kind": "primary_review", "schema_version": 1,

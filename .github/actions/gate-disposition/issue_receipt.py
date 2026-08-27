@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Issue immutable disposition artifacts from a canonical primary audit."""
+"""Issue immutable disposition artifacts from a canonical primary audit.
+
+audit_digest is SHA-256 of the stable audit subset (scope fields + sorted
+finding id/severity/file/line + verdict) via convergence.canonical_audit_digest.
+The audit file's raw bytes are not stable across reruns (duration/tokens/
+timestamps), so they are not hashed here.
+"""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -16,6 +23,20 @@ from typing import Any
 SCHEMA_VERSION = 1
 P1_SEVERITIES = frozenset({"major", "blocker"})
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _load_convergence():
+    path = Path(__file__).resolve().parents[1] / "gate-aggregator" / "convergence.py"
+    spec = importlib.util.spec_from_file_location("gate_convergence_from_disposition", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"convergence module is unavailable: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_CONVERGENCE = _load_convergence()
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -104,8 +125,8 @@ def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repositor
 def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[str, Any]:
     audit_path = Path(_required(args, envelope, "audit_path", "DISPOSITION_AUDIT_PATH"))
     raw_audit = audit_path.read_bytes()
-    audit_digest = _sha256_bytes(raw_audit)
     audit = json.loads(raw_audit.decode("utf-8"))
+    audit_digest = _CONVERGENCE.canonical_audit_digest(audit)
 
     repository_id = str(_required(args, envelope, "repository_id", "GITHUB_REPOSITORY_ID"))
     pr_number = _positive_int(_required(args, envelope, "pr_number", "PR_NUMBER"), "pr_number")

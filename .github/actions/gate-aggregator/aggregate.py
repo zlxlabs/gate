@@ -427,7 +427,7 @@ def build_convergence_envelope(
     if not isinstance(decision, _CONVERGENCE.RoundDecision):
         raise ValueError("convergence envelope requires a RoundDecision")
     if not isinstance(audit_digest, str) or len(audit_digest) != 64:
-        raise ValueError("convergence envelope requires the raw audit SHA-256 digest")
+        raise ValueError("convergence envelope requires a 64-character SHA-256 digest")
     envelope = {
         "schema_version": CONVERGENCE_ENVELOPE_SCHEMA_VERSION,
         "kind": CONVERGENCE_ENVELOPE_KIND,
@@ -557,6 +557,7 @@ def evaluate(
     audit_artifact_name: Optional[str] = None,
     scope: Optional[Any] = None,
     audit_digest: Optional[str] = None,
+    legacy_raw_audit_digest: Optional[str] = None,
     convergence_state: Optional[Any] = None,
     waiver_receipts: Sequence[Any] = (),
 ) -> Outcome:
@@ -711,6 +712,7 @@ def evaluate(
             scope=scope,
             primary=primary,
             audit_digest=audit_digest,
+            legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
         # Historical / invalid receipts must not fail-close this round's
         # convergence; only receipts that already consumed a current finding
@@ -723,6 +725,7 @@ def evaluate(
             audit_digest=audit_digest,
             waiver_receipts=consumption.consumed_receipts,
             processing_key=processing_key,
+            legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
         outcome.convergence_envelope = build_convergence_envelope(
             scope=scope,
@@ -2060,7 +2063,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     audit, audit_error, audit_bytes = _read_audit_file(args.audit_dir)
     scope, missing_scope_fields = _convergence_scope_from_audit(audit, identity)
-    audit_digest = hashlib.sha256(audit_bytes).hexdigest() if audit_bytes is not None else None
+    legacy_raw_audit_digest = hashlib.sha256(audit_bytes).hexdigest() if audit_bytes is not None else None
+    if isinstance(audit, dict):
+        audit_digest = _CONVERGENCE.canonical_audit_digest(audit)
+    else:
+        audit_digest = legacy_raw_audit_digest
 
     waiver_receipts: tuple[Any, ...] = ()
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -2088,6 +2095,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit_artifact_name=args.audit_artifact_name or None,
         scope=scope,
         audit_digest=audit_digest,
+        legacy_raw_audit_digest=legacy_raw_audit_digest,
         waiver_receipts=waiver_receipts,
     )
 

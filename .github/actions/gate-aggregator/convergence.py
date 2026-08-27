@@ -368,6 +368,89 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+# Locked contract for disposition audit_digest (gate#90). Adding or removing a
+# field must update issuer, consumer, and tests together.
+CANONICAL_AUDIT_DIGEST_SCOPE_FIELDS = (
+    "base_sha",
+    "caller_sha",
+    "diff_digest",
+    "head_sha",
+    "policy_digest",
+    "policy_version",
+    "pr_number",
+    "repository_id",
+    "reusable_workflow_sha",
+    "tier",
+)
+CANONICAL_AUDIT_DIGEST_FINDING_FIELDS = ("id", "severity", "file", "line")
+
+
+def _canonical_finding_sort_key(item: dict[str, Any]) -> tuple[str, str, str, str]:
+    line = item["line"]
+    return (
+        "" if item["id"] is None else str(item["id"]),
+        "" if item["severity"] is None else str(item["severity"]),
+        "" if item["file"] is None else str(item["file"]),
+        "" if line is None else str(line),
+    )
+
+
+def canonical_audit_binding(audit: Any) -> dict[str, Any]:
+    """Project the stable audit subset hashed into disposition audit_digest.
+
+    Runtime noise (duration, tokens, timestamps, run/attempt, reviewer) is
+    excluded so the same finding set yields the same digest across reruns.
+    """
+
+    if not isinstance(audit, dict):
+        raise ValueError("canonical audit digest requires an object")
+    findings_raw: list[Any] = []
+    result = audit.get("result")
+    if isinstance(result, dict) and isinstance(result.get("findings"), list):
+        findings_raw = result["findings"]
+    findings: list[dict[str, Any]] = []
+    for finding in findings_raw:
+        if not isinstance(finding, dict):
+            continue
+        findings.append({field: finding.get(field) for field in CANONICAL_AUDIT_DIGEST_FINDING_FIELDS})
+    findings.sort(key=_canonical_finding_sort_key)
+    pr_number = audit["pr_number"] if "pr_number" in audit else audit.get("pr")
+    scope = {field: audit.get(field) for field in CANONICAL_AUDIT_DIGEST_SCOPE_FIELDS}
+    scope["pr_number"] = pr_number
+    return {
+        "findings": findings,
+        "scope": scope,
+        "verdict": audit.get("verdict"),
+    }
+
+
+def canonical_audit_digest(audit: Any) -> str:
+    """SHA-256 of canonical_audit_binding via _canonical_json. Single definition."""
+
+    return _sha256(canonical_audit_binding(audit))
+
+
+def _receipt_audit_digest_matches(
+    receipt_digest: str,
+    audit_digest: str,
+    legacy_raw_audit_digest: str | None,
+) -> bool:
+    if _audit_digest_errors(audit_digest) or _audit_digest_errors(receipt_digest):
+        return False
+    if receipt_digest == audit_digest:
+        return True
+    # Expand-then-contract: also accept the pre-gate#90 raw-bytes digest of the
+    # current audit file so in-flight receipts are not voided on deploy.
+    # TODO(gate#90): drop this legacy match after no remaining
+    # gate-disposition-receipt-v1 artifact still carries sha256(file bytes)
+    # (reissue after this SHA is pinned, or the 30-day artifact TTL elapses).
+    return (
+        legacy_raw_audit_digest is not None
+        and not _audit_digest_errors(legacy_raw_audit_digest)
+        and receipt_digest == legacy_raw_audit_digest
+    )
+
+
 def _disposition_status(
     receipt: DispositionReceipt,
     *,
@@ -406,6 +489,7 @@ def validate_disposition_receipt(
     scope: Scope,
     primary: CanonicalPrimary,
     audit_digest: str,
+    legacy_raw_audit_digest: str | None = None,
 ) -> DispositionStatus:
     """Validate one receipt against the current canonical audit round."""
 
@@ -441,7 +525,7 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="epoch_mismatch_stale")
     if receipt.head_sha != scope.head_sha:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="head_sha_mismatch")
-    if _audit_digest_errors(audit_digest) or receipt.audit_digest != audit_digest:
+    if not _receipt_audit_digest_matches(receipt.audit_digest, audit_digest, legacy_raw_audit_digest):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="audit_digest_mismatch")
     if receipt.finding_id in {"*", "all"} or any(character in receipt.finding_id for character in "?[]"):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_target_not_exact")
@@ -456,6 +540,7 @@ def disposition_status(
     scope: Scope,
     primary: CanonicalPrimary,
     audit_digest: str,
+    legacy_raw_audit_digest: str | None = None,
 ) -> DispositionStatus:
     """Return the observational status view used by ledger/human summaries."""
 
@@ -464,6 +549,7 @@ def disposition_status(
         scope=scope,
         primary=primary,
         audit_digest=audit_digest,
+        legacy_raw_audit_digest=legacy_raw_audit_digest,
     )
 
 
@@ -486,6 +572,7 @@ def consume_dispositions(
     scope: Scope,
     primary: CanonicalPrimary,
     audit_digest: str,
+    legacy_raw_audit_digest: str | None = None,
 ) -> DispositionConsumption:
     """Apply only active exact false-positive receipts to this P1 projection."""
 
@@ -505,6 +592,7 @@ def consume_dispositions(
         if not isinstance(receipt, DispositionReceipt):
             status = validate_disposition_receipt(
                 receipt, scope=scope, primary=primary, audit_digest=audit_digest,
+                legacy_raw_audit_digest=legacy_raw_audit_digest,
             )
             statuses.append(status)
             rejected.append((status.receipt, status.reason))
@@ -520,6 +608,7 @@ def consume_dispositions(
         seen_payloads.add(payload_signature)
         status = validate_disposition_receipt(
             receipt, scope=scope, primary=primary, audit_digest=audit_digest,
+            legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
         statuses.append(status)
         if status.consumable:
@@ -995,6 +1084,7 @@ def evaluate_round(
     audit_digest: str,
     waiver_receipts: Sequence[DispositionReceipt],
     processing_key: ProcessingKey,
+    legacy_raw_audit_digest: str | None = None,
 ) -> RoundDecision:
     """Consume exactly one canonical primary observation.
 
@@ -1144,6 +1234,7 @@ def evaluate_round(
         scope=scope,
         primary=primary,
         audit_digest=audit_digest,
+        legacy_raw_audit_digest=legacy_raw_audit_digest,
     )
     if disposition_result.fail_closed:
         reasons = ", ".join(reason for _, reason in disposition_result.rejected_receipts)
