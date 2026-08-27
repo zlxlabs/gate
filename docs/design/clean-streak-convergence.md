@@ -152,7 +152,7 @@ def evaluate_round(
 | 介质 | 允许承载 | 不允许承载 | 失败语义/检测点 |
 |---|---|---|---|
 | `gate-convergence-receipt-v1-*` immutable artifact（每个 producer event 一个） | scope/epoch、run/attempt、audit digest、当轮 P1 evidence、disposition consumption、producer metadata、event id、可重算的 decision 诊断 | 可被 PATCH 的累计 counter、唯一“当前 state”文件、跨轮 finding lineage；artifact 中的 counter 只能是诊断字段 | 按 artifact 全集纯函数 replay；listing/download/字节/digest 错误 F/M；`tests/test_gate_convergence_artifact.py::test_replay_uses_receipt_bytes_not_reported_counters` |
-| canonical primary audit artifact | reviewer 原始 verdict、findings、scope、attempt chain、audit bytes | streak、waiver authorization、PR comment state | 只作为 canonical input；`aggregate.py` 先校验 identity/schema；`tests/test_gate_aggregator.py` 既有 canonical matrix + `tests/test_gate_convergence_artifact.py::test_audit_digest_is_raw_bytes_digest` |
+| canonical primary audit artifact | reviewer 原始 verdict、findings、scope、attempt chain、audit bytes | streak、waiver authorization、PR comment state | 只作为 canonical input；`aggregate.py` 先校验 identity/schema。audit **文件字节不稳定**（含 duration/tokens/timestamps）；disposition `audit_digest` 对 `canonical_audit_digest` 的字段子集取哈希，见 `tests/test_gate_convergence.py::test_canonical_audit_digest_ignores_runtime_noise` |
 | disposition receipt artifact | 9 个字段：`schema_version`、`disposition`、`repository_id`、`pr_number`、`epoch`、`head_sha`、`audit_digest`、`finding_id`、`reason` | 直接 gate pass、全局忽略规则、可变“active=true”旗标 | reducer 按当前 head/audit/epoch/finding 重算消费；`tests/test_gate_convergence_artifact.py::test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit` |
 | `codex-review-ledger-v2` JSONL | 每轮观测、review status、finding/disposition 诊断、convergence decision/receipt ids 的 additive projection | correctness state、唯一 writer cursor、缺历史时的默认 clean | ledger 可 fail-open 但 required evaluator 不可依赖；`tests/test_review_ledger.py::test_convergence_projection_is_observational_only` |
 | `gate-terminal-v1` / 新 versioned terminal envelope | 本 run 的最终 machine decision、epoch、streak snapshot、reason、receipt ids | 下一轮要修改的累计 state | envelope 是发布结果不是输入；`tests/test_gate_aggregator.py::test_terminal_envelope_bytes_unchanged_by_rendering_work` 与新增 convergence envelope golden test |
@@ -227,8 +227,9 @@ Agent 开发门禁，write 权限只有 owner 与其派出的 agent，**上述�
 
 **保留的绑定（与安全无关，与正确性有关）**
 
-豁免绑定 `head_sha + audit_digest + epoch + finding_id`。换 head、换 audit 或换 epoch 即失效。
-理由：门禁主审存在「挤牙膏」行为（每轮只报一条不代表只剩一条），一次豁免若能跨轮永久生效，
+豁免绑定 `head_sha + audit_digest + epoch + finding_id`。换 head、换 **canonical** audit 或换 epoch 即失效。
+`audit_digest` 是 scope 稳定字段 + 排序后的 finding `id/severity/file/line` + `verdict` 的 canonical JSON SHA-256（`convergence.canonical_audit_digest`），**不是** audit 文件原始字节：primary 每次 run 都会写入 duration/tokens/timestamps，按字节绑定会使任何 rerun 都 `audit_digest_mismatch`。消费端过渡期同时接受新 canonical digest 与旧 raw-bytes digest（expand-then-contract）；签发端只产新 digest。
+理由：门禁主审存在「挤牙膏」行为（每轮只报一条不代表只剩一条），一次豁免若能跨 finding 集永久生效，
 clean streak 就不再反映真实收敛。这条不是防攻击，是防自欺。
 
 **receipt 形状**

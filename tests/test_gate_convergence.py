@@ -8,7 +8,9 @@ no-op; findings with missing, non-string, unknown, known non-P1, P1 severity
 -> fail-closed/fail-closed/fail-closed/ignore/reset.
 """
 
+import hashlib
 import importlib.util
+import json
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -196,6 +198,69 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
     assert CONV.validate_disposition_receipt(
         replace(receipt, finding_id="other"), scope=SCOPE, primary=primary, audit_digest="a" * 64,
     ).reason == "finding_not_current_p1"
+
+
+def _runtime_audit(*, verdict="fail", findings=None, **noise):
+    findings = findings or [{"id": "p1", "severity": "major", "file": "lock.py", "line": 12}]
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": SCOPE.repository_id, "pr": SCOPE.pr_number,
+        "head_sha": SCOPE.head_sha, "base_sha": SCOPE.base_sha,
+        "diff_digest": SCOPE.diff_digest, "policy_version": SCOPE.policy_version,
+        "policy_digest": SCOPE.policy_digest, "tier": SCOPE.tier,
+        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "verdict": verdict, "result": {"findings": findings},
+        "run_id": 77, "run_attempt": 2, "reviewer": "codex-sub",
+        "duration_ms": 111, "total_tokens": 9, "started_at": "2026-08-27T01:00:00Z",
+    }
+    audit.update(noise)
+    return audit
+
+
+def test_canonical_audit_digest_ignores_runtime_noise():
+    first = _runtime_audit(duration_ms=11, total_tokens=3, started_at="t1", run_attempt=2)
+    second = _runtime_audit(duration_ms=9999, total_tokens=88, started_at="t2", run_attempt=4)
+    canonical = CONV.canonical_audit_digest(first)
+    assert canonical == CONV.canonical_audit_digest(second)
+    first_bytes = json.dumps(first, indent=2, sort_keys=True).encode()
+    second_bytes = json.dumps(second, indent=2, sort_keys=True).encode()
+    # Red-proof: hashing file bytes would diverge; this assert goes red if the
+    # implementation silently falls back to sha256(raw audit bytes).
+    assert hashlib.sha256(first_bytes).hexdigest() != hashlib.sha256(second_bytes).hexdigest()
+    assert canonical != hashlib.sha256(first_bytes).hexdigest()
+    payload = CONV.canonical_audit_binding(first)
+    assert set(payload) == {"findings", "scope", "verdict"}
+    assert tuple(payload["scope"]) == CONV.CANONICAL_AUDIT_DIGEST_SCOPE_FIELDS
+    assert tuple(payload["findings"][0]) == CONV.CANONICAL_AUDIT_DIGEST_FINDING_FIELDS
+
+
+def test_canonical_audit_digest_changes_with_findings_or_verdict():
+    base = _runtime_audit()
+    moved = _runtime_audit(findings=[{"id": "p1", "severity": "major", "file": "lock.py", "line": 13}])
+    other = _runtime_audit(findings=[{"id": "p2", "severity": "major", "file": "lock.py", "line": 12}])
+    passed = _runtime_audit(verdict="pass")
+    digest = CONV.canonical_audit_digest(base)
+    assert digest != CONV.canonical_audit_digest(moved)
+    assert digest != CONV.canonical_audit_digest(other)
+    assert digest != CONV.canonical_audit_digest(passed)
+
+
+def test_legacy_raw_bytes_digest_still_consumes_current_file():
+    audit = _runtime_audit()
+    canonical = CONV.canonical_audit_digest(audit)
+    legacy = hashlib.sha256(json.dumps(audit, indent=2).encode()).hexdigest()
+    assert canonical != legacy
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",), verdict="fail")
+    receipt = _disposition(primary=primary, audit_digest=legacy)
+    matched = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest=canonical,
+        legacy_raw_audit_digest=legacy,
+    )
+    rejected = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest=canonical,
+    )
+    assert (matched.consumable, matched.reason) == (True, "active_false_positive")
+    assert rejected.reason == "audit_digest_mismatch"
 
 
 def test_only_false_positive_resolves_matching_current_finding():
