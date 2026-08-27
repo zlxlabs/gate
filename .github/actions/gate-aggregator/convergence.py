@@ -336,6 +336,7 @@ class RoundDecision:
     processing_key: ProcessingKey
     round_key: RoundKey
     event_id: str
+    disposition: DispositionConsumption | None = None
 
     @property
     def clean_streak(self) -> int:
@@ -538,6 +539,46 @@ def consume_dispositions(
         fail_closed=fail_closed,
         statuses=tuple(statuses),
     )
+
+
+def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
+    """Reconstruct the producer artifact name bound to one receipt payload."""
+
+    digest_prefix = receipt.audit_digest[:12]
+    return f"gate-disposition-receipt-v1-{receipt.epoch}-{digest_prefix}-{receipt.finding_id}"
+
+
+def required_disposition_lines(consumption: DispositionConsumption) -> tuple[str, ...]:
+    """Human-visible required-gate lines for consumed false-positive receipts."""
+
+    return tuple(
+        f"finding {receipt.finding_id} resolved by receipt {disposition_receipt_artifact_name(receipt)}"
+        for receipt in consumption.consumed_receipts
+    )
+
+
+def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
+    """Project one producer JSON object into a typed disposition receipt."""
+
+    if not isinstance(payload, dict):
+        raise ReceiptValidationError("disposition receipt payload must be an object")
+    kind = payload.get("kind")
+    if kind is not None and kind != "gate-disposition-receipt-v1":
+        raise ReceiptValidationError("unexpected disposition receipt kind")
+    try:
+        return DispositionReceipt(
+            schema_version=payload["schema_version"],
+            disposition=payload["disposition"],
+            repository_id=str(payload["repository_id"]),
+            pr_number=payload["pr_number"],
+            epoch=str(payload["epoch"]),
+            head_sha=str(payload["head_sha"]),
+            audit_digest=str(payload["audit_digest"]),
+            finding_id=str(payload["finding_id"]),
+            reason=str(payload["reason"]),
+        )
+    except (KeyError, TypeError) as exc:
+        raise ReceiptValidationError("malformed disposition receipt") from exc
 
 
 def _strict_int(value: Any) -> bool:
@@ -931,6 +972,7 @@ def _decision(
     reason: str,
     accepted: bool,
     no_op: bool,
+    disposition: DispositionConsumption | None = None,
 ) -> RoundDecision:
     return RoundDecision(
         state=state,
@@ -941,6 +983,7 @@ def _decision(
         processing_key=processing_key,
         round_key=round_key,
         event_id=event_id,
+        disposition=disposition,
     )
 
 
@@ -1113,6 +1156,7 @@ def evaluate_round(
             reason=failed.reason,
             accepted=False,
             no_op=False,
+            disposition=disposition_result,
         )
 
     if working.terminal_decision == "fail_closed":
@@ -1124,6 +1168,7 @@ def evaluate_round(
             reason="fail_closed state is sticky",
             accepted=False,
             no_op=True,
+            disposition=disposition_result,
         )
     if working.terminal_decision == "manual_required":
         return _decision(
@@ -1134,6 +1179,7 @@ def evaluate_round(
             reason="manual_required is terminal for this epoch",
             accepted=False,
             no_op=True,
+            disposition=disposition_result,
         )
     if working.terminal_decision == "converged":
         recorded = _record_event(
@@ -1153,6 +1199,7 @@ def evaluate_round(
             reason=terminal.reason,
             accepted=True,
             no_op=False,
+            disposition=disposition_result,
         )
 
     recorded = _record_event(
@@ -1181,6 +1228,7 @@ def evaluate_round(
             reason=next_state.reason,
             accepted=True,
             no_op=False,
+            disposition=disposition_result,
         )
 
     eligible = recorded.eligible_rounds + 1
@@ -1211,6 +1259,7 @@ def evaluate_round(
         reason=reason,
         accepted=True,
         no_op=False,
+        disposition=disposition_result,
     )
 
 
