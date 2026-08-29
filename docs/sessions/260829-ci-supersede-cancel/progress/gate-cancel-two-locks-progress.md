@@ -13,3 +13,10 @@
 - 本段结论：旧测试 `test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level` 已拆成四个具名测试：顶层无 concurrency；gate/ledger 仍 cancel false；quality/primary 各有独立 cancel true 组（含 job 身份、repository_id、PR 号、run_id 兜底、禁 panel/ledger/shadow 前缀）；其余 job 无 concurrency。`test_gate_shadow_v2_contract.py` 未改。
 - 关键决策与已否决方案：无。旧函数名已删除（与新事实矛盾）。`_assert_expensive_job_cancel_lock` 只服务 quality/primary 两处同构断言，不是新抽象层。
 - 下一步唯一动作：改写本仓设计文档为两把锁事实（本仓原先没有 `docs/design/gate-convergence-criterion.md`）。
+
+## 2026-08-29 设计文档改写
+
+- 当前阶段：implementing / milestone ③ 设计文档
+- 本段结论：本仓原先没有 `docs/design/gate-convergence-criterion.md`（规划卡引用的 280–288 行在 gate-hub）。按允许清单在本仓新建该路径，只写两把锁事实，明确否决顶层一把 cancel true；不复制 hub 全文，hub §12.4 由另一张卡处理。
+- 关键决策与已否决方案：不把 hub 524 行设计整份拷进本仓（超预算且越权）。不改 `docs/design/clean-streak-convergence.md` 里已过时的旧测试名指针（不在允许清单）。
+- 下一步唯一动作：红验（改 primary 的 cancel-in-progress 为 false，确认新契约转红为 AssertionError）后写报告。
