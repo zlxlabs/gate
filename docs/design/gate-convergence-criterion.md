@@ -51,3 +51,9 @@ OCR / `resolve_advisory` / `notify` 无 concurrency（第一版范围）。
 
 Job 级取消只停旧 run 里同组的那个 job，不是整个旧 run；运行时语义由真实 PR
 连推验证，静态契约锁不住。
+
+## 已知限制
+
+被 supersede 的旧 run 中 quality/primary 被取消后，旧 run 的 `gate` 仍会发布
+fail-closed 状态条，但 `ledger` 因缺上游 artifact 会硬失败——旧 run 可能
+「有 panel、无 ledger 记录」。required 结论由新 run 决定，不受影响。
