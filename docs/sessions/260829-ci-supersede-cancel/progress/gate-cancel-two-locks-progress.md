@@ -20,3 +20,10 @@
 - 本段结论：本仓原先没有 `docs/design/gate-convergence-criterion.md`（规划卡引用的 280–288 行在 gate-hub）。按允许清单在本仓新建该路径，只写两把锁事实，明确否决顶层一把 cancel true；不复制 hub 全文，hub §12.4 由另一张卡处理。
 - 关键决策与已否决方案：不把 hub 524 行设计整份拷进本仓（超预算且越权）。不改 `docs/design/clean-streak-convergence.md` 里已过时的旧测试名指针（不在允许清单）。
 - 下一步唯一动作：红验（改 primary 的 cancel-in-progress 为 false，确认新契约转红为 AssertionError）后写报告。
+
+## 2026-08-29 R1 三条 P2 收口
+
+- 当前阶段：repairing / R1 findings F1–F3
+- 本段结论：F1 只做文档披露——`docs/design/gate-convergence-criterion.md` 新增「已知限制」节（被 supersede 的旧 run 可能有 panel 无 ledger）；F2 `_assert_expensive_job_cancel_lock` 收紧为完整 group 表达式精确相等（锁定 `pull_request.number || github.run_id` 顺序）；F3 gate/ledger writer 锁收紧为完整 mapping 精确相等（常量 `_WRITER_CONCURRENCY`）。红验通过：反转 quality fallback 顺序与 ledger 组名改一字符均转 AssertionError 后还原。workflow 未改。
+- 关键决策与已否决方案：不为 F1 加 continue-on-error / 兜底下载路径（P2 禁新机制，review-discipline）；删除 `_FORBIDDEN_EXPENSIVE_GROUP_PREFIXES` 常量与 quality≠primary 断言（精确相等已蕴含，避免双路径断言体系）。
+- 下一步唯一动作：R2 审查（另卡）。
