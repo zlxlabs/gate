@@ -44,6 +44,14 @@
 #              remain future work, not this file).
 #   notify   — same fail-only Feishu notification semantics as legacy,
 #              triggered by `gate` (not by quality/primary individually).
+#
+# Concurrency is two job-level locks, never a workflow-level group (a single
+# top-level cancel-in-progress: true would kill the gate panel / ledger
+# writers). quality and primary each have their own per-PR group with
+# cancel-in-progress: true so a newer head supersedes stale lint/review
+# without those two jobs queueing or killing each other in the same run.
+# gate and ledger keep cancel-in-progress: false. OCR / advisory jobs stay
+# unlocked (first-cut scope).
 name: gate
 
 on:
@@ -109,6 +117,14 @@ jobs:
     # quality 走无凭据 ci 池（spec：gate-hub docs/designs/runner-ci-pool-split.md）。
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
+    # Per-PR cancel of stale quality only. Group is independent of `primary`
+    # (same-run jobs must not share a group) and of the gate/ledger writer
+    # locks (those stay cancel-in-progress: false). Workflow identity prefix
+    # + repository_id keep this out of other workflows' namespace
+    # (zlxlabs/agent-config#68). Non-PR events fall back to run_id.
+    concurrency:
+      group: gate-required-v2-quality-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 1 }
@@ -358,6 +374,11 @@ jobs:
     runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
+    # Per-PR cancel of stale primary only. Own group (not shared with
+    # quality) so one run's lint and review never queue or kill each other.
+    concurrency:
+      group: gate-required-v2-primary-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 1 }
