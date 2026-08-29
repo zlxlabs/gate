@@ -273,10 +273,23 @@ def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
 
 
 # ── concurrency contract ─────────────────────────────────────────────────────
+# Two job-level locks, no workflow-level group: quality/primary cancel stale
+# work per PR; gate/ledger keep cancel-in-progress: false so writers finish.
 
-def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
+_FORBIDDEN_EXPENSIVE_GROUP_PREFIXES = (
+    "gate-required-v2-panel-",
+    "gate-required-v2-ledger-",
+    "gate-shadow-v2-",
+)
+
+
+def test_required_v2_has_no_workflow_level_concurrency():
     raw, _ = _load_workflow()
     assert "concurrency" not in raw
+
+
+def test_gate_and_ledger_writer_locks_remain_cancel_false():
+    raw, _ = _load_workflow()
     gate_concurrency = raw["jobs"]["gate"].get("concurrency", {})
     assert gate_concurrency.get("cancel-in-progress") is False
     assert str(gate_concurrency.get("group", "")).startswith("gate-required-v2-panel-")
@@ -288,14 +301,38 @@ def test_concurrency_group_is_required_v2_and_defined_once_at_workflow_level():
     assert group.startswith("gate-required-v2-ledger-")
     assert "github.repository_id" in group
     assert "github.event.pull_request.number" not in group
-    # Independence from the (future) Shadow Calibration group is a naming
+    # Independence from the Shadow Calibration group is a naming
     # contract, not something this file alone can prove — but the literal
     # prefix must never collide with `gate-shadow-v2-`.
     assert "shadow" not in group
-    # Review jobs retain only workflow-level PR cancellation; ledger owns the
-    # additional repository-level writer lock.
+
+
+def _assert_expensive_job_cancel_lock(job_name: str, concurrency: dict) -> None:
+    assert concurrency.get("cancel-in-progress") is True
+    group = str(concurrency.get("group", ""))
+    assert group.startswith(f"gate-required-v2-{job_name}-")
+    assert "github.repository_id" in group
+    assert "github.event.pull_request.number" in group
+    assert "github.run_id" in group
+    assert "||" in group
+    for prefix in _FORBIDDEN_EXPENSIVE_GROUP_PREFIXES:
+        assert not group.startswith(prefix), group
+    assert "shadow" not in group
+
+
+def test_quality_and_primary_have_independent_cancel_true_pr_locks():
+    raw, _ = _load_workflow()
+    quality = raw["jobs"]["quality"].get("concurrency", {})
+    primary = raw["jobs"]["primary"].get("concurrency", {})
+    _assert_expensive_job_cancel_lock("quality", quality)
+    _assert_expensive_job_cancel_lock("primary", primary)
+    assert quality["group"] != primary["group"]
+
+
+def test_non_writer_non_expensive_jobs_have_no_concurrency():
+    raw, _ = _load_workflow()
     for job_name, job in raw["jobs"].items():
-        if job_name not in {"ledger", "gate"}:
+        if job_name not in {"ledger", "gate", "quality", "primary"}:
             assert "concurrency" not in job
 
 
