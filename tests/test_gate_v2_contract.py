@@ -276,11 +276,16 @@ def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
 # Two job-level locks, no workflow-level group: quality/primary cancel stale
 # work per PR; gate/ledger keep cancel-in-progress: false so writers finish.
 
-_FORBIDDEN_EXPENSIVE_GROUP_PREFIXES = (
-    "gate-required-v2-panel-",
-    "gate-required-v2-ledger-",
-    "gate-shadow-v2-",
-)
+_WRITER_CONCURRENCY = {
+    "gate": {
+        "group": "gate-required-v2-panel-${{ github.repository_id }}-${{ github.event.pull_request.number }}",
+        "cancel-in-progress": False,
+    },
+    "ledger": {
+        "group": "gate-required-v2-ledger-${{ github.repository_id }}",
+        "cancel-in-progress": False,
+    },
+}
 
 
 def test_required_v2_has_no_workflow_level_concurrency():
@@ -290,34 +295,23 @@ def test_required_v2_has_no_workflow_level_concurrency():
 
 def test_gate_and_ledger_writer_locks_remain_cancel_false():
     raw, _ = _load_workflow()
-    gate_concurrency = raw["jobs"]["gate"].get("concurrency", {})
-    assert gate_concurrency.get("cancel-in-progress") is False
-    assert str(gate_concurrency.get("group", "")).startswith("gate-required-v2-panel-")
-    assert "github.repository_id" in gate_concurrency["group"]
-    assert "github.event.pull_request.number" in gate_concurrency["group"]
-    ledger_concurrency = raw["jobs"]["ledger"].get("concurrency", {})
-    assert ledger_concurrency.get("cancel-in-progress") is False
-    group = str(ledger_concurrency.get("group", ""))
-    assert group.startswith("gate-required-v2-ledger-")
-    assert "github.repository_id" in group
-    assert "github.event.pull_request.number" not in group
-    # Independence from the Shadow Calibration group is a naming
-    # contract, not something this file alone can prove — but the literal
-    # prefix must never collide with `gate-shadow-v2-`.
-    assert "shadow" not in group
+    # Byte-exact contract with base: the full mapping (complete group literal
+    # + cancel-in-progress) must equal these constants, not just pass per-field
+    # shape probes.
+    for job_name, expected in _WRITER_CONCURRENCY.items():
+        assert raw["jobs"][job_name].get("concurrency") == expected
 
 
 def _assert_expensive_job_cancel_lock(job_name: str, concurrency: dict) -> None:
-    assert concurrency.get("cancel-in-progress") is True
-    group = str(concurrency.get("group", ""))
-    assert group.startswith(f"gate-required-v2-{job_name}-")
-    assert "github.repository_id" in group
-    assert "github.event.pull_request.number" in group
-    assert "github.run_id" in group
-    assert "||" in group
-    for prefix in _FORBIDDEN_EXPENSIVE_GROUP_PREFIXES:
-        assert not group.startswith(prefix), group
-    assert "shadow" not in group
+    # Full-expression equality, not substring shape probes: the fallback order
+    # (PR number first, run_id last) is part of the contract.
+    assert concurrency == {
+        "group": (
+            f"gate-required-v2-{job_name}-${{{{ github.repository_id }}}}"
+            f"-${{{{ github.event.pull_request.number || github.run_id }}}}"
+        ),
+        "cancel-in-progress": True,
+    }
 
 
 def test_quality_and_primary_have_independent_cancel_true_pr_locks():
@@ -326,7 +320,6 @@ def test_quality_and_primary_have_independent_cancel_true_pr_locks():
     primary = raw["jobs"]["primary"].get("concurrency", {})
     _assert_expensive_job_cancel_lock("quality", quality)
     _assert_expensive_job_cancel_lock("primary", primary)
-    assert quality["group"] != primary["group"]
 
 
 def test_non_writer_non_expensive_jobs_have_no_concurrency():
