@@ -1141,7 +1141,7 @@ jobs:
                   raise SystemExit("current run artifact listing has invalid JSON shape")
               artifacts.extend(page["artifacts"])
 
-          def select_artifact(prefix, missing_message, required):
+          def select_artifact(prefix, missing_message, required, exact_attempt=None):
               candidates = []
               for artifact in artifacts:
                   if not isinstance(artifact, dict) or artifact.get("expired") is True:
@@ -1153,9 +1153,14 @@ jobs:
                   if not re.fullmatch(r"[0-9]+", suffix):
                       continue
                   attempt = int(suffix)
-                  # Only attempts <= current are eligible; never select a future artifact.
+                  # input/audit may reuse an earlier attempt of this run.
+                  # terminal is this attempt's judge fact; never fall back.
+                  if exact_attempt is None:
+                      eligible = attempt <= current
+                  else:
+                      eligible = attempt == exact_attempt
                   artifact_id = artifact.get("id")
-                  if attempt <= current and isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
+                  if eligible and isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
                       candidates.append((attempt, artifact_id, name))
               if not candidates:
                   if required:
@@ -1165,7 +1170,10 @@ jobs:
 
           input_artifact = select_artifact(input_prefix, "No matching required ledger input artifact found", True)
           audit_artifact = select_artifact(audit_prefix, "No matching canonical primary audit artifact found", expected_text == "true")
-          terminal_artifact = select_artifact(terminal_prefix, "No matching required gate terminal artifact found", True)
+          terminal_artifact = select_artifact(
+              terminal_prefix, "No matching required gate terminal artifact found", True,
+              exact_attempt=current,
+          )
           with open(output_path, "a", encoding="utf-8") as output:
               output.write(f"input_artifact_id={input_artifact[1]}\n")
               output.write(f"input_source_attempt={input_artifact[0]}\n")

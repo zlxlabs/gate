@@ -750,7 +750,11 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
         "${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}"
     )
     run = resolver["run"]
-    for marker in ("--paginate", "expired", "<= current", "input_artifact_id", "audit_artifact_id", "terminal_artifact_id"):
+    for marker in (
+        "--paginate", "expired", "<= current", "exact_attempt=current",
+        "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
+        "terminal_source_attempt",
+    ):
         assert marker in run
     assert resolver["env"]["TERMINAL_PREFIX"] == (
         "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
@@ -758,6 +762,70 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
     assert "No matching required ledger input artifact found" in run
     assert "No matching canonical primary audit artifact found" in run
     assert "No matching required gate terminal artifact found" in run
+
+
+def _ledger_resolver_python() -> str:
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["ledger"]["steps"]
+        if s.get("name") == "Resolve v2 ledger artifacts"
+    )
+    run = step["run"]
+    start = run.index("<<'PY'\n") + len("<<'PY'\n")
+    end = run.index("\nPY\n", start)
+    return run[start:end]
+
+
+def _run_ledger_resolver(tmp_path, *, artifacts, current, review_expected="false"):
+    listing = tmp_path / "listing.json"
+    listing.write_text(json.dumps({"artifacts": artifacts}), encoding="utf-8")
+    output = tmp_path / "github_output"
+    output.write_text("", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, "-",
+            str(listing),
+            "review-ledger-input-v2-",
+            "primary-audit-v2-",
+            "gate-terminal-v1-",
+            str(current),
+            review_expected,
+            str(output),
+        ],
+        input=_ledger_resolver_python(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, output.read_text(encoding="utf-8")
+
+
+def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+    assert "identity mismatch" not in combined
+    assert "terminal_artifact_id=" not in output
+
+
+def test_ledger_resolver_selects_current_attempt_terminal_not_an_older_one(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
+    ]
+    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    assert result.returncode == 0, result.stderr
+    assert "terminal_artifact_id=202\n" in output
+    assert "terminal_source_attempt=2\n" in output
+    assert "terminal_artifact_id=201" not in output
 
 
 def test_ledger_persistence_steps_are_fail_closed():
