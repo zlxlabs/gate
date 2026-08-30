@@ -8,6 +8,15 @@ on:
       primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
+  workflow_call:
+    inputs:
+      pr_number: { description: "pull request number", required: true, type: string }
+      primary_run_id: { description: "canonical primary run id", required: true, type: string }
+      primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
+      finding_id: { description: "exact current-audit finding id", required: true, type: string }
+      reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
 
 permissions:
   actions: write
@@ -29,6 +38,8 @@ jobs:
       - name: Checkout disposition producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          repository: zlxlabs/gate
+          ref: ${{ inputs.gate_ref }}
           sparse-checkout: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py

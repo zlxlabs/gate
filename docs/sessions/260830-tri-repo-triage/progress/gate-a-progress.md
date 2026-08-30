@@ -13,3 +13,10 @@
 - 本段结论：checkout 已加 `sparse-checkout-cone-mode: false`，与两个文件级 sparse-checkout 路径同在。契约测试断言清单恰好是 `issue_receipt.py` 与 `convergence.py`，且 cone-mode 为 false。
 - 关键决策与已否决方案：不把清单改成目录（会扩大检出面）；不改 `actions/checkout` pin。
 - 下一步唯一动作：给 workflow 加 `workflow_call` 与必填 `gate_ref`，checkout 改为 `repository: zlxlabs/gate` + `ref: ${{ inputs.gate_ref }}`。
+
+## 2026-08-30 里程碑 ③ workflow_call + gate_ref
+
+- 当前阶段：implementing / milestone ③ workflow_call
+- 本段结论：`on` 同时含 `workflow_dispatch` 与 `workflow_call`，两边 inputs 集合同为五业务字段 + 必填 `gate_ref`。checkout 改为 `repository: zlxlabs/gate` + `ref: ${{ inputs.gate_ref }}`，dispatch 路径也显式传 pin，不再靠「跑在自己仓」的巧合。
+- 关键决策与已否决方案：两条 trigger 的 inputs 各写一遍（不用 YAML anchor，避免 `on`/`True` 解析歧义）。`actions: write` 本段不收窄，核对结果放末段报告。
+- 下一步唯一动作：新增 `templates/caller-gate-disposition.yml` 并补 caller 契约测试。

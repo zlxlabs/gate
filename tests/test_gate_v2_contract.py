@@ -127,15 +127,22 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     raw, trigger = _load_disposition_workflow()
     assert raw["name"] == "gate-v2 disposition control"
     assert "workflow_dispatch" in trigger
+    assert "workflow_call" in trigger
     assert raw["permissions"] == {"actions": "write", "contents": "read", "pull-requests": "read"}
     control = raw["jobs"]["control"]
     assert control["environment"] == {"name": "gate-disposition"}
+    expected_inputs = {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+    }
     assert "operation" not in trigger["workflow_dispatch"]["inputs"]
     assert "repository_id" not in trigger["workflow_dispatch"]["inputs"]
     assert "epoch" not in trigger["workflow_dispatch"]["inputs"]
-    assert set(trigger["workflow_dispatch"]["inputs"]) == {
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
-    }
+    assert set(trigger["workflow_dispatch"]["inputs"]) == expected_inputs
+    assert set(trigger["workflow_call"]["inputs"]) == expected_inputs
+    for kind in ("workflow_dispatch", "workflow_call"):
+        gate_ref = trigger[kind]["inputs"]["gate_ref"]
+        assert gate_ref["required"] is True
+        assert gate_ref["type"] == "string"
     text = DISPOSITION_WORKFLOW.read_text()
     assert "issue_receipt.py issue" in text
     assert "issue_receipt.py revoke" not in text
@@ -223,6 +230,17 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
         ".github/actions/gate-aggregator/convergence.py",
     }
     assert checkout["with"]["sparse-checkout-cone-mode"] is False
+
+
+def test_disposition_checkout_pins_zlxlabs_gate_at_gate_ref():
+    raw, _ = _load_disposition_workflow()
+    checkout = next(
+        step
+        for step in raw["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+    assert checkout["with"]["repository"] == "zlxlabs/gate"
+    assert checkout["with"]["ref"] == "${{ inputs.gate_ref }}"
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
