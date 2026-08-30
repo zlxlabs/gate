@@ -9,6 +9,8 @@ kept behaviorally aligned with this file.
 """
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -82,6 +84,20 @@ def _load_disposition_workflow():
     return raw, trigger
 
 
+def _disposition_scope_python() -> str:
+    """Return the inline python that constructs Scope from the disposition workflow."""
+    raw, _ = _load_disposition_workflow()
+    step = next(
+        s
+        for s in raw["jobs"]["control"]["steps"]
+        if s.get("name") == "Construct canonical scope and derive epoch"
+    )
+    run = step["run"]
+    start = run.index("<<'PY'\n") + len("<<'PY'\n")
+    end = run.index("\nPY\n", start)
+    return run[start:end]
+
+
 def _fromjson_label_sets(runs_on: str) -> list[set[str]]:
     """Parse each fromJSON('[...]') label array in a runs-on expression into a set."""
     out: list[set[str]] = []
@@ -147,6 +163,49 @@ def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
     assert "steps.disposition.outputs.artifact_name" in text
     assert "CURRENT_AUDIT_DIGEST" in text
     assert 'digest_prefix = fields["audit_digest"][:12]' in producer
+
+
+def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(tmp_path):
+    """Lock issue #88: dataclass Scope crashes unless sys.modules is registered first."""
+    source = _disposition_scope_python()
+    register = "sys.modules[spec.name] = module"
+    exec_call = "spec.loader.exec_module(module)"
+    assert register in source
+    assert exec_call in source
+    assert source.index(register) < source.index(exec_call)
+    assert "if spec is None or spec.loader is None" in source
+
+    head_sha = "a" * 40
+    base_sha = "b" * 40
+    audit = {
+        "diff_digest": "d" * 64,
+        "policy_version": "1",
+        "policy_digest": "p" * 64,
+        "tier": "personal",
+        "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "r" * 40,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    pull = {"base": {"sha": base_sha}, "head": {"sha": head_sha}}
+    audit_path = tmp_path / "audit.json"
+    pr_path = tmp_path / "pr.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    pr_path.write_text(json.dumps(pull), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
+        input=source,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["scope"]["repository_id"] == 123
+    assert payload["scope"]["pr_number"] == 42
+    assert payload["scope"]["head_sha"] == head_sha
+    assert isinstance(payload["epoch"], str) and len(payload["epoch"]) == 64
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():

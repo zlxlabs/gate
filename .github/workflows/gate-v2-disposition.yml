@@ -95,9 +95,12 @@ jobs:
           head_sha = pull["head"]["sha"]
           if audit["base_sha"] != base_sha or audit["head_sha"] != head_sha:
               raise SystemExit("canonical audit scope disagrees with current PR base/head")
-          module_path = ".github/actions/gate-aggregator/convergence.py"
+          module_path = Path(".github/actions/gate-aggregator/convergence.py").resolve()
           spec = importlib.util.spec_from_file_location("gate_convergence_scope", module_path)
+          if spec is None or spec.loader is None:
+              raise ImportError(f"convergence module is unavailable: {module_path}")
           module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
           spec.loader.exec_module(module)
           scope = module.Scope(
               repository_id=repository_id,
