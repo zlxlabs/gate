@@ -183,12 +183,33 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
     return fields
 
 
+_AUTH_FIELDS = frozenset({"approver", "approver_id", "approved_at"})
+
+
+def _payload_without_auth(raw: bytes) -> bytes:
+    obj = json.loads(raw.decode("utf-8"))
+    if not isinstance(obj, dict):
+        raise ValueError("immutable receipt payload must be an object")
+    return _canonical_json({key: value for key, value in obj.items() if key not in _AUTH_FIELDS})
+
+
 def _write_immutable(path: Path, payload: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        if path.read_bytes() != payload:
-            raise ValueError(f"immutable artifact conflict: {path.name}")
-        return False
+        existing = path.read_bytes()
+        if existing == payload:
+            return False
+        try:
+            same_body = _payload_without_auth(existing) == _payload_without_auth(payload)
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            same_body = False
+        if same_body:
+            print(
+                "immutable receipt exists with the same non-auth payload; keeping the original",
+                file=sys.stderr,
+            )
+            return False
+        raise ValueError(f"immutable artifact conflict: {path.name}")
     with path.open("xb") as output:
         output.write(payload)
     return True
