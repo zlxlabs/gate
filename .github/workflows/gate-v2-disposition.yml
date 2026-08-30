@@ -35,6 +35,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Require 40-hex gate_ref
+        env:
+          GATE_REF: ${{ inputs.gate_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::gate_ref must be a 40-character lowercase hex SHA, not a branch or tag"
+            exit 1
+          fi
+
       - name: Checkout disposition producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

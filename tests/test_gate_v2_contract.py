@@ -251,6 +251,25 @@ def test_disposition_checkout_pins_zlxlabs_gate_at_gate_ref():
     assert checkout["with"]["ref"] == "${{ inputs.gate_ref }}"
 
 
+def test_disposition_requires_lowercase_40_hex_gate_ref_before_checkout():
+    raw, _ = _load_disposition_workflow()
+    steps = raw["jobs"]["control"]["steps"]
+    names = [step.get("name") for step in steps]
+    validate_name = "Require 40-hex gate_ref"
+    checkout_name = "Checkout disposition producer"
+    assert validate_name in names
+    assert names.index(validate_name) < names.index(checkout_name)
+    validate = next(step for step in steps if step.get("name") == validate_name)
+    assert validate["env"]["GATE_REF"] == "${{ inputs.gate_ref }}"
+    run = validate["run"]
+    assert "^[0-9a-f]{40}$" in run
+    assert '[[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]' in run
+    assert "::error::" in run
+    assert "exit 1" in run
+    assert "rev-parse" not in run
+    assert "git " not in run
+
+
 def test_production_v2_official_actions_are_exactly_sha_pinned():
     raw, _ = _load_workflow()
     actual = {}
