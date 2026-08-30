@@ -349,6 +349,7 @@ def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     assert "codex-review-result.json" in build["with"]["audit-path"]
     assert "pr-size-preflight.json" in build["with"]["preflight-path"]
     assert "install-result.json" in build["with"]["install-path"]
+    assert "terminal-path" not in build["with"]
 
     upload = next(step for step in steps if step.get("name") == "Upload review effectiveness ledger")
     assert upload["if"] == "always()"
@@ -356,6 +357,20 @@ def test_review_effectiveness_ledger_is_built_and_uploaded_even_on_failure():
     assert upload["with"]["name"] == "codex-review-ledger"
     assert "ledger.jsonl" in upload["with"]["path"]
     assert upload["with"]["retention-days"] == 90
+
+
+def test_legacy_ledger_caller_input_set_stays_compatible_without_terminal_path():
+    raw, _ = _load()
+    build = next(
+        step for step in raw["jobs"]["gate"]["steps"]
+        if step.get("name") == "Build review effectiveness ledger"
+    )
+    assert "terminal-path" not in build.get("with", {})
+    action = yaml.safe_load(
+        (REPO_ROOT / ".github" / "actions" / "review-ledger" / "action.yml").read_text()
+    )
+    terminal = action["inputs"]["terminal-path"]
+    assert terminal.get("required") is not True
 
 
 def test_legacy_internal_actions_follow_the_reusable_workflow_source():

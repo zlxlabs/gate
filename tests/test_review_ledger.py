@@ -1082,14 +1082,13 @@ def test_ledger_empty_consumption_when_producer_had_no_receipts():
     assert entry["disposition_receipt_consumption"] == expected
 
 
-def test_ledger_default_consumption_without_terminal_matches_empty_schema():
+def test_ledger_omits_consumption_when_terminal_is_absent():
     module = _module()
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
         head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
     )
-    assert entry["disposition_receipt_consumption"] == module.empty_disposition_receipt_consumption()
-    assert "disposition_receipt_consumption" in entry
+    assert "disposition_receipt_consumption" not in entry
 
 
 def test_disposition_consumption_stays_out_of_review_summary_and_compact_attempts():
@@ -1132,7 +1131,7 @@ def test_comment_dispositions_remain_a_separate_channel_from_receipt_consumption
     assert entry["finding_dispositions"]["p1"]["reason"] == "comment observation"
     assert entry["convergence_projection"]["source"] == "disposition-observation"
     assert entry["convergence_projection"]["required_gate_effect"] == "none"
-    assert entry["disposition_receipt_consumption"] == module.empty_disposition_receipt_consumption()
+    assert "disposition_receipt_consumption" not in entry
 
 
 def _write_terminal(tmp_path, payload):
@@ -1186,6 +1185,50 @@ def test_missing_consumption_block_is_fail_loud_not_empty_default():
             dispositions={},
             terminal_envelope=terminal,
         )
+
+
+def _mutate_resolved_not_array(block):
+    block["resolved"] = {"not": "array"}
+
+
+def _mutate_item_missing_receipt(block):
+    del block["resolved"][0]["receipt"]
+
+
+def _mutate_approver_id_not_positive(block):
+    block["resolved"][0]["approver_id"] = 0
+
+
+def _mutate_consumed_count_mismatch(block):
+    block["consumed_count"] = 0
+
+
+def _mutate_rejected_reasons_total_mismatch(block):
+    block["rejected_count"] = 3
+
+
+def _mutate_fail_closed_not_bool(block):
+    block["fail_closed"] = "false"
+
+
+@pytest.mark.parametrize(
+    "mutator, match",
+    [
+        (_mutate_resolved_not_array, "resolved must be an array"),
+        (_mutate_item_missing_receipt, "missing receipt"),
+        (_mutate_approver_id_not_positive, "approver_id must be a positive integer"),
+        (_mutate_consumed_count_mismatch, "consumed_count does not match resolved"),
+        (_mutate_rejected_reasons_total_mismatch, "rejected_count does not match rejected_reasons"),
+        (_mutate_fail_closed_not_bool, "fail_closed must be a boolean"),
+    ],
+)
+def test_validator_rejects_malformed_consumption_shapes(mutator, match):
+    module = _module()
+    *_rest, terminal = _producer_terminal(receipts=[{}])
+    block = json.loads(json.dumps(terminal["disposition_receipt_consumption"]))
+    mutator(block)
+    with pytest.raises(ValueError, match=match):
+        module.validate_disposition_receipt_consumption(block)
 
 
 def test_malformed_consumption_block_is_fail_loud():

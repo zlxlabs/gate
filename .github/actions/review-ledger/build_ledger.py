@@ -435,7 +435,7 @@ def _primary_identity(
 
 
 def empty_disposition_receipt_consumption() -> dict[str, Any]:
-    """Default ledger projection when this run consumed no disposition receipt."""
+    """Producer empty block. Copied onto the ledger only when a terminal is present."""
     return {
         "resolved": [],
         "consumed_count": 0,
@@ -523,11 +523,9 @@ def validate_disposition_receipt_consumption(block: Any) -> dict[str, Any]:
 
 
 def _disposition_receipt_consumption_from_terminal(
-    envelope: dict[str, Any] | None, *, repository: str, pr_number: int,
+    envelope: dict[str, Any], *, repository: str, pr_number: int,
     run_id: int, run_attempt: int, head_sha: str,
 ) -> dict[str, Any]:
-    if envelope is None:
-        return empty_disposition_receipt_consumption()
     if envelope.get("schema_version") != 1 or envelope.get("kind") != "gate_terminal":
         raise ValueError("gate terminal artifact has an unsupported schema")
     expected = {
@@ -610,7 +608,7 @@ def build_entry(
             if isinstance(value, dict)
         },
     }
-    return {
+    entry = {
         "schema_version": 1,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "repository": repository,
@@ -635,15 +633,17 @@ def build_entry(
         "false_positive_count": sum(
             item.get("disposition") == "false-positive" for item in relevant_dispositions.values()
         ),
-        "disposition_receipt_consumption": _disposition_receipt_consumption_from_terminal(
+    }
+    if terminal_envelope is not None:
+        entry["disposition_receipt_consumption"] = _disposition_receipt_consumption_from_terminal(
             terminal_envelope,
             repository=repository,
             pr_number=pr_number,
             run_id=run_id,
             run_attempt=run_attempt,
             head_sha=head_sha,
-        ),
-    }
+        )
+    return entry
 
 
 def write_ledger(path: Path, entries: list[dict[str, Any]], *, max_entries: int) -> None:
@@ -813,7 +813,7 @@ def main() -> int:
     parser.add_argument("--audit-path", required=True, type=Path)
     parser.add_argument("--preflight-path", required=True, type=Path)
     parser.add_argument("--install-path", required=True, type=Path)
-    parser.add_argument("--terminal-path", required=True, type=Path)
+    parser.add_argument("--terminal-path", default="")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", required=True, type=int)
@@ -835,7 +835,8 @@ def main() -> int:
     preflight = _load_json(args.preflight_path) or {}
     audit = _load_json(args.audit_path)
     install = _load_json(args.install_path)
-    terminal = load_gate_terminal_envelope(args.terminal_path)
+    terminal_raw = args.terminal_path.strip() if isinstance(args.terminal_path, str) else str(args.terminal_path or "").strip()
+    terminal = load_gate_terminal_envelope(Path(terminal_raw)) if terminal_raw else None
     if not preflight.get("reviewable", True):
         fallback = "blocked_by_size"
     elif _truthy(args.codex_waived):
