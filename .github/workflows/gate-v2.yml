@@ -1203,6 +1203,7 @@ jobs:
           audit-path: ${{ runner.temp }}/primary-audit/primary-review-audit.json
           preflight-path: ${{ runner.temp }}/review-ledger-input/pr-size-preflight.json
           install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
+          terminal-path: ${{ runner.temp }}/gate-terminal/gate-terminal.json
           token: ${{ github.token }}
           codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
           codex-waived: false

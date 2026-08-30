@@ -729,6 +729,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert build["with"]["expected-base-sha"] == "${{ github.event.pull_request.base.sha }}"
     assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
     assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
+    assert build["with"]["terminal-path"] == "${{ runner.temp }}/gate-terminal/gate-terminal.json"
 
     upload = steps[upload_index]
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION

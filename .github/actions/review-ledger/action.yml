@@ -12,6 +12,9 @@ inputs:
   # scripts/review-ledger-report.py,按 key 取值、不会因未知/缺失字段报错)
   # 都是纯新增、向后兼容。
   install-path: { required: true }
+  # Same-run gate-terminal.json. required and fail-loud: missing/corrupt
+  # files must not project as "no consumption".
+  terminal-path: { required: true }
   token: { required: true }
   codex-expected: { required: true }
   codex-waived: { required: true }
@@ -30,6 +33,7 @@ runs:
           --audit-path "${{ inputs.audit-path }}" \
           --preflight-path "${{ inputs.preflight-path }}" \
           --install-path "${{ inputs.install-path }}" \
+          --terminal-path "${{ inputs.terminal-path }}" \
           --output "$RUNNER_TEMP/review-ledger/ledger.jsonl" \
           --repository "$GITHUB_REPOSITORY" \
           --pr-number "${{ github.event.pull_request.number }}" \
