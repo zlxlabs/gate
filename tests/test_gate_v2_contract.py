@@ -9,6 +9,8 @@ kept behaviorally aligned with this file.
 """
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -23,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
 DISPOSITION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2-disposition.yml"
 CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-v2.yml"
+DISPOSITION_CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-disposition.yml"
+DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
@@ -82,6 +86,26 @@ def _load_disposition_workflow():
     return raw, trigger
 
 
+def _disposition_scope_python() -> str:
+    """Return the inline python that constructs Scope from the disposition workflow."""
+    raw, _ = _load_disposition_workflow()
+    step = next(
+        s
+        for s in raw["jobs"]["control"]["steps"]
+        if s.get("name") == "Construct canonical scope and derive epoch"
+    )
+    run = step["run"]
+    start = run.index("<<'PY'\n") + len("<<'PY'\n")
+    end = run.index("\nPY\n", start)
+    return run[start:end]
+
+
+def _load_disposition_caller():
+    raw = yaml.safe_load(DISPOSITION_CALLER_TEMPLATE.read_text())
+    trigger = raw.get("on", raw.get(True))
+    return raw, trigger
+
+
 def _fromjson_label_sets(runs_on: str) -> list[set[str]]:
     """Parse each fromJSON('[...]') label array in a runs-on expression into a set."""
     out: list[set[str]] = []
@@ -111,15 +135,22 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     raw, trigger = _load_disposition_workflow()
     assert raw["name"] == "gate-v2 disposition control"
     assert "workflow_dispatch" in trigger
+    assert "workflow_call" in trigger
     assert raw["permissions"] == {"actions": "write", "contents": "read", "pull-requests": "read"}
     control = raw["jobs"]["control"]
     assert control["environment"] == {"name": "gate-disposition"}
+    expected_inputs = {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+    }
     assert "operation" not in trigger["workflow_dispatch"]["inputs"]
     assert "repository_id" not in trigger["workflow_dispatch"]["inputs"]
     assert "epoch" not in trigger["workflow_dispatch"]["inputs"]
-    assert set(trigger["workflow_dispatch"]["inputs"]) == {
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
-    }
+    assert set(trigger["workflow_dispatch"]["inputs"]) == expected_inputs
+    assert set(trigger["workflow_call"]["inputs"]) == expected_inputs
+    for kind in ("workflow_dispatch", "workflow_call"):
+        gate_ref = trigger[kind]["inputs"]["gate_ref"]
+        assert gate_ref["required"] is True
+        assert gate_ref["type"] == "string"
     text = DISPOSITION_WORKFLOW.read_text()
     assert "issue_receipt.py issue" in text
     assert "issue_receipt.py revoke" not in text
@@ -147,6 +178,96 @@ def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
     assert "steps.disposition.outputs.artifact_name" in text
     assert "CURRENT_AUDIT_DIGEST" in text
     assert 'digest_prefix = fields["audit_digest"][:12]' in producer
+
+
+def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(tmp_path):
+    """Lock issue #88: dataclass Scope crashes unless sys.modules is registered first."""
+    source = _disposition_scope_python()
+    register = "sys.modules[spec.name] = module"
+    exec_call = "spec.loader.exec_module(module)"
+    assert register in source
+    assert exec_call in source
+    assert source.index(register) < source.index(exec_call)
+    assert "if spec is None or spec.loader is None" in source
+
+    head_sha = "a" * 40
+    base_sha = "b" * 40
+    audit = {
+        "diff_digest": "d" * 64,
+        "policy_version": "1",
+        "policy_digest": "p" * 64,
+        "tier": "personal",
+        "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "r" * 40,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    pull = {"base": {"sha": base_sha}, "head": {"sha": head_sha}}
+    audit_path = tmp_path / "audit.json"
+    pr_path = tmp_path / "pr.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    pr_path.write_text(json.dumps(pull), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
+        input=source,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["scope"]["repository_id"] == 123
+    assert payload["scope"]["pr_number"] == 42
+    assert payload["scope"]["head_sha"] == head_sha
+    assert isinstance(payload["epoch"], str) and len(payload["epoch"]) == 64
+
+
+def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
+    """Lock issue #88: file-path sparse-checkout requires cone-mode off."""
+    raw, _ = _load_disposition_workflow()
+    checkout = next(
+        step
+        for step in raw["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+    sparse = checkout["with"]["sparse-checkout"]
+    listed = {line.strip() for line in sparse.splitlines() if line.strip()}
+    assert listed == {
+        ".github/actions/gate-disposition/issue_receipt.py",
+        ".github/actions/gate-aggregator/convergence.py",
+    }
+    assert checkout["with"].get("sparse-checkout-cone-mode") is False
+
+
+def test_disposition_checkout_pins_zlxlabs_gate_at_gate_ref():
+    raw, _ = _load_disposition_workflow()
+    checkout = next(
+        step
+        for step in raw["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+    assert checkout["with"]["repository"] == "zlxlabs/gate"
+    assert checkout["with"]["ref"] == "${{ inputs.gate_ref }}"
+
+
+def test_disposition_requires_lowercase_40_hex_gate_ref_before_checkout():
+    raw, _ = _load_disposition_workflow()
+    steps = raw["jobs"]["control"]["steps"]
+    names = [step.get("name") for step in steps]
+    validate_name = "Require 40-hex gate_ref"
+    checkout_name = "Checkout disposition producer"
+    assert validate_name in names
+    assert names.index(validate_name) < names.index(checkout_name)
+    validate = next(step for step in steps if step.get("name") == validate_name)
+    assert validate["env"]["GATE_REF"] == "${{ inputs.gate_ref }}"
+    run = validate["run"]
+    assert "^[0-9a-f]{40}$" in run
+    assert '[[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]' in run
+    assert "::error::" in run
+    assert "exit 1" in run
+    assert "rev-parse" not in run
+    assert "git " not in run
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
@@ -1180,3 +1301,39 @@ def test_diff_coverage_advisory_never_gates_quality_job():
     )
     assert advisory["continue-on-error"] is True
     assert "exit 1" not in advisory.get("run", "")
+
+
+def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
+    raw, trigger = _load_disposition_caller()
+    assert raw["name"] == "gate-disposition"
+    assert set(trigger["workflow_dispatch"]["inputs"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
+    }
+    assert "workflow_call" not in trigger
+    # reusable-workflow token is caller ∩ callee; upload-artifact needs write, gh api pulls needs pull-requests: read.
+    assert raw["permissions"] == {
+        "actions": "write",
+        "contents": "read",
+        "pull-requests": "read",
+    }
+    assert raw["concurrency"] == {
+        "group": "gate-disposition-${{ github.repository_id }}-${{ inputs.pr_number }}",
+        "cancel-in-progress": False,
+    }
+    assert set(raw["jobs"]) == {"disposition"}
+    job = raw["jobs"]["disposition"]
+    uses = job["uses"]
+    assert uses == (
+        "zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@" + DISPOSITION_CALLER_PIN
+    )
+    pin = uses.rsplit("@", 1)[1]
+    assert job["with"]["gate_ref"] == pin
+    for key in ("pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason"):
+        assert job["with"][key] == "${{ inputs." + key + " }}"
+    assert set(job["with"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+    }
+    text = DISPOSITION_CALLER_TEMPLATE.read_text()
+    assert "pull-requests: write" not in text
+    assert "secrets:" not in text
+    assert "environment:" not in text

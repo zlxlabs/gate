@@ -8,6 +8,15 @@ on:
       primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
+  workflow_call:
+    inputs:
+      pr_number: { description: "pull request number", required: true, type: string }
+      primary_run_id: { description: "canonical primary run id", required: true, type: string }
+      primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
+      finding_id: { description: "exact current-audit finding id", required: true, type: string }
+      reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
 
 permissions:
   actions: write
@@ -26,12 +35,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Require 40-hex gate_ref
+        env:
+          GATE_REF: ${{ inputs.gate_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::gate_ref must be a 40-character lowercase hex SHA, not a branch or tag"
+            exit 1
+          fi
+
       - name: Checkout disposition producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          repository: zlxlabs/gate
+          ref: ${{ inputs.gate_ref }}
           sparse-checkout: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
+          sparse-checkout-cone-mode: false
           fetch-depth: 1
 
       - name: Resolve current PR head and canonical primary audit
@@ -95,9 +117,12 @@ jobs:
           head_sha = pull["head"]["sha"]
           if audit["base_sha"] != base_sha or audit["head_sha"] != head_sha:
               raise SystemExit("canonical audit scope disagrees with current PR base/head")
-          module_path = ".github/actions/gate-aggregator/convergence.py"
+          module_path = Path(".github/actions/gate-aggregator/convergence.py").resolve()
           spec = importlib.util.spec_from_file_location("gate_convergence_scope", module_path)
+          if spec is None or spec.loader is None:
+              raise ImportError(f"convergence module is unavailable: {module_path}")
           module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
           spec.loader.exec_module(module)
           scope = module.Scope(
               repository_id=repository_id,
