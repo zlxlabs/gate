@@ -2144,6 +2144,19 @@ def test_valid_disposition_receipt_resolves_p1_and_turns_required_gate_pass(seve
     assert resolved in summary
     assert "**Result: pass**" in summary
     assert "blocking findings were resolved by disposition receipts" in summary
+    terminal = AGG.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=IDENTITY, quality_result="success",
+        primary_result="failure", review_expected=True, is_draft=False, runner="self",
+        outcome=outcome,
+    )
+    panel_row = AGG._terminal_row(
+        terminal, repository="zlxlabs/gate",
+        repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
+    )
+    panel = AGG.render_status_panel([panel_row])
+    pr_panel_has_required_line = resolved in panel
+    assert pr_panel_has_required_line is True
+    assert "Resolved:" in panel
 
 
 def test_digest_mismatch_keeps_finding_active_and_gate_fail():

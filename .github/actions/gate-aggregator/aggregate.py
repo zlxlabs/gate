@@ -351,7 +351,7 @@ def build_terminal_envelope(
     """Build the versioned machine-readable gate terminal envelope."""
     if outcome.classification not in TERMINAL_CLASSIFICATION_DOMAIN or outcome.reason_code not in TERMINAL_REASON_DOMAIN or outcome.gate_result not in GATE_RESULT_DOMAIN:
         raise ValueError("terminal field is outside the finite domain")
-    return {
+    envelope = {
         "schema_version": 1, "kind": "gate_terminal", "repository": repository,
         "repository_id": identity.repository_id, "pr_number": identity.pr, "run_id": identity.run_id,
         "run_attempt": identity.run_attempt, "head_sha": identity.head_sha,
@@ -365,6 +365,9 @@ def build_terminal_envelope(
         "reason_code": outcome.reason_code,
         "audit": {"available": outcome.audit_available, "source_attempt": outcome.audit_source_attempt if outcome.audit_available else None, "artifact_name": outcome.audit_artifact_name if outcome.audit_available else None},
     }
+    if outcome.resolved_findings:
+        envelope["resolved_findings"] = list(outcome.resolved_findings)
+    return envelope
 
 
 def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
@@ -1024,6 +1027,14 @@ def render_status_panel(
     warning_line = _bounded_history_warning(history_warning=history_warning, history_reasons=history_reasons)
     if warning_line:
         lines.extend(["", warning_line])
+    resolved = [
+        line for line in (current.get("resolved_findings") or [])
+        if isinstance(line, str) and line
+    ]
+    if resolved:
+        lines.extend(["", "Resolved:"])
+        for line in resolved:
+            lines.append(f"- {line}")
     lines.extend([
         "",
         "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
@@ -1209,7 +1220,7 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         raise ValueError("gate terminal gate_result is outside the finite domain")
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")
-    return {
+    row = {
         "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
         "repository": repository,
         "run_id": record["run_id"],
@@ -1219,6 +1230,10 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "classification": record["classification"],
         "reason_code": record["reason_code"],
     }
+    resolved = record.get("resolved_findings")
+    if isinstance(resolved, list) and all(isinstance(item, str) for item in resolved) and resolved:
+        row["resolved_findings"] = list(resolved)
+    return row
 
 
 def _read_terminal_zip(raw: bytes) -> dict[str, Any]:
@@ -1760,7 +1775,7 @@ def _panel_current_row(
     gate_result = outcome.gate_result if outcome.gate_result in GATE_RESULT_DOMAIN else "unavailable"
     classification = outcome.classification if outcome.classification in TERMINAL_CLASSIFICATION_DOMAIN else "integration_error"
     reason_code = outcome.reason_code if outcome.reason_code in TERMINAL_REASON_DOMAIN else "audit_invalid"
-    return {
+    row = {
         "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
         "repository": repository or "",
         "run_id": identity.run_id if identity else 0,
@@ -1770,6 +1785,9 @@ def _panel_current_row(
         "classification": classification,
         "reason_code": reason_code,
     }
+    if outcome.resolved_findings:
+        row["resolved_findings"] = list(outcome.resolved_findings)
+    return row
 
 
 def _persist_panel_delivery(path: str, receipt: dict[str, Any]) -> None:
