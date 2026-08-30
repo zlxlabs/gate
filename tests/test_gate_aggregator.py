@@ -799,14 +799,22 @@ _TERMINAL_GOLDEN = """{
     "available": true,
     "source_attempt": 1,
     "artifact_name": "primary-audit-v2-1"
+  },
+  "disposition_receipt_consumption": {
+    "resolved": [],
+    "consumed_count": 0,
+    "rejected_count": 0,
+    "rejected_reasons": {},
+    "fail_closed": false
   }
 }
 """
 
 
 def test_terminal_envelope_bytes_unchanged_by_rendering_work():
-    # gate-terminal.json is a cross-job publish boundary whose schema this
-    # card must NOT touch: lock the envelope bytes for a fixed outcome.
+    # gate-terminal.json is a cross-job publish boundary. The G3 structured
+    # consumption block is always present; empty shape is the no-consumption
+    # default (distinct from download/parse failure on the ledger side).
     outcome = AGG.Outcome(
         ok=True, classification="code_pass", reason_code="primary_pass", gate_result="pass",
         audit_available=True, audit_source_attempt=1, audit_artifact_name="primary-audit-v2-1",
@@ -2157,6 +2165,90 @@ def test_valid_disposition_receipt_resolves_p1_and_turns_required_gate_pass(seve
     pr_panel_has_required_line = resolved in panel
     assert pr_panel_has_required_line is True
     assert "Resolved:" in panel
+
+
+def _terminal_for(outcome, *, primary_result="failure"):
+    return AGG.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=IDENTITY, quality_result="success",
+        primary_result=primary_result, review_expected=True, is_draft=False, runner="self",
+        outcome=outcome,
+    )
+
+
+def test_terminal_projects_structured_consumption_from_consume_dispositions_objects():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope)
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    block = _terminal_for(outcome)["disposition_receipt_consumption"]
+    assert block == {
+        "resolved": [
+            {
+                "finding_id": "p1",
+                "receipt": CONV.disposition_receipt_artifact_name(receipt),
+                "approver": "octocat",
+                "approver_id": 1,
+                "approved_at": "2026-08-30T12:00:00Z",
+                "reason": "locked upstream behavior",
+            }
+        ],
+        "consumed_count": 1,
+        "rejected_count": 0,
+        "rejected_reasons": {},
+        "fail_closed": False,
+    }
+    assert outcome.resolved_findings == [_resolved_line(receipt)]
+    assert "resolved by receipt" not in json.dumps(block)
+
+
+def test_terminal_structured_block_does_not_parse_g4_display_strings():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope, finding_id="p1")
+    g4 = _resolved_line(receipt)
+    consumption = CONV.DispositionConsumption(
+        remaining_p1_ids=(),
+        consumed_receipts=(receipt,),
+        rejected_receipts=(),
+        fail_closed=False,
+    )
+    outcome = AGG.Outcome(
+        ok=True, classification="code_pass", reason_code="primary_pass", gate_result="pass",
+        resolved_findings=[g4],
+        disposition_consumption=consumption,
+    )
+    block = _terminal_for(outcome, primary_result="success")["disposition_receipt_consumption"]
+    assert block["resolved"][0]["finding_id"] == "p1"
+    assert isinstance(block["resolved"][0], dict)
+    assert block["resolved"][0]["approver"] == "octocat"
+    assert g4 != block["resolved"][0]
+
+
+def test_terminal_empty_consumption_when_evaluate_sees_no_receipts():
+    audit = _failing_scoped_audit()
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=())
+    block = _terminal_for(outcome)["disposition_receipt_consumption"]
+    assert block == AGG.empty_disposition_receipt_consumption()
+    assert outcome.disposition_consumption is not None
+    assert outcome.disposition_consumption.consumed_receipts == ()
+
+
+def test_terminal_rejected_receipts_project_reason_counts_and_fail_closed():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    mismatched = _false_positive_receipt(scope, audit_digest=_DIGEST_B)
+    unknown = _false_positive_receipt(scope, finding_id="other-finding")
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(mismatched, unknown))
+    block = _terminal_for(outcome)["disposition_receipt_consumption"]
+    assert block["resolved"] == []
+    assert block["consumed_count"] == 0
+    assert block["rejected_count"] == 2
+    assert block["rejected_reasons"] == {
+        "audit_digest_mismatch": 1,
+        "finding_not_current_p1": 1,
+    }
+    assert block["fail_closed"] is True
+    assert outcome.resolved_findings == []
 
 
 def test_digest_mismatch_keeps_finding_active_and_gate_fail():

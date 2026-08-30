@@ -258,6 +258,10 @@ class Outcome:
     convergence_envelope: Optional[dict[str, Any]] = None
     convergence_receipt: Optional[Any] = None
     resolved_findings: list[str] = field(default_factory=list)
+    # Structured consume_dispositions result. Panel/G4 strings live in
+    # resolved_findings; this object is the only source for the terminal
+    # persistence block (ledger is the second consumer).
+    disposition_consumption: Optional[Any] = None
 
 
 @dataclass
@@ -344,6 +348,49 @@ _ACTIVE_PUBLISH_BUDGET: contextvars.ContextVar[Optional[_PublishBudget]] = conte
 )
 
 
+def empty_disposition_receipt_consumption() -> dict[str, Any]:
+    """Default block for a run that never consumed a disposition receipt."""
+    return {
+        "resolved": [],
+        "consumed_count": 0,
+        "rejected_count": 0,
+        "rejected_reasons": {},
+        "fail_closed": False,
+    }
+
+
+def project_disposition_receipt_consumption(consumption: Any) -> dict[str, Any]:
+    """Project consume_dispositions onto the terminal persistence block.
+
+    Reads DispositionReceipt objects, never G4 display strings. Ledger
+    copies this block as the top-level disposition_receipt_consumption
+    field (the second consumer).
+    """
+    if consumption is None:
+        return empty_disposition_receipt_consumption()
+    resolved = [
+        {
+            "finding_id": receipt.finding_id,
+            "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
+            "approver": receipt.approver,
+            "approver_id": receipt.approver_id,
+            "approved_at": receipt.approved_at,
+            "reason": receipt.reason,
+        }
+        for receipt in consumption.consumed_receipts
+    ]
+    rejected_reasons: dict[str, int] = {}
+    for _receipt, reason in consumption.rejected_receipts:
+        rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+    return {
+        "resolved": resolved,
+        "consumed_count": len(consumption.consumed_receipts),
+        "rejected_count": len(consumption.rejected_receipts),
+        "rejected_reasons": dict(sorted(rejected_reasons.items())),
+        "fail_closed": bool(consumption.fail_closed),
+    }
+
+
 def build_terminal_envelope(
     *, repository: str, identity: Identity, quality_result: str, primary_result: str, review_expected: bool,
     is_draft: bool, runner: str, outcome: Outcome,
@@ -364,6 +411,9 @@ def build_terminal_envelope(
         "classification": outcome.classification,
         "reason_code": outcome.reason_code,
         "audit": {"available": outcome.audit_available, "source_attempt": outcome.audit_source_attempt if outcome.audit_available else None, "artifact_name": outcome.audit_artifact_name if outcome.audit_available else None},
+        "disposition_receipt_consumption": project_disposition_receipt_consumption(
+            outcome.disposition_consumption,
+        ),
     }
     if outcome.resolved_findings:
         envelope["resolved_findings"] = list(outcome.resolved_findings)
@@ -717,6 +767,10 @@ def evaluate(
             audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
+        # First-pass consumption is the judge's durable fact: rejected
+        # receipts never reach evaluate_round, so round_decision.disposition
+        # cannot be the persistence source.
+        outcome.disposition_consumption = consumption
         # Historical / invalid receipts must not fail-close this round's
         # convergence; only receipts that already consumed a current finding
         # are forwarded to the evaluator.
