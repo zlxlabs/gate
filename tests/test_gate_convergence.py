@@ -294,6 +294,23 @@ def test_parse_v2_missing_or_empty_auth_fields_are_malformed():
     ).reason == "malformed_receipt"
 
 
+def test_required_disposition_lines_include_approver_and_truncated_reason():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    reason = "locked\n  upstream\tbehavior " + ("x" * 600)
+    receipt = _disposition(primary=primary, reason=reason)
+    consumed = CONV.consume_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert consumed.consumed_receipts == (receipt,)
+    name = CONV.disposition_receipt_artifact_name(receipt)
+    expected_reason = " ".join(reason.split())[:CONV.DISPOSITION_REASON_DISPLAY_MAX]
+    assert CONV.required_disposition_lines(consumed) == (
+        f"finding p1 (false-positive, approved by octocat) resolved by receipt {name}: {expected_reason}",
+    )
+    assert "\n" not in CONV.required_disposition_lines(consumed)[0]
+    assert len(expected_reason) == CONV.DISPOSITION_REASON_DISPLAY_MAX
+
+
 def _runtime_audit(*, verdict="fail", findings=None, **noise):
     findings = findings or [{"id": "p1", "severity": "major", "file": "lock.py", "line": 12}]
     audit = {

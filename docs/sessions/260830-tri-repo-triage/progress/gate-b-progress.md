@@ -13,3 +13,10 @@
 - 本段结论：`issue_receipt.py` 经 argv/env 写入 `approver`/`approver_id`/`approved_at`，kind 与 artifact 名走消费端 v2 常量。workflow 从 `github.triggering_actor` 与 `github.actor_id` 注入，签发时刻由 job 内 `date -u` 一次生成后传入 `--approved-at`，inputs 集合不变。
 - 关键决策与已否决方案：`approver_id` 用 `github.actor_id` 而非 API 反查；与 `triggering_actor` 在首次 dispatch 同源，Re-run jobs 时 actor 可能换成重跑人（边界写报告）。`approved_at` 不用进程内 `now()`，避免同目录二次签发因时间戳不同撞 `_write_immutable`。
 - 下一步唯一动作：扩 `required_disposition_lines` 为 G4 可读行，三处发布面仍只调该函数。
+
+## 2026-08-30 里程碑 ③ G4 resolved 行
+
+- 当前阶段：implementing / milestone ③ G4 lines
+- 本段结论：`required_disposition_lines` 现产出 `finding <id> (false-positive, approved by <approver>) resolved by receipt <name>: <reason>`；reason 折叠空白并截到 500 字。Step Summary / `::notice::` / `render_summary`（PR 评论同源）都读 `outcome.resolved_findings`，该列表只由这一函数填充。
+- 关键决策与已否决方案：envelope 的 `resolved_findings` 仍保持 `{finding_id, receipt}` 机器结构，留给 G3 ledger 投影，不把 G4 字符串塞进 envelope（与设计「三处发布面」字面冲突，写报告）。显示上限 500 取自仓内既有人类可读截断量级（`MAX_HISTORY_WARNING_CHARS`），receipt 存储的 reason 本身不截。
+- 下一步唯一动作：补 producer→parse 跨边界样例，收紧生产端字段集断言，跑全量测试。

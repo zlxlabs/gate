@@ -2095,6 +2095,17 @@ def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", *
     return CONV.DispositionReceipt(**fields)
 
 
+def _resolved_line(receipt):
+    return CONV.required_disposition_lines(
+        CONV.DispositionConsumption(
+            remaining_p1_ids=(),
+            consumed_receipts=(receipt,),
+            rejected_receipts=(),
+            fail_closed=False,
+        )
+    )[0]
+
+
 def _evaluate_failing_primary(audit, *, audit_digest=_DIGEST_A, waiver_receipts=()):
     return AGG.evaluate(
         **_base_kwargs(
@@ -2120,7 +2131,7 @@ def test_valid_disposition_receipt_resolves_p1_and_turns_required_gate_pass(seve
     scope = _scope_for(audit)
     receipt = _false_positive_receipt(scope)
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    resolved = f"finding p1 resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+    resolved = _resolved_line(receipt)
     assert outcome.gate_result == "pass"
     assert outcome.ok is True
     assert outcome.classification == "code_pass"
@@ -2173,7 +2184,7 @@ def test_duplicate_disposition_receipt_is_idempotent_pass():
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt, receipt))
     assert outcome.gate_result == "pass"
     assert outcome.resolved_findings == [
-        f"finding p1 resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+        _resolved_line(receipt)
     ]
 
 
@@ -2204,7 +2215,7 @@ def test_partial_disposition_leaves_remaining_finding_blocking():
     assert outcome.gate_result == "fail"
     assert outcome.reason_code == "primary_findings"
     assert outcome.resolved_findings == [
-        f"finding drop resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+        _resolved_line(receipt)
     ]
 
 
@@ -2242,7 +2253,7 @@ def test_main_fail_primary_plus_matching_receipt_marks_resolved(monkeypatch, tmp
         _cli_args(audit_dir, summary_path, primary_result="failure")
     )
     text = summary_path.read_text()
-    resolved = f"finding p1 resolved by receipt {artifact_name}"
+    resolved = _resolved_line(receipt)
     assert rc == 0
     assert "**Result: pass**" in text
     assert "Resolved:" in text

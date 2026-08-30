@@ -29,6 +29,7 @@ RECEIPT_KIND = "canonical_primary"
 DISPOSITION_KINDS = frozenset({"false-positive"})
 DISPOSITION_RECEIPT_SCHEMA_VERSION = 2
 DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}"
+DISPOSITION_REASON_DISPLAY_MAX = 500
 
 # This is intentionally local to the public gate repository.  The private
 # policy source is represented only by Scope.policy_version/policy_digest in
@@ -661,9 +662,20 @@ def required_disposition_lines(consumption: DispositionConsumption) -> tuple[str
     """Human-visible required-gate lines for consumed false-positive receipts."""
 
     return tuple(
-        f"finding {receipt.finding_id} resolved by receipt {disposition_receipt_artifact_name(receipt)}"
+        (
+            f"finding {receipt.finding_id} ({receipt.disposition}, approved by {receipt.approver}) "
+            f"resolved by receipt {disposition_receipt_artifact_name(receipt)}: "
+            f"{_single_line_reason(receipt.reason)}"
+        )
         for receipt in consumption.consumed_receipts
     )
+
+
+def _single_line_reason(reason: str) -> str:
+    collapsed = " ".join(reason.split())
+    if len(collapsed) <= DISPOSITION_REASON_DISPLAY_MAX:
+        return collapsed
+    return collapsed[:DISPOSITION_REASON_DISPLAY_MAX]
 
 
 def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
