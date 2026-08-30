@@ -34,3 +34,10 @@
 - 本段结论：cone-mode 断言改为 `.get(...) is False`。缺键时原先是 KeyError（pytest ERROR 形态），现在是 AssertionError（None is False），满足红验「断言失败」要求。
 - 关键决策与已否决方案：不把缺键写成 `assert "sparse-checkout-cone-mode" in checkout["with"]` 再另断言取值——一条 `is False` 同时锁「键存在且为 false」。
 - 下一步唯一动作：去掉 cone-mode 行红验（断言失败）后还原，再跑全量测试。
+
+## 2026-08-30 收口
+
+- 当前阶段：implementing / 验证收口
+- 本段结论：两处 #88 红验均为 AssertionError 后已还原。全量 `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` 659 passed 退出码 0；`python3 scripts/check_pinned_uses.py` 退出码 0。`actions: write` 因 `actions/upload-artifact` 不能收窄，核对写进报告。
+- 关键决策与已否决方案：无。
+- 下一步唯一动作：主脑走本地 review 循环；合并须用 merge commit（执行器不合并不删分支）。
