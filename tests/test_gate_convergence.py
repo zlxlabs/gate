@@ -215,6 +215,8 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
         ({"approver_id": 1.0}, "malformed_receipt"),
         ({"approved_at": ""}, "malformed_receipt"),
         ({"approved_at": "2026-08-30"}, "malformed_receipt"),
+        ({"approved_at": "2026-08-30Tnot-a-time"}, "malformed_receipt"),
+        ({"approver": 12}, "malformed_receipt"),
         ({"schema_version": 1}, "schema_version_mismatch"),
     ],
     ids=[
@@ -227,6 +229,8 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
         "approver-id-float",
         "approved-at-empty",
         "approved-at-bare-date",
+        "approved-at-invalid-time",
+        "approver-non-string",
         "schema-version-v1",
     ],
 )
@@ -291,6 +295,29 @@ def test_parse_v2_missing_or_empty_auth_fields_are_malformed():
     assert CONV.validate_disposition_receipt(
         CONV.parse_disposition_receipt(bare),
         scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    missing_id = dict(base)
+    del missing_id["approver_id"]
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(missing_id),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    missing_at = dict(base)
+    del missing_at["approved_at"]
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(missing_at),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    invalid_time = dict(base, approved_at="2026-08-30Tnot-a-time")
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(invalid_time),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    non_string = dict(base, approver=12)
+    parsed_non_string = CONV.parse_disposition_receipt(non_string)
+    assert parsed_non_string.approver == 12
+    assert CONV.validate_disposition_receipt(
+        parsed_non_string, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     ).reason == "malformed_receipt"
 
 
