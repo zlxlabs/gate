@@ -41,3 +41,10 @@
 - 本段结论：两处 #88 红验均为 AssertionError 后已还原。全量 `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` 659 passed 退出码 0；`python3 scripts/check_pinned_uses.py` 退出码 0。`actions: write` 因 `actions/upload-artifact` 不能收窄，核对写进报告。
 - 关键决策与已否决方案：无。
 - 下一步唯一动作：主脑走本地 review 循环；合并须用 merge commit（执行器不合并不删分支）。
+
+## 2026-08-30 主脑修订 caller 权限交集
+
+- 当前阶段：implementing / 验收修订
+- 本段结论：caller 模板 permissions 改为精确三项 `actions: write` / `contents: read` / `pull-requests: read`，使 reusable-workflow token（caller ∩ callee）覆盖 upload-artifact 与 `gh api pulls`。契约测试按精确集合锁定，并注释交集机理。
+- 关键决策与已否决方案：主脑修订卡面锁定决策 2；不扩其它 scope。去掉原文案负断言 `actions: write not in text`（与定稿矛盾），`pull-requests: write` 负断言保留。
+- 下一步唯一动作：主脑走本地 review 循环；合并须用 merge commit（执行器不合并不删分支）。

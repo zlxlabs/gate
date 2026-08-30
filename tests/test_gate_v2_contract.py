@@ -1291,7 +1291,12 @@ def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
         "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
     }
     assert "workflow_call" not in trigger
-    assert raw["permissions"] == {"actions": "read", "contents": "read"}
+    # reusable-workflow token is caller ∩ callee; upload-artifact needs write, gh api pulls needs pull-requests: read.
+    assert raw["permissions"] == {
+        "actions": "write",
+        "contents": "read",
+        "pull-requests": "read",
+    }
     assert raw["concurrency"] == {
         "group": "gate-disposition-${{ github.repository_id }}-${{ inputs.pr_number }}",
         "cancel-in-progress": False,
@@ -1311,6 +1316,5 @@ def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
     }
     text = DISPOSITION_CALLER_TEMPLATE.read_text()
     assert "pull-requests: write" not in text
-    assert "actions: write" not in text
     assert "secrets:" not in text
     assert "environment:" not in text

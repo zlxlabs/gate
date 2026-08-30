@@ -13,8 +13,9 @@ on:
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
 
 permissions:
-  actions: read
+  actions: write
   contents: read
+  pull-requests: read
 
 concurrency:
   group: gate-disposition-${{ github.repository_id }}-${{ inputs.pr_number }}
