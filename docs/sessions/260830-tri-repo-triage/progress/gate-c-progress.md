@@ -27,3 +27,10 @@
 - 本段结论：缺文件、空文件、非法 JSON、非对象、缺消费块、计数类型错、身份不匹配一律 `ValueError`，不会落到空消费缺省。缺省空块只在 `terminal_envelope is None`（单测无消费）或 producer 写出的零计数块。
 - 关键决策与已否决方案：无 fallback/兼容分支。损坏 payload 不投影成无消费。
 - 下一步唯一动作：红验约束 2（改坏 terminal 结构化块字段名 → consumer 契约测试红），再跑全量 pytest 与 pin 检查。
+
+## 2026-08-31 里程碑 ⑤ 红验与全量收口
+
+- 当前阶段：done / verification
+- 本段结论：红验把 producer 块字段 `resolved` 改成 `resolved_items` 后，producer 字典断言以 AssertionError 转红，consumer 契约以 `ValueError: disposition_receipt_consumption is missing resolved` 转红（未投影成无消费）。已只还原该行。全量 pytest 701 passed 退出码 0，`check_pinned_uses.py` 退出码 0。
+- 关键决策与已否决方案：无新增。
+- 下一步唯一动作：主脑本地 review；合并须用 merge commit（执行器不推不合并）。
