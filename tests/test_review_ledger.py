@@ -1,7 +1,9 @@
 import base64
 import hashlib
 import importlib.util
+import inspect
 import json
+import sys
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -948,3 +950,310 @@ def test_state_comment_and_summary_mention_reviewer_on_failover():
     body = module.render_state_comment([entry], entry)
     assert "codex-sub" in body
     assert "failover" in body.lower() or "切换" in body
+
+
+def _aggregator():
+    path = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+    spec = importlib.util.spec_from_file_location("gate_aggregate_for_ledger", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _producer_terminal(*, receipts=()):
+    agg = _aggregator()
+    conv = agg._CONVERGENCE
+    identity = agg.Identity(
+        repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=1, pr=42,
+    )
+    audit = {
+        "kind": "primary_review",
+        "schema_version": 1,
+        "repository_id": identity.repository_id,
+        "head_sha": identity.head_sha,
+        "run_id": identity.run_id,
+        "run_attempt": identity.run_attempt,
+        "pr": identity.pr,
+        "verdict": "fail",
+        "reviewer": "claude-glm",
+        "base_sha": "b" * 40,
+        "diff_digest": "d" * 64,
+        "policy_version": "policy-v1",
+        "policy_digest": "p" * 64,
+        "tier": "personal",
+        "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "w" * 40,
+        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+    }
+    scope, missing = agg._convergence_scope_from_audit(audit, identity)
+    assert not missing and scope is not None
+    digest = "a" * 64
+    typed_receipts = []
+    for changes in receipts:
+        fields = dict(
+            schema_version=conv.DISPOSITION_RECEIPT_SCHEMA_VERSION,
+            disposition="false-positive",
+            repository_id=str(identity.repository_id),
+            pr_number=identity.pr,
+            epoch=conv.derive_epoch(scope),
+            head_sha=identity.head_sha,
+            audit_digest=digest,
+            finding_id="p1",
+            reason="locked upstream behavior",
+            approver="octocat",
+            approver_id=1,
+            approved_at="2026-08-30T12:00:00Z",
+        )
+        fields.update(changes)
+        typed_receipts.append(conv.DispositionReceipt(**fields))
+    outcome = agg.evaluate(
+        quality_result="success",
+        primary_result="failure",
+        runner="self",
+        is_draft=False,
+        review_expected=True,
+        audit=audit,
+        audit_error=None,
+        identity=identity,
+        audit_source_attempt=identity.run_attempt,
+        audit_artifact_name="primary-audit-v2-1",
+        scope=scope,
+        audit_digest=digest,
+        waiver_receipts=tuple(typed_receipts),
+    )
+    terminal = agg.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=identity, quality_result="success",
+        primary_result="failure", review_expected=True, is_draft=False, runner="self",
+        outcome=outcome,
+    )
+    return agg, conv, identity, typed_receipts, outcome, terminal
+
+
+def test_ledger_projects_real_producer_terminal_consumption():
+    module = _module()
+    agg, conv, identity, receipts, outcome, terminal = _producer_terminal(receipts=[{}])
+    assert outcome.disposition_consumption is not None
+    assert terminal["disposition_receipt_consumption"]["consumed_count"] == 1
+    entry = module.build_entry(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
+    assert entry["disposition_receipt_consumption"]["resolved"] == [
+        {
+            "finding_id": "p1",
+            "receipt": conv.disposition_receipt_artifact_name(receipts[0]),
+            "approver": "octocat",
+            "approver_id": 1,
+            "approved_at": "2026-08-30T12:00:00Z",
+            "reason": "locked upstream behavior",
+        }
+    ]
+    assert "resolved by receipt" not in json.dumps(entry["disposition_receipt_consumption"])
+
+
+def test_ledger_empty_consumption_when_producer_had_no_receipts():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    entry = module.build_entry(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    expected = module.empty_disposition_receipt_consumption()
+    assert terminal["disposition_receipt_consumption"] == expected
+    assert entry["disposition_receipt_consumption"] == expected
+
+
+def test_ledger_omits_consumption_when_terminal_is_absent():
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+    )
+    assert "disposition_receipt_consumption" not in entry
+
+
+def test_disposition_consumption_stays_out_of_review_summary_and_compact_attempts():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    entry = module.build_entry(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    assert "disposition_receipt_consumption" in entry
+    assert "disposition_receipt_consumption" not in entry["review"]
+    for attempt in entry["review"]["attempts"]:
+        assert "disposition_receipt_consumption" not in attempt
+    assert "disposition_receipt_consumption" not in inspect.getsource(module._review_summary)
+    assert "disposition_receipt_consumption" not in inspect.getsource(module._compact_attempts)
+
+
+def test_comment_dispositions_remain_a_separate_channel_from_receipt_consumption():
+    module = _module()
+    dispositions = {
+        "p1": {
+            "disposition": "false-positive",
+            "reason": "comment observation",
+            "status": "active_false_positive",
+        }
+    }
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", ["p1"]),
+        prior_entries=[], dispositions=dispositions,
+    )
+    assert entry["finding_dispositions"]["p1"]["reason"] == "comment observation"
+    assert entry["convergence_projection"]["source"] == "disposition-observation"
+    assert entry["convergence_projection"]["required_gate_effect"] == "none"
+    assert "disposition_receipt_consumption" not in entry
+
+
+def _write_terminal(tmp_path, payload):
+    path = tmp_path / "gate-terminal.json"
+    if isinstance(payload, bytes):
+        path.write_bytes(payload)
+    else:
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_missing_or_empty_terminal_file_is_fail_loud_not_empty_consumption(tmp_path):
+    module = _module()
+    missing = tmp_path / "missing" / "gate-terminal.json"
+    empty = tmp_path / "gate-terminal.json"
+    empty.write_text("")
+    with pytest.raises(ValueError, match="missing or empty"):
+        module.load_gate_terminal_envelope(missing)
+    with pytest.raises(ValueError, match="missing or empty"):
+        module.load_gate_terminal_envelope(empty)
+
+
+def test_corrupt_terminal_json_is_fail_loud_not_empty_consumption(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, "{not json")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        module.load_gate_terminal_envelope(path)
+
+
+def test_terminal_array_payload_is_fail_loud(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, "[]")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        module.load_gate_terminal_envelope(path)
+
+
+def test_missing_consumption_block_is_fail_loud_not_empty_default():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    del terminal["disposition_receipt_consumption"]
+    with pytest.raises(ValueError, match="missing disposition_receipt_consumption"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"],
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+@pytest.mark.parametrize("kind, match", [
+    ("resolved_not_array", "resolved must be an array"),
+    ("missing_receipt", "missing receipt"),
+    ("approver_id", "approver_id must be a positive integer"),
+    ("consumed_count", "consumed_count does not match resolved"),
+    ("rejected_count", "rejected_count does not match rejected_reasons"),
+    ("fail_closed", "fail_closed must be a boolean"),
+])
+def test_validator_rejects_malformed_consumption_shapes(kind, match):
+    module = _module()
+    *_rest, terminal = _producer_terminal(receipts=[{}])
+    block = json.loads(json.dumps(terminal["disposition_receipt_consumption"]))
+    if kind == "resolved_not_array":
+        block["resolved"] = {}
+    elif kind == "missing_receipt":
+        del block["resolved"][0]["receipt"]
+    elif kind == "approver_id":
+        block["resolved"][0]["approver_id"] = 0
+    elif kind == "consumed_count":
+        block["consumed_count"] = 0
+    elif kind == "rejected_count":
+        block["rejected_count"] = 3
+    else:
+        block["fail_closed"] = "false"
+    with pytest.raises(ValueError, match=match):
+        module.validate_disposition_receipt_consumption(block)
+
+
+def test_malformed_consumption_block_is_fail_loud():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    terminal["disposition_receipt_consumption"]["consumed_count"] = "1"
+    with pytest.raises(ValueError, match="consumed_count"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"],
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+def test_terminal_identity_mismatch_is_fail_loud():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    with pytest.raises(ValueError, match="identity mismatch"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"] + 1,
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+def test_unsupported_terminal_schema_is_fail_loud(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, {"schema_version": 2, "kind": "gate_terminal"})
+    with pytest.raises(ValueError, match="unsupported schema"):
+        module.load_gate_terminal_envelope(path)

@@ -716,6 +716,10 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "pr-size-preflight.json" in input_upload["with"]["path"]
     assert "install-result.json" in input_upload["with"]["path"]
     assert input_download["with"]["path"] == "${{ runner.temp }}/review-ledger-input"
+    terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
+    assert terminal_download["with"]["artifact-ids"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
+    assert terminal_download["with"]["path"] == "${{ runner.temp }}/gate-terminal"
+    assert "continue-on-error" not in terminal_download
     build = steps[build_index]
     assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
     assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
@@ -725,6 +729,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert build["with"]["expected-base-sha"] == "${{ github.event.pull_request.base.sha }}"
     assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
     assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
+    assert build["with"]["terminal-path"] == "${{ runner.temp }}/gate-terminal/gate-terminal.json"
 
     upload = steps[upload_index]
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
@@ -745,10 +750,67 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
         "${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}"
     )
     run = resolver["run"]
-    for marker in ("--paginate", "expired", "<= current", "input_artifact_id", "audit_artifact_id"):
+    for marker in (
+        "--paginate", "expired", "<= current", "exact_attempt=current",
+        "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
+        "terminal_source_attempt",
+    ):
         assert marker in run
+    assert resolver["env"]["TERMINAL_PREFIX"] == (
+        "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
+    )
     assert "No matching required ledger input artifact found" in run
     assert "No matching canonical primary audit artifact found" in run
+    assert "No matching required gate terminal artifact found" in run
+
+
+def _ledger_resolver_python() -> str:
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["ledger"]["steps"]
+        if s.get("name") == "Resolve v2 ledger artifacts"
+    )
+    run = step["run"]
+    start = run.index("<<'PY'\n") + len("<<'PY'\n")
+    end = run.index("\nPY\n", start)
+    return run[start:end]
+
+
+def _run_ledger_resolver(tmp_path, *, artifacts, current, review_expected="false"):
+    listing = tmp_path / "listing.json"
+    listing.write_text(json.dumps({"artifacts": artifacts}), encoding="utf-8")
+    output = tmp_path / "github_output"
+    output.write_text("", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, "-",
+            str(listing),
+            "review-ledger-input-v2-",
+            "primary-audit-v2-",
+            "gate-terminal-v1-",
+            str(current),
+            review_expected,
+            str(output),
+        ],
+        input=_ledger_resolver_python(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, output.read_text(encoding="utf-8")
+
+
+def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+    assert "identity mismatch" not in combined
 
 
 def test_ledger_persistence_steps_are_fail_closed():
@@ -757,6 +819,7 @@ def test_ledger_persistence_steps_are_fail_closed():
     for name in (
         "Download v2 review ledger inputs",
         "Download canonical primary audit for ledger",
+        "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger",
     ):
