@@ -716,6 +716,10 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "pr-size-preflight.json" in input_upload["with"]["path"]
     assert "install-result.json" in input_upload["with"]["path"]
     assert input_download["with"]["path"] == "${{ runner.temp }}/review-ledger-input"
+    terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
+    assert terminal_download["with"]["artifact-ids"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
+    assert terminal_download["with"]["path"] == "${{ runner.temp }}/gate-terminal"
+    assert "continue-on-error" not in terminal_download
     build = steps[build_index]
     assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
     assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
@@ -745,10 +749,14 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
         "${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}"
     )
     run = resolver["run"]
-    for marker in ("--paginate", "expired", "<= current", "input_artifact_id", "audit_artifact_id"):
+    for marker in ("--paginate", "expired", "<= current", "input_artifact_id", "audit_artifact_id", "terminal_artifact_id"):
         assert marker in run
+    assert resolver["env"]["TERMINAL_PREFIX"] == (
+        "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
+    )
     assert "No matching required ledger input artifact found" in run
     assert "No matching canonical primary audit artifact found" in run
+    assert "No matching required gate terminal artifact found" in run
 
 
 def test_ledger_persistence_steps_are_fail_closed():
@@ -757,6 +765,7 @@ def test_ledger_persistence_steps_are_fail_closed():
     for name in (
         "Download v2 review ledger inputs",
         "Download canonical primary audit for ledger",
+        "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger",
     ):

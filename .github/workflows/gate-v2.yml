@@ -1115,6 +1115,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_PREFIX: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
+          TERMINAL_PREFIX: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
         run: |
@@ -1122,13 +1123,13 @@ jobs:
           listing="$(mktemp)"
           trap 'rm -f "$listing"' EXIT
           gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$listing"
-          python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
+          python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$TERMINAL_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
           import json
           import re
           import sys
           from pathlib import Path
 
-          listing_path, input_prefix, audit_prefix, current_text, expected_text, output_path = sys.argv[1:]
+          listing_path, input_prefix, audit_prefix, terminal_prefix, current_text, expected_text, output_path = sys.argv[1:]
           current = int(current_text)
           if expected_text not in {"true", "false"}:
               raise SystemExit("REVIEW_EXPECTED must be true or false")
@@ -1164,11 +1165,14 @@ jobs:
 
           input_artifact = select_artifact(input_prefix, "No matching required ledger input artifact found", True)
           audit_artifact = select_artifact(audit_prefix, "No matching canonical primary audit artifact found", expected_text == "true")
+          terminal_artifact = select_artifact(terminal_prefix, "No matching required gate terminal artifact found", True)
           with open(output_path, "a", encoding="utf-8") as output:
               output.write(f"input_artifact_id={input_artifact[1]}\n")
               output.write(f"input_source_attempt={input_artifact[0]}\n")
               output.write(f"audit_artifact_id={audit_artifact[1] if audit_artifact else ''}\n")
               output.write(f"audit_source_attempt={audit_artifact[0] if audit_artifact else ''}\n")
+              output.write(f"terminal_artifact_id={terminal_artifact[1]}\n")
+              output.write(f"terminal_source_attempt={terminal_artifact[0]}\n")
           PY
 
       - name: Download v2 review ledger inputs
@@ -1185,6 +1189,13 @@ jobs:
           artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/primary-audit
+
+      - name: Download gate terminal envelope for ledger
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/gate-terminal
 
       - name: Build v2 review effectiveness ledger
         uses: ./_gate-aggregator-src/.github/actions/review-ledger
