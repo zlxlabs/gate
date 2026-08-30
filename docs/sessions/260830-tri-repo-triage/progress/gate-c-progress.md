@@ -20,3 +20,10 @@
 - 本段结论：`build_entry` 顶层写入 `disposition_receipt_consumption`，缺省为恒在的空块。CLI/`action.yml` 增加 required `terminal-path`；契约测试用 `evaluate` + `build_terminal_envelope` 真实产物喂 `build_entry`，resolved 列表字节一致。`_review_summary` / `_compact_attempts` 源码与返回值都不含该字段。
 - 关键决策与已否决方案：ledger 侧复制空块形状（跨 job 发布边界，禁止共享模块）。无 terminal 实参的单测走缺省空块，与「文件缺失/损坏」的 fail-loud 路径分开。评论通道 `finding_dispositions` 不动。
 - 下一步唯一动作：注入损坏 terminal payload，断言报错方向且不可投影成无消费。
+
+## 2026-08-31 里程碑 ④ 失败路径 fail-loud
+
+- 当前阶段：implementing / milestone ④ fail-loud paths
+- 本段结论：缺文件、空文件、非法 JSON、非对象、缺消费块、计数类型错、身份不匹配一律 `ValueError`，不会落到空消费缺省。缺省空块只在 `terminal_envelope is None`（单测无消费）或 producer 写出的零计数块。
+- 关键决策与已否决方案：无 fallback/兼容分支。损坏 payload 不投影成无消费。
+- 下一步唯一动作：红验约束 2（改坏 terminal 结构化块字段名 → consumer 契约测试红），再跑全量 pytest 与 pin 检查。

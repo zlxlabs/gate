@@ -1133,3 +1133,100 @@ def test_comment_dispositions_remain_a_separate_channel_from_receipt_consumption
     assert entry["convergence_projection"]["source"] == "disposition-observation"
     assert entry["convergence_projection"]["required_gate_effect"] == "none"
     assert entry["disposition_receipt_consumption"] == module.empty_disposition_receipt_consumption()
+
+
+def _write_terminal(tmp_path, payload):
+    path = tmp_path / "gate-terminal.json"
+    if isinstance(payload, bytes):
+        path.write_bytes(payload)
+    else:
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_missing_or_empty_terminal_file_is_fail_loud_not_empty_consumption(tmp_path):
+    module = _module()
+    missing = tmp_path / "missing" / "gate-terminal.json"
+    empty = tmp_path / "gate-terminal.json"
+    empty.write_text("")
+    with pytest.raises(ValueError, match="missing or empty"):
+        module.load_gate_terminal_envelope(missing)
+    with pytest.raises(ValueError, match="missing or empty"):
+        module.load_gate_terminal_envelope(empty)
+
+
+def test_corrupt_terminal_json_is_fail_loud_not_empty_consumption(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, "{not json")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        module.load_gate_terminal_envelope(path)
+
+
+def test_terminal_array_payload_is_fail_loud(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, "[]")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        module.load_gate_terminal_envelope(path)
+
+
+def test_missing_consumption_block_is_fail_loud_not_empty_default():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    del terminal["disposition_receipt_consumption"]
+    with pytest.raises(ValueError, match="missing disposition_receipt_consumption"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"],
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+def test_malformed_consumption_block_is_fail_loud():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    terminal["disposition_receipt_consumption"]["consumed_count"] = "1"
+    with pytest.raises(ValueError, match="consumed_count"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"],
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+def test_terminal_identity_mismatch_is_fail_loud():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    with pytest.raises(ValueError, match="identity mismatch"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"] + 1,
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+def test_unsupported_terminal_schema_is_fail_loud(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, {"schema_version": 2, "kind": "gate_terminal"})
+    with pytest.raises(ValueError, match="unsupported schema"):
+        module.load_gate_terminal_envelope(path)
