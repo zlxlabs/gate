@@ -1,5 +1,6 @@
 """Cross-process producer/consumer contract tests for convergence receipts."""
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -271,6 +272,18 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     second = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
     assert json.loads(second.stdout)["written"] is False
     assert artifact_path.read_bytes() == payload_bytes
+    parsed = CONV.parse_disposition_receipt(json.loads(payload_bytes))
+    primary = CONV.CanonicalPrimary(
+        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
+        head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
+    )
+    status = CONV.validate_disposition_receipt(
+        parsed, scope=SCOPE, primary=primary, audit_digest=digest,
+    )
+    assert (status.consumable, status.reason) == (True, "active_false_positive")
+    assert (parsed.approver, parsed.approver_id, parsed.approved_at) == (
+        "octocat", 1, "2026-08-30T12:00:00Z",
+    )
 
 
 def test_disposition_producer_rejects_non_p1_finding(tmp_path):
@@ -290,6 +303,92 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
     failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
     assert failed.returncode == 1
     assert "finding_id must identify a P1 finding" in failed.stderr
+
+
+def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
+        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
+        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
+        "tier": SCOPE.tier,
+        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "run_id": 77, "run_attempt": 1,
+        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+    }
+    audit_path = tmp_path / "canonical-audit.json"
+    audit_path.write_bytes(json.dumps(audit, indent=2).encode("utf-8") + b"\n")
+    output_dir = tmp_path / "out"
+    spec = importlib.util.spec_from_file_location("gate_disposition_issue_receipt", DISPOSITION_PRODUCER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(module)
+    args = argparse.Namespace(
+        output_dir=str(output_dir),
+        audit_path=str(audit_path),
+        repository_id="123",
+        pr_number="42",
+        head_sha=SCOPE.head_sha,
+        finding_id="p1",
+        reason="locked upstream behavior",
+        approver="octocat",
+        approver_id="7",
+        approved_at="2026-08-30T12:00:00Z",
+        scope_json=json.dumps(SCOPE.as_dict(), sort_keys=True),
+        input_stdin=False,
+    )
+    assert module.issue(args, {}) == 0
+    produced = next(output_dir.iterdir())
+    payload = json.loads(produced.read_bytes())
+    receipt = CONV.parse_disposition_receipt(payload)
+    primary = CONV.CanonicalPrimary(
+        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
+        head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
+    )
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary,
+        audit_digest=CONV.canonical_audit_digest(audit),
+    )
+    assert status.reason == "active_false_positive"
+    assert (receipt.approver, receipt.approver_id, receipt.approved_at) == (
+        "octocat", 7, "2026-08-30T12:00:00Z",
+    )
+
+
+@pytest.mark.parametrize(
+    "override,needle",
+    [
+        ({"--approver": "   "}, "approver must be non-empty"),
+        ({"--approver-id": "0"}, "approver_id must be a positive integer"),
+        ({"--approved-at": "2026-08-30"}, "time-of-day"),
+    ],
+)
+def test_disposition_producer_rejects_malformed_auth_fields(tmp_path, override, needle):
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
+        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
+        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
+        "tier": SCOPE.tier,
+        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+    }
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit, sort_keys=True))
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue",
+        "--output-dir", str(tmp_path), "--audit-path", str(audit_path),
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--finding-id", "p1", "--reason", "reason",
+        "--approver", "octocat", "--approver-id", "1",
+        "--approved-at", "2026-08-30T12:00:00Z",
+        "--scope-json", json.dumps(SCOPE.as_dict()),
+    ]
+    flag, value = next(iter(override.items()))
+    argv[argv.index(flag) + 1] = value
+    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert failed.returncode == 1
+    assert needle in failed.stderr
 
 
 def _failing_runtime_audit(*, duration_ms, run_attempt, findings=None):

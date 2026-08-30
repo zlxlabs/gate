@@ -20,3 +20,10 @@
 - 本段结论：`required_disposition_lines` 现产出 `finding <id> (false-positive, approved by <approver>) resolved by receipt <name>: <reason>`；reason 折叠空白并截到 500 字。Step Summary / `::notice::` / `render_summary`（PR 评论同源）都读 `outcome.resolved_findings`，该列表只由这一函数填充。
 - 关键决策与已否决方案：envelope 的 `resolved_findings` 仍保持 `{finding_id, receipt}` 机器结构，留给 G3 ledger 投影，不把 G4 字符串塞进 envelope（与设计「三处发布面」字面冲突，写报告）。显示上限 500 取自仓内既有人类可读截断量级（`MAX_HISTORY_WARNING_CHARS`），receipt 存储的 reason 本身不截。
 - 下一步唯一动作：补 producer→parse 跨边界样例，收紧生产端字段集断言，跑全量测试。
+
+## 2026-08-30 里程碑 ④ 跨边界样例与收口
+
+- 当前阶段：implementing / milestone ④ producer contract + 全量验证
+- 本段结论：`issue()` 与 `main` 写出的 payload 直接喂 `parse_disposition_receipt` 后可消费；生产端对空白 approver / 非正 id / 裸日期 fail-loud。全量 pytest 与 `check_pinned_uses.py` 收口。
+- 关键决策与已否决方案：无。
+- 下一步唯一动作：主脑走本地 review 循环；合并须用 merge commit（执行器不推不合并）。
