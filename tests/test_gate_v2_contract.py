@@ -169,15 +169,35 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert 'gh run download "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
     issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
     assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
+    assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.triggering_actor }}"
+    assert issue["env"]["DISPOSITION_APPROVER_ID"] == "${{ github.actor_id }}"
+    assert "--approver \"$DISPOSITION_APPROVER\"" in issue["run"]
+    assert "--approver-id \"$DISPOSITION_APPROVER_ID\"" in issue["run"]
+    assert "--approved-at \"$approved_at\"" in issue["run"]
+    assert "inputs.approver" not in text
+    assert "${{ github.triggering_actor }}" in text
+    assert "${{ github.actor_id }}" in text
 
 
 def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
     text = DISPOSITION_WORKFLOW.read_text()
     producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()
-    assert "gate-disposition-receipt-v1-" in producer
+    consumer = (REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "convergence.py").read_text()
+    assert "disposition_receipt_artifact_name" in producer
+    assert "DISPOSITION_APPROVER" in producer
     assert "steps.disposition.outputs.artifact_name" in text
     assert "CURRENT_AUDIT_DIGEST" in text
-    assert 'digest_prefix = fields["audit_digest"][:12]' in producer
+    assert "receipt.audit_digest[:12]" in consumer
+
+
+def test_required_disposition_lines_is_the_only_g4_line_builder():
+    hits = []
+    for path in (REPO_ROOT / ".github").rglob("*"):
+        if not path.is_file() or path.suffix not in {".py", ".yml"}:
+            continue
+        if "resolved by receipt" in path.read_text(encoding="utf-8"):
+            hits.append(str(path.relative_to(REPO_ROOT)))
+    assert hits == [".github/actions/gate-aggregator/convergence.py"]
 
 
 def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(tmp_path):

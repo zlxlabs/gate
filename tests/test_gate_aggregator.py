@@ -2078,7 +2078,7 @@ def _scope_for(audit):
 
 def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", **changes):
     fields = dict(
-        schema_version=1,
+        schema_version=CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION,
         disposition="false-positive",
         repository_id=str(IDENTITY.repository_id),
         pr_number=IDENTITY.pr,
@@ -2087,9 +2087,23 @@ def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", *
         audit_digest=audit_digest,
         finding_id=finding_id,
         reason="locked upstream behavior",
+        approver="octocat",
+        approver_id=1,
+        approved_at="2026-08-30T12:00:00Z",
     )
     fields.update(changes)
     return CONV.DispositionReceipt(**fields)
+
+
+def _resolved_line(receipt):
+    return CONV.required_disposition_lines(
+        CONV.DispositionConsumption(
+            remaining_p1_ids=(),
+            consumed_receipts=(receipt,),
+            rejected_receipts=(),
+            fail_closed=False,
+        )
+    )[0]
 
 
 def _evaluate_failing_primary(audit, *, audit_digest=_DIGEST_A, waiver_receipts=()):
@@ -2117,7 +2131,7 @@ def test_valid_disposition_receipt_resolves_p1_and_turns_required_gate_pass(seve
     scope = _scope_for(audit)
     receipt = _false_positive_receipt(scope)
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    resolved = f"finding p1 resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+    resolved = _resolved_line(receipt)
     assert outcome.gate_result == "pass"
     assert outcome.ok is True
     assert outcome.classification == "code_pass"
@@ -2130,6 +2144,19 @@ def test_valid_disposition_receipt_resolves_p1_and_turns_required_gate_pass(seve
     assert resolved in summary
     assert "**Result: pass**" in summary
     assert "blocking findings were resolved by disposition receipts" in summary
+    terminal = AGG.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=IDENTITY, quality_result="success",
+        primary_result="failure", review_expected=True, is_draft=False, runner="self",
+        outcome=outcome,
+    )
+    panel_row = AGG._terminal_row(
+        terminal, repository="zlxlabs/gate",
+        repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
+    )
+    panel = AGG.render_status_panel([panel_row])
+    pr_panel_has_required_line = resolved in panel
+    assert pr_panel_has_required_line is True
+    assert "Resolved:" in panel
 
 
 def test_digest_mismatch_keeps_finding_active_and_gate_fail():
@@ -2170,7 +2197,7 @@ def test_duplicate_disposition_receipt_is_idempotent_pass():
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt, receipt))
     assert outcome.gate_result == "pass"
     assert outcome.resolved_findings == [
-        f"finding p1 resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+        _resolved_line(receipt)
     ]
 
 
@@ -2201,7 +2228,7 @@ def test_partial_disposition_leaves_remaining_finding_blocking():
     assert outcome.gate_result == "fail"
     assert outcome.reason_code == "primary_findings"
     assert outcome.resolved_findings == [
-        f"finding drop resolved by receipt {CONV.disposition_receipt_artifact_name(receipt)}"
+        _resolved_line(receipt)
     ]
 
 
@@ -2214,7 +2241,7 @@ def test_main_fail_primary_plus_matching_receipt_marks_resolved(monkeypatch, tmp
     digest = hashlib.sha256(raw).hexdigest()
     scope = _scope_for(audit)
     receipt = _false_positive_receipt(scope, audit_digest=digest)
-    payload = {**receipt.as_dict(), "kind": "gate-disposition-receipt-v1"}
+    payload = {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
     artifact_name = CONV.disposition_receipt_artifact_name(receipt)
     zip_bytes = _zip_receipt_bytes(payload)
 
@@ -2239,7 +2266,7 @@ def test_main_fail_primary_plus_matching_receipt_marks_resolved(monkeypatch, tmp
         _cli_args(audit_dir, summary_path, primary_result="failure")
     )
     text = summary_path.read_text()
-    resolved = f"finding p1 resolved by receipt {artifact_name}"
+    resolved = _resolved_line(receipt)
     assert rc == 0
     assert "**Result: pass**" in text
     assert "Resolved:" in text
@@ -2255,10 +2282,10 @@ def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
     other = _false_positive_receipt(scope, pr_number=99)
     payloads = {
         "https://api.github.com/artifacts/mine/zip": _zip_receipt_bytes(
-            {**mine.as_dict(), "kind": "gate-disposition-receipt-v1"}
+            {**mine.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
         ),
         "https://api.github.com/artifacts/other/zip": _zip_receipt_bytes(
-            {**other.as_dict(), "kind": "gate-disposition-receipt-v1"}
+            {**other.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
         ),
     }
 
@@ -2276,7 +2303,7 @@ def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
                     "archive_download_url": "https://api.github.com/artifacts/other/zip",
                 },
                 {
-                    "name": "gate-disposition-receipt-v1-expired",
+                    "name": "gate-disposition-receipt-v2-expired",
                     "expired": True,
                     "archive_download_url": "https://api.github.com/artifacts/expired/zip",
                 },

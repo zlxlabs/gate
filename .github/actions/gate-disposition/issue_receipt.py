@@ -16,11 +16,11 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
 P1_SEVERITIES = frozenset({"major", "blocker"})
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -37,6 +37,7 @@ def _load_convergence():
 
 
 _CONVERGENCE = _load_convergence()
+SCHEMA_VERSION = _CONVERGENCE.DISPOSITION_RECEIPT_SCHEMA_VERSION
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -97,6 +98,18 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
+def _approved_at(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("approved_at is required")
+    if "T" not in value:
+        raise ValueError("approved_at must include a time-of-day component")
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("approved_at must be an ISO-8601 timestamp") from exc
+    return value
+
+
 def _audit_findings(audit: Any) -> list[dict[str, Any]]:
     if not isinstance(audit, dict) or not isinstance(audit.get("result"), dict):
         raise ValueError("canonical audit result is missing")
@@ -133,8 +146,15 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
     head_sha = str(_required(args, envelope, "head_sha", "DISPOSITION_HEAD_SHA"))
     finding_id = str(_required(args, envelope, "finding_id", "DISPOSITION_FINDING_ID"))
     reason = str(_required(args, envelope, "reason", "DISPOSITION_REASON"))
+    approver = str(_required(args, envelope, "approver", "DISPOSITION_APPROVER"))
+    approver_id = _positive_int(
+        _required(args, envelope, "approver_id", "DISPOSITION_APPROVER_ID"), "approver_id",
+    )
+    approved_at = _approved_at(_required(args, envelope, "approved_at", "DISPOSITION_APPROVED_AT"))
     if not reason.strip():
         raise ValueError("reason must be non-empty")
+    if not approver.strip():
+        raise ValueError("approver must be non-empty")
     if not head_sha:
         raise ValueError("head_sha must be non-empty")
     scope = _read_scope(
@@ -156,16 +176,40 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         "audit_digest": audit_digest,
         "finding_id": finding_id,
         "reason": reason,
+        "approver": approver,
+        "approver_id": approver_id,
+        "approved_at": approved_at,
     }
     return fields
+
+
+_AUTH_FIELDS = frozenset({"approver", "approver_id", "approved_at"})
+
+
+def _payload_without_auth(raw: bytes) -> bytes:
+    obj = json.loads(raw.decode("utf-8"))
+    if not isinstance(obj, dict):
+        raise ValueError("immutable receipt payload must be an object")
+    return _canonical_json({key: value for key, value in obj.items() if key not in _AUTH_FIELDS})
 
 
 def _write_immutable(path: Path, payload: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        if path.read_bytes() != payload:
-            raise ValueError(f"immutable artifact conflict: {path.name}")
-        return False
+        existing = path.read_bytes()
+        if existing == payload:
+            return False
+        try:
+            same_body = _payload_without_auth(existing) == _payload_without_auth(payload)
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            same_body = False
+        if same_body:
+            print(
+                "immutable receipt exists with the same non-auth payload; keeping the original",
+                file=sys.stderr,
+            )
+            return False
+        raise ValueError(f"immutable artifact conflict: {path.name}")
     with path.open("xb") as output:
         output.write(payload)
     return True
@@ -175,12 +219,14 @@ def issue(args: argparse.Namespace, envelope: dict[str, Any]) -> int:
     fields = _receipt_fields(args, envelope)
     payload = {
         **fields,
-        "kind": "gate-disposition-receipt-v1",
+        "kind": _CONVERGENCE.DISPOSITION_RECEIPT_KIND,
     }
-    epoch = _safe_component(fields["epoch"], "epoch")
-    digest_prefix = fields["audit_digest"][:12]
-    finding = _safe_component(fields["finding_id"], "finding_id")
-    name = f"gate-disposition-receipt-v1-{epoch}-{digest_prefix}-{finding}"
+    receipt = _CONVERGENCE.DispositionReceipt(
+        **{key: fields[key] for key in _CONVERGENCE.DispositionReceipt.__dataclass_fields__}
+    )
+    _safe_component(fields["epoch"], "epoch")
+    _safe_component(fields["finding_id"], "finding_id")
+    name = _CONVERGENCE.disposition_receipt_artifact_name(receipt)
     output = Path(_required(args, envelope, "output_dir", "DISPOSITION_OUTPUT_DIR")) / name
     changed = _write_immutable(output, _canonical_json(payload))
     print(json.dumps({"artifact": name, "path": str(output), "written": changed}, sort_keys=True))
@@ -196,6 +242,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_argument("--audit-path")
     for name in (
         "repository-id", "pr-number", "head-sha", "finding-id", "scope-json",
+        "approver", "approver-id", "approved-at",
     ):
         sub.add_argument(f"--{name}", dest=name.replace("-", "_"))
     return parser

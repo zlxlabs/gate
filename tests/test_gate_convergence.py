@@ -140,7 +140,7 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
     primary = primary or _primary(scope, run_id=7, run_attempt=2, p1_ids=("p1",))
     audit_digest = audit_digest or "a" * 64
     receipt = CONV.DispositionReceipt(
-        schema_version=1,
+        schema_version=CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION,
         disposition="false-positive",
         repository_id=str(scope.repository_id),
         pr_number=scope.pr_number,
@@ -149,6 +149,9 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
         audit_digest=audit_digest,
         finding_id=primary.p1_ids[0],
         reason="locked upstream behavior",
+        approver="octocat",
+        approver_id=1,
+        approved_at="2026-08-30T12:00:00Z",
     )
     return replace(receipt, **changes)
 
@@ -198,6 +201,141 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
     assert CONV.validate_disposition_receipt(
         replace(receipt, finding_id="other"), scope=SCOPE, primary=primary, audit_digest="a" * 64,
     ).reason == "finding_not_current_p1"
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"approver": ""}, "malformed_receipt"),
+        ({"approver": "   "}, "malformed_receipt"),
+        ({"approver_id": 0}, "malformed_receipt"),
+        ({"approver_id": -3}, "malformed_receipt"),
+        ({"approver_id": True}, "malformed_receipt"),
+        ({"approver_id": "1"}, "malformed_receipt"),
+        ({"approver_id": 1.0}, "malformed_receipt"),
+        ({"approved_at": ""}, "malformed_receipt"),
+        ({"approved_at": "2026-08-30"}, "malformed_receipt"),
+        ({"approved_at": "2026-08-30Tnot-a-time"}, "malformed_receipt"),
+        ({"approver": 12}, "malformed_receipt"),
+        ({"schema_version": 1}, "schema_version_mismatch"),
+    ],
+    ids=[
+        "approver-empty",
+        "approver-whitespace",
+        "approver-id-zero",
+        "approver-id-negative",
+        "approver-id-bool",
+        "approver-id-digit-string",
+        "approver-id-float",
+        "approved-at-empty",
+        "approved-at-bare-date",
+        "approved-at-invalid-time",
+        "approver-non-string",
+        "schema-version-v1",
+    ],
+)
+def test_disposition_v2_auth_fields_fail_closed(changes, reason):
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary, **changes)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert status.reason == reason
+    assert status.consumable is False
+    consumed = CONV.consume_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert consumed.fail_closed is True
+    assert consumed.consumed_receipts == ()
+    assert consumed.rejected_receipts == ((receipt, reason),)
+
+
+def test_parse_v1_payload_without_auth_fields_is_schema_version_mismatch():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    payload = {
+        "schema_version": 1,
+        "disposition": receipt.disposition,
+        "repository_id": receipt.repository_id,
+        "pr_number": receipt.pr_number,
+        "epoch": receipt.epoch,
+        "head_sha": receipt.head_sha,
+        "audit_digest": receipt.audit_digest,
+        "finding_id": receipt.finding_id,
+        "reason": receipt.reason,
+        "kind": "gate-disposition-receipt-v1",
+    }
+    with pytest.raises(CONV.ReceiptValidationError, match="unexpected disposition receipt kind"):
+        CONV.parse_disposition_receipt(payload)
+    parsed = CONV.parse_disposition_receipt({**payload, "kind": CONV.DISPOSITION_RECEIPT_KIND})
+    status = CONV.validate_disposition_receipt(
+        parsed, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert status.reason == "schema_version_mismatch"
+    assert status.consumable is False
+
+
+def test_parse_v2_missing_or_empty_auth_fields_are_malformed():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    base = {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
+    missing_approver = dict(base)
+    del missing_approver["approver"]
+    parsed = CONV.parse_disposition_receipt(missing_approver)
+    assert parsed.approver == ""
+    assert CONV.validate_disposition_receipt(
+        parsed, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    empty_id = dict(base, approver_id=0)
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(empty_id),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    bare = dict(base, approved_at="2026-08-30")
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(bare),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    missing_id = dict(base)
+    del missing_id["approver_id"]
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(missing_id),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    missing_at = dict(base)
+    del missing_at["approved_at"]
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(missing_at),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    invalid_time = dict(base, approved_at="2026-08-30Tnot-a-time")
+    assert CONV.validate_disposition_receipt(
+        CONV.parse_disposition_receipt(invalid_time),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+    non_string = dict(base, approver=12)
+    parsed_non_string = CONV.parse_disposition_receipt(non_string)
+    assert parsed_non_string.approver == 12
+    assert CONV.validate_disposition_receipt(
+        parsed_non_string, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+
+
+def test_required_disposition_lines_include_approver_and_truncated_reason():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    reason = "locked\n  upstream\tbehavior " + ("x" * 600)
+    receipt = _disposition(primary=primary, reason=reason)
+    consumed = CONV.consume_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert consumed.consumed_receipts == (receipt,)
+    name = CONV.disposition_receipt_artifact_name(receipt)
+    expected_reason = " ".join(reason.split())[:CONV.DISPOSITION_REASON_DISPLAY_MAX]
+    assert CONV.required_disposition_lines(consumed) == (
+        f"finding p1 (false-positive, approved by octocat) resolved by receipt {name}: {expected_reason}",
+    )
+    assert "\n" not in CONV.required_disposition_lines(consumed)[0]
+    assert len(expected_reason) == CONV.DISPOSITION_REASON_DISPLAY_MAX
 
 
 def _runtime_audit(*, verdict="fail", findings=None, **noise):
