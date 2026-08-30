@@ -25,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
 DISPOSITION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2-disposition.yml"
 CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-v2.yml"
+DISPOSITION_CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-disposition.yml"
+DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
@@ -96,6 +98,12 @@ def _disposition_scope_python() -> str:
     start = run.index("<<'PY'\n") + len("<<'PY'\n")
     end = run.index("\nPY\n", start)
     return run[start:end]
+
+
+def _load_disposition_caller():
+    raw = yaml.safe_load(DISPOSITION_CALLER_TEMPLATE.read_text())
+    trigger = raw.get("on", raw.get(True))
+    return raw, trigger
 
 
 def _fromjson_label_sets(runs_on: str) -> list[set[str]]:
@@ -1274,3 +1282,35 @@ def test_diff_coverage_advisory_never_gates_quality_job():
     )
     assert advisory["continue-on-error"] is True
     assert "exit 1" not in advisory.get("run", "")
+
+
+def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
+    raw, trigger = _load_disposition_caller()
+    assert raw["name"] == "gate-disposition"
+    assert set(trigger["workflow_dispatch"]["inputs"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
+    }
+    assert "workflow_call" not in trigger
+    assert raw["permissions"] == {"actions": "read", "contents": "read"}
+    assert raw["concurrency"] == {
+        "group": "gate-disposition-${{ github.repository_id }}-${{ inputs.pr_number }}",
+        "cancel-in-progress": False,
+    }
+    assert set(raw["jobs"]) == {"disposition"}
+    job = raw["jobs"]["disposition"]
+    uses = job["uses"]
+    assert uses == (
+        "zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@" + DISPOSITION_CALLER_PIN
+    )
+    pin = uses.rsplit("@", 1)[1]
+    assert job["with"]["gate_ref"] == pin
+    for key in ("pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason"):
+        assert job["with"][key] == "${{ inputs." + key + " }}"
+    assert set(job["with"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+    }
+    text = DISPOSITION_CALLER_TEMPLATE.read_text()
+    assert "pull-requests: write" not in text
+    assert "actions: write" not in text
+    assert "secrets:" not in text
+    assert "environment:" not in text

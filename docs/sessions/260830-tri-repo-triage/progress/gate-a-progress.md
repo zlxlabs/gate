@@ -20,3 +20,10 @@
 - 本段结论：`on` 同时含 `workflow_dispatch` 与 `workflow_call`，两边 inputs 集合同为五业务字段 + 必填 `gate_ref`。checkout 改为 `repository: zlxlabs/gate` + `ref: ${{ inputs.gate_ref }}`，dispatch 路径也显式传 pin，不再靠「跑在自己仓」的巧合。
 - 关键决策与已否决方案：两条 trigger 的 inputs 各写一遍（不用 YAML anchor，避免 `on`/`True` 解析歧义）。`actions: write` 本段不收窄，核对结果放末段报告。
 - 下一步唯一动作：新增 `templates/caller-gate-disposition.yml` 并补 caller 契约测试。
+
+## 2026-08-30 里程碑 ④ caller 模板
+
+- 当前阶段：implementing / milestone ④ caller 模板
+- 本段结论：新增 `templates/caller-gate-disposition.yml`：`workflow_dispatch` 收五个业务输入，`uses` 与 `gate_ref` 同为 `__PINNED_GATE_SHA__` 占位（onboarding 换成同一 40-hex），permissions 仅 `actions: read` + `contents: read`，concurrency 组名沿用 `gate-disposition-<repository_id>-<pr_number>`。
+- 关键决策与已否决方案：`gate_ref` 不做成 dispatch 输入（避免与 uses pin 手填不一致）；占位符形态与 `caller-gate-v2.yml` 相同。caller 不声明 `environment`（保护留在被调 workflow 的 `jobs.control`）。
+- 下一步唯一动作：红验两处 #88 测试锁，再跑全量 pytest 与 `check_pinned_uses.py`。
