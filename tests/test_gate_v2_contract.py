@@ -237,7 +237,7 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
     }
-    assert checkout["with"]["sparse-checkout-cone-mode"] is False
+    assert checkout["with"].get("sparse-checkout-cone-mode") is False
 
 
 def test_disposition_checkout_pins_zlxlabs_gate_at_gate_ref():

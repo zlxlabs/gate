@@ -27,3 +27,10 @@
 - 本段结论：新增 `templates/caller-gate-disposition.yml`：`workflow_dispatch` 收五个业务输入，`uses` 与 `gate_ref` 同为 `__PINNED_GATE_SHA__` 占位（onboarding 换成同一 40-hex），permissions 仅 `actions: read` + `contents: read`，concurrency 组名沿用 `gate-disposition-<repository_id>-<pr_number>`。
 - 关键决策与已否决方案：`gate_ref` 不做成 dispatch 输入（避免与 uses pin 手填不一致）；占位符形态与 `caller-gate-v2.yml` 相同。caller 不声明 `environment`（保护留在被调 workflow 的 `jobs.control`）。
 - 下一步唯一动作：红验两处 #88 测试锁，再跑全量 pytest 与 `check_pinned_uses.py`。
+
+## 2026-08-30 红验判据收口
+
+- 当前阶段：implementing / 红验判据
+- 本段结论：cone-mode 断言改为 `.get(...) is False`。缺键时原先是 KeyError（pytest ERROR 形态），现在是 AssertionError（None is False），满足红验「断言失败」要求。
+- 关键决策与已否决方案：不把缺键写成 `assert "sparse-checkout-cone-mode" in checkout["with"]` 再另断言取值——一条 `is False` 同时锁「键存在且为 false」。
+- 下一步唯一动作：去掉 cone-mode 行红验（断言失败）后还原，再跑全量测试。
