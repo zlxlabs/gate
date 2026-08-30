@@ -1187,46 +1187,30 @@ def test_missing_consumption_block_is_fail_loud_not_empty_default():
         )
 
 
-def _mutate_resolved_not_array(block):
-    block["resolved"] = {"not": "array"}
-
-
-def _mutate_item_missing_receipt(block):
-    del block["resolved"][0]["receipt"]
-
-
-def _mutate_approver_id_not_positive(block):
-    block["resolved"][0]["approver_id"] = 0
-
-
-def _mutate_consumed_count_mismatch(block):
-    block["consumed_count"] = 0
-
-
-def _mutate_rejected_reasons_total_mismatch(block):
-    block["rejected_count"] = 3
-
-
-def _mutate_fail_closed_not_bool(block):
-    block["fail_closed"] = "false"
-
-
-@pytest.mark.parametrize(
-    "mutator, match",
-    [
-        (_mutate_resolved_not_array, "resolved must be an array"),
-        (_mutate_item_missing_receipt, "missing receipt"),
-        (_mutate_approver_id_not_positive, "approver_id must be a positive integer"),
-        (_mutate_consumed_count_mismatch, "consumed_count does not match resolved"),
-        (_mutate_rejected_reasons_total_mismatch, "rejected_count does not match rejected_reasons"),
-        (_mutate_fail_closed_not_bool, "fail_closed must be a boolean"),
-    ],
-)
-def test_validator_rejects_malformed_consumption_shapes(mutator, match):
+@pytest.mark.parametrize("kind, match", [
+    ("resolved_not_array", "resolved must be an array"),
+    ("missing_receipt", "missing receipt"),
+    ("approver_id", "approver_id must be a positive integer"),
+    ("consumed_count", "consumed_count does not match resolved"),
+    ("rejected_count", "rejected_count does not match rejected_reasons"),
+    ("fail_closed", "fail_closed must be a boolean"),
+])
+def test_validator_rejects_malformed_consumption_shapes(kind, match):
     module = _module()
     *_rest, terminal = _producer_terminal(receipts=[{}])
     block = json.loads(json.dumps(terminal["disposition_receipt_consumption"]))
-    mutator(block)
+    if kind == "resolved_not_array":
+        block["resolved"] = {}
+    elif kind == "missing_receipt":
+        del block["resolved"][0]["receipt"]
+    elif kind == "approver_id":
+        block["resolved"][0]["approver_id"] = 0
+    elif kind == "consumed_count":
+        block["consumed_count"] = 0
+    elif kind == "rejected_count":
+        block["rejected_count"] = 3
+    else:
+        block["fail_closed"] = "false"
     with pytest.raises(ValueError, match=match):
         module.validate_disposition_receipt_consumption(block)
 

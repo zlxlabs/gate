@@ -34,3 +34,10 @@
 - 本段结论：红验把 producer 块字段 `resolved` 改成 `resolved_items` 后，producer 字典断言以 AssertionError 转红，consumer 契约以 `ValueError: disposition_receipt_consumption is missing resolved` 转红（未投影成无消费）。已只还原该行。全量 pytest 701 passed 退出码 0，`check_pinned_uses.py` 退出码 0。
 - 关键决策与已否决方案：无新增。
 - 下一步唯一动作：主脑本地 review；合并须用 merge commit（执行器不推不合并）。
+
+## 2026-08-31 r1 修复（P1-1 / P1-2 / P2-1）
+
+- 当前阶段：done / r1 repair
+- 本段结论：P1-1 选 Option A——ledger terminal resolver 只认当前 attempt，旧 artifact 残存且当前缺失时直接报 `No matching required gate terminal artifact found`，不再先选旧再 identity mismatch。P1-2 把 `terminal-path` 改为可选：未提供时条目缺 `disposition_receipt_consumption` 键（与 G3 前逐字一致）；提供时走 G3 投影（含 producer 空块）。P2-1 用真实 producer 块 mutate 锁 validator 六类负例。
+- 关键决策与已否决方案：禁止继续 `<= current` 却丢掉 `terminal_source_attempt`。这是输入可选性（legacy `gate.yml` 是真实第二消费者），不是损坏路径 fallback。旧 terminal 缺消费块在路径已提供时仍 fail-loud。
+- 下一步唯一动作：主脑本地 review；执行器不推不合并。
