@@ -2078,7 +2078,7 @@ def _scope_for(audit):
 
 def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", **changes):
     fields = dict(
-        schema_version=1,
+        schema_version=CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION,
         disposition="false-positive",
         repository_id=str(IDENTITY.repository_id),
         pr_number=IDENTITY.pr,
@@ -2087,6 +2087,9 @@ def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", *
         audit_digest=audit_digest,
         finding_id=finding_id,
         reason="locked upstream behavior",
+        approver="octocat",
+        approver_id=1,
+        approved_at="2026-08-30T12:00:00Z",
     )
     fields.update(changes)
     return CONV.DispositionReceipt(**fields)
@@ -2214,7 +2217,7 @@ def test_main_fail_primary_plus_matching_receipt_marks_resolved(monkeypatch, tmp
     digest = hashlib.sha256(raw).hexdigest()
     scope = _scope_for(audit)
     receipt = _false_positive_receipt(scope, audit_digest=digest)
-    payload = {**receipt.as_dict(), "kind": "gate-disposition-receipt-v1"}
+    payload = {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
     artifact_name = CONV.disposition_receipt_artifact_name(receipt)
     zip_bytes = _zip_receipt_bytes(payload)
 
@@ -2255,10 +2258,10 @@ def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
     other = _false_positive_receipt(scope, pr_number=99)
     payloads = {
         "https://api.github.com/artifacts/mine/zip": _zip_receipt_bytes(
-            {**mine.as_dict(), "kind": "gate-disposition-receipt-v1"}
+            {**mine.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
         ),
         "https://api.github.com/artifacts/other/zip": _zip_receipt_bytes(
-            {**other.as_dict(), "kind": "gate-disposition-receipt-v1"}
+            {**other.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
         ),
     }
 
@@ -2276,7 +2279,7 @@ def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
                     "archive_download_url": "https://api.github.com/artifacts/other/zip",
                 },
                 {
-                    "name": "gate-disposition-receipt-v1-expired",
+                    "name": "gate-disposition-receipt-v2-expired",
                     "expired": True,
                     "archive_download_url": "https://api.github.com/artifacts/expired/zip",
                 },

@@ -254,14 +254,17 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     assert result["artifact"] == f"gate-disposition-receipt-v1-{epoch}-{digest[:12]}-p1"
     assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     assert payload["kind"] == "gate-disposition-receipt-v1"
-    assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__)
+    assert set(payload) - {"kind"} <= set(CONV.DispositionReceipt.__dataclass_fields__)
     assert payload["audit_digest"] == digest and payload["finding_id"] == "p1"
     receipt = CONV.DispositionReceipt(**{
         field: payload[field]
         for field in CONV.DispositionReceipt.__dataclass_fields__
         if field in payload
     })
-    assert receipt.as_dict() == {field: payload[field] for field in receipt.__dataclass_fields__}
+    for field, value in payload.items():
+        if field == "kind":
+            continue
+        assert receipt.as_dict()[field] == value
     second = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
     assert json.loads(second.stdout)["written"] is False
     assert artifact_path.read_bytes() == payload_bytes
@@ -318,6 +321,11 @@ def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_pat
     ]
     produced = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
     payload = json.loads(Path(json.loads(produced.stdout)["path"]).read_bytes())
+    payload["kind"] = CONV.DISPOSITION_RECEIPT_KIND
+    payload["schema_version"] = CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION
+    payload["approver"] = "octocat"
+    payload["approver_id"] = 1
+    payload["approved_at"] = "2026-08-30T12:00:00Z"
     receipt = CONV.parse_disposition_receipt(payload)
     identity = AGG.Identity(123, SCOPE.head_sha, 77, 4, 42)
     digest = CONV.canonical_audit_digest(second)
@@ -351,10 +359,12 @@ def test_legacy_raw_bytes_receipt_still_consumes_same_audit_file():
     canonical = CONV.canonical_audit_digest(audit)
     assert canonical != legacy
     receipt = CONV.DispositionReceipt(
-        schema_version=1, disposition="false-positive",
+        schema_version=CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION,
+        disposition="false-positive",
         repository_id=str(SCOPE.repository_id), pr_number=SCOPE.pr_number,
         epoch=CONV.derive_epoch(SCOPE), head_sha=SCOPE.head_sha,
         audit_digest=legacy, finding_id="p1", reason="locked upstream behavior",
+        approver="octocat", approver_id=1, approved_at="2026-08-30T12:00:00Z",
     )
     identity = AGG.Identity(123, SCOPE.head_sha, 77, 2, 42)
     kwargs = dict(

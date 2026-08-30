@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Sequence
 
 
@@ -26,7 +27,8 @@ TERMINAL_DECISIONS = frozenset(
 )
 RECEIPT_KIND = "canonical_primary"
 DISPOSITION_KINDS = frozenset({"false-positive"})
-DISPOSITION_RECEIPT_SCHEMA_VERSION = 1
+DISPOSITION_RECEIPT_SCHEMA_VERSION = 2
+DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}"
 
 # This is intentionally local to the public gate repository.  The private
 # policy source is represented only by Scope.policy_version/policy_digest in
@@ -163,6 +165,9 @@ class DispositionReceipt:
     audit_digest: str = ""
     finding_id: str = ""
     reason: str = ""
+    approver: str = ""
+    approver_id: int = 0
+    approved_at: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +180,9 @@ class DispositionReceipt:
             "audit_digest": self.audit_digest,
             "finding_id": self.finding_id,
             "reason": self.reason,
+            "approver": self.approver,
+            "approver_id": self.approver_id,
+            "approved_at": self.approved_at,
         }
 
 
@@ -480,6 +488,9 @@ def _legacy_disposition_stub(receipt: DispositionReceipt) -> bool:
         and receipt.audit_digest == ""
         and receipt.finding_id == ""
         and receipt.reason == ""
+        and receipt.approver == ""
+        and receipt.approver_id == 0
+        and receipt.approved_at == ""
     )
 
 
@@ -513,6 +524,12 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="unknown_disposition")
     required_text = ("repository_id", "epoch", "head_sha", "audit_digest", "finding_id", "reason")
     if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+    if not isinstance(receipt.approver, str) or not receipt.approver.strip():
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+    if type(receipt.approver_id) is not int or receipt.approver_id <= 0:
+        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+    if not _approved_at_has_time(receipt.approved_at):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
     if type(receipt.pr_number) is not int or receipt.pr_number <= 0:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_pr_number")
@@ -634,7 +651,10 @@ def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
     """Reconstruct the producer artifact name bound to one receipt payload."""
 
     digest_prefix = receipt.audit_digest[:12]
-    return f"gate-disposition-receipt-v1-{receipt.epoch}-{digest_prefix}-{receipt.finding_id}"
+    return (
+        f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}-"
+        f"{receipt.epoch}-{digest_prefix}-{receipt.finding_id}"
+    )
 
 
 def required_disposition_lines(consumption: DispositionConsumption) -> tuple[str, ...]:
@@ -652,7 +672,7 @@ def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
     if not isinstance(payload, dict):
         raise ReceiptValidationError("disposition receipt payload must be an object")
     kind = payload.get("kind")
-    if kind is not None and kind != "gate-disposition-receipt-v1":
+    if kind is not None and kind != DISPOSITION_RECEIPT_KIND:
         raise ReceiptValidationError("unexpected disposition receipt kind")
     try:
         return DispositionReceipt(
@@ -665,6 +685,9 @@ def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
             audit_digest=str(payload["audit_digest"]),
             finding_id=str(payload["finding_id"]),
             reason=str(payload["reason"]),
+            approver=payload["approver"] if "approver" in payload else "",
+            approver_id=payload["approver_id"] if "approver_id" in payload else 0,
+            approved_at=payload["approved_at"] if "approved_at" in payload else "",
         )
     except (KeyError, TypeError) as exc:
         raise ReceiptValidationError("malformed disposition receipt") from exc
@@ -676,6 +699,20 @@ def _strict_int(value: Any) -> bool:
 
 def _nonempty_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _approved_at_has_time(value: Any) -> bool:
+    """ISO-8601 approval instant; a bare date is not a timestamp (hub waiver rule)."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    if "T" not in value:
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
 
 
 def _scope_errors(scope: Scope) -> list[str]:
