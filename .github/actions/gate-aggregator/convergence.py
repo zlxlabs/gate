@@ -661,21 +661,16 @@ def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
 def required_disposition_lines(consumption: DispositionConsumption) -> tuple[str, ...]:
     """Human-visible required-gate lines for consumed false-positive receipts."""
 
-    return tuple(
-        (
+    lines: list[str] = []
+    for receipt in consumption.consumed_receipts:
+        collapsed = " ".join(receipt.reason.split())
+        if len(collapsed) > DISPOSITION_REASON_DISPLAY_MAX:
+            collapsed = collapsed[:DISPOSITION_REASON_DISPLAY_MAX]
+        lines.append(
             f"finding {receipt.finding_id} ({receipt.disposition}, approved by {receipt.approver}) "
-            f"resolved by receipt {disposition_receipt_artifact_name(receipt)}: "
-            f"{_single_line_reason(receipt.reason)}"
+            f"resolved by receipt {disposition_receipt_artifact_name(receipt)}: {collapsed}"
         )
-        for receipt in consumption.consumed_receipts
-    )
-
-
-def _single_line_reason(reason: str) -> str:
-    collapsed = " ".join(reason.split())
-    if len(collapsed) <= DISPOSITION_REASON_DISPLAY_MAX:
-        return collapsed
-    return collapsed[:DISPOSITION_REASON_DISPLAY_MAX]
+    return tuple(lines)
 
 
 def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
