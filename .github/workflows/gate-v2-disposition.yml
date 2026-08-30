@@ -32,6 +32,7 @@ jobs:
           sparse-checkout: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
+          sparse-checkout-cone-mode: false
           fetch-depth: 1
 
       - name: Resolve current PR head and canonical primary audit

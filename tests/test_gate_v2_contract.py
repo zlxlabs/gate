@@ -208,6 +208,23 @@ def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(t
     assert isinstance(payload["epoch"], str) and len(payload["epoch"]) == 64
 
 
+def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
+    """Lock issue #88: file-path sparse-checkout requires cone-mode off."""
+    raw, _ = _load_disposition_workflow()
+    checkout = next(
+        step
+        for step in raw["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+    sparse = checkout["with"]["sparse-checkout"]
+    listed = {line.strip() for line in sparse.splitlines() if line.strip()}
+    assert listed == {
+        ".github/actions/gate-disposition/issue_receipt.py",
+        ".github/actions/gate-aggregator/convergence.py",
+    }
+    assert checkout["with"]["sparse-checkout-cone-mode"] is False
+
+
 def test_production_v2_official_actions_are_exactly_sha_pinned():
     raw, _ = _load_workflow()
     actual = {}
