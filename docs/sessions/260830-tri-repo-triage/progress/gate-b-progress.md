@@ -27,3 +27,17 @@
 - 本段结论：`issue()` 与 `main` 写出的 payload 直接喂 `parse_disposition_receipt` 后可消费；生产端对空白 approver / 非正 id / 裸日期 fail-loud。全量 pytest 与 `check_pinned_uses.py` 收口。
 - 关键决策与已否决方案：无。
 - 下一步唯一动作：主脑走本地 review 循环；合并须用 merge commit（执行器不推不合并）。
+
+## 2026-08-30 R1 P2 四条收口
+
+- 当前阶段：repairing / R1 P2-1..P2-4
+- 本段结论：状态面板从 terminal 行上的 `resolved_findings`（同源 `required_disposition_lines`）渲染 Resolved 段。同名 receipt 仅授权三字段不同时 `_write_immutable` no-op 保留原件。补缺失 id/时刻、非法 `T` 时间、非字符串 approver 负例。删掉单用 `_single_line_reason`。
+- 关键决策与已否决方案：terminal 只在有 resolved 行时才写该字段，避免改无 receipt 的 golden 字节。幂等比较是去掉三字段后的 canonical JSON，不是忽略任意差异。不把 G4 字符串塞进 convergence envelope 机器结构。
+- 下一步唯一动作：P2-2 红验后跑全量 pytest 与 pin 检查。
+
+## 2026-08-30 R1 P2 验证收口
+
+- 当前阶段：done / R1 P2-1..P2-4
+- 本段结论：全量 pytest 685 passed、`check_pinned_uses.py` 退出码 0。P2-2 红验把 `if same_body:` 改成 `if False and same_body:` 后，`test_disposition_producer_same_params_new_approved_at_is_noop` 以 `AssertionError: assert 1 == 0` 转红，已只还原该行。
+- 关键决策与已否决方案：无新增。幂等只认去掉 `approver`/`approver_id`/`approved_at` 后的 canonical JSON；reason 等其余差异仍 conflict。
+- 下一步唯一动作：主脑本地 review；合并须用 merge commit（执行器不推不合并）。
