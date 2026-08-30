@@ -152,6 +152,8 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           FINDING_ID: ${{ inputs.finding_id }}
           DISPOSITION_REASON: ${{ inputs.reason }}
+          DISPOSITION_APPROVER: ${{ github.triggering_actor }}
+          DISPOSITION_APPROVER_ID: ${{ github.actor_id }}
           OUTPUT_DIR: ${{ runner.temp }}/gate-disposition-artifact
         run: |
           set -euo pipefail
@@ -160,11 +162,17 @@ jobs:
           test -n "$CURRENT_HEAD_SHA"
           test -n "$CURRENT_AUDIT_DIGEST"
           test -n "$CURRENT_EPOCH"
+          test -n "$DISPOSITION_APPROVER"
+          test -n "$DISPOSITION_APPROVER_ID"
+          approved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           output="$(python3 .github/actions/gate-disposition/issue_receipt.py issue \
             --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
             --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
             --head-sha "$CURRENT_HEAD_SHA" --finding-id "$FINDING_ID" \
-            --reason "$DISPOSITION_REASON" --scope-json "$CURRENT_SCOPE_JSON")"
+            --reason "$DISPOSITION_REASON" --scope-json "$CURRENT_SCOPE_JSON" \
+            --approver "$DISPOSITION_APPROVER" \
+            --approver-id "$DISPOSITION_APPROVER_ID" \
+            --approved-at "$approved_at")"
           artifact_name="$(printf '%s' "$output" | jq -r '.artifact')"
           test -n "$artifact_name" && echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 

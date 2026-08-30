@@ -243,6 +243,9 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
         "--finding-id", "p1",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
         "--reason", "locked upstream behavior",
+        "--approver", "octocat",
+        "--approver-id", "1",
+        "--approved-at", "2026-08-30T12:00:00Z",
     ]
     producer_env = {"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-77", "GITHUB_ACTOR": "maintainer"}
     first = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
@@ -251,20 +254,20 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     artifact_path = Path(result["path"])
     payload_bytes = artifact_path.read_bytes()
     payload = json.loads(payload_bytes)
-    assert result["artifact"] == f"gate-disposition-receipt-v1-{epoch}-{digest[:12]}-p1"
+    assert result["artifact"] == f"gate-disposition-receipt-v2-{epoch}-{digest[:12]}-p1"
     assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    assert payload["kind"] == "gate-disposition-receipt-v1"
-    assert set(payload) - {"kind"} <= set(CONV.DispositionReceipt.__dataclass_fields__)
+    assert payload["kind"] == CONV.DISPOSITION_RECEIPT_KIND
+    assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__)
     assert payload["audit_digest"] == digest and payload["finding_id"] == "p1"
+    assert payload["approver"] == "octocat"
+    assert payload["approver_id"] == 1
+    assert payload["approved_at"] == "2026-08-30T12:00:00Z"
     receipt = CONV.DispositionReceipt(**{
         field: payload[field]
         for field in CONV.DispositionReceipt.__dataclass_fields__
         if field in payload
     })
-    for field, value in payload.items():
-        if field == "kind":
-            continue
-        assert receipt.as_dict()[field] == value
+    assert receipt.as_dict() == {field: payload[field] for field in receipt.__dataclass_fields__}
     second = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
     assert json.loads(second.stdout)["written"] is False
     assert artifact_path.read_bytes() == payload_bytes
@@ -280,6 +283,8 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
         sys.executable, str(DISPOSITION_PRODUCER), "issue", "--output-dir", str(tmp_path),
         "--audit-path", str(audit_path), "--repository-id", "123", "--pr-number", "42",
         "--head-sha", SCOPE.head_sha, "--finding-id", "minor", "--reason", "reason",
+        "--approver", "octocat", "--approver-id", "1",
+        "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict()),
     ]
     failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
@@ -317,15 +322,12 @@ def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_pat
         "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
         "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
         "--finding-id", "p1", "--reason", "locked upstream behavior",
+        "--approver", "octocat", "--approver-id", "1",
+        "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
     ]
     produced = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
     payload = json.loads(Path(json.loads(produced.stdout)["path"]).read_bytes())
-    payload["kind"] = CONV.DISPOSITION_RECEIPT_KIND
-    payload["schema_version"] = CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION
-    payload["approver"] = "octocat"
-    payload["approver_id"] = 1
-    payload["approved_at"] = "2026-08-30T12:00:00Z"
     receipt = CONV.parse_disposition_receipt(payload)
     identity = AGG.Identity(123, SCOPE.head_sha, 77, 4, 42)
     digest = CONV.canonical_audit_digest(second)
