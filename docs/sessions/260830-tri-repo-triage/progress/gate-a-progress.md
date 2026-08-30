@@ -55,3 +55,10 @@
 - 本段结论：checkout 前新增独立 step `Require 40-hex gate_ref`，bash 正则 `^[0-9a-f]{40}$` 不匹配则 `::error` 后 `exit 1`。step 读 `inputs.gate_ref`，dispatch 与 workflow_call 同一道闸。不解析 branch/tag、不做 SHA 规范化。
 - 关键决策与已否决方案：拒绝把 `git rev-parse` / API 解析成 SHA 再继续（评审明确禁止 fallback）。正则不含 `A-F`（只收小写）。
 - 下一步唯一动作：红验改坏正则确认 AssertionError 后还原，再跑全量测试与 `check_pinned_uses.py`。
+
+## 2026-08-30 R1 F1 验证收口
+
+- 当前阶段：repairing / R1 F1 验证收口
+- 本段结论：红验把 `{40}` 改成 `{39}` 后 `test_disposition_requires_lowercase_40_hex_gate_ref_before_checkout` 以 AssertionError 转红，已还原。全量 pytest 660 passed 退出码 0；`check_pinned_uses.py` 退出码 0。
+- 关键决策与已否决方案：无。
+- 下一步唯一动作：主脑走本地 review 循环；不推不合并（推送由主脑做）。
