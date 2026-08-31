@@ -109,12 +109,16 @@ def parse_state_entries(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return []
 
 
-def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any]) -> str:
-    relevant = [
+def relevant_pr_entries(entries: list[dict[str, Any]], current: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
         entry for entry in entries
         if entry.get("repository") == current.get("repository")
         and entry.get("pr_number") == current.get("pr_number")
-    ][-20:]
+    ]
+
+
+def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any]) -> str:
+    relevant = relevant_pr_entries(entries, current)[-20:]
     encoded = base64.urlsafe_b64encode(
         json.dumps(relevant, ensure_ascii=False, separators=(",", ":")).encode()
     ).decode()
@@ -749,6 +753,9 @@ def post_state_comment(
         print("::notice::skip stale review ledger state; PR head advanced")
         return
     existing = next((comment for comment in comments if STATE_MARKER in comment.get("body", "")), None)
+    if existing is None and len(relevant_pr_entries(entries, current)) <= 1:
+        print("::notice::skip first-round review ledger state comment; no prior history to persist")
+        return
     if existing:
         _api_request(token, f"{api}/issues/comments/{existing['id']}", method="PATCH", payload={"body": body})
     else:
