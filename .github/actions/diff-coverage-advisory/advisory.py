@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post a one-line diff-coverage advisory on a pull request."""
+"""Measure diff coverage and write a one-line advisory to the job summary."""
 
 from __future__ import annotations
 
@@ -9,8 +9,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +18,6 @@ if str(GATE_ROOT) not in sys.path:
 
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
-MARKER = "<!-- diff-coverage-advisory -->"
 NOTE_PREFIX = "diff-coverage: "
 DEFAULT_LCOV_PATH = Path("coverage/lcov.info")
 CODE_EXTENSIONS = (
@@ -171,70 +168,6 @@ def measure(
     }
 
 
-def render_comment(result: dict[str, Any]) -> str | None:
-    note = render_note_line(result)
-    if note is None:
-        return None
-    return f"{MARKER}\n\n{note}\n"
-
-
-def _request(token: str, method: str, url: str, payload: dict[str, Any] | None = None) -> Any:
-    data = json.dumps(payload).encode() if payload is not None else None
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "Content-Type": "application/json",
-            "User-Agent": "zlxlabs-gate-diff-coverage-advisory",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        raw = response.read()
-    return json.loads(raw) if raw else None
-
-
-def post_sticky_comment(
-    result: dict[str, Any],
-    *,
-    token: str,
-    repository: str,
-    pr_number: int,
-) -> None:
-    body = render_comment(result)
-    if body is None:
-        print("::notice::skip diff-coverage advisory; no note for this PR")
-        return
-
-    body = scrub_for_publish(body, runtime_values=runtime_values_from_environment())
-    api = f"https://api.github.com/repos/{repository}"
-    current = _request(token, "GET", f"{api}/pulls/{pr_number}")
-    if current["head"]["sha"] != result["head_sha"]:
-        print("::notice::skip stale diff-coverage result; head advanced")
-        return
-
-    comments: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        batch = _request(
-            token,
-            "GET",
-            f"{api}/issues/{pr_number}/comments?per_page=100&page={page}",
-        )
-        comments.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    existing = next((comment for comment in comments if MARKER in comment.get("body", "")), None)
-    if existing:
-        _request(token, "PATCH", f"{api}/issues/comments/{existing['id']}", {"body": body})
-    else:
-        _request(token, "POST", f"{api}/issues/{pr_number}/comments", {"body": body})
-
-
 def _append_summary(result: dict[str, Any], path: str) -> None:
     note = render_note_line(result)
     if note is None:
@@ -282,20 +215,6 @@ def main() -> int:
             _append_summary(result, os.environ["GITHUB_STEP_SUMMARY"])
         except OSError as error:
             print(f"::warning::could not append diff-coverage summary: {error}")
-
-    token = os.environ.get("GH_TOKEN", "")
-    pr_number = int(os.environ.get("PR_NUMBER", "0") or 0)
-    repository = os.environ.get("GITHUB_REPOSITORY", "")
-    if token and pr_number and repository:
-        try:
-            post_sticky_comment(
-                result,
-                token=token,
-                repository=repository,
-                pr_number=pr_number,
-            )
-        except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as error:
-            print(f"::warning::could not update diff-coverage PR comment: {error}")
 
     return 0
 

@@ -1,7 +1,9 @@
 import importlib.util
 import json
+import re
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 import diff_cover  # noqa: F401 — CI must install diff-cover; missing dep must fail, not skip
@@ -192,116 +194,92 @@ def test_main_never_returns_nonzero_on_measure_failure(tmp_path, monkeypatch):
     assert module.main() == 0
 
 
-def test_post_sticky_comment_uses_marker_and_prefix(module, monkeypatch):
-    posted: dict[str, str] = {}
-
-    def fake_request(_token, method, url, payload=None):
-        if method == "GET" and url.endswith("/pulls/42"):
-            return {"head": {"sha": "abc123"}}
-        if method == "GET" and "/issues/42/comments" in url:
-            return []
-        if method == "POST" and payload is not None:
-            posted["body"] = payload["body"]
-            return {"id": 1}
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(module, "_request", fake_request)
-    module.post_sticky_comment(
-        {
-            "state": "covered",
-            "percent_covered": 100,
-            "covered_lines": 2,
-            "total_lines": 2,
-            "head_sha": "abc123",
-        },
-        token="token",
-        repository="owner/repo",
-        pr_number=42,
-    )
-
-    assert module.MARKER in posted["body"]
-    assert "diff-coverage: 100% (2/2 changed lines)" in posted["body"]
+@pytest.mark.parametrize(
+    "result, fragments",
+    [
+        ({"state": "skip"}, ["Status: `skipped`"]),
+        (
+            {"state": "no_data"},
+            ["Status: `no_data`", "diff-coverage: no coverage data"],
+        ),
+        (
+            {
+                "state": "covered",
+                "percent_covered": 50,
+                "covered_lines": 1,
+                "total_lines": 2,
+                "lcov_path": "coverage/lcov.info",
+            },
+            ["Status: `covered`", "50% (1/2 changed lines)", "coverage/lcov.info"],
+        ),
+    ],
+)
+def test_append_summary_covers_skip_no_data_and_covered(module, tmp_path, result, fragments):
+    path = tmp_path / "summary.md"
+    module._append_summary(result, str(path))
+    text = path.read_text(encoding="utf-8")
+    for fragment in fragments:
+        assert fragment in text
 
 
-def test_post_sticky_comment_patches_existing_marker_comment(module, monkeypatch):
-    patched: dict[str, str] = {}
-    posted = False
+def test_advisory_source_has_no_issue_comment_http_writes():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert re.search(r"issues/[^\"']*comments", source) is None
+    for name in ("post_sticky_comment", "render_comment", "MARKER", "_request"):
+        assert f"def {name}" not in source
+        assert f"{name} =" not in source
 
-    def fake_request(_token, method, url, payload=None):
-        nonlocal posted
-        if method == "GET" and url.endswith("/pulls/42"):
-            return {"head": {"sha": "abc123"}}
-        if method == "GET" and "/issues/42/comments" in url:
-            return [{"id": 99, "body": f"{module.MARKER}\n\nold note\n"}]
-        if method == "PATCH" and url.endswith("/issues/comments/99"):
-            patched["body"] = payload["body"]
-            return {"id": 99}
-        if method == "POST":
-            posted = True
-            return {"id": 100}
-        raise AssertionError(f"unexpected request: {method} {url}")
 
-    monkeypatch.setattr(module, "_request", fake_request)
-    module.post_sticky_comment(
-        {
+def test_main_writes_job_summary_and_makes_no_github_write_requests(module, tmp_path, monkeypatch):
+    summary = tmp_path / "summary.md"
+    requests: list[tuple[str, str]] = []
+
+    class RecordingRequest(urllib.request.Request):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            requests.append((self.get_method(), self.full_url))
+
+    def fake_urlopen(request, timeout=None):
+        requests.append((request.get_method(), getattr(request, "full_url", str(request))))
+        raise AssertionError(f"unexpected GitHub HTTP: {request.get_method()} {request.full_url}")
+
+    monkeypatch.setattr(urllib.request, "Request", RecordingRequest)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    if hasattr(module, "_request"):
+        monkeypatch.setattr(
+            module,
+            "_request",
+            lambda *args, **kwargs: requests.append(("CALL", str(args))) or (_ for _ in ()).throw(
+                AssertionError("advisory _request must not be called")
+            ),
+        )
+    monkeypatch.setenv("GH_TOKEN", "token")
+    monkeypatch.setenv("PR_NUMBER", "42")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setattr(
+        module,
+        "measure",
+        lambda *args, **kwargs: {
             "state": "covered",
             "percent_covered": 50,
             "covered_lines": 1,
             "total_lines": 2,
             "head_sha": "abc123",
+            "lcov_path": "coverage/lcov.info",
         },
-        token="token",
-        repository="owner/repo",
-        pr_number=42,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["advisory.py", "--base-sha", "base", "--head-sha", "abc123"],
     )
 
-    assert not posted
-    assert module.MARKER in patched["body"]
-    assert "diff-coverage: 50% (1/2 changed lines)" in patched["body"]
+    assert module.main() == 0
 
-
-def test_post_sticky_comment_finds_marker_on_second_page(module, monkeypatch):
-    patched: dict[str, str] = {}
-    posted = False
-
-    def _comment_page(url: str) -> int:
-        from urllib.parse import parse_qs, urlparse
-
-        return int(parse_qs(urlparse(url).query).get("page", ["1"])[0])
-
-    def fake_request(_token, method, url, payload=None):
-        nonlocal posted
-        if method == "GET" and url.endswith("/pulls/42"):
-            return {"head": {"sha": "abc123"}}
-        if method == "GET" and "/issues/42/comments" in url:
-            page = _comment_page(url)
-            if page == 1:
-                return [{"id": index, "body": f"noise {index}"} for index in range(100)]
-            if page == 2:
-                return [{"id": 99, "body": f"{module.MARKER}\n\nold note\n"}]
-            return []
-        if method == "PATCH" and url.endswith("/issues/comments/99"):
-            patched["body"] = payload["body"]
-            return {"id": 99}
-        if method == "POST":
-            posted = True
-            return {"id": 100}
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(module, "_request", fake_request)
-    module.post_sticky_comment(
-        {
-            "state": "covered",
-            "percent_covered": 75,
-            "covered_lines": 3,
-            "total_lines": 4,
-            "head_sha": "abc123",
-        },
-        token="token",
-        repository="owner/repo",
-        pr_number=42,
-    )
-
-    assert not posted
-    assert module.MARKER in patched["body"]
-    assert "diff-coverage: 75% (3/4 changed lines)" in patched["body"]
+    writes = [item for item in requests if item[0] in {"POST", "PATCH", "PUT", "DELETE", "CALL"}]
+    assert writes == []
+    assert requests == []
+    text = summary.read_text(encoding="utf-8")
+    assert "Diff coverage advisory" in text
+    assert "Status: `covered`" in text
