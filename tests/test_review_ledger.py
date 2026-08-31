@@ -2,8 +2,10 @@ import base64
 import hashlib
 import importlib.util
 import inspect
+import io
 import json
 import sys
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -521,9 +523,106 @@ def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
     )
 
     assert module.fetch_prior_entries("token", "zlxlabs/app") == []
-    assert len(requested) == 1
+    assert len(requested) == 2
     assert "name=codex-review-ledger-v2" in requested[0]
     assert "name=codex-review-ledger&" not in requested[0]
+    assert "name=codex-review-ledger&" in requested[1]
+    assert "name=codex-review-ledger-v2" not in requested[1]
+
+
+def _ledger_zip_bytes(entries: list[dict]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as bundle:
+        bundle.writestr("ledger.jsonl", "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
+    return buf.getvalue()
+
+
+def _named_entry(run_id: int, sha: str) -> dict:
+    return {"repository": "zlxlabs/app", "run_id": run_id, "run_attempt": 1, "head_sha": sha}
+
+
+def _entry_keys(entries: list[dict]) -> set[tuple]:
+    return {(e.get("repository"), e.get("run_id"), e.get("run_attempt"), e.get("head_sha")) for e in entries}
+
+
+def _patch_named_artifact_api(module, monkeypatch, artifacts_by_name: dict[str, list[list[dict]]]):
+    archives, listed, artifact_id = {}, {}, 0
+    for name, artifacts in artifacts_by_name.items():
+        rows = []
+        for entries in artifacts:
+            artifact_id += 1
+            url = f"https://example.test/archive/{artifact_id}"
+            archives[url] = _ledger_zip_bytes(entries)
+            rows.append({"id": artifact_id, "expired": False, "archive_download_url": url})
+        listed[name] = rows
+
+    def fake_json(token, url):
+        name = (urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("name") or [""])[0]
+        return {"artifacts": listed.get(name, [])}
+
+    monkeypatch.setattr(module, "_api_json", fake_json)
+    monkeypatch.setattr(module, "_api_request", lambda token, url, **kwargs: archives[url])
+
+
+_V2, _V1, _SHARED, _V2U, _V1U = (
+    _named_entry(21, "v2-only"), _named_entry(11, "v1-only"),
+    _named_entry(10, "shared"), _named_entry(22, "v2-unique"), _named_entry(12, "v1-unique"),
+)
+
+
+@pytest.mark.parametrize(
+    "artifacts_by_name, expected",
+    [
+        ({"codex-review-ledger-v2": [[_V2]], "codex-review-ledger": []}, [_V2]),
+        ({"codex-review-ledger-v2": [], "codex-review-ledger": [[_V1]]}, [_V1]),
+        (
+            {"codex-review-ledger-v2": [[_SHARED, _V2U]], "codex-review-ledger": [[_SHARED, _V1U]]},
+            [_SHARED, _V2U, _V1U],
+        ),
+        ({"codex-review-ledger-v2": [], "codex-review-ledger": []}, []),
+    ],
+    ids=["v2_only", "v1_only", "both_union_deduped", "neither"],
+)
+def test_fetch_prior_entries_reads_v1_and_v2_artifact_names(artifacts_by_name, expected, monkeypatch):
+    module = _module()
+    _patch_named_artifact_api(module, monkeypatch, artifacts_by_name)
+    assert _entry_keys(module.fetch_prior_entries("token", "zlxlabs/app")) == _entry_keys(expected)
+
+
+def test_v1_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
+    module = _module()
+    historical, current = _pr_ledger_entries(module, 2)
+    zip_bytes = _ledger_zip_bytes([historical])
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        parsed = urllib.parse.urlparse(url)
+        name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
+        if parsed.path.endswith("/actions/artifacts"):
+            artifacts = ([{"id": 1, "expired": False, "archive_download_url": "https://example.test/v1"}]
+                         if name == "codex-review-ledger" else [])
+            return json.dumps({"artifacts": artifacts}).encode()
+        if url == "https://example.test/v1":
+            return zip_bytes
+        if "/pulls/" in parsed.path:
+            return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+        if method == "POST":
+            return b"{}"
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    prior = module.fetch_prior_entries("token", "zlxlabs/app")
+    assert _entry_keys(prior) == _entry_keys([historical])
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"],
+        module.dedupe_entries([*prior, current]), current, [],
+    )
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert "skip first-round review ledger state comment" not in capsys.readouterr().out
+    assert len(writes) == 1 and writes[0][0] == "POST"
+    assert writes[0][1] == "https://api.github.com/repos/zlxlabs/app/issues/7/comments"
+    assert writes[0][2] is not None and "codex-review-ledger-state:v2:" in writes[0][2]["body"]
 
 
 @pytest.mark.parametrize("max_entries", [0, -1])
