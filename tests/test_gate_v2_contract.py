@@ -165,8 +165,9 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
     assert upload["with"]["if-no-files-found"] == "error"
     resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
+    assert resolve["env"]["GH_REPO"] == "${{ github.repository }}"
     assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
-    assert 'gh run download "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
+    assert 'gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
     issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
     assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
     assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.triggering_actor }}"
