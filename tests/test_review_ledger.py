@@ -862,18 +862,38 @@ def _pr_ledger_entries(module, count: int) -> list[dict]:
     return entries
 
 
-def _unrelated_ledger_entry(module) -> dict:
+def _same_repo_other_pr_entry(module) -> dict:
+    """Noise that a repository-only filter would keep."""
     return module.build_entry(
-        repository="other/repo",
+        repository="zlxlabs/app",
         pr_number=99,
         run_id=1,
         run_attempt=1,
-        head_sha="other",
+        head_sha="other-pr",
         preflight={},
-        audit=_audit("other", []),
+        audit=_audit("other-pr", []),
         prior_entries=[],
         dispositions={},
     )
+
+
+def _other_repo_same_pr_entry(module) -> dict:
+    """Noise that a pr_number-only filter would keep."""
+    return module.build_entry(
+        repository="other/repo",
+        pr_number=7,
+        run_id=2,
+        run_attempt=1,
+        head_sha="other-repo",
+        preflight={},
+        audit=_audit("other-repo", []),
+        prior_entries=[],
+        dispositions={},
+    )
+
+
+def _cross_key_noise_entries(module) -> list[dict]:
+    return [_same_repo_other_pr_entry(module), _other_repo_same_pr_entry(module)]
 
 
 @pytest.mark.parametrize(
@@ -897,7 +917,7 @@ def test_post_state_comment_create_or_skip_matrix(
     module = _module()
     same_pr = _pr_ledger_entries(module, entry_count)
     current = same_pr[-1]
-    entries = [_unrelated_ledger_entry(module), *same_pr]
+    entries = [*_cross_key_noise_entries(module), *same_pr]
     comments = [{"id": 99, "body": f"{module.STATE_MARKER}\n\nold\n"}] if has_existing else []
     recorded: list[tuple[str, str, dict | None]] = []
 
@@ -942,10 +962,80 @@ def test_post_state_comment_create_or_skip_matrix(
         assert not any(item[0] == "POST" for item in recorded)
 
 
-def test_render_and_post_share_relevant_pr_entries_filter():
+def test_post_state_comment_skips_when_live_head_advanced(monkeypatch, capsys):
     module = _module()
-    assert "relevant_pr_entries(" in inspect.getsource(module.render_state_comment)
-    assert "relevant_pr_entries(" in inspect.getsource(module.post_state_comment)
+    same_pr = _pr_ledger_entries(module, 2)
+    current = same_pr[-1]
+    entries = [*_cross_key_noise_entries(module), *same_pr]
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        if method == "GET":
+            return json.dumps({"head": {"sha": "live-new-head"}}).encode()
+        return b"{}"
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
+    )
+
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert writes == []
+    assert "skip stale review ledger state; PR head advanced" in capsys.readouterr().out
+
+
+def test_render_and_post_share_relevant_pr_entries_filter(monkeypatch, capsys):
+    module = _module()
+    noise = _cross_key_noise_entries(module)
+
+    def run_post(entries, current):
+        recorded: list[tuple[str, str, dict | None]] = []
+
+        def fake_api_request(token, url, *, method="GET", payload=None):
+            recorded.append((method, url, payload))
+            if method == "GET":
+                return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+            return b"{}"
+
+        monkeypatch.setattr(module, "_api_request", fake_api_request)
+        module.post_state_comment(
+            "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
+        )
+        return recorded, capsys.readouterr().out
+
+    same_pr_one = _pr_ledger_entries(module, 1)
+    current_one = same_pr_one[-1]
+    recorded, output = run_post([*noise, *same_pr_one], current_one)
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert writes == []
+    assert (
+        "::notice::skip first-round review ledger state comment; no prior history to persist"
+        in output
+    )
+
+    same_pr = _pr_ledger_entries(module, 2)
+    current = same_pr[-1]
+    entries = [*noise, *same_pr]
+    expected = [
+        entry for entry in entries
+        if entry.get("repository") == current.get("repository")
+        and entry.get("pr_number") == current.get("pr_number")
+    ]
+    assert len(expected) >= 2
+    assert len(entries) > len(expected)
+    recorded, output = run_post(entries, current)
+    posts = [item for item in recorded if item[0] == "POST"]
+    assert len(posts) == 1
+    assert "skip first-round review ledger state comment" not in output
+    restored = module.parse_state_entries(
+        [{
+            "body": posts[0][2]["body"],
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+        }]
+    )
+    assert restored == expected
+    assert restored == same_pr
 
 
 def test_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
