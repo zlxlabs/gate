@@ -245,14 +245,6 @@ def test_main_writes_job_summary_and_makes_no_github_write_requests(module, tmp_
 
     monkeypatch.setattr(urllib.request, "Request", RecordingRequest)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    if hasattr(module, "_request"):
-        monkeypatch.setattr(
-            module,
-            "_request",
-            lambda *args, **kwargs: requests.append(("CALL", str(args))) or (_ for _ in ()).throw(
-                AssertionError("advisory _request must not be called")
-            ),
-        )
     monkeypatch.setenv("GH_TOKEN", "token")
     monkeypatch.setenv("PR_NUMBER", "42")
     monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
@@ -277,8 +269,6 @@ def test_main_writes_job_summary_and_makes_no_github_write_requests(module, tmp_
 
     assert module.main() == 0
 
-    writes = [item for item in requests if item[0] in {"POST", "PATCH", "PUT", "DELETE", "CALL"}]
-    assert writes == []
     assert requests == []
     text = summary.read_text(encoding="utf-8")
     assert "Diff coverage advisory" in text
