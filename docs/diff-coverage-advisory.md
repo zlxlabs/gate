@@ -1,8 +1,9 @@
 # Diff coverage advisory (gate-v2 Phase C / 1a)
 
-Gate v2 posts a **non-blocking** one-line PR comment that summarizes how well
-the pull request's **changed executable lines** are covered by tests. The step
-never affects the required gate verdict; failures degrade to a missing note.
+Gate v2 writes a **non-blocking** one-line note to the Actions job summary that
+summarizes how well the pull request's **changed executable lines** are covered
+by tests. The step never affects the required gate verdict; failures degrade to
+a missing note. It does not create or update a PR comment.
 
 ## LCOV contract
 
@@ -18,7 +19,7 @@ vitest/c8). Gate reads this path only; it does not generate coverage itself.
 
 ## Three-state semantics
 
-| Situation | PR comment |
+| Situation | Job summary note |
 |---|---|
 | `coverage/lcov.info` exists and diff-cover can measure changed code lines | `diff-coverage: <pct>% (<covered>/<total> changed lines)` |
 | Code changed but `coverage/lcov.info` is absent | `diff-coverage: no coverage data` |
@@ -36,4 +37,7 @@ Notes:
 ## Machine-readable prefix
 
 Every emitted note line starts with `diff-coverage: ` so downstream aggregators can
-parse PR comments without scraping free-form markdown.
+parse the Actions job summary without scraping free-form markdown.
+
+The required `token` input is kept for caller compatibility; the action no longer
+uses it to create or update a PR comment.
