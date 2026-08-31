@@ -109,12 +109,16 @@ def parse_state_entries(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return []
 
 
-def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any]) -> str:
-    relevant = [
+def relevant_pr_entries(entries: list[dict[str, Any]], current: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
         entry for entry in entries
         if entry.get("repository") == current.get("repository")
         and entry.get("pr_number") == current.get("pr_number")
-    ][-20:]
+    ]
+
+
+def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any]) -> str:
+    relevant = relevant_pr_entries(entries, current)[-20:]
     encoded = base64.urlsafe_b64encode(
         json.dumps(relevant, ensure_ascii=False, separators=(",", ":")).encode()
     ).decode()
@@ -703,26 +707,30 @@ def _api_json(token: str, url: str) -> Any:
     return json.loads(_api_request(token, url))
 
 
+LEDGER_ARTIFACT_NAMES = ("codex-review-ledger-v2", "codex-review-ledger")
+
+
 def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode({"name": "codex-review-ledger-v2", "per_page": artifact_limit})
-    payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
-    if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
-        raise ValueError("prior ledger artifact list has invalid JSON shape")
     entries: list[dict[str, Any]] = []
-    for artifact in payload.get("artifacts", [])[:artifact_limit]:
-        if artifact.get("expired"):
-            continue
-        archive = _api_request(token, artifact["archive_download_url"])
-        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-            name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
-            if not name:
-                raise ValueError(f"prior ledger artifact {artifact.get('id')} has no ledger.jsonl")
-            for line in bundle.read(name).decode("utf-8").splitlines():
-                if line.strip():
-                    entry = json.loads(line)
-                    if not isinstance(entry, dict):
-                        raise ValueError("prior ledger entry must be a JSON object")
-                    entries.append(entry)
+    for artifact_name in LEDGER_ARTIFACT_NAMES:
+        query = urllib.parse.urlencode({"name": artifact_name, "per_page": artifact_limit})
+        payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
+            raise ValueError("prior ledger artifact list has invalid JSON shape")
+        for artifact in payload.get("artifacts", [])[:artifact_limit]:
+            if artifact.get("expired"):
+                continue
+            archive = _api_request(token, artifact["archive_download_url"])
+            with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+                name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
+                if not name:
+                    raise ValueError(f"prior ledger artifact {artifact.get('id')} has no ledger.jsonl")
+                for line in bundle.read(name).decode("utf-8").splitlines():
+                    if line.strip():
+                        entry = json.loads(line)
+                        if not isinstance(entry, dict):
+                            raise ValueError("prior ledger entry must be a JSON object")
+                        entries.append(entry)
     return dedupe_entries(entries)
 
 
@@ -749,6 +757,9 @@ def post_state_comment(
         print("::notice::skip stale review ledger state; PR head advanced")
         return
     existing = next((comment for comment in comments if STATE_MARKER in comment.get("body", "")), None)
+    if existing is None and len(relevant_pr_entries(entries, current)) <= 1:
+        print("::notice::skip first-round review ledger state comment; no prior history to persist")
+        return
     if existing:
         _api_request(token, f"{api}/issues/comments/{existing['id']}", method="PATCH", payload={"body": body})
     else:

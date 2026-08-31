@@ -2,8 +2,10 @@ import base64
 import hashlib
 import importlib.util
 import inspect
+import io
 import json
 import sys
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -521,9 +523,106 @@ def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
     )
 
     assert module.fetch_prior_entries("token", "zlxlabs/app") == []
-    assert len(requested) == 1
+    assert len(requested) == 2
     assert "name=codex-review-ledger-v2" in requested[0]
     assert "name=codex-review-ledger&" not in requested[0]
+    assert "name=codex-review-ledger&" in requested[1]
+    assert "name=codex-review-ledger-v2" not in requested[1]
+
+
+def _ledger_zip_bytes(entries: list[dict]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as bundle:
+        bundle.writestr("ledger.jsonl", "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
+    return buf.getvalue()
+
+
+def _named_entry(run_id: int, sha: str) -> dict:
+    return {"repository": "zlxlabs/app", "run_id": run_id, "run_attempt": 1, "head_sha": sha}
+
+
+def _entry_keys(entries: list[dict]) -> set[tuple]:
+    return {(e.get("repository"), e.get("run_id"), e.get("run_attempt"), e.get("head_sha")) for e in entries}
+
+
+def _patch_named_artifact_api(module, monkeypatch, artifacts_by_name: dict[str, list[list[dict]]]):
+    archives, listed, artifact_id = {}, {}, 0
+    for name, artifacts in artifacts_by_name.items():
+        rows = []
+        for entries in artifacts:
+            artifact_id += 1
+            url = f"https://example.test/archive/{artifact_id}"
+            archives[url] = _ledger_zip_bytes(entries)
+            rows.append({"id": artifact_id, "expired": False, "archive_download_url": url})
+        listed[name] = rows
+
+    def fake_json(token, url):
+        name = (urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("name") or [""])[0]
+        return {"artifacts": listed.get(name, [])}
+
+    monkeypatch.setattr(module, "_api_json", fake_json)
+    monkeypatch.setattr(module, "_api_request", lambda token, url, **kwargs: archives[url])
+
+
+_V2, _V1, _SHARED, _V2U, _V1U = (
+    _named_entry(21, "v2-only"), _named_entry(11, "v1-only"),
+    _named_entry(10, "shared"), _named_entry(22, "v2-unique"), _named_entry(12, "v1-unique"),
+)
+
+
+@pytest.mark.parametrize(
+    "artifacts_by_name, expected",
+    [
+        ({"codex-review-ledger-v2": [[_V2]], "codex-review-ledger": []}, [_V2]),
+        ({"codex-review-ledger-v2": [], "codex-review-ledger": [[_V1]]}, [_V1]),
+        (
+            {"codex-review-ledger-v2": [[_SHARED, _V2U]], "codex-review-ledger": [[_SHARED, _V1U]]},
+            [_SHARED, _V2U, _V1U],
+        ),
+        ({"codex-review-ledger-v2": [], "codex-review-ledger": []}, []),
+    ],
+    ids=["v2_only", "v1_only", "both_union_deduped", "neither"],
+)
+def test_fetch_prior_entries_reads_v1_and_v2_artifact_names(artifacts_by_name, expected, monkeypatch):
+    module = _module()
+    _patch_named_artifact_api(module, monkeypatch, artifacts_by_name)
+    assert _entry_keys(module.fetch_prior_entries("token", "zlxlabs/app")) == _entry_keys(expected)
+
+
+def test_v1_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
+    module = _module()
+    historical, current = _pr_ledger_entries(module, 2)
+    zip_bytes = _ledger_zip_bytes([historical])
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        parsed = urllib.parse.urlparse(url)
+        name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
+        if parsed.path.endswith("/actions/artifacts"):
+            artifacts = ([{"id": 1, "expired": False, "archive_download_url": "https://example.test/v1"}]
+                         if name == "codex-review-ledger" else [])
+            return json.dumps({"artifacts": artifacts}).encode()
+        if url == "https://example.test/v1":
+            return zip_bytes
+        if "/pulls/" in parsed.path:
+            return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+        if method == "POST":
+            return b"{}"
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    prior = module.fetch_prior_entries("token", "zlxlabs/app")
+    assert _entry_keys(prior) == _entry_keys([historical])
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"],
+        module.dedupe_entries([*prior, current]), current, [],
+    )
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert "skip first-round review ledger state comment" not in capsys.readouterr().out
+    assert len(writes) == 1 and writes[0][0] == "POST"
+    assert writes[0][1] == "https://api.github.com/repos/zlxlabs/app/issues/7/comments"
+    assert writes[0][2] is not None and "codex-review-ledger-state:v2:" in writes[0][2]["body"]
 
 
 @pytest.mark.parametrize("max_entries", [0, -1])
@@ -801,9 +900,13 @@ def test_sticky_comment_scrub_failure_prevents_github_write(monkeypatch):
 
 def test_sticky_comment_sends_scrubbed_body(monkeypatch):
     module = _module()
+    previous = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=9, run_attempt=1,
+        head_sha="old", preflight={}, audit=_audit("old", []), prior_entries=[], dispositions={},
+    )
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[], dispositions={},
+        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[previous], dispositions={},
     )
     entry["review"]["reviewer"] = "runner-secret"
     writes = []
@@ -830,12 +933,208 @@ def test_sticky_comment_sends_scrubbed_body(monkeypatch):
     monkeypatch.setenv("RUNNER_NAME", "runner-secret")
     monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
 
-    module.post_state_comment("token", "org/repo", 7, "head", [entry], entry, [])
+    module.post_state_comment("token", "org/repo", 7, "head", [previous, entry], entry, [])
 
     assert len(writes) == 1
     body = writes[0]["body"]
     assert "runner-secret" not in body
     assert "[REDACTED:RUNNER_NAME]" in body
+
+
+def _pr_ledger_entries(module, count: int) -> list[dict]:
+    entries = []
+    for index in range(count):
+        sha = "head" if index == count - 1 else f"old{index}"
+        entries.append(
+            module.build_entry(
+                repository="zlxlabs/app",
+                pr_number=7,
+                run_id=10 + index,
+                run_attempt=1,
+                head_sha=sha,
+                preflight={},
+                audit=_audit(sha, []),
+                prior_entries=entries,
+                dispositions={},
+            )
+        )
+    return entries
+
+
+def _same_repo_other_pr_entry(module) -> dict:
+    """Noise that a repository-only filter would keep."""
+    return module.build_entry(
+        repository="zlxlabs/app",
+        pr_number=99,
+        run_id=1,
+        run_attempt=1,
+        head_sha="other-pr",
+        preflight={},
+        audit=_audit("other-pr", []),
+        prior_entries=[],
+        dispositions={},
+    )
+
+
+def _other_repo_same_pr_entry(module) -> dict:
+    """Noise that a pr_number-only filter would keep."""
+    return module.build_entry(
+        repository="other/repo",
+        pr_number=7,
+        run_id=2,
+        run_attempt=1,
+        head_sha="other-repo",
+        preflight={},
+        audit=_audit("other-repo", []),
+        prior_entries=[],
+        dispositions={},
+    )
+
+
+def _cross_key_noise_entries(module) -> list[dict]:
+    return [_same_repo_other_pr_entry(module), _other_repo_same_pr_entry(module)]
+
+
+@pytest.mark.parametrize(
+    "has_existing, entry_count, expected_write",
+    [
+        (False, 1, None),
+        (False, 2, "POST"),
+        (True, 1, "PATCH"),
+        (True, 2, "PATCH"),
+    ],
+    ids=[
+        "no_comment_one_entry",
+        "no_comment_two_entries",
+        "has_comment_one_entry",
+        "has_comment_two_entries",
+    ],
+)
+def test_post_state_comment_create_or_skip_matrix(
+    has_existing, entry_count, expected_write, monkeypatch, capsys,
+):
+    module = _module()
+    same_pr = _pr_ledger_entries(module, entry_count)
+    current = same_pr[-1]
+    entries = [*_cross_key_noise_entries(module), *same_pr]
+    comments = [{"id": 99, "body": f"{module.STATE_MARKER}\n\nold\n"}] if has_existing else []
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        if method == "GET":
+            return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+        return b"{}"
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"], entries, current, comments,
+    )
+
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    output = capsys.readouterr().out
+    if expected_write is None:
+        assert writes == []
+        assert (
+            "::notice::skip first-round review ledger state comment; no prior history to persist"
+            in output
+        )
+        return
+
+    assert "skip first-round review ledger state comment" not in output
+    assert len(writes) == 1
+    method, url, payload = writes[0]
+    assert method == expected_write
+    assert payload is not None
+    if expected_write == "POST":
+        assert url == "https://api.github.com/repos/zlxlabs/app/issues/7/comments"
+        restored = module.parse_state_entries(
+            [{
+                "body": payload["body"],
+                "user": {"login": "github-actions[bot]", "type": "Bot"},
+            }]
+        )
+        assert restored == same_pr
+        assert "codex-review-ledger-state:v2:" in payload["body"]
+    else:
+        assert url == "https://api.github.com/repos/zlxlabs/app/issues/comments/99"
+        assert not any(item[0] == "POST" for item in recorded)
+
+
+def test_post_state_comment_skips_when_live_head_advanced(monkeypatch, capsys):
+    module = _module()
+    same_pr = _pr_ledger_entries(module, 2)
+    current = same_pr[-1]
+    entries = [*_cross_key_noise_entries(module), *same_pr]
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        if method == "GET":
+            return json.dumps({"head": {"sha": "live-new-head"}}).encode()
+        return b"{}"
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
+    )
+
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert writes == []
+    assert "skip stale review ledger state; PR head advanced" in capsys.readouterr().out
+
+
+def test_render_and_post_share_relevant_pr_entries_filter(monkeypatch, capsys):
+    module = _module()
+    noise = _cross_key_noise_entries(module)
+
+    def run_post(entries, current):
+        recorded: list[tuple[str, str, dict | None]] = []
+
+        def fake_api_request(token, url, *, method="GET", payload=None):
+            recorded.append((method, url, payload))
+            if method == "GET":
+                return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+            return b"{}"
+
+        monkeypatch.setattr(module, "_api_request", fake_api_request)
+        module.post_state_comment(
+            "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
+        )
+        return recorded, capsys.readouterr().out
+
+    same_pr_one = _pr_ledger_entries(module, 1)
+    current_one = same_pr_one[-1]
+    recorded, output = run_post([*noise, *same_pr_one], current_one)
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert writes == []
+    assert (
+        "::notice::skip first-round review ledger state comment; no prior history to persist"
+        in output
+    )
+
+    same_pr = _pr_ledger_entries(module, 2)
+    current = same_pr[-1]
+    entries = [*noise, *same_pr]
+    expected = [
+        entry for entry in entries
+        if entry.get("repository") == current.get("repository")
+        and entry.get("pr_number") == current.get("pr_number")
+    ]
+    assert len(expected) >= 2
+    assert len(entries) > len(expected)
+    recorded, output = run_post(entries, current)
+    posts = [item for item in recorded if item[0] == "POST"]
+    assert len(posts) == 1
+    assert "skip first-round review ledger state comment" not in output
+    restored = module.parse_state_entries(
+        [{
+            "body": posts[0][2]["body"],
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+        }]
+    )
+    assert restored == expected
+    assert restored == same_pr
 
 
 def test_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
