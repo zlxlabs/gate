@@ -17,12 +17,13 @@ permissions:
   contents: read
   pull-requests: read
 
-concurrency:
-  group: gate-disposition-${{ github.repository_id }}-${{ inputs.pr_number }}
-  cancel-in-progress: false
-
 jobs:
   disposition:
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    secrets: inherit
     uses: zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@__PINNED_GATE_SHA__
     with:
       pr_number: ${{ inputs.pr_number }}

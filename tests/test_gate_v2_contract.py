@@ -1395,17 +1395,18 @@ def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
     }
     assert "workflow_call" not in trigger
     # reusable-workflow token is caller ∩ callee; upload-artifact needs write, gh api pulls needs pull-requests: read.
-    assert raw["permissions"] == {
+    expected_permissions = {
         "actions": "write",
         "contents": "read",
         "pull-requests": "read",
     }
-    assert raw["concurrency"] == {
-        "group": "gate-disposition-${{ github.repository_id }}-${{ inputs.pr_number }}",
-        "cancel-in-progress": False,
-    }
+    assert raw["permissions"] == expected_permissions
+    assert "concurrency" not in raw
     assert set(raw["jobs"]) == {"disposition"}
     job = raw["jobs"]["disposition"]
+    assert job["permissions"] == expected_permissions
+    assert job.get("secrets") == "inherit"
+    assert "environment" not in job
     uses = job["uses"]
     assert uses == (
         "zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@" + DISPOSITION_CALLER_PIN
@@ -1418,6 +1419,8 @@ def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
         "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
     }
     text = DISPOSITION_CALLER_TEMPLATE.read_text()
+    non_comment_text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     assert "pull-requests: write" not in text
-    assert "secrets:" not in text
+    assert "secrets." not in non_comment_text
     assert "environment:" not in text
+
