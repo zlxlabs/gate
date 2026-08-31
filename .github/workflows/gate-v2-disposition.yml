@@ -59,6 +59,7 @@ jobs:
       - name: Resolve current PR head and canonical primary audit
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
           PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
           PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
@@ -75,7 +76,7 @@ jobs:
           audit_dir="$RUNNER_TEMP/current-primary-audit"
           mkdir -p "$audit_dir"
           audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
-          gh run download "$PRIMARY_RUN_ID" --name "$audit_name" --dir "$audit_dir"
+          gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name" --dir "$audit_dir"
           audit_path="$(find "$audit_dir" -type f -name '*.json' -print -quit)"
           test -n "$audit_path"
           audit_digest="$(sha256sum "$audit_path" | cut -d' ' -f1)"
