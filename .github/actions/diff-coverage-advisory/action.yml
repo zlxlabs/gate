@@ -1,7 +1,8 @@
 name: Diff coverage advisory
 description: >-
-  Post a one-line diff-coverage advisory on the PR from the caller workspace's
-  coverage/lcov.info. Never gates; failures degrade to a missing note.
+  Write a one-line diff-coverage advisory to the Actions job summary from the
+  caller workspace's coverage/lcov.info. Never gates; failures degrade to a
+  missing note. Does not create or update a PR comment.
 inputs:
   base-sha: { required: true }
   head-sha: { required: true }

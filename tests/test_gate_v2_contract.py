@@ -8,9 +8,13 @@ ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
 kept behaviorally aligned with this file.
 """
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 from _gha_lint import (
@@ -23,6 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
 DISPOSITION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2-disposition.yml"
 CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-v2.yml"
+DISPOSITION_CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-disposition.yml"
+DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
@@ -82,6 +88,26 @@ def _load_disposition_workflow():
     return raw, trigger
 
 
+def _disposition_scope_python() -> str:
+    """Return the inline python that constructs Scope from the disposition workflow."""
+    raw, _ = _load_disposition_workflow()
+    step = next(
+        s
+        for s in raw["jobs"]["control"]["steps"]
+        if s.get("name") == "Construct canonical scope and derive epoch"
+    )
+    run = step["run"]
+    start = run.index("<<'PY'\n") + len("<<'PY'\n")
+    end = run.index("\nPY\n", start)
+    return run[start:end]
+
+
+def _load_disposition_caller():
+    raw = yaml.safe_load(DISPOSITION_CALLER_TEMPLATE.read_text())
+    trigger = raw.get("on", raw.get(True))
+    return raw, trigger
+
+
 def _fromjson_label_sets(runs_on: str) -> list[set[str]]:
     """Parse each fromJSON('[...]') label array in a runs-on expression into a set."""
     out: list[set[str]] = []
@@ -111,15 +137,22 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     raw, trigger = _load_disposition_workflow()
     assert raw["name"] == "gate-v2 disposition control"
     assert "workflow_dispatch" in trigger
+    assert "workflow_call" in trigger
     assert raw["permissions"] == {"actions": "write", "contents": "read", "pull-requests": "read"}
     control = raw["jobs"]["control"]
     assert control["environment"] == {"name": "gate-disposition"}
+    expected_inputs = {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+    }
     assert "operation" not in trigger["workflow_dispatch"]["inputs"]
     assert "repository_id" not in trigger["workflow_dispatch"]["inputs"]
     assert "epoch" not in trigger["workflow_dispatch"]["inputs"]
-    assert set(trigger["workflow_dispatch"]["inputs"]) == {
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
-    }
+    assert set(trigger["workflow_dispatch"]["inputs"]) == expected_inputs
+    assert set(trigger["workflow_call"]["inputs"]) == expected_inputs
+    for kind in ("workflow_dispatch", "workflow_call"):
+        gate_ref = trigger[kind]["inputs"]["gate_ref"]
+        assert gate_ref["required"] is True
+        assert gate_ref["type"] == "string"
     text = DISPOSITION_WORKFLOW.read_text()
     assert "issue_receipt.py issue" in text
     assert "issue_receipt.py revoke" not in text
@@ -134,19 +167,130 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
     assert upload["with"]["if-no-files-found"] == "error"
     resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
+    assert resolve["env"]["GH_REPO"] == "${{ github.repository }}"
     assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
-    assert 'gh run download "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
+    assert 'gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
     issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
     assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
+    assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.triggering_actor }}"
+    assert issue["env"]["DISPOSITION_APPROVER_ID"] == "${{ github.actor_id }}"
+    assert "--approver \"$DISPOSITION_APPROVER\"" in issue["run"]
+    assert "--approver-id \"$DISPOSITION_APPROVER_ID\"" in issue["run"]
+    assert "--approved-at \"$approved_at\"" in issue["run"]
+    assert "inputs.approver" not in text
+    assert "${{ github.triggering_actor }}" in text
+    assert "${{ github.actor_id }}" in text
 
 
 def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
     text = DISPOSITION_WORKFLOW.read_text()
     producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()
-    assert "gate-disposition-receipt-v1-" in producer
+    consumer = (REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "convergence.py").read_text()
+    assert "disposition_receipt_artifact_name" in producer
+    assert "DISPOSITION_APPROVER" in producer
     assert "steps.disposition.outputs.artifact_name" in text
     assert "CURRENT_AUDIT_DIGEST" in text
-    assert 'digest_prefix = fields["audit_digest"][:12]' in producer
+    assert "receipt.audit_digest[:12]" in consumer
+
+
+def test_required_disposition_lines_is_the_only_g4_line_builder():
+    hits = []
+    for path in (REPO_ROOT / ".github").rglob("*"):
+        if not path.is_file() or path.suffix not in {".py", ".yml"}:
+            continue
+        if "resolved by receipt" in path.read_text(encoding="utf-8"):
+            hits.append(str(path.relative_to(REPO_ROOT)))
+    assert hits == [".github/actions/gate-aggregator/convergence.py"]
+
+
+def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(tmp_path):
+    """Lock issue #88: dataclass Scope crashes unless sys.modules is registered first."""
+    source = _disposition_scope_python()
+    register = "sys.modules[spec.name] = module"
+    exec_call = "spec.loader.exec_module(module)"
+    assert register in source
+    assert exec_call in source
+    assert source.index(register) < source.index(exec_call)
+    assert "if spec is None or spec.loader is None" in source
+
+    head_sha = "a" * 40
+    base_sha = "b" * 40
+    audit = {
+        "diff_digest": "d" * 64,
+        "policy_version": "1",
+        "policy_digest": "p" * 64,
+        "tier": "personal",
+        "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "r" * 40,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    pull = {"base": {"sha": base_sha}, "head": {"sha": head_sha}}
+    audit_path = tmp_path / "audit.json"
+    pr_path = tmp_path / "pr.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    pr_path.write_text(json.dumps(pull), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
+        input=source,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["scope"]["repository_id"] == 123
+    assert payload["scope"]["pr_number"] == 42
+    assert payload["scope"]["head_sha"] == head_sha
+    assert isinstance(payload["epoch"], str) and len(payload["epoch"]) == 64
+
+
+def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
+    """Lock issue #88: file-path sparse-checkout requires cone-mode off."""
+    raw, _ = _load_disposition_workflow()
+    checkout = next(
+        step
+        for step in raw["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+    sparse = checkout["with"]["sparse-checkout"]
+    listed = {line.strip() for line in sparse.splitlines() if line.strip()}
+    assert listed == {
+        ".github/actions/gate-disposition/issue_receipt.py",
+        ".github/actions/gate-aggregator/convergence.py",
+    }
+    assert checkout["with"].get("sparse-checkout-cone-mode") is False
+
+
+def test_disposition_checkout_pins_zlxlabs_gate_at_gate_ref():
+    raw, _ = _load_disposition_workflow()
+    checkout = next(
+        step
+        for step in raw["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+    assert checkout["with"]["repository"] == "zlxlabs/gate"
+    assert checkout["with"]["ref"] == "${{ inputs.gate_ref }}"
+
+
+def test_disposition_requires_lowercase_40_hex_gate_ref_before_checkout():
+    raw, _ = _load_disposition_workflow()
+    steps = raw["jobs"]["control"]["steps"]
+    names = [step.get("name") for step in steps]
+    validate_name = "Require 40-hex gate_ref"
+    checkout_name = "Checkout disposition producer"
+    assert validate_name in names
+    assert names.index(validate_name) < names.index(checkout_name)
+    validate = next(step for step in steps if step.get("name") == validate_name)
+    assert validate["env"]["GATE_REF"] == "${{ inputs.gate_ref }}"
+    run = validate["run"]
+    assert "^[0-9a-f]{40}$" in run
+    assert '[[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]' in run
+    assert "::error::" in run
+    assert "exit 1" in run
+    assert "rev-parse" not in run
+    assert "git " not in run
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
@@ -575,6 +719,10 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "pr-size-preflight.json" in input_upload["with"]["path"]
     assert "install-result.json" in input_upload["with"]["path"]
     assert input_download["with"]["path"] == "${{ runner.temp }}/review-ledger-input"
+    terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
+    assert terminal_download["with"]["artifact-ids"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
+    assert terminal_download["with"]["path"] == "${{ runner.temp }}/gate-terminal"
+    assert "continue-on-error" not in terminal_download
     build = steps[build_index]
     assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
     assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
@@ -584,6 +732,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert build["with"]["expected-base-sha"] == "${{ github.event.pull_request.base.sha }}"
     assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
     assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
+    assert build["with"]["terminal-path"] == "${{ runner.temp }}/gate-terminal/gate-terminal.json"
 
     upload = steps[upload_index]
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
@@ -604,10 +753,269 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
         "${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}"
     )
     run = resolver["run"]
-    for marker in ("--paginate", "expired", "<= current", "input_artifact_id", "audit_artifact_id"):
+    for marker in (
+        "--paginate", "expired", "<= current",
+        "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
+        "terminal_source_attempt",
+    ):
         assert marker in run
+    assert "exact_attempt" not in run
+    assert resolver["env"]["TERMINAL_PREFIX"] == (
+        "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
+    )
+    assert resolver["env"]["REPOSITORY"] == "${{ github.repository }}"
+    assert resolver["env"]["RUN_ID"] == "${{ github.run_id }}"
     assert "No matching required ledger input artifact found" in run
     assert "No matching canonical primary audit artifact found" in run
+    assert "No matching required gate terminal artifact found" in run
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in run
+    assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in run
+    assert "/attempts/" in run and "/jobs" in run
+    assert "run_started_at" in run
+
+
+def _ledger_resolver_python() -> str:
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["ledger"]["steps"]
+        if s.get("name") == "Resolve v2 ledger artifacts"
+    )
+    run = step["run"]
+    start = run.index("<<'PY'\n") + len("<<'PY'\n")
+    end = run.index("\nPY\n", start)
+    return run[start:end]
+
+
+def _run_ledger_resolver(
+    tmp_path, *, artifacts, current, review_expected="false",
+    jobs=None, jobs_path=None, attempt=None, attempt_path=None,
+):
+    listing = tmp_path / "listing.json"
+    listing.write_text(json.dumps({"artifacts": artifacts}), encoding="utf-8")
+    output = tmp_path / "github_output"
+    output.write_text("", encoding="utf-8")
+    argv = [
+        sys.executable, "-",
+        str(listing),
+        "review-ledger-input-v2-",
+        "primary-audit-v2-",
+        "gate-terminal-v1-",
+        str(current),
+        review_expected,
+        str(output),
+    ]
+    extra = jobs is not None or jobs_path is not None or attempt is not None or attempt_path is not None
+    if extra:
+        if jobs_path is not None:
+            argv.append(str(jobs_path))
+        elif jobs is not None:
+            jobs_file = tmp_path / "jobs.json"
+            jobs_file.write_text(json.dumps(jobs), encoding="utf-8")
+            argv.append(str(jobs_file))
+        else:
+            argv.append("")
+        if attempt_path is not None:
+            argv.append(str(attempt_path))
+        elif attempt is not None:
+            attempt_file = tmp_path / "attempt.json"
+            attempt_file.write_text(json.dumps(attempt), encoding="utf-8")
+            argv.append(str(attempt_file))
+    env = os.environ.copy()
+    for key in ("REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"):
+        env.pop(key, None)
+    result = subprocess.run(
+        argv,
+        input=_ledger_resolver_python(),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    return result, output.read_text(encoding="utf-8")
+
+
+ISSUE_101_RUN_STARTED_AT = "2026-09-01T02:57:51Z"
+
+
+def _jobs(*names, started_at=None):
+    jobs = []
+    for index, name in enumerate(names, start=1):
+        job = {"name": name, "id": index}
+        if started_at is not None:
+            job["started_at"] = started_at
+        jobs.append(job)
+    return {"jobs": jobs}
+
+
+def _issue_101_attempt2_jobs():
+    return {
+        "jobs": [
+            {"name": "gate / gate", "id": 99721378127, "run_attempt": 2, "started_at": "2026-09-01T02:49:00Z", "conclusion": "success"},
+            {"name": "gate / quality", "id": 99721377855, "run_attempt": 2, "started_at": "2026-09-01T02:30:19Z", "conclusion": "success"},
+            {"name": "gate / primary", "id": 99721378200, "run_attempt": 2, "started_at": "2026-09-01T02:30:19Z", "conclusion": "success"},
+            {"name": "gate / ledger", "id": 99721378122, "run_attempt": 2, "started_at": "2026-09-01T02:57:57Z", "conclusion": "failure"},
+            {"name": "gate / ocr (ocr-minimax-m3)", "id": 99721377502, "run_attempt": 2, "started_at": "2026-09-01T02:57:57Z", "conclusion": "success"},
+            {"name": "gate / notify", "id": 99721378564, "run_attempt": 2, "started_at": "2026-09-01T02:57:54Z", "conclusion": "skipped"},
+        ]
+    }
+
+
+def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+    ]
+    result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+    assert "identity mismatch" not in combined
+
+
+def test_ledger_resolver_falls_back_to_prior_terminal_when_current_attempt_is_missing(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2,
+        jobs=_jobs("gate / ledger", "gate / quality"),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+
+
+def test_ledger_resolver_selects_current_attempt_terminal_not_an_older_one(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
+    ]
+    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=202" in output
+    assert "terminal_source_attempt=2" in output
+
+
+def test_ledger_resolver_refuses_future_terminal_artifact(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
+    ]
+    result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+    assert "terminal_artifact_id=203" not in _output
+
+
+def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, jobs=_jobs("gate / ledger"),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+    assert "terminal_artifact_id=203" not in output
+
+
+@pytest.mark.parametrize("gate_job_name", ["gate", "gate / gate"])
+def test_ledger_resolver_hard_fails_when_aggregator_ran_without_terminal(tmp_path, gate_job_name):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2,
+        jobs=_jobs(gate_job_name, "gate / ledger", started_at="2026-09-01T02:57:51Z"),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in combined
+    assert "No matching required gate terminal artifact found" not in combined
+
+
+def test_ledger_resolver_skips_jobs_listing_when_current_terminal_exists(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
+    ]
+    missing = tmp_path / "jobs-missing.json"
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, jobs_path=missing,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=202" in output
+    assert "terminal_source_attempt=2" in output
+    poison = tmp_path / "jobs-poison.json"
+    poison.write_text("{not json", encoding="utf-8")
+    attempt_poison = tmp_path / "attempt-poison.json"
+    attempt_poison.write_text("{not json", encoding="utf-8")
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, jobs_path=poison, attempt_path=attempt_poison,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_source_attempt=2" in output
+
+
+def _prior_terminal_artifacts():
+    return [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+
+
+def test_ledger_resolver_falls_back_when_copied_aggregator_job_predates_attempt(tmp_path):
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
+        jobs=_issue_101_attempt2_jobs(),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+
+
+def test_ledger_resolver_hard_fails_when_aggregator_started_at_or_after_attempt(tmp_path):
+    jobs = _issue_101_attempt2_jobs()
+    jobs["jobs"][0]["started_at"] = "2026-09-01T02:57:51Z"
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
+        jobs=jobs, attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in combined
+    assert "No matching required gate terminal artifact found" not in combined
+    assert "run_started_at is missing or unparseable" not in combined
+
+
+@pytest.mark.parametrize("attempt", [
+    {},
+    {"run_started_at": None},
+    {"run_started_at": "not-a-timestamp"},
+    {"run_started_at": "2026-09-01 02:57:51"},
+])
+def test_ledger_resolver_fail_louds_when_run_started_at_is_unusable(tmp_path, attempt):
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
+        jobs=_issue_101_attempt2_jobs(), attempt=attempt,
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in combined
+    assert "No matching required gate terminal artifact found" not in combined
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" not in combined
 
 
 def test_ledger_persistence_steps_are_fail_closed():
@@ -616,6 +1024,7 @@ def test_ledger_persistence_steps_are_fail_closed():
     for name in (
         "Download v2 review ledger inputs",
         "Download canonical primary audit for ledger",
+        "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger",
     ):
@@ -1180,3 +1589,42 @@ def test_diff_coverage_advisory_never_gates_quality_job():
     )
     assert advisory["continue-on-error"] is True
     assert "exit 1" not in advisory.get("run", "")
+
+
+def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
+    raw, trigger = _load_disposition_caller()
+    assert raw["name"] == "gate-disposition"
+    assert set(trigger["workflow_dispatch"]["inputs"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
+    }
+    assert "workflow_call" not in trigger
+    # reusable-workflow token is caller ∩ callee; upload-artifact needs write, gh api pulls needs pull-requests: read.
+    expected_permissions = {
+        "actions": "write",
+        "contents": "read",
+        "pull-requests": "read",
+    }
+    assert raw["permissions"] == expected_permissions
+    assert "concurrency" not in raw
+    assert set(raw["jobs"]) == {"disposition"}
+    job = raw["jobs"]["disposition"]
+    assert job["permissions"] == expected_permissions
+    assert job.get("secrets") == "inherit"
+    assert "environment" not in job
+    uses = job["uses"]
+    assert uses == (
+        "zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@" + DISPOSITION_CALLER_PIN
+    )
+    pin = uses.rsplit("@", 1)[1]
+    assert job["with"]["gate_ref"] == pin
+    for key in ("pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason"):
+        assert job["with"][key] == "${{ inputs." + key + " }}"
+    assert set(job["with"]) == {
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+    }
+    text = DISPOSITION_CALLER_TEMPLATE.read_text()
+    non_comment_text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "pull-requests: write" not in text
+    assert "secrets." not in non_comment_text
+    assert "environment:" not in text
+

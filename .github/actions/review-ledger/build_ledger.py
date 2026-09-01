@@ -109,12 +109,16 @@ def parse_state_entries(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return []
 
 
-def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any]) -> str:
-    relevant = [
+def relevant_pr_entries(entries: list[dict[str, Any]], current: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
         entry for entry in entries
         if entry.get("repository") == current.get("repository")
         and entry.get("pr_number") == current.get("pr_number")
-    ][-20:]
+    ]
+
+
+def render_state_comment(entries: list[dict[str, Any]], current: dict[str, Any]) -> str:
+    relevant = relevant_pr_entries(entries, current)[-20:]
     encoded = base64.urlsafe_b64encode(
         json.dumps(relevant, ensure_ascii=False, separators=(",", ":")).encode()
     ).decode()
@@ -434,6 +438,122 @@ def _primary_identity(
     return {field: audit[field] for field in PRIMARY_IDENTITY_FIELDS if field in audit}
 
 
+def empty_disposition_receipt_consumption() -> dict[str, Any]:
+    """Producer empty block. Copied onto the ledger only when a terminal is present."""
+    return {
+        "resolved": [],
+        "consumed_count": 0,
+        "rejected_count": 0,
+        "rejected_reasons": {},
+        "fail_closed": False,
+    }
+
+
+def _strict_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def load_gate_terminal_envelope(path: Path) -> dict[str, Any]:
+    """Read the same-run gate-terminal artifact; missing or corrupt is fail-loud."""
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("gate terminal artifact is missing or empty")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("gate terminal artifact is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("gate terminal artifact is not a JSON object")
+    if payload.get("schema_version") != 1 or payload.get("kind") != "gate_terminal":
+        raise ValueError("gate terminal artifact has an unsupported schema")
+    return payload
+
+
+def validate_disposition_receipt_consumption(block: Any) -> dict[str, Any]:
+    """Type-check the producer block. Does not re-run receipt auth/waiver rules."""
+    if not isinstance(block, dict):
+        raise ValueError("disposition_receipt_consumption must be an object")
+    for key in ("resolved", "consumed_count", "rejected_count", "rejected_reasons", "fail_closed"):
+        if key not in block:
+            raise ValueError(f"disposition_receipt_consumption is missing {key}")
+    resolved = block["resolved"]
+    if not isinstance(resolved, list):
+        raise ValueError("disposition_receipt_consumption.resolved must be an array")
+    projected: list[dict[str, Any]] = []
+    for item in resolved:
+        if not isinstance(item, dict):
+            raise ValueError("disposition_receipt_consumption.resolved item must be an object")
+        for key in ("finding_id", "receipt", "approver", "approver_id", "approved_at", "reason"):
+            if key not in item:
+                raise ValueError(f"disposition_receipt_consumption.resolved item is missing {key}")
+        for key in ("finding_id", "receipt", "approver", "approved_at", "reason"):
+            if not isinstance(item[key], str) or not item[key]:
+                raise ValueError("disposition_receipt_consumption.resolved item has an invalid text field")
+        if not _strict_int(item["approver_id"]) or item["approver_id"] <= 0:
+            raise ValueError("disposition_receipt_consumption.resolved item approver_id must be a positive integer")
+        projected.append({
+            "finding_id": item["finding_id"],
+            "receipt": item["receipt"],
+            "approver": item["approver"],
+            "approver_id": item["approver_id"],
+            "approved_at": item["approved_at"],
+            "reason": item["reason"],
+        })
+    consumed_count = block["consumed_count"]
+    rejected_count = block["rejected_count"]
+    if not _strict_int(consumed_count) or consumed_count < 0:
+        raise ValueError("disposition_receipt_consumption.consumed_count must be a non-negative integer")
+    if not _strict_int(rejected_count) or rejected_count < 0:
+        raise ValueError("disposition_receipt_consumption.rejected_count must be a non-negative integer")
+    if consumed_count != len(projected):
+        raise ValueError("disposition_receipt_consumption.consumed_count does not match resolved")
+    reasons = block["rejected_reasons"]
+    if not isinstance(reasons, dict) or any(
+        not isinstance(key, str) or not key or not _strict_int(value) or value <= 0
+        for key, value in reasons.items()
+    ):
+        raise ValueError("disposition_receipt_consumption.rejected_reasons must map reasons to positive counts")
+    if sum(reasons.values()) != rejected_count:
+        raise ValueError("disposition_receipt_consumption.rejected_count does not match rejected_reasons")
+    fail_closed = block["fail_closed"]
+    if type(fail_closed) is not bool:
+        raise ValueError("disposition_receipt_consumption.fail_closed must be a boolean")
+    return {
+        "resolved": projected,
+        "consumed_count": consumed_count,
+        "rejected_count": rejected_count,
+        "rejected_reasons": dict(sorted(reasons.items())),
+        "fail_closed": fail_closed,
+    }
+
+
+def _disposition_receipt_consumption_from_terminal(
+    envelope: dict[str, Any], *, repository: str, pr_number: int,
+    run_id: int, run_attempt: int, head_sha: str,
+) -> dict[str, Any]:
+    if envelope.get("schema_version") != 1 or envelope.get("kind") != "gate_terminal":
+        raise ValueError("gate terminal artifact has an unsupported schema")
+    expected = {
+        "repository": repository,
+        "pr_number": pr_number,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+    }
+    mismatches = []
+    for field, value in expected.items():
+        observed = envelope.get(field)
+        if field == "run_attempt":
+            if not _strict_int(observed) or not 1 <= observed <= value:
+                mismatches.append(field)
+        elif observed != value:
+            mismatches.append(field)
+    if mismatches:
+        raise ValueError(f"gate terminal identity mismatch: {sorted(mismatches)}")
+    if "disposition_receipt_consumption" not in envelope:
+        raise ValueError("gate terminal artifact is missing disposition_receipt_consumption")
+    return validate_disposition_receipt_consumption(envelope["disposition_receipt_consumption"])
+
+
 def build_entry(
     *,
     repository: str,
@@ -448,6 +568,7 @@ def build_entry(
     expected_identity: dict[str, Any] | None = None,
     install: dict[str, Any] | None = None,
     fallback_status: str = "not_run",
+    terminal_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     relevant = [
         entry for entry in prior_entries
@@ -498,7 +619,7 @@ def build_entry(
             if isinstance(value, dict)
         },
     }
-    return {
+    entry = {
         "schema_version": 1,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "repository": repository,
@@ -524,6 +645,19 @@ def build_entry(
             item.get("disposition") == "false-positive" for item in relevant_dispositions.values()
         ),
     }
+    if terminal_envelope is not None:
+        entry["disposition_receipt_consumption"] = _disposition_receipt_consumption_from_terminal(
+            terminal_envelope,
+            repository=repository,
+            pr_number=pr_number,
+            run_id=run_id,
+            run_attempt=run_attempt,
+            head_sha=head_sha,
+        )
+        source_attempt = terminal_envelope.get("run_attempt")
+        if source_attempt != run_attempt:
+            entry["terminal_source_attempt"] = source_attempt
+    return entry
 
 
 def write_ledger(path: Path, entries: list[dict[str, Any]], *, max_entries: int) -> None:
@@ -583,26 +717,30 @@ def _api_json(token: str, url: str) -> Any:
     return json.loads(_api_request(token, url))
 
 
+LEDGER_ARTIFACT_NAMES = ("codex-review-ledger-v2", "codex-review-ledger")
+
+
 def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode({"name": "codex-review-ledger-v2", "per_page": artifact_limit})
-    payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
-    if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
-        raise ValueError("prior ledger artifact list has invalid JSON shape")
     entries: list[dict[str, Any]] = []
-    for artifact in payload.get("artifacts", [])[:artifact_limit]:
-        if artifact.get("expired"):
-            continue
-        archive = _api_request(token, artifact["archive_download_url"])
-        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-            name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
-            if not name:
-                raise ValueError(f"prior ledger artifact {artifact.get('id')} has no ledger.jsonl")
-            for line in bundle.read(name).decode("utf-8").splitlines():
-                if line.strip():
-                    entry = json.loads(line)
-                    if not isinstance(entry, dict):
-                        raise ValueError("prior ledger entry must be a JSON object")
-                    entries.append(entry)
+    for artifact_name in LEDGER_ARTIFACT_NAMES:
+        query = urllib.parse.urlencode({"name": artifact_name, "per_page": artifact_limit})
+        payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
+            raise ValueError("prior ledger artifact list has invalid JSON shape")
+        for artifact in payload.get("artifacts", [])[:artifact_limit]:
+            if artifact.get("expired"):
+                continue
+            archive = _api_request(token, artifact["archive_download_url"])
+            with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+                name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
+                if not name:
+                    raise ValueError(f"prior ledger artifact {artifact.get('id')} has no ledger.jsonl")
+                for line in bundle.read(name).decode("utf-8").splitlines():
+                    if line.strip():
+                        entry = json.loads(line)
+                        if not isinstance(entry, dict):
+                            raise ValueError("prior ledger entry must be a JSON object")
+                        entries.append(entry)
     return dedupe_entries(entries)
 
 
@@ -629,6 +767,9 @@ def post_state_comment(
         print("::notice::skip stale review ledger state; PR head advanced")
         return
     existing = next((comment for comment in comments if STATE_MARKER in comment.get("body", "")), None)
+    if existing is None and len(relevant_pr_entries(entries, current)) <= 1:
+        print("::notice::skip first-round review ledger state comment; no prior history to persist")
+        return
     if existing:
         _api_request(token, f"{api}/issues/comments/{existing['id']}", method="PATCH", payload={"body": body})
     else:
@@ -693,6 +834,7 @@ def main() -> int:
     parser.add_argument("--audit-path", required=True, type=Path)
     parser.add_argument("--preflight-path", required=True, type=Path)
     parser.add_argument("--install-path", required=True, type=Path)
+    parser.add_argument("--terminal-path", default="")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", required=True, type=int)
@@ -714,6 +856,8 @@ def main() -> int:
     preflight = _load_json(args.preflight_path) or {}
     audit = _load_json(args.audit_path)
     install = _load_json(args.install_path)
+    terminal_raw = args.terminal_path.strip() if isinstance(args.terminal_path, str) else str(args.terminal_path or "").strip()
+    terminal = load_gate_terminal_envelope(Path(terminal_raw)) if terminal_raw else None
     if not preflight.get("reviewable", True):
         fallback = "blocked_by_size"
     elif _truthy(args.codex_waived):
@@ -753,6 +897,7 @@ def main() -> int:
         },
         install=install,
         fallback_status=fallback,
+        terminal_envelope=terminal,
     )
     all_entries = dedupe_entries([*prior_entries, entry])
     write_ledger(args.output, all_entries, max_entries=args.max_entries)

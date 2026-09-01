@@ -1,7 +1,11 @@
 import base64
 import hashlib
 import importlib.util
+import inspect
+import io
 import json
+import sys
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -519,9 +523,106 @@ def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
     )
 
     assert module.fetch_prior_entries("token", "zlxlabs/app") == []
-    assert len(requested) == 1
+    assert len(requested) == 2
     assert "name=codex-review-ledger-v2" in requested[0]
     assert "name=codex-review-ledger&" not in requested[0]
+    assert "name=codex-review-ledger&" in requested[1]
+    assert "name=codex-review-ledger-v2" not in requested[1]
+
+
+def _ledger_zip_bytes(entries: list[dict]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as bundle:
+        bundle.writestr("ledger.jsonl", "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
+    return buf.getvalue()
+
+
+def _named_entry(run_id: int, sha: str) -> dict:
+    return {"repository": "zlxlabs/app", "run_id": run_id, "run_attempt": 1, "head_sha": sha}
+
+
+def _entry_keys(entries: list[dict]) -> set[tuple]:
+    return {(e.get("repository"), e.get("run_id"), e.get("run_attempt"), e.get("head_sha")) for e in entries}
+
+
+def _patch_named_artifact_api(module, monkeypatch, artifacts_by_name: dict[str, list[list[dict]]]):
+    archives, listed, artifact_id = {}, {}, 0
+    for name, artifacts in artifacts_by_name.items():
+        rows = []
+        for entries in artifacts:
+            artifact_id += 1
+            url = f"https://example.test/archive/{artifact_id}"
+            archives[url] = _ledger_zip_bytes(entries)
+            rows.append({"id": artifact_id, "expired": False, "archive_download_url": url})
+        listed[name] = rows
+
+    def fake_json(token, url):
+        name = (urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("name") or [""])[0]
+        return {"artifacts": listed.get(name, [])}
+
+    monkeypatch.setattr(module, "_api_json", fake_json)
+    monkeypatch.setattr(module, "_api_request", lambda token, url, **kwargs: archives[url])
+
+
+_V2, _V1, _SHARED, _V2U, _V1U = (
+    _named_entry(21, "v2-only"), _named_entry(11, "v1-only"),
+    _named_entry(10, "shared"), _named_entry(22, "v2-unique"), _named_entry(12, "v1-unique"),
+)
+
+
+@pytest.mark.parametrize(
+    "artifacts_by_name, expected",
+    [
+        ({"codex-review-ledger-v2": [[_V2]], "codex-review-ledger": []}, [_V2]),
+        ({"codex-review-ledger-v2": [], "codex-review-ledger": [[_V1]]}, [_V1]),
+        (
+            {"codex-review-ledger-v2": [[_SHARED, _V2U]], "codex-review-ledger": [[_SHARED, _V1U]]},
+            [_SHARED, _V2U, _V1U],
+        ),
+        ({"codex-review-ledger-v2": [], "codex-review-ledger": []}, []),
+    ],
+    ids=["v2_only", "v1_only", "both_union_deduped", "neither"],
+)
+def test_fetch_prior_entries_reads_v1_and_v2_artifact_names(artifacts_by_name, expected, monkeypatch):
+    module = _module()
+    _patch_named_artifact_api(module, monkeypatch, artifacts_by_name)
+    assert _entry_keys(module.fetch_prior_entries("token", "zlxlabs/app")) == _entry_keys(expected)
+
+
+def test_v1_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
+    module = _module()
+    historical, current = _pr_ledger_entries(module, 2)
+    zip_bytes = _ledger_zip_bytes([historical])
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        parsed = urllib.parse.urlparse(url)
+        name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
+        if parsed.path.endswith("/actions/artifacts"):
+            artifacts = ([{"id": 1, "expired": False, "archive_download_url": "https://example.test/v1"}]
+                         if name == "codex-review-ledger" else [])
+            return json.dumps({"artifacts": artifacts}).encode()
+        if url == "https://example.test/v1":
+            return zip_bytes
+        if "/pulls/" in parsed.path:
+            return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+        if method == "POST":
+            return b"{}"
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    prior = module.fetch_prior_entries("token", "zlxlabs/app")
+    assert _entry_keys(prior) == _entry_keys([historical])
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"],
+        module.dedupe_entries([*prior, current]), current, [],
+    )
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert "skip first-round review ledger state comment" not in capsys.readouterr().out
+    assert len(writes) == 1 and writes[0][0] == "POST"
+    assert writes[0][1] == "https://api.github.com/repos/zlxlabs/app/issues/7/comments"
+    assert writes[0][2] is not None and "codex-review-ledger-state:v2:" in writes[0][2]["body"]
 
 
 @pytest.mark.parametrize("max_entries", [0, -1])
@@ -799,9 +900,13 @@ def test_sticky_comment_scrub_failure_prevents_github_write(monkeypatch):
 
 def test_sticky_comment_sends_scrubbed_body(monkeypatch):
     module = _module()
+    previous = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=9, run_attempt=1,
+        head_sha="old", preflight={}, audit=_audit("old", []), prior_entries=[], dispositions={},
+    )
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[], dispositions={},
+        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[previous], dispositions={},
     )
     entry["review"]["reviewer"] = "runner-secret"
     writes = []
@@ -828,12 +933,208 @@ def test_sticky_comment_sends_scrubbed_body(monkeypatch):
     monkeypatch.setenv("RUNNER_NAME", "runner-secret")
     monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
 
-    module.post_state_comment("token", "org/repo", 7, "head", [entry], entry, [])
+    module.post_state_comment("token", "org/repo", 7, "head", [previous, entry], entry, [])
 
     assert len(writes) == 1
     body = writes[0]["body"]
     assert "runner-secret" not in body
     assert "[REDACTED:RUNNER_NAME]" in body
+
+
+def _pr_ledger_entries(module, count: int) -> list[dict]:
+    entries = []
+    for index in range(count):
+        sha = "head" if index == count - 1 else f"old{index}"
+        entries.append(
+            module.build_entry(
+                repository="zlxlabs/app",
+                pr_number=7,
+                run_id=10 + index,
+                run_attempt=1,
+                head_sha=sha,
+                preflight={},
+                audit=_audit(sha, []),
+                prior_entries=entries,
+                dispositions={},
+            )
+        )
+    return entries
+
+
+def _same_repo_other_pr_entry(module) -> dict:
+    """Noise that a repository-only filter would keep."""
+    return module.build_entry(
+        repository="zlxlabs/app",
+        pr_number=99,
+        run_id=1,
+        run_attempt=1,
+        head_sha="other-pr",
+        preflight={},
+        audit=_audit("other-pr", []),
+        prior_entries=[],
+        dispositions={},
+    )
+
+
+def _other_repo_same_pr_entry(module) -> dict:
+    """Noise that a pr_number-only filter would keep."""
+    return module.build_entry(
+        repository="other/repo",
+        pr_number=7,
+        run_id=2,
+        run_attempt=1,
+        head_sha="other-repo",
+        preflight={},
+        audit=_audit("other-repo", []),
+        prior_entries=[],
+        dispositions={},
+    )
+
+
+def _cross_key_noise_entries(module) -> list[dict]:
+    return [_same_repo_other_pr_entry(module), _other_repo_same_pr_entry(module)]
+
+
+@pytest.mark.parametrize(
+    "has_existing, entry_count, expected_write",
+    [
+        (False, 1, None),
+        (False, 2, "POST"),
+        (True, 1, "PATCH"),
+        (True, 2, "PATCH"),
+    ],
+    ids=[
+        "no_comment_one_entry",
+        "no_comment_two_entries",
+        "has_comment_one_entry",
+        "has_comment_two_entries",
+    ],
+)
+def test_post_state_comment_create_or_skip_matrix(
+    has_existing, entry_count, expected_write, monkeypatch, capsys,
+):
+    module = _module()
+    same_pr = _pr_ledger_entries(module, entry_count)
+    current = same_pr[-1]
+    entries = [*_cross_key_noise_entries(module), *same_pr]
+    comments = [{"id": 99, "body": f"{module.STATE_MARKER}\n\nold\n"}] if has_existing else []
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        if method == "GET":
+            return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+        return b"{}"
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"], entries, current, comments,
+    )
+
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    output = capsys.readouterr().out
+    if expected_write is None:
+        assert writes == []
+        assert (
+            "::notice::skip first-round review ledger state comment; no prior history to persist"
+            in output
+        )
+        return
+
+    assert "skip first-round review ledger state comment" not in output
+    assert len(writes) == 1
+    method, url, payload = writes[0]
+    assert method == expected_write
+    assert payload is not None
+    if expected_write == "POST":
+        assert url == "https://api.github.com/repos/zlxlabs/app/issues/7/comments"
+        restored = module.parse_state_entries(
+            [{
+                "body": payload["body"],
+                "user": {"login": "github-actions[bot]", "type": "Bot"},
+            }]
+        )
+        assert restored == same_pr
+        assert "codex-review-ledger-state:v2:" in payload["body"]
+    else:
+        assert url == "https://api.github.com/repos/zlxlabs/app/issues/comments/99"
+        assert not any(item[0] == "POST" for item in recorded)
+
+
+def test_post_state_comment_skips_when_live_head_advanced(monkeypatch, capsys):
+    module = _module()
+    same_pr = _pr_ledger_entries(module, 2)
+    current = same_pr[-1]
+    entries = [*_cross_key_noise_entries(module), *same_pr]
+    recorded: list[tuple[str, str, dict | None]] = []
+
+    def fake_api_request(token, url, *, method="GET", payload=None):
+        recorded.append((method, url, payload))
+        if method == "GET":
+            return json.dumps({"head": {"sha": "live-new-head"}}).encode()
+        return b"{}"
+
+    monkeypatch.setattr(module, "_api_request", fake_api_request)
+    module.post_state_comment(
+        "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
+    )
+
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert writes == []
+    assert "skip stale review ledger state; PR head advanced" in capsys.readouterr().out
+
+
+def test_render_and_post_share_relevant_pr_entries_filter(monkeypatch, capsys):
+    module = _module()
+    noise = _cross_key_noise_entries(module)
+
+    def run_post(entries, current):
+        recorded: list[tuple[str, str, dict | None]] = []
+
+        def fake_api_request(token, url, *, method="GET", payload=None):
+            recorded.append((method, url, payload))
+            if method == "GET":
+                return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
+            return b"{}"
+
+        monkeypatch.setattr(module, "_api_request", fake_api_request)
+        module.post_state_comment(
+            "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
+        )
+        return recorded, capsys.readouterr().out
+
+    same_pr_one = _pr_ledger_entries(module, 1)
+    current_one = same_pr_one[-1]
+    recorded, output = run_post([*noise, *same_pr_one], current_one)
+    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+    assert writes == []
+    assert (
+        "::notice::skip first-round review ledger state comment; no prior history to persist"
+        in output
+    )
+
+    same_pr = _pr_ledger_entries(module, 2)
+    current = same_pr[-1]
+    entries = [*noise, *same_pr]
+    expected = [
+        entry for entry in entries
+        if entry.get("repository") == current.get("repository")
+        and entry.get("pr_number") == current.get("pr_number")
+    ]
+    assert len(expected) >= 2
+    assert len(entries) > len(expected)
+    recorded, output = run_post(entries, current)
+    posts = [item for item in recorded if item[0] == "POST"]
+    assert len(posts) == 1
+    assert "skip first-round review ledger state comment" not in output
+    restored = module.parse_state_entries(
+        [{
+            "body": posts[0][2]["body"],
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+        }]
+    )
+    assert restored == expected
+    assert restored == same_pr
 
 
 def test_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
@@ -948,3 +1249,390 @@ def test_state_comment_and_summary_mention_reviewer_on_failover():
     body = module.render_state_comment([entry], entry)
     assert "codex-sub" in body
     assert "failover" in body.lower() or "切换" in body
+
+
+def _aggregator():
+    path = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+    spec = importlib.util.spec_from_file_location("gate_aggregate_for_ledger", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _producer_terminal(*, receipts=(), run_attempt=1):
+    agg = _aggregator()
+    conv = agg._CONVERGENCE
+    identity = agg.Identity(
+        repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=run_attempt, pr=42,
+    )
+    audit = {
+        "kind": "primary_review",
+        "schema_version": 1,
+        "repository_id": identity.repository_id,
+        "head_sha": identity.head_sha,
+        "run_id": identity.run_id,
+        "run_attempt": identity.run_attempt,
+        "pr": identity.pr,
+        "verdict": "fail",
+        "reviewer": "claude-glm",
+        "base_sha": "b" * 40,
+        "diff_digest": "d" * 64,
+        "policy_version": "policy-v1",
+        "policy_digest": "p" * 64,
+        "tier": "personal",
+        "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "w" * 40,
+        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+    }
+    scope, missing = agg._convergence_scope_from_audit(audit, identity)
+    assert not missing and scope is not None
+    digest = "a" * 64
+    typed_receipts = []
+    for changes in receipts:
+        fields = dict(
+            schema_version=conv.DISPOSITION_RECEIPT_SCHEMA_VERSION,
+            disposition="false-positive",
+            repository_id=str(identity.repository_id),
+            pr_number=identity.pr,
+            epoch=conv.derive_epoch(scope),
+            head_sha=identity.head_sha,
+            audit_digest=digest,
+            finding_id="p1",
+            reason="locked upstream behavior",
+            approver="octocat",
+            approver_id=1,
+            approved_at="2026-08-30T12:00:00Z",
+        )
+        fields.update(changes)
+        typed_receipts.append(conv.DispositionReceipt(**fields))
+    outcome = agg.evaluate(
+        quality_result="success",
+        primary_result="failure",
+        runner="self",
+        is_draft=False,
+        review_expected=True,
+        audit=audit,
+        audit_error=None,
+        identity=identity,
+        audit_source_attempt=identity.run_attempt,
+        audit_artifact_name="primary-audit-v2-1",
+        scope=scope,
+        audit_digest=digest,
+        waiver_receipts=tuple(typed_receipts),
+    )
+    terminal = agg.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=identity, quality_result="success",
+        primary_result="failure", review_expected=True, is_draft=False, runner="self",
+        outcome=outcome,
+    )
+    return agg, conv, identity, typed_receipts, outcome, terminal
+
+
+def test_ledger_projects_real_producer_terminal_consumption():
+    module = _module()
+    agg, conv, identity, receipts, outcome, terminal = _producer_terminal(receipts=[{}])
+    assert outcome.disposition_consumption is not None
+    assert terminal["disposition_receipt_consumption"]["consumed_count"] == 1
+    entry = module.build_entry(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
+    assert entry["disposition_receipt_consumption"]["resolved"] == [
+        {
+            "finding_id": "p1",
+            "receipt": conv.disposition_receipt_artifact_name(receipts[0]),
+            "approver": "octocat",
+            "approver_id": 1,
+            "approved_at": "2026-08-30T12:00:00Z",
+            "reason": "locked upstream behavior",
+        }
+    ]
+    assert "resolved by receipt" not in json.dumps(entry["disposition_receipt_consumption"])
+
+
+def test_ledger_empty_consumption_when_producer_had_no_receipts():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    entry = module.build_entry(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    expected = module.empty_disposition_receipt_consumption()
+    assert terminal["disposition_receipt_consumption"] == expected
+    assert entry["disposition_receipt_consumption"] == expected
+
+
+def test_ledger_omits_consumption_when_terminal_is_absent():
+    module = _module()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+    )
+    assert "disposition_receipt_consumption" not in entry
+
+
+def test_disposition_consumption_stays_out_of_review_summary_and_compact_attempts():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    entry = module.build_entry(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    assert "disposition_receipt_consumption" in entry
+    assert "disposition_receipt_consumption" not in entry["review"]
+    for attempt in entry["review"]["attempts"]:
+        assert "disposition_receipt_consumption" not in attempt
+    assert "disposition_receipt_consumption" not in inspect.getsource(module._review_summary)
+    assert "disposition_receipt_consumption" not in inspect.getsource(module._compact_attempts)
+
+
+def test_comment_dispositions_remain_a_separate_channel_from_receipt_consumption():
+    module = _module()
+    dispositions = {
+        "p1": {
+            "disposition": "false-positive",
+            "reason": "comment observation",
+            "status": "active_false_positive",
+        }
+    }
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=_audit("sha", ["p1"]),
+        prior_entries=[], dispositions=dispositions,
+    )
+    assert entry["finding_dispositions"]["p1"]["reason"] == "comment observation"
+    assert entry["convergence_projection"]["source"] == "disposition-observation"
+    assert entry["convergence_projection"]["required_gate_effect"] == "none"
+    assert "disposition_receipt_consumption" not in entry
+
+
+def _write_terminal(tmp_path, payload):
+    path = tmp_path / "gate-terminal.json"
+    if isinstance(payload, bytes):
+        path.write_bytes(payload)
+    else:
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_missing_or_empty_terminal_file_is_fail_loud_not_empty_consumption(tmp_path):
+    module = _module()
+    missing = tmp_path / "missing" / "gate-terminal.json"
+    empty = tmp_path / "gate-terminal.json"
+    empty.write_text("")
+    with pytest.raises(ValueError, match="missing or empty"):
+        module.load_gate_terminal_envelope(missing)
+    with pytest.raises(ValueError, match="missing or empty"):
+        module.load_gate_terminal_envelope(empty)
+
+
+def test_corrupt_terminal_json_is_fail_loud_not_empty_consumption(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, "{not json")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        module.load_gate_terminal_envelope(path)
+
+
+def test_terminal_array_payload_is_fail_loud(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, "[]")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        module.load_gate_terminal_envelope(path)
+
+
+def test_missing_consumption_block_is_fail_loud_not_empty_default():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    del terminal["disposition_receipt_consumption"]
+    with pytest.raises(ValueError, match="missing disposition_receipt_consumption"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"],
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+@pytest.mark.parametrize("kind, match", [
+    ("resolved_not_array", "resolved must be an array"),
+    ("missing_receipt", "missing receipt"),
+    ("approver_id", "approver_id must be a positive integer"),
+    ("consumed_count", "consumed_count does not match resolved"),
+    ("rejected_count", "rejected_count does not match rejected_reasons"),
+    ("fail_closed", "fail_closed must be a boolean"),
+])
+def test_validator_rejects_malformed_consumption_shapes(kind, match):
+    module = _module()
+    *_rest, terminal = _producer_terminal(receipts=[{}])
+    block = json.loads(json.dumps(terminal["disposition_receipt_consumption"]))
+    if kind == "resolved_not_array":
+        block["resolved"] = {}
+    elif kind == "missing_receipt":
+        del block["resolved"][0]["receipt"]
+    elif kind == "approver_id":
+        block["resolved"][0]["approver_id"] = 0
+    elif kind == "consumed_count":
+        block["consumed_count"] = 0
+    elif kind == "rejected_count":
+        block["rejected_count"] = 3
+    else:
+        block["fail_closed"] = "false"
+    with pytest.raises(ValueError, match=match):
+        module.validate_disposition_receipt_consumption(block)
+
+
+def test_malformed_consumption_block_is_fail_loud():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    terminal["disposition_receipt_consumption"]["consumed_count"] = "1"
+    with pytest.raises(ValueError, match="consumed_count"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"],
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+def test_terminal_identity_mismatch_is_fail_loud():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    with pytest.raises(ValueError, match="identity mismatch"):
+        module.build_entry(
+            repository=terminal["repository"],
+            pr_number=terminal["pr_number"],
+            run_id=terminal["run_id"] + 1,
+            run_attempt=terminal["run_attempt"],
+            head_sha=terminal["head_sha"],
+            preflight={},
+            audit=None,
+            prior_entries=[],
+            dispositions={},
+            terminal_envelope=terminal,
+        )
+
+
+def _build_from_terminal(module, terminal, **overrides):
+    kwargs = dict(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    kwargs.update(overrides)
+    return module.build_entry(**kwargs)
+
+
+_SAME_ATTEMPT_TERMINAL_ENTRY_KEYS = {
+    "schema_version", "recorded_at", "repository", "pr_number", "run_id",
+    "run_attempt", "head_sha", "review_round", "preflight", "install",
+    "primary_identity", "review", "comparison", "finding_dispositions",
+    "convergence_projection", "false_positive_count",
+    "disposition_receipt_consumption",
+}
+
+
+def test_prior_attempt_terminal_from_producer_is_accepted():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}], run_attempt=1)
+    assert terminal["run_attempt"] == 1
+    entry = _build_from_terminal(module, terminal, run_attempt=2)
+    assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
+
+
+def test_same_attempt_terminal_entry_keys_do_not_add_source_attempt():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    entry = _build_from_terminal(module, terminal)
+    assert "terminal_source_attempt" not in entry
+    assert set(entry) == _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS
+
+
+def test_prior_attempt_terminal_entry_records_source_attempt():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}], run_attempt=1)
+    entry = _build_from_terminal(module, terminal, run_attempt=2)
+    assert entry["terminal_source_attempt"] == 1
+    assert set(entry) == _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS | {"terminal_source_attempt"}
+
+
+def test_future_attempt_terminal_from_producer_is_rejected():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(run_attempt=3)
+    assert terminal["run_attempt"] == 3
+    with pytest.raises(ValueError, match="gate terminal identity mismatch"):
+        _build_from_terminal(module, terminal, run_attempt=2)
+
+
+@pytest.mark.parametrize("bad_attempt", [0, -1, 1.5, "1", True, False, None])
+def test_invalid_terminal_run_attempt_is_rejected(bad_attempt):
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    terminal["run_attempt"] = bad_attempt
+    with pytest.raises(ValueError, match="gate terminal identity mismatch"):
+        _build_from_terminal(module, terminal, run_attempt=1)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("repository", "other/repo"),
+    ("pr_number", 99),
+    ("run_id", 1),
+    ("head_sha", "b" * 40),
+])
+def test_terminal_identity_still_requires_exact_non_attempt_fields(field, value):
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    with pytest.raises(ValueError, match="gate terminal identity mismatch"):
+        _build_from_terminal(module, terminal, **{field: value})
+
+
+def test_unsupported_terminal_schema_is_fail_loud(tmp_path):
+    module = _module()
+    path = _write_terminal(tmp_path, {"schema_version": 2, "kind": "gate_terminal"})
+    with pytest.raises(ValueError, match="unsupported schema"):
+        module.load_gate_terminal_envelope(path)

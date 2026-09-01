@@ -153,7 +153,7 @@ HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
 MAX_REPO_WIDE_HISTORY_PAGES = 5
 MAX_TARGETED_HISTORY_RUNS = 50
 MAX_HISTORY_WARNING_CHARS = 500
-DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v1-"
+DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v2-"
 PUBLISH_OPERATION_ORDER = (
     "IDENTITY",
     "COMMENT_LOOKUP",
@@ -258,6 +258,10 @@ class Outcome:
     convergence_envelope: Optional[dict[str, Any]] = None
     convergence_receipt: Optional[Any] = None
     resolved_findings: list[str] = field(default_factory=list)
+    # Structured consume_dispositions result. Panel/G4 strings live in
+    # resolved_findings; this object is the only source for the terminal
+    # persistence block (ledger is the second consumer).
+    disposition_consumption: Optional[Any] = None
 
 
 @dataclass
@@ -344,6 +348,49 @@ _ACTIVE_PUBLISH_BUDGET: contextvars.ContextVar[Optional[_PublishBudget]] = conte
 )
 
 
+def empty_disposition_receipt_consumption() -> dict[str, Any]:
+    """Default block for a run that never consumed a disposition receipt."""
+    return {
+        "resolved": [],
+        "consumed_count": 0,
+        "rejected_count": 0,
+        "rejected_reasons": {},
+        "fail_closed": False,
+    }
+
+
+def project_disposition_receipt_consumption(consumption: Any) -> dict[str, Any]:
+    """Project consume_dispositions onto the terminal persistence block.
+
+    Reads DispositionReceipt objects, never G4 display strings. Ledger
+    copies this block as the top-level disposition_receipt_consumption
+    field (the second consumer).
+    """
+    if consumption is None:
+        return empty_disposition_receipt_consumption()
+    resolved = [
+        {
+            "finding_id": receipt.finding_id,
+            "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
+            "approver": receipt.approver,
+            "approver_id": receipt.approver_id,
+            "approved_at": receipt.approved_at,
+            "reason": receipt.reason,
+        }
+        for receipt in consumption.consumed_receipts
+    ]
+    rejected_reasons: dict[str, int] = {}
+    for _receipt, reason in consumption.rejected_receipts:
+        rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+    return {
+        "resolved": resolved,
+        "consumed_count": len(consumption.consumed_receipts),
+        "rejected_count": len(consumption.rejected_receipts),
+        "rejected_reasons": dict(sorted(rejected_reasons.items())),
+        "fail_closed": bool(consumption.fail_closed),
+    }
+
+
 def build_terminal_envelope(
     *, repository: str, identity: Identity, quality_result: str, primary_result: str, review_expected: bool,
     is_draft: bool, runner: str, outcome: Outcome,
@@ -351,7 +398,7 @@ def build_terminal_envelope(
     """Build the versioned machine-readable gate terminal envelope."""
     if outcome.classification not in TERMINAL_CLASSIFICATION_DOMAIN or outcome.reason_code not in TERMINAL_REASON_DOMAIN or outcome.gate_result not in GATE_RESULT_DOMAIN:
         raise ValueError("terminal field is outside the finite domain")
-    return {
+    envelope = {
         "schema_version": 1, "kind": "gate_terminal", "repository": repository,
         "repository_id": identity.repository_id, "pr_number": identity.pr, "run_id": identity.run_id,
         "run_attempt": identity.run_attempt, "head_sha": identity.head_sha,
@@ -364,7 +411,13 @@ def build_terminal_envelope(
         "classification": outcome.classification,
         "reason_code": outcome.reason_code,
         "audit": {"available": outcome.audit_available, "source_attempt": outcome.audit_source_attempt if outcome.audit_available else None, "artifact_name": outcome.audit_artifact_name if outcome.audit_available else None},
+        "disposition_receipt_consumption": project_disposition_receipt_consumption(
+            outcome.disposition_consumption,
+        ),
     }
+    if outcome.resolved_findings:
+        envelope["resolved_findings"] = list(outcome.resolved_findings)
+    return envelope
 
 
 def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
@@ -714,6 +767,10 @@ def evaluate(
             audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
+        # First-pass consumption is the judge's durable fact: rejected
+        # receipts never reach evaluate_round, so round_decision.disposition
+        # cannot be the persistence source.
+        outcome.disposition_consumption = consumption
         # Historical / invalid receipts must not fail-close this round's
         # convergence; only receipts that already consumed a current finding
         # are forwarded to the evaluator.
@@ -1024,6 +1081,14 @@ def render_status_panel(
     warning_line = _bounded_history_warning(history_warning=history_warning, history_reasons=history_reasons)
     if warning_line:
         lines.extend(["", warning_line])
+    resolved = [
+        line for line in (current.get("resolved_findings") or [])
+        if isinstance(line, str) and line
+    ]
+    if resolved:
+        lines.extend(["", "Resolved:"])
+        for line in resolved:
+            lines.append(f"- {line}")
     lines.extend([
         "",
         "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
@@ -1209,7 +1274,7 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         raise ValueError("gate terminal gate_result is outside the finite domain")
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")
-    return {
+    row = {
         "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
         "repository": repository,
         "run_id": record["run_id"],
@@ -1219,6 +1284,10 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "classification": record["classification"],
         "reason_code": record["reason_code"],
     }
+    resolved = record.get("resolved_findings")
+    if isinstance(resolved, list) and all(isinstance(item, str) for item in resolved) and resolved:
+        row["resolved_findings"] = list(resolved)
+    return row
 
 
 def _read_terminal_zip(raw: bytes) -> dict[str, Any]:
@@ -1760,7 +1829,7 @@ def _panel_current_row(
     gate_result = outcome.gate_result if outcome.gate_result in GATE_RESULT_DOMAIN else "unavailable"
     classification = outcome.classification if outcome.classification in TERMINAL_CLASSIFICATION_DOMAIN else "integration_error"
     reason_code = outcome.reason_code if outcome.reason_code in TERMINAL_REASON_DOMAIN else "audit_invalid"
-    return {
+    row = {
         "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
         "repository": repository or "",
         "run_id": identity.run_id if identity else 0,
@@ -1770,6 +1839,9 @@ def _panel_current_row(
         "classification": classification,
         "reason_code": reason_code,
     }
+    if outcome.resolved_findings:
+        row["resolved_findings"] = list(outcome.resolved_findings)
+    return row
 
 
 def _persist_panel_delivery(path: str, receipt: dict[str, Any]) -> None:

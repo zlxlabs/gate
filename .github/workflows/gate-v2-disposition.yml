@@ -8,6 +8,15 @@ on:
       primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
+  workflow_call:
+    inputs:
+      pr_number: { description: "pull request number", required: true, type: string }
+      primary_run_id: { description: "canonical primary run id", required: true, type: string }
+      primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
+      finding_id: { description: "exact current-audit finding id", required: true, type: string }
+      reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
 
 permissions:
   actions: write
@@ -26,17 +35,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Require 40-hex gate_ref
+        env:
+          GATE_REF: ${{ inputs.gate_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::gate_ref must be a 40-character lowercase hex SHA, not a branch or tag"
+            exit 1
+          fi
+
       - name: Checkout disposition producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          repository: zlxlabs/gate
+          ref: ${{ inputs.gate_ref }}
           sparse-checkout: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
+          sparse-checkout-cone-mode: false
           fetch-depth: 1
 
       - name: Resolve current PR head and canonical primary audit
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
           PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
           PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
@@ -53,7 +76,7 @@ jobs:
           audit_dir="$RUNNER_TEMP/current-primary-audit"
           mkdir -p "$audit_dir"
           audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
-          gh run download "$PRIMARY_RUN_ID" --name "$audit_name" --dir "$audit_dir"
+          gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name" --dir "$audit_dir"
           audit_path="$(find "$audit_dir" -type f -name '*.json' -print -quit)"
           test -n "$audit_path"
           audit_digest="$(sha256sum "$audit_path" | cut -d' ' -f1)"
@@ -95,9 +118,12 @@ jobs:
           head_sha = pull["head"]["sha"]
           if audit["base_sha"] != base_sha or audit["head_sha"] != head_sha:
               raise SystemExit("canonical audit scope disagrees with current PR base/head")
-          module_path = ".github/actions/gate-aggregator/convergence.py"
+          module_path = Path(".github/actions/gate-aggregator/convergence.py").resolve()
           spec = importlib.util.spec_from_file_location("gate_convergence_scope", module_path)
+          if spec is None or spec.loader is None:
+              raise ImportError(f"convergence module is unavailable: {module_path}")
           module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
           spec.loader.exec_module(module)
           scope = module.Scope(
               repository_id=repository_id,
@@ -127,6 +153,8 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           FINDING_ID: ${{ inputs.finding_id }}
           DISPOSITION_REASON: ${{ inputs.reason }}
+          DISPOSITION_APPROVER: ${{ github.triggering_actor }}
+          DISPOSITION_APPROVER_ID: ${{ github.actor_id }}
           OUTPUT_DIR: ${{ runner.temp }}/gate-disposition-artifact
         run: |
           set -euo pipefail
@@ -135,11 +163,17 @@ jobs:
           test -n "$CURRENT_HEAD_SHA"
           test -n "$CURRENT_AUDIT_DIGEST"
           test -n "$CURRENT_EPOCH"
+          test -n "$DISPOSITION_APPROVER"
+          test -n "$DISPOSITION_APPROVER_ID"
+          approved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           output="$(python3 .github/actions/gate-disposition/issue_receipt.py issue \
             --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
             --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
             --head-sha "$CURRENT_HEAD_SHA" --finding-id "$FINDING_ID" \
-            --reason "$DISPOSITION_REASON" --scope-json "$CURRENT_SCOPE_JSON")"
+            --reason "$DISPOSITION_REASON" --scope-json "$CURRENT_SCOPE_JSON" \
+            --approver "$DISPOSITION_APPROVER" \
+            --approver-id "$DISPOSITION_APPROVER_ID" \
+            --approved-at "$approved_at")"
           artifact_name="$(printf '%s' "$output" | jq -r '.artifact')"
           test -n "$artifact_name" && echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 

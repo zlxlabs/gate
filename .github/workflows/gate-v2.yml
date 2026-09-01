@@ -1113,8 +1113,11 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
           INPUT_PREFIX: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
+          TERMINAL_PREFIX: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
         run: |
@@ -1122,13 +1125,19 @@ jobs:
           listing="$(mktemp)"
           trap 'rm -f "$listing"' EXIT
           gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$listing"
-          python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
+          python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$TERMINAL_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
           import json
+          import os
           import re
+          import subprocess
           import sys
+          from datetime import datetime
           from pathlib import Path
 
-          listing_path, input_prefix, audit_prefix, current_text, expected_text, output_path = sys.argv[1:]
+          argv = sys.argv[1:]
+          listing_path, input_prefix, audit_prefix, terminal_prefix, current_text, expected_text, output_path = argv[:7]
+          jobs_listing_path = argv[7] if len(argv) > 7 else ""
+          attempt_listing_path = argv[8] if len(argv) > 8 else ""
           current = int(current_text)
           if expected_text not in {"true", "false"}:
               raise SystemExit("REVIEW_EXPECTED must be true or false")
@@ -1152,7 +1161,8 @@ jobs:
                   if not re.fullmatch(r"[0-9]+", suffix):
                       continue
                   attempt = int(suffix)
-                  # Only attempts <= current are eligible; never select a future artifact.
+                  # input/audit/terminal may reuse an earlier attempt of this run.
+                  # never select an attempt newer than the current run attempt.
                   artifact_id = artifact.get("id")
                   if attempt <= current and isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
                       candidates.append((attempt, artifact_id, name))
@@ -1164,11 +1174,117 @@ jobs:
 
           input_artifact = select_artifact(input_prefix, "No matching required ledger input artifact found", True)
           audit_artifact = select_artifact(audit_prefix, "No matching canonical primary audit artifact found", expected_text == "true")
+          terminal_artifact = select_artifact(
+              terminal_prefix, "No matching required gate terminal artifact found", True,
+          )
+
+          def is_gate_aggregator_job(name):
+              return name == "gate" or (isinstance(name, str) and name.endswith(" / gate"))
+
+          def jobs_pages(payload):
+              pages = payload if isinstance(payload, list) else [payload]
+              jobs = []
+              for page in pages:
+                  if not isinstance(page, dict) or not isinstance(page.get("jobs"), list):
+                      raise SystemExit("current attempt jobs listing has invalid JSON shape")
+                  jobs.extend(page["jobs"])
+              return jobs
+
+          def attribution_repo():
+              repo = os.environ.get("REPOSITORY", "")
+              run_id = os.environ.get("RUN_ID", "")
+              if not repo or not run_id:
+                  raise SystemExit("cannot attribute missing current-attempt terminal: jobs listing not provided")
+              return repo, run_id
+
+          def load_current_attempt_jobs():
+              if jobs_listing_path:
+                  return json.loads(Path(jobs_listing_path).read_text(encoding="utf-8"))
+              repo, run_id = attribution_repo()
+              proc = subprocess.run(
+                  [
+                      "gh", "api",
+                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}/jobs",
+                      "--paginate", "--slurp",
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
+              return json.loads(proc.stdout)
+
+          def load_current_attempt_meta():
+              if attempt_listing_path:
+                  return json.loads(Path(attempt_listing_path).read_text(encoding="utf-8"))
+              repo, run_id = attribution_repo()
+              proc = subprocess.run(
+                  [
+                      "gh", "api",
+                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}",
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
+              return json.loads(proc.stdout)
+
+          def parse_utc_datetime(value):
+              if not isinstance(value, str) or not value:
+                  return None
+              text = value[:-1] + "+00:00" if value.endswith("Z") else value
+              try:
+                  parsed = datetime.fromisoformat(text)
+              except ValueError:
+                  return None
+              if parsed.tzinfo is None:
+                  return None
+              return parsed
+
+          RUN_STARTED_AT_ERROR = (
+              "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable"
+          )
+
+          def parse_run_started_at(payload):
+              if isinstance(payload, list):
+                  if len(payload) != 1 or not isinstance(payload[0], dict):
+                      raise SystemExit("current attempt listing has invalid JSON shape")
+                  payload = payload[0]
+              if not isinstance(payload, dict):
+                  raise SystemExit("current attempt listing has invalid JSON shape")
+              parsed = parse_utc_datetime(payload.get("run_started_at"))
+              if parsed is None:
+                  raise SystemExit(RUN_STARTED_AT_ERROR)
+              return parsed
+
+          if terminal_artifact[0] != current:
+              payload = load_current_attempt_jobs()
+              attempt_started = parse_run_started_at(load_current_attempt_meta())
+              aggregator_ran = False
+              for job in jobs_pages(payload):
+                  if not isinstance(job, dict) or not is_gate_aggregator_job(job.get("name")):
+                      continue
+                  job_started = parse_utc_datetime(job.get("started_at"))
+                  if job_started is None:
+                      raise SystemExit(
+                          "Cannot attribute missing current-attempt terminal: aggregator job started_at is missing or unparseable"
+                      )
+                  # timezone-aware datetime compare; copied jobs keep the prior
+                  # attempt's started_at, which is earlier than this attempt.
+                  if job_started >= attempt_started:
+                      aggregator_ran = True
+                      break
+              if aggregator_ran:
+                  raise SystemExit(
+                      "Aggregator ran on this attempt but did not produce a terminal artifact"
+                  )
+
           with open(output_path, "a", encoding="utf-8") as output:
               output.write(f"input_artifact_id={input_artifact[1]}\n")
               output.write(f"input_source_attempt={input_artifact[0]}\n")
               output.write(f"audit_artifact_id={audit_artifact[1] if audit_artifact else ''}\n")
               output.write(f"audit_source_attempt={audit_artifact[0] if audit_artifact else ''}\n")
+              output.write(f"terminal_artifact_id={terminal_artifact[1]}\n")
+              output.write(f"terminal_source_attempt={terminal_artifact[0]}\n")
           PY
 
       - name: Download v2 review ledger inputs
@@ -1186,12 +1302,20 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/primary-audit
 
+      - name: Download gate terminal envelope for ledger
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/gate-terminal
+
       - name: Build v2 review effectiveness ledger
         uses: ./_gate-aggregator-src/.github/actions/review-ledger
         with:
           audit-path: ${{ runner.temp }}/primary-audit/primary-review-audit.json
           preflight-path: ${{ runner.temp }}/review-ledger-input/pr-size-preflight.json
           install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
+          terminal-path: ${{ runner.temp }}/gate-terminal/gate-terminal.json
           token: ${{ github.token }}
           codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
           codex-waived: false
