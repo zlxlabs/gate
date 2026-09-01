@@ -1113,6 +1113,8 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
           INPUT_PREFIX: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           TERMINAL_PREFIX: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
@@ -1125,11 +1127,15 @@ jobs:
           gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$listing"
           python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$TERMINAL_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
           import json
+          import os
           import re
+          import subprocess
           import sys
           from pathlib import Path
 
-          listing_path, input_prefix, audit_prefix, terminal_prefix, current_text, expected_text, output_path = sys.argv[1:]
+          argv = sys.argv[1:]
+          listing_path, input_prefix, audit_prefix, terminal_prefix, current_text, expected_text, output_path = argv[:7]
+          jobs_listing_path = argv[7] if len(argv) > 7 else ""
           current = int(current_text)
           if expected_text not in {"true", "false"}:
               raise SystemExit("REVIEW_EXPECTED must be true or false")
@@ -1169,6 +1175,45 @@ jobs:
           terminal_artifact = select_artifact(
               terminal_prefix, "No matching required gate terminal artifact found", True,
           )
+
+          def is_gate_aggregator_job(name):
+              return name == "gate" or (isinstance(name, str) and name.endswith(" / gate"))
+
+          def jobs_pages(payload):
+              pages = payload if isinstance(payload, list) else [payload]
+              jobs = []
+              for page in pages:
+                  if not isinstance(page, dict) or not isinstance(page.get("jobs"), list):
+                      raise SystemExit("current attempt jobs listing has invalid JSON shape")
+                  jobs.extend(page["jobs"])
+              return jobs
+
+          def load_current_attempt_jobs():
+              if jobs_listing_path:
+                  return json.loads(Path(jobs_listing_path).read_text(encoding="utf-8"))
+              repo = os.environ.get("REPOSITORY", "")
+              run_id = os.environ.get("RUN_ID", "")
+              if not repo or not run_id:
+                  raise SystemExit("cannot attribute missing current-attempt terminal: jobs listing not provided")
+              proc = subprocess.run(
+                  [
+                      "gh", "api",
+                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}/jobs",
+                      "--paginate", "--slurp",
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
+              return json.loads(proc.stdout)
+
+          if terminal_artifact[0] != current:
+              payload = load_current_attempt_jobs()
+              if any(isinstance(job, dict) and is_gate_aggregator_job(job.get("name")) for job in jobs_pages(payload)):
+                  raise SystemExit(
+                      "Aggregator ran on this attempt but did not produce a terminal artifact"
+                  )
+
           with open(output_path, "a", encoding="utf-8") as output:
               output.write(f"input_artifact_id={input_artifact[1]}\n")
               output.write(f"input_source_attempt={input_artifact[0]}\n")
