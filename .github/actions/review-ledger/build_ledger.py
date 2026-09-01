@@ -539,7 +539,14 @@ def _disposition_receipt_consumption_from_terminal(
         "run_attempt": run_attempt,
         "head_sha": head_sha,
     }
-    mismatches = [field for field, value in expected.items() if envelope.get(field) != value]
+    mismatches = []
+    for field, value in expected.items():
+        observed = envelope.get(field)
+        if field == "run_attempt":
+            if not _strict_int(observed) or not 1 <= observed <= value:
+                mismatches.append(field)
+        elif observed != value:
+            mismatches.append(field)
     if mismatches:
         raise ValueError(f"gate terminal identity mismatch: {sorted(mismatches)}")
     if "disposition_receipt_consumption" not in envelope:
@@ -647,6 +654,9 @@ def build_entry(
             run_attempt=run_attempt,
             head_sha=head_sha,
         )
+        source_attempt = terminal_envelope.get("run_attempt")
+        if source_attempt != run_attempt:
+            entry["terminal_source_attempt"] = source_attempt
     return entry
 
 

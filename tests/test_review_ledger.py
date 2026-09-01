@@ -1261,11 +1261,11 @@ def _aggregator():
     return module
 
 
-def _producer_terminal(*, receipts=()):
+def _producer_terminal(*, receipts=(), run_attempt=1):
     agg = _aggregator()
     conv = agg._CONVERGENCE
     identity = agg.Identity(
-        repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=1, pr=42,
+        repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=run_attempt, pr=42,
     )
     audit = {
         "kind": "primary_review",
@@ -1549,6 +1549,86 @@ def test_terminal_identity_mismatch_is_fail_loud():
             dispositions={},
             terminal_envelope=terminal,
         )
+
+
+def _build_from_terminal(module, terminal, **overrides):
+    kwargs = dict(
+        repository=terminal["repository"],
+        pr_number=terminal["pr_number"],
+        run_id=terminal["run_id"],
+        run_attempt=terminal["run_attempt"],
+        head_sha=terminal["head_sha"],
+        preflight={},
+        audit=None,
+        prior_entries=[],
+        dispositions={},
+        terminal_envelope=terminal,
+    )
+    kwargs.update(overrides)
+    return module.build_entry(**kwargs)
+
+
+_SAME_ATTEMPT_TERMINAL_ENTRY_KEYS = {
+    "schema_version", "recorded_at", "repository", "pr_number", "run_id",
+    "run_attempt", "head_sha", "review_round", "preflight", "install",
+    "primary_identity", "review", "comparison", "finding_dispositions",
+    "convergence_projection", "false_positive_count",
+    "disposition_receipt_consumption",
+}
+
+
+def test_prior_attempt_terminal_from_producer_is_accepted():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}], run_attempt=1)
+    assert terminal["run_attempt"] == 1
+    entry = _build_from_terminal(module, terminal, run_attempt=2)
+    assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
+
+
+def test_same_attempt_terminal_entry_keys_do_not_add_source_attempt():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    entry = _build_from_terminal(module, terminal)
+    assert "terminal_source_attempt" not in entry
+    assert set(entry) == _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS
+
+
+def test_prior_attempt_terminal_entry_records_source_attempt():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}], run_attempt=1)
+    entry = _build_from_terminal(module, terminal, run_attempt=2)
+    assert entry["terminal_source_attempt"] == 1
+    assert set(entry) == _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS | {"terminal_source_attempt"}
+
+
+def test_future_attempt_terminal_from_producer_is_rejected():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(run_attempt=3)
+    assert terminal["run_attempt"] == 3
+    with pytest.raises(ValueError, match="gate terminal identity mismatch"):
+        _build_from_terminal(module, terminal, run_attempt=2)
+
+
+@pytest.mark.parametrize("bad_attempt", [0, -1, 1.5, "1", True, False, None])
+def test_invalid_terminal_run_attempt_is_rejected(bad_attempt):
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    terminal["run_attempt"] = bad_attempt
+    with pytest.raises(ValueError, match="gate terminal identity mismatch"):
+        _build_from_terminal(module, terminal, run_attempt=1)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("repository", "other/repo"),
+    ("pr_number", 99),
+    ("run_id", 1),
+    ("head_sha", "b" * 40),
+])
+def test_terminal_identity_still_requires_exact_non_attempt_fields(field, value):
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    with pytest.raises(ValueError, match="gate terminal identity mismatch"):
+        _build_from_terminal(module, terminal, **{field: value})
 
 
 def test_unsupported_terminal_schema_is_fail_loud(tmp_path):

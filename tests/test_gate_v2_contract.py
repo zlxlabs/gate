@@ -8,11 +8,13 @@ ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
 kept behaviorally aligned with this file.
 """
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 from _gha_lint import (
@@ -752,17 +754,24 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
     )
     run = resolver["run"]
     for marker in (
-        "--paginate", "expired", "<= current", "exact_attempt=current",
+        "--paginate", "expired", "<= current",
         "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
         "terminal_source_attempt",
     ):
         assert marker in run
+    assert "exact_attempt" not in run
     assert resolver["env"]["TERMINAL_PREFIX"] == (
         "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
     )
+    assert resolver["env"]["REPOSITORY"] == "${{ github.repository }}"
+    assert resolver["env"]["RUN_ID"] == "${{ github.run_id }}"
     assert "No matching required ledger input artifact found" in run
     assert "No matching canonical primary audit artifact found" in run
     assert "No matching required gate terminal artifact found" in run
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in run
+    assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in run
+    assert "/attempts/" in run and "/jobs" in run
+    assert "run_started_at" in run
 
 
 def _ledger_resolver_python() -> str:
@@ -777,41 +786,236 @@ def _ledger_resolver_python() -> str:
     return run[start:end]
 
 
-def _run_ledger_resolver(tmp_path, *, artifacts, current, review_expected="false"):
+def _run_ledger_resolver(
+    tmp_path, *, artifacts, current, review_expected="false",
+    jobs=None, jobs_path=None, attempt=None, attempt_path=None,
+):
     listing = tmp_path / "listing.json"
     listing.write_text(json.dumps({"artifacts": artifacts}), encoding="utf-8")
     output = tmp_path / "github_output"
     output.write_text("", encoding="utf-8")
+    argv = [
+        sys.executable, "-",
+        str(listing),
+        "review-ledger-input-v2-",
+        "primary-audit-v2-",
+        "gate-terminal-v1-",
+        str(current),
+        review_expected,
+        str(output),
+    ]
+    extra = jobs is not None or jobs_path is not None or attempt is not None or attempt_path is not None
+    if extra:
+        if jobs_path is not None:
+            argv.append(str(jobs_path))
+        elif jobs is not None:
+            jobs_file = tmp_path / "jobs.json"
+            jobs_file.write_text(json.dumps(jobs), encoding="utf-8")
+            argv.append(str(jobs_file))
+        else:
+            argv.append("")
+        if attempt_path is not None:
+            argv.append(str(attempt_path))
+        elif attempt is not None:
+            attempt_file = tmp_path / "attempt.json"
+            attempt_file.write_text(json.dumps(attempt), encoding="utf-8")
+            argv.append(str(attempt_file))
+    env = os.environ.copy()
+    for key in ("REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"):
+        env.pop(key, None)
     result = subprocess.run(
-        [
-            sys.executable, "-",
-            str(listing),
-            "review-ledger-input-v2-",
-            "primary-audit-v2-",
-            "gate-terminal-v1-",
-            str(current),
-            review_expected,
-            str(output),
-        ],
+        argv,
         input=_ledger_resolver_python(),
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     return result, output.read_text(encoding="utf-8")
+
+
+ISSUE_101_RUN_STARTED_AT = "2026-09-01T02:57:51Z"
+
+
+def _jobs(*names, started_at=None):
+    jobs = []
+    for index, name in enumerate(names, start=1):
+        job = {"name": name, "id": index}
+        if started_at is not None:
+            job["started_at"] = started_at
+        jobs.append(job)
+    return {"jobs": jobs}
+
+
+def _issue_101_attempt2_jobs():
+    return {
+        "jobs": [
+            {"name": "gate / gate", "id": 99721378127, "run_attempt": 2, "started_at": "2026-09-01T02:49:00Z", "conclusion": "success"},
+            {"name": "gate / quality", "id": 99721377855, "run_attempt": 2, "started_at": "2026-09-01T02:30:19Z", "conclusion": "success"},
+            {"name": "gate / primary", "id": 99721378200, "run_attempt": 2, "started_at": "2026-09-01T02:30:19Z", "conclusion": "success"},
+            {"name": "gate / ledger", "id": 99721378122, "run_attempt": 2, "started_at": "2026-09-01T02:57:57Z", "conclusion": "failure"},
+            {"name": "gate / ocr (ocr-minimax-m3)", "id": 99721377502, "run_attempt": 2, "started_at": "2026-09-01T02:57:57Z", "conclusion": "success"},
+            {"name": "gate / notify", "id": 99721378564, "run_attempt": 2, "started_at": "2026-09-01T02:57:54Z", "conclusion": "skipped"},
+        ]
+    }
 
 
 def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(tmp_path):
     artifacts = [
         {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
         {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
     ]
     result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
     combined = result.stderr + result.stdout
     assert result.returncode != 0
     assert "No matching required gate terminal artifact found" in combined
     assert "identity mismatch" not in combined
+
+
+def test_ledger_resolver_falls_back_to_prior_terminal_when_current_attempt_is_missing(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2,
+        jobs=_jobs("gate / ledger", "gate / quality"),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+
+
+def test_ledger_resolver_selects_current_attempt_terminal_not_an_older_one(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
+    ]
+    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=202" in output
+    assert "terminal_source_attempt=2" in output
+
+
+def test_ledger_resolver_refuses_future_terminal_artifact(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
+    ]
+    result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+    assert "terminal_artifact_id=203" not in _output
+
+
+def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, jobs=_jobs("gate / ledger"),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+    assert "terminal_artifact_id=203" not in output
+
+
+@pytest.mark.parametrize("gate_job_name", ["gate", "gate / gate"])
+def test_ledger_resolver_hard_fails_when_aggregator_ran_without_terminal(tmp_path, gate_job_name):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2,
+        jobs=_jobs(gate_job_name, "gate / ledger", started_at="2026-09-01T02:57:51Z"),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in combined
+    assert "No matching required gate terminal artifact found" not in combined
+
+
+def test_ledger_resolver_skips_jobs_listing_when_current_terminal_exists(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
+    ]
+    missing = tmp_path / "jobs-missing.json"
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, jobs_path=missing,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=202" in output
+    assert "terminal_source_attempt=2" in output
+    poison = tmp_path / "jobs-poison.json"
+    poison.write_text("{not json", encoding="utf-8")
+    attempt_poison = tmp_path / "attempt-poison.json"
+    attempt_poison.write_text("{not json", encoding="utf-8")
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, jobs_path=poison, attempt_path=attempt_poison,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_source_attempt=2" in output
+
+
+def _prior_terminal_artifacts():
+    return [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+
+
+def test_ledger_resolver_falls_back_when_copied_aggregator_job_predates_attempt(tmp_path):
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
+        jobs=_issue_101_attempt2_jobs(),
+        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+
+
+def test_ledger_resolver_hard_fails_when_aggregator_started_at_or_after_attempt(tmp_path):
+    jobs = _issue_101_attempt2_jobs()
+    jobs["jobs"][0]["started_at"] = "2026-09-01T02:57:51Z"
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
+        jobs=jobs, attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in combined
+    assert "No matching required gate terminal artifact found" not in combined
+    assert "run_started_at is missing or unparseable" not in combined
+
+
+@pytest.mark.parametrize("attempt", [
+    {},
+    {"run_started_at": None},
+    {"run_started_at": "not-a-timestamp"},
+    {"run_started_at": "2026-09-01 02:57:51"},
+])
+def test_ledger_resolver_fail_louds_when_run_started_at_is_unusable(tmp_path, attempt):
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
+        jobs=_issue_101_attempt2_jobs(), attempt=attempt,
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in combined
+    assert "No matching required gate terminal artifact found" not in combined
+    assert "Aggregator ran on this attempt but did not produce a terminal artifact" not in combined
 
 
 def test_ledger_persistence_steps_are_fail_closed():
