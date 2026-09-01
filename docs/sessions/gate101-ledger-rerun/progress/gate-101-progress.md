@@ -27,3 +27,10 @@
 - 本段结论：terminal 来源 attempt 不等于当前 `run_attempt` 时，账本条目顶层写入可选字段 `terminal_source_attempt`；同 attempt 路径的 key 集合不含该字段。真实 producer envelope 的前序 attempt 场景走同一条 `build_entry` 路径。
 - 关键决策与已否决方案：字段放顶层而不是塞进 `disposition_receipt_consumption`（后者是消费投影，有严格 shape 校验）。不在同 attempt 条目上写等于当前值的冗余字段。
 - 下一步唯一动作：红验约束 1/2/3，再跑全量 pytest 与 jobs API 实测。
+
+## 2026-09-01 归因闸改为 started_at 对照 attempt 开始时间
+
+- 当前阶段：repairing / P1 归因判据
+- 本段结论：Jobs API 会把未重跑的 job 原样搬进新 attempt，名字仍是 `gate / gate`，所以「出现在列表里」不能当「本 attempt 运行过」。现改为：匹配聚合器名字，且 `started_at >=` 当前 attempt 的 `run_started_at`（解析成带时区的 datetime 再比）。#101 真实 fixture（copied `gate / gate` 02:49:00 < attempt 2 的 02:57:51）走回落；`run_started_at` 缺失/null/不可解析 fail-loud，第三条文案与既有两条互斥。
+- 关键决策与已否决方案：名字匹配规则不动。不采用字符串比时间。不在 `run_started_at` 坏掉时静默回落或静默判没跑。attempt 元数据与 jobs 一样只在当前 attempt 无 terminal 时消费。
+- 下一步唯一动作：红验 #101 那一格（只改 `>=` 判据）后跑全量 pytest。

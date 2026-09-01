@@ -1131,11 +1131,13 @@ jobs:
           import re
           import subprocess
           import sys
+          from datetime import datetime
           from pathlib import Path
 
           argv = sys.argv[1:]
           listing_path, input_prefix, audit_prefix, terminal_prefix, current_text, expected_text, output_path = argv[:7]
           jobs_listing_path = argv[7] if len(argv) > 7 else ""
+          attempt_listing_path = argv[8] if len(argv) > 8 else ""
           current = int(current_text)
           if expected_text not in {"true", "false"}:
               raise SystemExit("REVIEW_EXPECTED must be true or false")
@@ -1188,13 +1190,17 @@ jobs:
                   jobs.extend(page["jobs"])
               return jobs
 
-          def load_current_attempt_jobs():
-              if jobs_listing_path:
-                  return json.loads(Path(jobs_listing_path).read_text(encoding="utf-8"))
+          def attribution_repo():
               repo = os.environ.get("REPOSITORY", "")
               run_id = os.environ.get("RUN_ID", "")
               if not repo or not run_id:
                   raise SystemExit("cannot attribute missing current-attempt terminal: jobs listing not provided")
+              return repo, run_id
+
+          def load_current_attempt_jobs():
+              if jobs_listing_path:
+                  return json.loads(Path(jobs_listing_path).read_text(encoding="utf-8"))
+              repo, run_id = attribution_repo()
               proc = subprocess.run(
                   [
                       "gh", "api",
@@ -1207,9 +1213,67 @@ jobs:
                   raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
               return json.loads(proc.stdout)
 
+          def load_current_attempt_meta():
+              if attempt_listing_path:
+                  return json.loads(Path(attempt_listing_path).read_text(encoding="utf-8"))
+              repo, run_id = attribution_repo()
+              proc = subprocess.run(
+                  [
+                      "gh", "api",
+                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}",
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
+              return json.loads(proc.stdout)
+
+          def parse_utc_datetime(value):
+              if not isinstance(value, str) or not value:
+                  return None
+              text = value[:-1] + "+00:00" if value.endswith("Z") else value
+              try:
+                  parsed = datetime.fromisoformat(text)
+              except ValueError:
+                  return None
+              if parsed.tzinfo is None:
+                  return None
+              return parsed
+
+          RUN_STARTED_AT_ERROR = (
+              "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable"
+          )
+
+          def parse_run_started_at(payload):
+              if isinstance(payload, list):
+                  if len(payload) != 1 or not isinstance(payload[0], dict):
+                      raise SystemExit("current attempt listing has invalid JSON shape")
+                  payload = payload[0]
+              if not isinstance(payload, dict):
+                  raise SystemExit("current attempt listing has invalid JSON shape")
+              parsed = parse_utc_datetime(payload.get("run_started_at"))
+              if parsed is None:
+                  raise SystemExit(RUN_STARTED_AT_ERROR)
+              return parsed
+
           if terminal_artifact[0] != current:
               payload = load_current_attempt_jobs()
-              if any(isinstance(job, dict) and is_gate_aggregator_job(job.get("name")) for job in jobs_pages(payload)):
+              attempt_started = parse_run_started_at(load_current_attempt_meta())
+              aggregator_ran = False
+              for job in jobs_pages(payload):
+                  if not isinstance(job, dict) or not is_gate_aggregator_job(job.get("name")):
+                      continue
+                  job_started = parse_utc_datetime(job.get("started_at"))
+                  if job_started is None:
+                      raise SystemExit(
+                          "Cannot attribute missing current-attempt terminal: aggregator job started_at is missing or unparseable"
+                      )
+                  # timezone-aware datetime compare; copied jobs keep the prior
+                  # attempt's started_at, which is earlier than this attempt.
+                  if job_started >= attempt_started:
+                      aggregator_ran = True
+                      break
+              if aggregator_ran:
                   raise SystemExit(
                       "Aggregator ran on this attempt but did not produce a terminal artifact"
                   )
