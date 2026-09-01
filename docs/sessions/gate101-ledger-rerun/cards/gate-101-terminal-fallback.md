@@ -29,7 +29,7 @@
   `run_attempt` 一项。对期望值有异议按「给执行器的一条要求」在 report.md 显式提出。
 - **任务类型**：backend-logic
 - **复杂度**：M
-- **Base commit**：8de5d07ee21d7a95a5deb17ca1744aa0c758d582（origin/feat/gate-101 HEAD）
+- **Base commit**：origin/feat/gate-101 HEAD（派发时以 `git rev-parse origin/feat/gate-101` 解析出的 sha 为准；该分支已含本卡与 design.md，勿改填 origin/main）
 - **Branch**：由 delegate 分配（`card/<worktree 名>`），执行器不得另建分支
 - **Worktree**：由 delegate `--worktree` 创建
 - **当前唯一写入者**：本卡执行器
