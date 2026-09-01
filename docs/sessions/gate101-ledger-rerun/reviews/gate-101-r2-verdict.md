@@ -99,3 +99,101 @@ r1 已按 design.md 五条不变式对表，并做了 Jobs API / `started_at` �
 ## 路径 A 小结
 
 没有找到一条在真实使用方式下「全程不报错、写出属于另一次判决/另一个 run/PR 的账本」的路径。能不报错选出前序 terminal 的，都是 spec 不变式 1 允许的回落，并且会被账本可选字段标出来（不变式 5）。
+
+## 路径 B：下游消费者视角——新字段与新输出谁在消费
+
+### B1. `terminal_source_attempt` 作为 GITHUB_OUTPUT / 作为 ledger 条目字段，有没有下游消费者？对照 `input_source_attempt` / `audit_source_attempt`
+
+**GITHUB_OUTPUT：ledger job 里三个 `*_source_attempt` 都没有步骤消费者。** 真正被后续步骤读的只有 artifact id。gate job 自己的 audit resolver 才把 `source_attempt` 传给聚合器——那是另一条、本 diff 未改的路。
+
+命令与摘要（本仓，排除本 verdict 自身）：
+
+```
+rg -n --glob '!docs/sessions/**' 'terminal_source_attempt'
+```
+
+命中：`.github/workflows/gate-v2.yml:1287` 写入；`tests/test_gate_v2_contract.py` 若干断言；`tests/test_review_ledger.py:1592,1600,1601` 断言账本字段。**没有** `steps.resolve-ledger-artifacts.outputs.terminal_source_attempt`。
+
+```
+rg -n 'steps.resolve-ledger-artifacts.outputs'
+```
+
+命中：
+
+- `.github/workflows/gate-v2.yml:1293` `outputs.input_artifact_id`
+- `:1301` `outputs.audit_artifact_id`
+- `:1308` `outputs.terminal_artifact_id`
+- 对应契约测试只锁这三根 id
+
+对照：
+
+| 输出 | 谁写 | 本仓运行时谁读 |
+|---|---|---|
+| ledger `input_source_attempt` | `gate-v2.yml:1283` | 无步骤消费者。与 terminal 同一模式。 |
+| ledger `audit_source_attempt` | `gate-v2.yml:1285` | 无步骤消费者。 |
+| ledger `terminal_source_attempt` | `gate-v2.yml:1287`（本 diff 之前已有，design 要点 1「继续保留」） | 无步骤消费者。验收路径 c 读的是 **step log 行**，不是 GITHUB_OUTPUT 下游。 |
+| gate job `resolve-audit-artifact.outputs.source_attempt` | `gate-v2.yml:997` `AUDIT_SOURCE_ATTEMPT` | **有**：聚合器 `aggregate.py` 用它校验下载到的 audit 是否就是选中的那份。本 diff 未改这条。 |
+
+**ledger 条目字段：本仓没有第二个运行时读者按名字取它。** 写入点只有 `build_ledger.py:659`。读者把整行 JSON 当不透明对象 round-trip（见 B2）。gate-hub `scripts/review-ledger-report.py::parse_ledger_jsonl_line` 实测喂入带该字段的行：`hub parse OK 1`，有/无 `disposition_receipt_consumption` 都不炸。它也不统计这个字段。
+
+熵增判定：GITHUB_OUTPUT 侧是既有诊断输出，不是本 diff 新增抽象，对照物 `input_source_attempt` 同样无步骤消费者，**不该删**——design 验收 c/d 明确要在日志里看到它。账本可选字段是不变式 5 要求的可分辨标记，同 attempt 不写，有第二消费者（人读 jsonl / 游标 round-trip / 将来 gate-hub 文档）。**该留。** 不是无消费者的通用化。
+
+### B2. 本仓所有读取 `ledger.jsonl` 条目的路径：新增顶层可选字段会不会打穿？有没有严格键集校验？
+
+**不会打穿。本仓运行时没有对 ledger 条目做顶层封闭键集校验。** 唯一的封闭键集在 **producer 测试**里，用来锁死「同 attempt 不加字段 / 跨 attempt 只加这一个」。
+
+路径与结论：
+
+| 路径 | 文件:行 | 对未知顶层键 |
+|---|---|---|
+| `fetch_prior_entries` | `build_ledger.py:723-744` | `json.loads` 后只要求是 `dict`。未知键原样进入 `dedupe_entries`。 |
+| `parse_state_entries` | `build_ledger.py:94-109` | base64 JSON → list[dict]，无键集。 |
+| `relevant_pr_entries` | `build_ledger.py:112-117` | 只读 `repository` / `pr_number`。 |
+| `render_state_comment` | `build_ledger.py:120-154` | 人类可见块只读 `head_sha` / `review_round` / `review.*` / `comparison.*`。整份 entry 进 base64 游标。本轮探针：人类可见不含 `terminal_source_attempt`；游标 `keeps extra field 1`；`parse_state_entries` 读回仍为 1。 |
+| `dedupe_entries` | `build_ledger.py:673-695` | 去重键是 `(repository, run_id, run_attempt)`；签名是去掉 `ledger_conflict` 后的整份 canonical JSON，**新字段参与签名**。同 attempt 有/无该字段会变成两个 variant → `ledger_conflict`。这是正确行为：同 key 内容不同才标冲突。探针：两份带相同新字段的 entry `dedupe n=1 keeps field 1`。 |
+| `_append_summary` | `build_ledger.py:789-829` | 只读已知键，不遍历 `entry.keys()`。 |
+| `write_ledger` | `build_ledger.py:663-670` | `json.dumps` 整份 entry。 |
+| aggregate / 聚合器 | `.github/actions/gate-aggregator/*` | **不读** `ledger.jsonl`。terminal envelope 是另一份 schema。 |
+| 严格键集 | `tests/test_review_ledger.py:1571-1601` `_SAME_ATTEMPT_TERMINAL_ENTRY_KEYS` | **只约束 producer 输出**，不是运行时校验。`PRIMARY_ALLOWED_FIELDS`（`build_ledger.py:70-73`）约束的是 **primary audit** 记录，不是 ledger 条目。 |
+
+gate-hub 侧（本卡要求看下游会不会被新字段打穿，不是改它）：`parse_ledger_jsonl_line` → `read_from_json_string`（纯 `json.loads`）+ 仅当存在时校验 `disposition_receipt_consumption`。无顶层封闭键集。实测带新字段通过。
+
+### B3. `README.md` 与 `AGENTS.md` 里关于 ledger / terminal / rerun 的既有描述，有没有被本次改动写成事实不符？
+
+**本次 diff 未改这两份文件**（`git diff origin/main..79b1fc1 -- README.md AGENTS.md` 空）。
+
+与本 diff 相关的既有段落：
+
+- `AGENTS.md`：没有 ledger / terminal / rerun 寻址描述。合并必须用 merge commit、pin 按 SHA——本 diff 没有引入新的 workflow 文件或新 `workflow_call` 输入，不与这段冲突。
+- `README.md:200-215`：仍写 `codex-review-ledger` artifact 名（生产 v2 实际是 `codex-review-ledger-v2`）——**存量**，本 diff 没动上传名。
+- `README.md:213`「GitHub 在点击 Re-run 时会删除同一 run 的旧 artifact」：对 **全量 Re-run** 仍可能成立（对照 run `33469651855` attempt 2 只剩 `*-2` 工件）。对 **#101 的 `gh run rerun --failed`** 实测不成立：`33462777858` attempt 2 仍保留 attempt 1 的 terminal/input/audit，且 `expired=false`。本方案**依赖** `--failed` 保留成功 job 的工件。文档没覆盖这条新依赖，但不是本 diff 把原文改错——原文说的是「点击 Re-run」+ sticky comment 存在的理由，那条理由对全量 Re-run 仍在。不判「本 diff 把文档写成事实不符」。记 backlog。
+
+### B4. 本仓 commit SHA 被下游 caller 与 org runner-group 白名单 pin。本次改动有没有引入「必须同时改下游」的隐含要求？
+
+**没有运行时必须同时改下游的隐含要求。** pin bump 仍是既有推广步骤，不是本 diff 新加的耦合。
+
+证据：
+
+- `git diff origin/main..79b1fc1 -- .github/workflows/gate-v2.yml` 没有 `workflow_call` / `inputs` / `secrets` / `permissions` hunk。caller `templates/caller-gate-v2.yml` 的 `with:` 块不用改。
+- 没有新 job id、没有新 runner label、没有新 required check 名（`gate / gate` 未动，符合 design 非目标）。
+- `actions: read` 已覆盖 Jobs API（文件头 `:90-92` 注释），本 diff 只是真的用了它。
+- 下游 pin 的是 `@<40hex>`。合并后的「白名单 `selected_workflows[]=gate-v2.yml@<new-sha>` + caller pin bump」是 `AGENTS.md` 和 `README.md:146-159` 已写明的独立推广步骤。不 bump 的仓继续跑旧 SHA，行为不变。
+- design 非目标已写明：不动 gate-hub `docs/review-effectiveness.md`。该文档仍写「`ledger.jsonl` entry schema is unchanged」。新可选字段对 `review-ledger-report.py` **不打穿**（B2），但文档字面「schema unchanged」会过时。这是跨仓文档跟进，不是「不改下游就红」。不把「必须同时改下游」算在本 PR 上。
+
+## Findings
+
+本轮 **0 条新 finding**。对抗四问与下游四问都没有落到 personal P1 红线，也没有需要阻塞的 P2。
+
+（若要把「GITHUB_OUTPUT 无步骤消费者」或「README 没写 `--failed` 保工件」升格成意见：前者 design 明确保留且对照 `input_source_attempt`；后者不是本 diff 引入的文案，无法溯源到本批不变式，按纪律默认降级后仍不阻塞。两者放 backlog，不编号为 finding。）
+
+## Backlog（不阻塞）
+
+- r1 F-1 / F-2 / F-3 仍接受不修。本轮没有新证据推翻它们：真实 Artifacts API 同样快返回；本窗口 aggregator 仍非 `started_at:null`；部署仍在 GitHub.com。
+- README 未区分「全量 Re-run 可能删旧工件」与「`rerun --failed` 保留成功 job 工件」。后者是本方案前提，建议以后改 README 时补一句；不是本 diff 的文档回归。
+- gate-hub `docs/review-effectiveness.md` 仍写 schema 不变。可选字段 `terminal_source_attempt` 不打穿现有 parser，文档跟进按 design 非目标留给持有该文档的仓。
+- 独立选择器允许 input/audit/terminal 来自不同 attempt。真实 `--failed` 路径未出现。若将来有人 `gh run rerun --job` 只重跑 primary，ledger 会按 spec 复用旧 terminal 配新 audit；这是要点 2 的字面行为，不是本轮缺陷。
+- 本仓 `issue #103`（attempt 1 缺 `review-ledger-input-v2`）与本次 terminal 回落正交，不在 H0 审查范围，不并入本循环。
+
+## 是否推翻 r1 的任何结论
+
+**没有推翻。** r1 的 pass、0 P1、三条不阻塞的 P2/P3 仍然成立。本轮换了证据源（对抗探针 + Artifacts API + 真实 terminal zip + 下游消费者实测），没有找到 r1 漏掉的静默错账本路径，也没有找到新字段打穿消费者的路径。
