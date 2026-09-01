@@ -1568,12 +1568,37 @@ def _build_from_terminal(module, terminal, **overrides):
     return module.build_entry(**kwargs)
 
 
+_SAME_ATTEMPT_TERMINAL_ENTRY_KEYS = {
+    "schema_version", "recorded_at", "repository", "pr_number", "run_id",
+    "run_attempt", "head_sha", "review_round", "preflight", "install",
+    "primary_identity", "review", "comparison", "finding_dispositions",
+    "convergence_projection", "false_positive_count",
+    "disposition_receipt_consumption",
+}
+
+
 def test_prior_attempt_terminal_from_producer_is_accepted():
     module = _module()
     _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}], run_attempt=1)
     assert terminal["run_attempt"] == 1
     entry = _build_from_terminal(module, terminal, run_attempt=2)
     assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
+
+
+def test_same_attempt_terminal_entry_keys_do_not_add_source_attempt():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}])
+    entry = _build_from_terminal(module, terminal)
+    assert "terminal_source_attempt" not in entry
+    assert set(entry) == _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS
+
+
+def test_prior_attempt_terminal_entry_records_source_attempt():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal(receipts=[{}], run_attempt=1)
+    entry = _build_from_terminal(module, terminal, run_attempt=2)
+    assert entry["terminal_source_attempt"] == 1
+    assert set(entry) == _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS | {"terminal_source_attempt"}
 
 
 def test_future_attempt_terminal_from_producer_is_rejected():

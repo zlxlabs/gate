@@ -654,6 +654,9 @@ def build_entry(
             run_attempt=run_attempt,
             head_sha=head_sha,
         )
+        source_attempt = terminal_envelope.get("run_attempt")
+        if source_attempt != run_attempt:
+            entry["terminal_source_attempt"] = source_attempt
     return entry
 
 

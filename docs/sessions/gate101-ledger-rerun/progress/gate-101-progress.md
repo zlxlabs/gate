@@ -20,3 +20,10 @@
 - 本段结论：`_disposition_receipt_consumption_from_terminal` 把 `run_attempt` 从严格等值改为 `1 <= terminal.run_attempt <= current`；repository / pr_number / run_id / head_sha 仍等值。前序 attempt 的真实 producer envelope 可以进账本，未来 attempt 与非整数/布尔/非正数仍抛 `gate terminal identity mismatch`。
 - 关键决策与已否决方案：校验复用已有 `_strict_int`，不新造身份类型。来源 attempt 字段尚未写入条目，留给下一里程碑。
 - 下一步唯一动作：同 attempt 不新增字段，跨 attempt 条目标注 `terminal_source_attempt`。
+
+## 2026-09-01 账本条目标注来源 attempt
+
+- 当前阶段：implementing / milestone ④ 来源 attempt 标注
+- 本段结论：terminal 来源 attempt 不等于当前 `run_attempt` 时，账本条目顶层写入可选字段 `terminal_source_attempt`；同 attempt 路径的 key 集合不含该字段。真实 producer envelope 的前序 attempt 场景走同一条 `build_entry` 路径。
+- 关键决策与已否决方案：字段放顶层而不是塞进 `disposition_receipt_consumption`（后者是消费投影，有严格 shape 校验）。不在同 attempt 条目上写等于当前值的冗余字段。
+- 下一步唯一动作：红验约束 1/2/3，再跑全量 pytest 与 jobs API 实测。
