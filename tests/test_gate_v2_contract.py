@@ -752,11 +752,12 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
     )
     run = resolver["run"]
     for marker in (
-        "--paginate", "expired", "<= current", "exact_attempt=current",
+        "--paginate", "expired", "<= current",
         "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
         "terminal_source_attempt",
     ):
         assert marker in run
+    assert "exact_attempt" not in run
     assert resolver["env"]["TERMINAL_PREFIX"] == (
         "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
     )
@@ -805,13 +806,60 @@ def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(
     artifacts = [
         {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
         {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
     ]
     result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
     combined = result.stderr + result.stdout
     assert result.returncode != 0
     assert "No matching required gate terminal artifact found" in combined
     assert "identity mismatch" not in combined
+
+
+def test_ledger_resolver_falls_back_to_prior_terminal_when_current_attempt_is_missing(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+
+
+def test_ledger_resolver_selects_current_attempt_terminal_not_an_older_one(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
+    ]
+    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=202" in output
+    assert "terminal_source_attempt=2" in output
+
+
+def test_ledger_resolver_refuses_future_terminal_artifact(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
+    ]
+    result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+    assert "terminal_artifact_id=203" not in _output
+
+
+def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp_path):
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
+    ]
+    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "terminal_artifact_id=201" in output
+    assert "terminal_source_attempt=1" in output
+    assert "terminal_artifact_id=203" not in output
 
 
 def test_ledger_persistence_steps_are_fail_closed():
