@@ -466,6 +466,24 @@ def test_quality_and_primary_have_independent_cancel_true_pr_locks():
     _assert_expensive_job_cancel_lock("primary", primary)
 
 
+# ── quality short-circuit on primary failure (gate#105 方案 A, owner 2026-09-02) ──
+# quality needs primary so a primary failure skips quality entirely and lets
+# `gate / gate` conclude without waiting on the slowest job. The `always()` in
+# the `if:` is mandatory, not decorative: with GitHub's default success()
+# gate, a primary that is cancelled (concurrency supersede on a newer head)
+# or skipped (draft PR / fork / hosted runner) would ALSO skip quality —
+# quality must still run in those cases; only primary failure short-circuits.
+
+
+def test_quality_needs_primary_and_short_circuits_only_on_primary_failure():
+    raw, _ = _load_workflow()
+    quality = raw["jobs"]["quality"]
+    assert quality["needs"] == ["primary"]
+    # Locked as a full literal: `!= 'failure'` means primary skipped (draft /
+    # fork / hosted) or cancelled (concurrency supersede) still runs quality.
+    assert quality["if"] == "always() && needs.primary.result != 'failure'"
+
+
 def test_non_writer_non_expensive_jobs_have_no_concurrency():
     raw, _ = _load_workflow()
     for job_name, job in raw["jobs"].items():
@@ -854,9 +872,13 @@ def _run_ledger_resolver(
     env = os.environ.copy()
     for key in (
         "REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID",
-        "QUALITY_LEDGER_INPUT_UPLOAD",
+        "QUALITY_LEDGER_INPUT_UPLOAD", "QUALITY_RESULT", "PRIMARY_RESULT",
     ):
         env.pop(key, None)
+    # The workflow always sets these via needs.*.result; default to the
+    # non-short-circuit happy path, overridable per test via extra_env.
+    env["QUALITY_RESULT"] = "success"
+    env["PRIMARY_RESULT"] = "success"
     if extra_env:
         env.update(extra_env)
     result = subprocess.run(
@@ -1071,6 +1093,52 @@ def test_ledger_resolver_missing_input_reports_quality_upload_outcome(
     assert result.returncode != 0
     assert expected_token in combined
     assert "No matching required ledger input artifact found" in combined
+
+
+# ── gate#105 A (PR #119 r1): short-circuited quality has no input BY DESIGN ──
+# With quality needs primary + `if: != 'failure'`, a primary failure skips
+# quality, so the review-ledger-input artifact legitimately does not exist and
+# needs.quality.outputs.ledger_input_upload is empty. The ledger job (if:
+# always()) must still write its row — the resolver makes the input optional
+# ONLY for this exact combination; every other missing-input case stays fatal.
+
+
+def test_ledger_resolver_short_circuited_quality_makes_input_optional(tmp_path):
+    artifacts = [
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1,
+        extra_env={"QUALITY_RESULT": "skipped", "PRIMARY_RESULT": "failure"},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "input_artifact_id=\n" in output
+    assert "input_short_circuited=true" in output
+    assert "::notice::ledger input skipped" in result.stdout
+
+
+def test_ledger_resolver_skipped_quality_without_primary_failure_still_requires_input(tmp_path):
+    artifacts = [
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1,
+        extra_env={"QUALITY_RESULT": "skipped", "PRIMARY_RESULT": "success"},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "quality upload outcome: unknown" in combined
+    assert "No matching required ledger input artifact found" in combined
+
+
+def test_ledger_resolver_step_env_and_download_guard_literals():
+    raw, _ = _load_workflow()
+    ledger_steps = raw["jobs"]["ledger"]["steps"]
+    resolve = next(s for s in ledger_steps if s.get("name") == "Resolve v2 ledger artifacts")
+    assert resolve["env"]["QUALITY_RESULT"] == "${{ needs.quality.result }}"
+    assert resolve["env"]["PRIMARY_RESULT"] == "${{ needs.primary.result }}"
+    download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
+    assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
 
 
 def test_ledger_persistence_steps_are_fail_closed():
