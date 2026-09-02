@@ -43,10 +43,12 @@
 3. 预期：`gate / gate` 为 failure，面板含 `review_expected_stale` 与 `gh pr ready --undo && gh pr ready`；重触发后新 run 的 primary 真跑。若竞态没复现（幸存的是 ready run），记录一次并改天再试，不以「没复现」当验过。
 4. #107 / #105 二的入口层证据只能等自然发生：下一次 `Failed to FinalizeArtifact` 出现时看重试步是否接住、或 ledger 文案是否带 quality 结论；下一次 ocr job failure 时用 jobs API 核 run 级 conclusion ≠ failure。合并时在 issue 上明写「等首个自然样本」，不把「合并了」写成「验过了」。
 
-## 待裁决（gate#105 第一条，owner）
+## 已裁决（gate#105 第一条，owner 2026-09-02：方案 A）
 
-primary 早失败时让 `gate / gate` 早出结论，候选三条，各有代价：
-- A. `quality` 改为 `needs: [primary]` 且 `if: needs.primary.result != 'failure'`：红路径省约 13 min，绿路径每次多等 primary 的 1.5–3 min（agent-config 平均墙钟 19 min → 约 21 min）。
-- B. `gate` 只 `needs: [primary]`，primary 通过时在 job 内轮询 jobs API 等 quality 完成：不改绿路径时序，但占一个 control-plane 槽最长 15 min，且 gate job 的 8 min timeout 要放宽。
-- C. 不动 `gate / gate`，加一个 `needs: [primary] / if: failure()` 的早报 job 只发飞书红卡与面板一行「primary 已判红，等 quality 收尾」：人早知道，check 结论时刻不变，但面板多一个写入者。
-推荐 A 仅当 primary 失败率 > 15%；否则 C。需 owner 决定或给出失败率数据。
+primary 早失败时让 `gate / gate` 早出结论。owner 2026-09-02 拍板 **A**：`quality` 改为 `needs: [primary]` 且 `if: always() && needs.primary.result != 'failure'`——primary 红时 quality 直接 skipped，汇总立刻出结论；`always()` 是必须的：primary 被 concurrency 取消（cancelled）或在 draft / fork / hosted 下 skipped 时 quality 仍要跑，只有 failure 才跳过。代价：绿路径每次多等 primary 的中位 ~1.8 min。
+
+裁决数据（agent-config 最近 40 run）：primary 有结论 19 个，其中失败 5 个（26%，过 15% 阈值）；primary 中位 1.8 min、quality 中位 8 min；primary 失败后 quality 还拖 4.2 / 6.3 / 11.0 / 31.1 min。
+
+aggregator 侧配套：`quality=skipped 且 primary=failure` 时 problems 写明 short-circuit（`quality job was skipped because primary already failed (short-circuit; the gate result is decided by primary)`），classification/reason 仍由 primary 终态决定，不再追加 `quality_skipped`；其它 quality skipped 组合语义不变。
+
+已否决（维持原判）：B（`gate` 只 `needs: [primary]`，primary 通过时在 job 内轮询 jobs API 等 quality——占 control-plane 槽最长 15 min，且 gate job 的 8 min timeout 要放宽）；C（加 `needs: [primary] / if: failure()` 的早报 job 只发通知——check 结论时刻不变，面板多一个写入者）。
