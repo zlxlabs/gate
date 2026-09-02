@@ -713,8 +713,17 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert ledger["if"] == "always()"
     assert not any(step.get("name") == "Build v2 review effectiveness ledger" for step in gate_steps)
     assert not any(step.get("name") == "Upload v2 review effectiveness ledger" for step in gate_steps)
+    retry_upload = next(
+        step for step in quality_steps if step.get("name") == "Retry upload v2 review ledger inputs"
+    )
     assert input_upload["if"] == "always()"
     assert input_upload["continue-on-error"] is True
+    assert retry_upload["continue-on-error"] is True
+    assert retry_upload["if"] == "always() && steps.ledger-input-upload.outcome == 'failure'"
+    assert retry_upload["with"]["name"] == input_upload["with"]["name"]
+    assert retry_upload["with"]["path"] == input_upload["with"]["path"]
+    assert retry_upload["uses"] == input_upload["uses"]
+    assert retry_upload["with"]["overwrite"] is True
     assert input_download["with"]["artifact-ids"] == "${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}"
     assert "pr-size-preflight.json" in input_upload["with"]["path"]
     assert "install-result.json" in input_upload["with"]["path"]
@@ -742,6 +751,27 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
         "if-no-files-found": "error",
         "retention-days": 90,
     }
+
+
+def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
+    raw, _ = _load_workflow()
+    quality = raw["jobs"]["quality"]
+    assert quality["outputs"]["ledger_input_upload"] == (
+        "${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}"
+    )
+    resolver = next(
+        s for s in raw["jobs"]["ledger"]["steps"]
+        if s.get("name") == "Resolve v2 ledger artifacts"
+    )
+    assert resolver["env"]["QUALITY_LEDGER_INPUT_UPLOAD"] == (
+        "${{ needs.quality.outputs.ledger_input_upload }}"
+    )
+
+
+def test_only_ocr_job_has_continue_on_error():
+    raw, _ = _load_workflow()
+    jobs = raw["jobs"]
+    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr"}
 
 
 def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
@@ -789,6 +819,7 @@ def _ledger_resolver_python() -> str:
 def _run_ledger_resolver(
     tmp_path, *, artifacts, current, review_expected="false",
     jobs=None, jobs_path=None, attempt=None, attempt_path=None,
+    extra_env=None,
 ):
     listing = tmp_path / "listing.json"
     listing.write_text(json.dumps({"artifacts": artifacts}), encoding="utf-8")
@@ -821,8 +852,13 @@ def _run_ledger_resolver(
             attempt_file.write_text(json.dumps(attempt), encoding="utf-8")
             argv.append(str(attempt_file))
     env = os.environ.copy()
-    for key in ("REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"):
+    for key in (
+        "REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID",
+        "QUALITY_LEDGER_INPUT_UPLOAD",
+    ):
         env.pop(key, None)
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         argv,
         input=_ledger_resolver_python(),
@@ -1016,6 +1052,25 @@ def test_ledger_resolver_fail_louds_when_run_started_at_is_unusable(tmp_path, at
     assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in combined
     assert "No matching required gate terminal artifact found" not in combined
     assert "Aggregator ran on this attempt but did not produce a terminal artifact" not in combined
+
+
+@pytest.mark.parametrize("upload_env,expected_token", [
+    ({"QUALITY_LEDGER_INPUT_UPLOAD": "failure"}, "quality upload outcome: failure"),
+    ({}, "quality upload outcome: unknown"),
+])
+def test_ledger_resolver_missing_input_reports_quality_upload_outcome(
+    tmp_path, upload_env, expected_token,
+):
+    artifacts = [
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1, extra_env=upload_env,
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert expected_token in combined
+    assert "No matching required ledger input artifact found" in combined
 
 
 def test_ledger_persistence_steps_are_fail_closed():
