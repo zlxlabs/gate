@@ -872,9 +872,13 @@ def _run_ledger_resolver(
     env = os.environ.copy()
     for key in (
         "REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID",
-        "QUALITY_LEDGER_INPUT_UPLOAD",
+        "QUALITY_LEDGER_INPUT_UPLOAD", "QUALITY_RESULT", "PRIMARY_RESULT",
     ):
         env.pop(key, None)
+    # The workflow always sets these via needs.*.result; default to the
+    # non-short-circuit happy path, overridable per test via extra_env.
+    env["QUALITY_RESULT"] = "success"
+    env["PRIMARY_RESULT"] = "success"
     if extra_env:
         env.update(extra_env)
     result = subprocess.run(
@@ -1089,6 +1093,52 @@ def test_ledger_resolver_missing_input_reports_quality_upload_outcome(
     assert result.returncode != 0
     assert expected_token in combined
     assert "No matching required ledger input artifact found" in combined
+
+
+# ── gate#105 A (PR #119 r1): short-circuited quality has no input BY DESIGN ──
+# With quality needs primary + `if: != 'failure'`, a primary failure skips
+# quality, so the review-ledger-input artifact legitimately does not exist and
+# needs.quality.outputs.ledger_input_upload is empty. The ledger job (if:
+# always()) must still write its row — the resolver makes the input optional
+# ONLY for this exact combination; every other missing-input case stays fatal.
+
+
+def test_ledger_resolver_short_circuited_quality_makes_input_optional(tmp_path):
+    artifacts = [
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1,
+        extra_env={"QUALITY_RESULT": "skipped", "PRIMARY_RESULT": "failure"},
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "input_artifact_id=\n" in output
+    assert "input_short_circuited=true" in output
+    assert "::notice::ledger input skipped" in result.stdout
+
+
+def test_ledger_resolver_skipped_quality_without_primary_failure_still_requires_input(tmp_path):
+    artifacts = [
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1,
+        extra_env={"QUALITY_RESULT": "skipped", "PRIMARY_RESULT": "success"},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "quality upload outcome: unknown" in combined
+    assert "No matching required ledger input artifact found" in combined
+
+
+def test_ledger_resolver_step_env_and_download_guard_literals():
+    raw, _ = _load_workflow()
+    ledger_steps = raw["jobs"]["ledger"]["steps"]
+    resolve = next(s for s in ledger_steps if s.get("name") == "Resolve v2 ledger artifacts")
+    assert resolve["env"]["QUALITY_RESULT"] == "${{ needs.quality.result }}"
+    assert resolve["env"]["PRIMARY_RESULT"] == "${{ needs.primary.result }}"
+    download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
+    assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
 
 
 def test_ledger_persistence_steps_are_fail_closed():
