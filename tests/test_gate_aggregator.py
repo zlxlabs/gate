@@ -783,6 +783,10 @@ def _assert_terminal_classification(outcome, expected):
     ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": None}, ("review_unavailable", "pr_state_unverifiable", "unavailable")),
     ({"primary_result": "skipped", "is_draft": False, "review_expected": False, "audit": None, "pr_draft_now": None}, ("expected_skip", "review_not_expected", "skipped")),
     ({}, ("code_pass", "primary_pass", "pass")), ({"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")}, ("code_fail", "primary_findings", "fail")),
+    # gate#105 方案 A: quality short-circuited (skipped) by a failed primary
+    # lands on the SAME classification/reason as (quality=success, primary=
+    # failure) — primary's terminal state decides, never quality_skipped.
+    ({"quality_result": "skipped", "primary_result": "failure", "audit": _valid_primary_record(verdict="fail")}, ("code_fail", "primary_findings", "fail")),
     ({"primary_result": "failure", "audit": _valid_primary_record(verdict="unavailable")}, ("review_unavailable", "primary_unavailable", "unavailable")), ({"primary_result": "cancelled", "audit": None}, ("review_unavailable", "primary_cancelled", "unavailable")),
     ({"primary_result": "skipped", "audit": None}, ("integration_error", "unexpected_primary_skip", "unavailable")), ({"audit": None, "audit_error": "missing"}, ("integration_error", "audit_missing", "unavailable")),
     ({"audit": _valid_primary_record(kind="synthetic_primary")}, ("integration_error", "audit_invalid", "unavailable")), ({"audit_source_attempt": 2}, ("integration_error", "audit_source_mismatch", "unavailable")),
@@ -792,6 +796,21 @@ def _assert_terminal_classification(outcome, expected):
 ])
 def test_terminal_classification_matrix(kwargs, expected):
     _assert_terminal_classification(AGG.evaluate(**_base_kwargs(**kwargs)), expected)
+
+
+def test_quality_skipped_by_primary_failure_reports_short_circuit_not_quality_problem():
+    # gate#105 方案 A: when the workflow short-circuits quality because primary
+    # already failed, the problems text must say WHY quality did not run (a
+    # short-circuit, not a quality defect). The other skipped combination —
+    # (quality=skipped, primary=success) — is unchanged and still fails as
+    # quality_skipped (matrix cell above).
+    outcome = AGG.evaluate(**_base_kwargs(
+        quality_result="skipped", primary_result="failure",
+        audit=_valid_primary_record(verdict="fail"),
+    ))
+    assert outcome.ok is False
+    assert any("short-circuit" in p for p in outcome.problems)
+    assert not any("quality job result is 'skipped'" in p for p in outcome.problems)
 
 
 # ── gate#110: stale draft=true payload re-verification ─────────────────────

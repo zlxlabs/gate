@@ -657,7 +657,14 @@ def evaluate(
     if invalid_inputs:
         return Outcome(ok=False, problems=invalid_inputs)
 
-    quality_reason = None if quality_result == "success" else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
+    # gate#105 方案 A: the workflow skips quality by design when primary
+    # already failed (quality: needs [primary], if != 'failure'). That skip is
+    # the short-circuit working as intended, NOT a quality problem — it must
+    # not claim the quality_skipped reason; primary's own terminal state
+    # decides the classification. Every other skipped combination (primary
+    # not failed) keeps the quality_skipped semantics.
+    quality_short_circuited = quality_result == "skipped" and primary_result == "failure"
+    quality_reason = None if quality_result == "success" or quality_short_circuited else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
     primary_classification = primary_reason = None
     audit_available = False
     convergence_eligible = False
@@ -665,6 +672,8 @@ def evaluate(
 
     if quality_result == "success":
         notes.append("quality: success")
+    elif quality_short_circuited:
+        problems.append("quality job was skipped because primary already failed (short-circuit; the gate result is decided by primary)")
     else:
         problems.append(f"quality job result is {quality_result!r} (required: success)")
 
