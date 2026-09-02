@@ -329,7 +329,7 @@ def test_reviewer_required_non_empty_string_for_verdict_bearing_records(verdict)
 
 def test_draft_pr_with_skipped_primary_and_successful_quality_passes():
     outcome = AGG.evaluate(
-        **_base_kwargs(primary_result="skipped", is_draft=True, review_expected=False, audit=None, audit_error=None)
+        **_base_kwargs(primary_result="skipped", is_draft=True, review_expected=False, audit=None, audit_error=None, pr_draft_now=True)
     )
     assert outcome.ok is True
     assert outcome.synthetic_audit is None
@@ -615,7 +615,8 @@ def test_cli_missing_scope_field_preserves_exit_and_receipt_semantics(
     assert not receipt_path.exists()
 
 
-def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path):
+def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", lambda **kw: True)
     summary_path = tmp_path / "summary.md"
     receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
 
@@ -662,13 +663,54 @@ def test_cli_exit_zero_with_receipt_for_clean_round(tmp_path):
     assert json.loads(receipt_path.read_text())["clean_streak"] == 1
 
 
-def test_cli_exit_zero_without_receipt_for_expected_skip(tmp_path):
+def test_cli_exit_zero_without_receipt_for_expected_skip(tmp_path, monkeypatch):
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", lambda **kw: True)
     rc, receipt_path = _run_receipt_cli_case(
         tmp_path, audit=None, primary_result="skipped", is_draft="true", review_expected="false",
     )
 
     assert rc == 0
     assert not receipt_path.exists()
+
+
+def test_cli_stale_draft_payload_fails_closed_with_retrigger_command(tmp_path, monkeypatch):
+    # gate#110: payload draft=true but the PR is already non-draft → red,
+    # summary + terminal JSON name the reason and the re-trigger command.
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", lambda **kw: False)
+    summary_path = tmp_path / "summary.md"
+    rc = AGG.main(
+        _cli_args(
+            tmp_path / "missing-audit", summary_path,
+            primary_result="skipped", is_draft="true", review_expected="false",
+        )
+    )
+
+    assert rc == 1
+    text = summary_path.read_text()
+    assert "review_expected_stale" in text
+    assert "gh pr ready --undo && gh pr ready" in text
+    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text())
+    assert terminal["reason_code"] == "review_expected_stale"
+    assert terminal["gate_result"] == "unavailable"
+
+
+def test_cli_non_draft_skip_never_calls_pr_draft_fetch(tmp_path, monkeypatch):
+    # Normal runs must not spend any extra GitHub API request: outside the
+    # (skipped + payload-draft) branch the fetch helper is never consulted.
+    def forbidden_fetch(**kw):
+        raise AssertionError("_fetch_pr_draft called outside the draft-skip branch")
+
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", forbidden_fetch)
+    summary_path = tmp_path / "summary.md"
+    rc = AGG.main(
+        _cli_args(
+            tmp_path / "missing-audit", summary_path,
+            primary_result="skipped", is_draft="false", review_expected="false",
+        )
+    )
+
+    assert rc == 0
+    assert "review_not_expected" in summary_path.read_text()
 
 
 @pytest.mark.parametrize("verdict", ["fail", "unavailable"])
@@ -736,7 +778,10 @@ def _assert_terminal_classification(outcome, expected):
 
 @pytest.mark.parametrize("kwargs,expected", [
     ({"quality_result": "failure"}, ("ci_failure", "quality_failure", "fail")), ({"quality_result": "cancelled"}, ("ci_failure", "quality_cancelled", "fail")),
-    ({"quality_result": "skipped"}, ("ci_failure", "quality_skipped", "fail")), ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None}, ("expected_skip", "review_not_expected", "skipped")),
+    ({"quality_result": "skipped"}, ("ci_failure", "quality_skipped", "fail")), ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": True}, ("expected_skip", "review_not_expected", "skipped")),
+    ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": False}, ("review_unavailable", "review_expected_stale", "unavailable")),
+    ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": None}, ("review_unavailable", "pr_state_unverifiable", "unavailable")),
+    ({"primary_result": "skipped", "is_draft": False, "review_expected": False, "audit": None, "pr_draft_now": None}, ("expected_skip", "review_not_expected", "skipped")),
     ({}, ("code_pass", "primary_pass", "pass")), ({"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")}, ("code_fail", "primary_findings", "fail")),
     ({"primary_result": "failure", "audit": _valid_primary_record(verdict="unavailable")}, ("review_unavailable", "primary_unavailable", "unavailable")), ({"primary_result": "cancelled", "audit": None}, ("review_unavailable", "primary_cancelled", "unavailable")),
     ({"primary_result": "skipped", "audit": None}, ("integration_error", "unexpected_primary_skip", "unavailable")), ({"audit": None, "audit_error": "missing"}, ("integration_error", "audit_missing", "unavailable")),
@@ -747,6 +792,122 @@ def _assert_terminal_classification(outcome, expected):
 ])
 def test_terminal_classification_matrix(kwargs, expected):
     _assert_terminal_classification(AGG.evaluate(**_base_kwargs(**kwargs)), expected)
+
+
+# ── gate#110: stale draft=true payload re-verification ─────────────────────
+#
+# A synchronize run can cancel the same-head ready_for_review run and survive
+# with a payload that still says draft=true. In that branch the CLI wrapper
+# re-fetches the PR's *current* draft state and hands it to evaluate() as
+# pr_draft_now; None there means "verification was attempted and failed"
+# (fail-closed), never "not consulted" — main() only consults in this branch.
+
+_STALE_DRAFT_PROBLEM = (
+    "primary was skipped on a stale draft=true payload but the PR is no longer draft "
+    "(a ready_for_review run was cancelled by this synchronize run); re-trigger with: "
+    "gh pr ready --undo && gh pr ready, or push a new commit"
+)
+_UNVERIFIABLE_DRAFT_PROBLEM = (
+    "primary was skipped on a draft=true payload and the PR's current draft state "
+    "could not be re-verified via the GitHub API; fail-closed — rerun the workflow"
+)
+
+
+def _stale_draft_kwargs(pr_draft_now):
+    return _base_kwargs(
+        primary_result="skipped", is_draft=True, review_expected=False,
+        audit=None, audit_error=None, pr_draft_now=pr_draft_now,
+    )
+
+
+def test_terminal_reason_domain_lock():
+    assert AGG.TERMINAL_REASON_DOMAIN == (
+        "primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled",
+        "quality_failure", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid",
+        "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip",
+        "review_expected_stale", "pr_state_unverifiable",
+    )
+
+
+def test_stale_draft_payload_problem_carries_the_retrigger_command_verbatim():
+    outcome = AGG.evaluate(**_stale_draft_kwargs(pr_draft_now=False))
+    assert outcome.ok is False
+    assert _STALE_DRAFT_PROBLEM in outcome.problems
+
+
+def test_unverifiable_draft_state_fails_closed_with_rerun_instruction():
+    outcome = AGG.evaluate(**_stale_draft_kwargs(pr_draft_now=None))
+    assert outcome.ok is False
+    assert _UNVERIFIABLE_DRAFT_PROBLEM in outcome.problems
+
+
+def test_reverified_still_draft_keeps_expected_skip_and_notes_the_recheck():
+    outcome = AGG.evaluate(**_stale_draft_kwargs(pr_draft_now=True))
+    assert outcome.ok is True
+    assert outcome.synthetic_audit is None
+    assert "pr draft state re-verified: still draft" in outcome.notes
+
+
+def _stub_github_json(monkeypatch, outcomes):
+    calls = []
+
+    def fake(*, token, url):
+        calls.append(url)
+        outcome = outcomes[len(calls) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(AGG, "_github_json", fake)
+    sleeps = []
+    monkeypatch.setattr(AGG.time, "sleep", sleeps.append)
+    return calls, sleeps
+
+
+def test_fetch_pr_draft_retries_connection_errors_then_returns_current_state(monkeypatch):
+    calls, sleeps = _stub_github_json(
+        monkeypatch,
+        [urllib.error.URLError("boom"), ConnectionResetError("reset"), {"draft": False}],
+    )
+    result = AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=42)
+    assert result is False
+    assert len(calls) == 3
+    assert calls == ["https://api.github.com/repos/zlxlabs/gate/pulls/42"] * 3
+    assert sleeps == list(AGG.PR_DRAFT_FETCH_BACKOFF_SECONDS)
+
+
+def test_fetch_pr_draft_http_error_is_not_retried(monkeypatch):
+    calls, sleeps = _stub_github_json(
+        monkeypatch,
+        [urllib.error.HTTPError("https://api.github.com/x", 404, "Not Found", {}, None)],
+    )
+    assert AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=42) is None
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_fetch_pr_draft_exhausts_connection_retries_and_fails_closed(monkeypatch):
+    calls, sleeps = _stub_github_json(
+        monkeypatch,
+        [urllib.error.URLError("boom")] * 3,
+    )
+    assert AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=42) is None
+    assert len(calls) == 3
+    assert sleeps == list(AGG.PR_DRAFT_FETCH_BACKOFF_SECONDS)
+
+
+def test_fetch_pr_draft_missing_draft_boolean_fails_closed(monkeypatch):
+    calls, _ = _stub_github_json(monkeypatch, [{"draft": "false"}])
+    assert AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=42) is None
+    assert len(calls) == 1
+
+
+def test_fetch_pr_draft_without_token_or_pr_number_makes_no_request(monkeypatch):
+    calls, _ = _stub_github_json(monkeypatch, [])
+    assert AGG._fetch_pr_draft(token="", repository="zlxlabs/gate", pr_number=42) is None
+    assert AGG._fetch_pr_draft(token=None, repository="zlxlabs/gate", pr_number=42) is None
+    assert AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=None) is None
+    assert calls == []
 
 def test_terminal_publish_barrier_failures(tmp_path, monkeypatch):
     audit_dir = tmp_path / "audit"
@@ -860,8 +1021,9 @@ def _visible_scenario(tmp_path, overrides, audit_record="__default__"):
     ],
 )
 def test_visible_terminal_state_axis(
-    capsys, tmp_path, overrides, audit_record, classification, reason_code, gate_result, exit_code, annotation,
+    capsys, tmp_path, monkeypatch, overrides, audit_record, classification, reason_code, gate_result, exit_code, annotation,
 ):
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", lambda **kw: True)
     _, summary_path, args = _visible_scenario(tmp_path, overrides, audit_record)
     rc = AGG.main(args)
     out = capsys.readouterr().out
@@ -891,7 +1053,8 @@ def test_visible_terminal_state_axis(
     assert f"{opposite}gate terminal state:" not in out
 
 
-def test_visible_expected_skip_summary_names_draft_as_the_skip_reason(capsys, tmp_path):
+def test_visible_expected_skip_summary_names_draft_as_the_skip_reason(capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", lambda **kw: True)
     _, summary_path, args = _visible_scenario(
         tmp_path, {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
     )
@@ -1010,7 +1173,8 @@ _RUN_URL = "https://github.com/zlxlabs/gate/actions/runs/999"
     ],
     ids=["pass", "fail", "skipped_draft", "skipped_hosted", "unavailable"],
 )
-def test_action_line_precedes_machine_codes_for_every_gate_result(tmp_path, overrides, audit_record, gate_result, action_phrases, needs_run_url):
+def test_action_line_precedes_machine_codes_for_every_gate_result(tmp_path, monkeypatch, overrides, audit_record, gate_result, action_phrases, needs_run_url):
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", lambda **kw: True)
     _, summary_path, args = _visible_scenario(tmp_path, overrides, audit_record)
     AGG.main(args)
     text = summary_path.read_text()
