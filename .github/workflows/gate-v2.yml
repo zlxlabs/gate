@@ -1176,6 +1176,8 @@ jobs:
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
           QUALITY_LEDGER_INPUT_UPLOAD: ${{ needs.quality.outputs.ledger_input_upload }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          PRIMARY_RESULT: ${{ needs.primary.result }}
         run: |
           set -euo pipefail
           listing="$(mktemp)"
@@ -1197,6 +1199,17 @@ jobs:
           current = int(current_text)
           if expected_text not in {"true", "false"}:
               raise SystemExit("REVIEW_EXPECTED must be true or false")
+          quality_result = (os.environ.get("QUALITY_RESULT") or "").strip()
+          primary_result = (os.environ.get("PRIMARY_RESULT") or "").strip()
+          RESULT_DOMAIN = {"success", "failure", "cancelled", "skipped"}
+          if quality_result not in RESULT_DOMAIN:
+              raise SystemExit("QUALITY_RESULT must be one of success, failure, cancelled, skipped")
+          if primary_result not in RESULT_DOMAIN:
+              raise SystemExit("PRIMARY_RESULT must be one of success, failure, cancelled, skipped")
+          # gate#105 A: quality is skipped BY DESIGN when primary already
+          # failed (quality needs primary, if != 'failure'), so the ledger
+          # input artifact legitimately does not exist for this combination.
+          quality_short_circuited = quality_result == "skipped" and primary_result == "failure"
           quality_upload = (os.environ.get("QUALITY_LEDGER_INPUT_UPLOAD") or "").strip() or "unknown"
           payload = json.loads(Path(listing_path).read_text(encoding="utf-8"))
           pages = payload if isinstance(payload, list) else [payload]
@@ -1232,8 +1245,10 @@ jobs:
           input_artifact = select_artifact(
               input_prefix,
               f"No matching required ledger input artifact found (quality upload outcome: {quality_upload})",
-              True,
+              not quality_short_circuited,
           )
+          if quality_short_circuited and input_artifact is None:
+              print("::notice::ledger input skipped: quality was short-circuited by primary failure (gate#105 A); preflight/install fields will be null")
           audit_artifact = select_artifact(audit_prefix, "No matching canonical primary audit artifact found", expected_text == "true")
           terminal_artifact = select_artifact(
               terminal_prefix, "No matching required gate terminal artifact found", True,
@@ -1340,8 +1355,9 @@ jobs:
                   )
 
           with open(output_path, "a", encoding="utf-8") as output:
-              output.write(f"input_artifact_id={input_artifact[1]}\n")
-              output.write(f"input_source_attempt={input_artifact[0]}\n")
+              output.write(f"input_artifact_id={input_artifact[1] if input_artifact else ''}\n")
+              output.write(f"input_source_attempt={input_artifact[0] if input_artifact else ''}\n")
+              output.write(f"input_short_circuited={'true' if quality_short_circuited and input_artifact is None else 'false'}\n")
               output.write(f"audit_artifact_id={audit_artifact[1] if audit_artifact else ''}\n")
               output.write(f"audit_source_attempt={audit_artifact[0] if audit_artifact else ''}\n")
               output.write(f"terminal_artifact_id={terminal_artifact[1]}\n")
@@ -1349,6 +1365,11 @@ jobs:
           PY
 
       - name: Download v2 review ledger inputs
+        # Empty only when quality was short-circuited by a primary failure
+        # (gate#105 A): nothing to download; build_ledger._load_json maps the
+        # missing files to null preflight/install fields and the row is
+        # still written.
+        if: steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}
