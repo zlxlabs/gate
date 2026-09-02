@@ -51,7 +51,9 @@
 # cancel-in-progress: true so a newer head supersedes stale lint/review
 # without those two jobs queueing or killing each other in the same run.
 # gate and ledger keep cancel-in-progress: false. OCR / advisory jobs stay
-# unlocked (first-cut scope).
+# unlocked (first-cut scope). ocr is advisory: job-level continue-on-error
+# keeps its failure out of the run-level conclusion; gate / gate is the only
+# verdict check — do not read run.conclusion downstream.
 name: gate
 
 on:
@@ -600,6 +602,7 @@ jobs:
   # ── ocr (advisory matrix; never gates `gate`) ────────────────────────────
   ocr:
     needs: resolve_advisory
+    continue-on-error: true
     permissions:
       actions: read
       contents: read
