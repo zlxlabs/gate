@@ -1,4 +1,5 @@
-# Required Gate v2 (reusable workflow) — quality ∥ primary ∥ ocr → gate aggregator.
+# Required Gate v2 (reusable workflow) — primary → quality (skipped on primary
+# failure, gate#105 A) ∥ ocr → gate aggregator.
 # Workspace lifecycle audit: only `quality` runs caller checks after a gate-source
 # checkout; `gate` and `ledger` run gate-owned code only and keep separate source
 # directories for their own control-plane steps.

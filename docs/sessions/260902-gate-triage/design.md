@@ -10,7 +10,7 @@
 
 - 不改 concurrency group 表达式（`tests/test_gate_v2_contract.py:419-494` 字节级锁死的两把 job 级锁形态不动）。
 - 不让 quality 因上传失败变红（上传是 ledger 的前置，不是门禁的前置）；不把 ledger input 在 draft 下改成 optional。
-- gate#105 第一条（汇总 job 被最慢 quality 绑架）本批不做：每个候选方案都改变绿路径时序或引入第二个 `gate / gate` 写入者，需 owner 拍板（见文末「待裁决」）。
+- gate#105 第一条按已裁决 A 落地于 PR #119（见文末「已裁决」）。
 - 不改 ocr/advisory 的判定语义，不动 registry。
 
 ## 方案要点与已否决方案
