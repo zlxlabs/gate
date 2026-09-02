@@ -93,12 +93,14 @@ from __future__ import annotations
 import argparse
 import contextvars
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
 import os
 import re
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -139,13 +141,26 @@ _IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
 PRIMARY_RESULT_DOMAIN = ("success", "failure", "cancelled", "skipped")
 QUALITY_RESULT_DOMAIN = PRIMARY_RESULT_DOMAIN
 TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
-TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip")
+TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip", "review_expected_stale", "pr_state_unverifiable")
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
 PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
 CONVERGENCE_ENVELOPE_SCHEMA_VERSION = 1
 CONVERGENCE_ENVELOPE_KIND = "gate_convergence_round"
 GITHUB_API_TIMEOUT_SECONDS = 15
+# gate#110: retry shape mirrors review-ledger's build_ledger.py (same form,
+# not an import — the two action directories must stay independent). Only
+# connection-level failures are retried; an HTTPError is a definitive answer.
+PR_DRAFT_FETCH_ATTEMPTS = 3
+PR_DRAFT_FETCH_BACKOFF_SECONDS = (1, 2)
+_RETRYABLE_CONNECTION_ERRORS = (
+    urllib.error.URLError,
+    ssl.SSLError,
+    ConnectionResetError,
+    http.client.IncompleteRead,
+    TimeoutError,
+    socket.timeout,
+)
 DEFAULT_PUBLISH_BUDGET_SECONDS = 120
 PUBLISH_BUDGET_ENV = "GATE_PUBLISH_BUDGET_SECONDS"
 DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS = 45
@@ -613,6 +628,7 @@ def evaluate(
     legacy_raw_audit_digest: Optional[str] = None,
     convergence_state: Optional[Any] = None,
     waiver_receipts: Sequence[Any] = (),
+    pr_draft_now: Optional[bool] = None,
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -620,8 +636,11 @@ def evaluate(
     `audit` is either the parsed JSON value found on disk (which may be any
     JSON type, not necessarily an object — see `validate_audit_identity`), or
     None; when None, `audit_error` explains why (download failed, no file,
-    bad JSON, ...). See tests/test_gate_aggregator.py for the judgement
-    matrix this function must satisfy.
+    bad JSON, ...). Likewise `pr_draft_now` is pre-fetched by `main` (only in
+    the skipped-on-draft-payload branch, gate#110): True/False is the PR's
+    re-verified current draft state, None means the re-check failed. See
+    tests/test_gate_aggregator.py for the judgement matrix this function must
+    satisfy.
     """
     notes: list[str] = []
     problems: list[str] = []
@@ -650,7 +669,30 @@ def evaluate(
         problems.append(f"quality job result is {quality_result!r} (required: success)")
 
     if primary_result == "skipped":
-        if is_draft or not review_expected:
+        if is_draft:
+            # gate#110: the payload's draft flag can be stale — a synchronize
+            # run cancels the same-head ready_for_review run and survives with
+            # draft=true. `main` re-fetches the PR's current draft state and
+            # passes it in as pr_draft_now; None here means the re-check was
+            # attempted and failed (fail-closed), never "not consulted".
+            if pr_draft_now is False:
+                problems.append(
+                    "primary was skipped on a stale draft=true payload but the PR is no longer draft "
+                    "(a ready_for_review run was cancelled by this synchronize run); re-trigger with: "
+                    "gh pr ready --undo && gh pr ready, or push a new commit"
+                )
+                primary_classification, primary_reason = "review_unavailable", "review_expected_stale"
+            elif pr_draft_now is None:
+                problems.append(
+                    "primary was skipped on a draft=true payload and the PR's current draft state "
+                    "could not be re-verified via the GitHub API; fail-closed — rerun the workflow"
+                )
+                primary_classification, primary_reason = "review_unavailable", "pr_state_unverifiable"
+            else:
+                notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
+                notes.append("pr draft state re-verified: still draft")
+                primary_classification, primary_reason = "expected_skip", "review_not_expected"
+        elif not review_expected:
             notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
             primary_classification, primary_reason = "expected_skip", "review_not_expected"
         else:
@@ -1202,6 +1244,35 @@ def _download_terminal_zip(*, token: str, url: str) -> bytes:
 def _github_json(*, token: str, url: str) -> Any:
     raw = _github_request(token=token, url=url)
     return json.loads(raw) if raw else None
+
+
+def _fetch_pr_draft(*, token: Optional[str], repository: str, pr_number: Optional[int]) -> Optional[bool]:
+    """Re-verify the PR's *current* draft state (gate#110).
+
+    The event payload that started this run can be stale: a synchronize run
+    cancels the same-head ready_for_review run and survives with
+    `draft=true` still in its payload. Returns the current `draft` boolean,
+    or None when the state cannot be determined (missing inputs, HTTP error,
+    exhausted connection retries, malformed payload) — callers must treat
+    None as fail-closed, never as "still draft".
+    """
+    if not token or pr_number is None:
+        return None
+    url = f"https://api.github.com/repos/{repository}/pulls/{pr_number}"
+    payload = None
+    for attempt in range(PR_DRAFT_FETCH_ATTEMPTS):
+        try:
+            payload = _github_json(token=token, url=url)
+            break
+        except urllib.error.HTTPError:
+            return None
+        except _RETRYABLE_CONNECTION_ERRORS:
+            if attempt >= PR_DRAFT_FETCH_ATTEMPTS - 1:
+                return None
+            time.sleep(PR_DRAFT_FETCH_BACKOFF_SECONDS[attempt])
+    if not isinstance(payload, dict) or type(payload.get("draft")) is not bool:
+        return None
+    return payload["draft"]
 
 
 def _github_identity(token: str) -> dict[str, Any]:
@@ -2154,6 +2225,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             waiver_receipts = ()
 
+    # gate#110: only the skipped-on-draft-payload branch can carry a stale
+    # draft flag, so only that branch spends an extra GitHub API call. This
+    # runs before any publish budget is active, so the fetch uses the plain
+    # GITHUB_API_TIMEOUT_SECONDS path in _github_request.
+    pr_draft_now: Optional[bool] = None
+    if args.primary_result == "skipped" and is_draft:
+        pr_draft_now = _fetch_pr_draft(token=token, repository=args.repository, pr_number=args.pr_number)
+
     outcome = evaluate(
         quality_result=args.quality_result,
         primary_result=args.primary_result,
@@ -2169,6 +2248,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit_digest=audit_digest,
         legacy_raw_audit_digest=legacy_raw_audit_digest,
         waiver_receipts=waiver_receipts,
+        pr_draft_now=pr_draft_now,
     )
 
     return _finish(

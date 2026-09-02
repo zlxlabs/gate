@@ -13,3 +13,10 @@
 - 本段结论：判定矩阵新增 3 格（`pr_draft_now` False/None/is_draft=False+None），既有 `(skipped, is_draft=True)` 格与 5 个既有 CLI/evaluate 用例改为显式 `pr_draft_now=True` 或 monkeypatch `_fetch_pr_draft` 返回 True——`None` 在该分支语义变为「复核失败」是锁定决策的必然结果。新增 `_fetch_pr_draft` 单测 5 条、CLI 级测试 2 条、reason 域全元组锁 1 条、problems 逐字断言 2 条。
 - 关键决策与已否决方案：monkeypatch 点选 `AGG._fetch_pr_draft`（main 内只有一处调用）与 `AGG.time.sleep`（模块内引用，测后不残留）；否决在测试里设真实 GITHUB_TOKEN——会真打 API。
 - 下一步唯一动作：实现 evaluate 分支、`_fetch_pr_draft`、main 接线，转绿。
+
+## 里程碑 3：实现转绿
+
+- 当前阶段：实现完成，`tests/test_gate_aggregator.py` 219 全绿。
+- 本段结论：`evaluate()` 新增 keyword-only `pr_draft_now`，draft+skipped 分支按真值表三分叉（False→`review_unavailable/review_expected_stale`，None→`review_unavailable/pr_state_unverifiable`，True→维持 `expected_skip`）；`_fetch_pr_draft` 走既有 `_github_json`，连接级异常 3 次尝试、退避 1s/2s，HTTPError 不重试，耗尽/畸形/缺 token 或 pr_number 一律 None；`main()` 仅在 `primary_result == "skipped" and is_draft` 时调用，发生在 publish 预算激活前（`_ACTIVE_PUBLISH_BUDGET` 为 None，走 `GITHUB_API_TIMEOUT_SECONDS`）。
+- 关键决策与已否决方案：常量命名 `PR_DRAFT_FETCH_ATTEMPTS` / `PR_DRAFT_FETCH_BACKOFF_SECONDS` / `_RETRYABLE_CONNECTION_ERRORS`（形态抄 build_ledger，不 import）；helper 置于 `_github_json` 之后；重试请求不吃 publish 预算（时序保证，未加预算守卫代码——无第二消费者）。
+- 下一步唯一动作：红验——把 `pr_draft_now is False` 分支改回落 `expected_skip`，确认矩阵第二格转 AssertionError，再还原。
