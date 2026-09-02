@@ -20,3 +20,10 @@
 - 本段结论：`evaluate()` 新增 keyword-only `pr_draft_now`，draft+skipped 分支按真值表三分叉（False→`review_unavailable/review_expected_stale`，None→`review_unavailable/pr_state_unverifiable`，True→维持 `expected_skip`）；`_fetch_pr_draft` 走既有 `_github_json`，连接级异常 3 次尝试、退避 1s/2s，HTTPError 不重试，耗尽/畸形/缺 token 或 pr_number 一律 None；`main()` 仅在 `primary_result == "skipped" and is_draft` 时调用，发生在 publish 预算激活前（`_ACTIVE_PUBLISH_BUDGET` 为 None，走 `GITHUB_API_TIMEOUT_SECONDS`）。
 - 关键决策与已否决方案：常量命名 `PR_DRAFT_FETCH_ATTEMPTS` / `PR_DRAFT_FETCH_BACKOFF_SECONDS` / `_RETRYABLE_CONNECTION_ERRORS`（形态抄 build_ledger，不 import）；helper 置于 `_github_json` 之后；重试请求不吃 publish 预算（时序保证，未加预算守卫代码——无第二消费者）。
 - 下一步唯一动作：红验——把 `pr_draft_now is False` 分支改回落 `expected_skip`，确认矩阵第二格转 AssertionError，再还原。
+
+## 里程碑 4：红验完成
+
+- 当前阶段：红验通过，实现已还原，等待全量回归。
+- 本段结论：把 `pr_draft_now is False` 分支判据行改坏为落回 `expected_skip / review_not_expected`（单行注入），判定矩阵第二格 `test_terminal_classification_matrix[kwargs4-expected4]` 转红且失败类型为 AssertionError（`assert ('expected_skip', 'review_not_expected', 'skipped') == ('review_unavailable', 'review_expected_stale', 'unavailable')`），同红的还有 problems 逐字断言与 CLI 测试；只还原该一行后 219 全绿、`git diff` 为空。
+- 关键决策与已否决方案：注入点只选判据赋值那一行（固定条款「默认只改判据本身那一行」）；未做整文件 checkout。
+- 下一步唯一动作：全量 pytest + `check_pinned_uses.py`，写最终报告。
