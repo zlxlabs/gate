@@ -466,6 +466,24 @@ def test_quality_and_primary_have_independent_cancel_true_pr_locks():
     _assert_expensive_job_cancel_lock("primary", primary)
 
 
+# ── quality short-circuit on primary failure (gate#105 方案 A, owner 2026-09-02) ──
+# quality needs primary so a primary failure skips quality entirely and lets
+# `gate / gate` conclude without waiting on the slowest job. The `always()` in
+# the `if:` is mandatory, not decorative: with GitHub's default success()
+# gate, a primary that is cancelled (concurrency supersede on a newer head)
+# or skipped (draft PR / fork / hosted runner) would ALSO skip quality —
+# quality must still run in those cases; only primary failure short-circuits.
+
+
+def test_quality_needs_primary_and_short_circuits_only_on_primary_failure():
+    raw, _ = _load_workflow()
+    quality = raw["jobs"]["quality"]
+    assert quality["needs"] == ["primary"]
+    # Locked as a full literal: `!= 'failure'` means primary skipped (draft /
+    # fork / hosted) or cancelled (concurrency supersede) still runs quality.
+    assert quality["if"] == "always() && needs.primary.result != 'failure'"
+
+
 def test_non_writer_non_expensive_jobs_have_no_concurrency():
     raw, _ = _load_workflow()
     for job_name, job in raw["jobs"].items():
