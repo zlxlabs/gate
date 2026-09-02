@@ -1154,6 +1154,7 @@ jobs:
           TERMINAL_PREFIX: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          QUALITY_LEDGER_INPUT_UPLOAD: ${{ needs.quality.outputs.ledger_input_upload }}
         run: |
           set -euo pipefail
           listing="$(mktemp)"
@@ -1175,6 +1176,7 @@ jobs:
           current = int(current_text)
           if expected_text not in {"true", "false"}:
               raise SystemExit("REVIEW_EXPECTED must be true or false")
+          quality_upload = (os.environ.get("QUALITY_LEDGER_INPUT_UPLOAD") or "").strip() or "unknown"
           payload = json.loads(Path(listing_path).read_text(encoding="utf-8"))
           pages = payload if isinstance(payload, list) else [payload]
           artifacts = []
@@ -1206,7 +1208,11 @@ jobs:
                   return None
               return max(candidates, key=lambda item: (item[0], item[1]))
 
-          input_artifact = select_artifact(input_prefix, "No matching required ledger input artifact found", True)
+          input_artifact = select_artifact(
+              input_prefix,
+              f"No matching required ledger input artifact found (quality upload outcome: {quality_upload})",
+              True,
+          )
           audit_artifact = select_artifact(audit_prefix, "No matching canonical primary audit artifact found", expected_text == "true")
           terminal_artifact = select_artifact(
               terminal_prefix, "No matching required gate terminal artifact found", True,
