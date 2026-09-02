@@ -206,6 +206,8 @@ def _require_finite_nonnegative(value: Any, field: str) -> None:
 
 def _review_summary(
     audit: dict[str, Any] | None, fallback_status: str, preflight: dict[str, Any] | None = None,
+    *,
+    input_short_circuited: bool = False,
 ) -> dict[str, Any]:
     if not audit:
         return {
@@ -231,27 +233,30 @@ def _review_summary(
     result = audit.get("result")
     is_primary_v2 = audit.get("kind") == "primary_review"
     if is_primary_v2:
-        if not isinstance(preflight, dict):
-            raise ValueError("canonical primary preflight must be an object")
-        thresholds = preflight.get("thresholds")
-        diff_lines = preflight.get("diff_lines")
-        if (
-            isinstance(diff_lines, bool) or not isinstance(diff_lines, int) or diff_lines < 0
-            or not isinstance(preflight.get("classification"), str)
-            or not isinstance(preflight.get("review_plan"), str)
-            or not isinstance(thresholds, dict)
-            or isinstance(thresholds.get("single_turn_lines"), bool)
-            or not isinstance(thresholds.get("single_turn_lines"), int)
-            or thresholds["single_turn_lines"] <= 0
-        ):
-            raise ValueError("canonical primary preflight has invalid coverage shape")
-        coverage_complete = diff_lines <= thresholds["single_turn_lines"]
-        coverage = {
-            "mode": "single" if coverage_complete else "sharded+cross-module integration",
-            "complete": coverage_complete,
-            "diff_lines": diff_lines,
-            "shards": 1 if coverage_complete else None,
-        }
+        if input_short_circuited and (preflight is None or preflight == {}):
+            coverage = None
+        else:
+            if not isinstance(preflight, dict):
+                raise ValueError("canonical primary preflight must be an object")
+            thresholds = preflight.get("thresholds")
+            diff_lines = preflight.get("diff_lines")
+            if (
+                isinstance(diff_lines, bool) or not isinstance(diff_lines, int) or diff_lines < 0
+                or not isinstance(preflight.get("classification"), str)
+                or not isinstance(preflight.get("review_plan"), str)
+                or not isinstance(thresholds, dict)
+                or isinstance(thresholds.get("single_turn_lines"), bool)
+                or not isinstance(thresholds.get("single_turn_lines"), int)
+                or thresholds["single_turn_lines"] <= 0
+            ):
+                raise ValueError("canonical primary preflight has invalid coverage shape")
+            coverage_complete = diff_lines <= thresholds["single_turn_lines"]
+            coverage = {
+                "mode": "single" if coverage_complete else "sharded+cross-module integration",
+                "complete": coverage_complete,
+                "diff_lines": diff_lines,
+                "shards": 1 if coverage_complete else None,
+            }
         findings = result["findings"] if isinstance(result, dict) else []
         cost_usd, tokens = audit.get("cost"), audit.get("tokens")
         expected_shadows = audit["expected_shadows"]
@@ -597,6 +602,7 @@ def build_entry(
     install: dict[str, Any] | None = None,
     fallback_status: str = "not_run",
     terminal_envelope: dict[str, Any] | None = None,
+    input_short_circuited: bool = False,
 ) -> dict[str, Any]:
     relevant = [
         entry for entry in prior_entries
@@ -609,7 +615,9 @@ def build_entry(
         audit, repository=repository, pr_number=pr_number, run_id=run_id,
         run_attempt=run_attempt, head_sha=head_sha, expected_identity=expected_identity,
     )
-    review = _review_summary(audit, fallback_status, preflight)
+    review = _review_summary(
+        audit, fallback_status, preflight, input_short_circuited=input_short_circuited,
+    )
     current_ids = set(review["finding_ids"])
     comparison: dict[str, Any] = {"kind": "prior_conflict" if prior_conflict else "first_review"}
     if previous:
@@ -885,7 +893,16 @@ def main() -> int:
     parser.add_argument("--codex-expected", default="false")
     parser.add_argument("--codex-waived", default="false")
     parser.add_argument("--max-entries", default=2000, type=int)
+    # Omitted means false. Do not use argparse default="false": the explicit
+    # None branch below is the documented default, and any other string fails.
+    parser.add_argument("--input-short-circuited", default=None)
     args = parser.parse_args()
+    if args.input_short_circuited is None:
+        input_short_circuited = False
+    elif args.input_short_circuited not in {"true", "false"}:
+        raise SystemExit("--input-short-circuited must be one of true, false")
+    else:
+        input_short_circuited = args.input_short_circuited == "true"
     token = os.environ.get("GH_TOKEN", "")
     if not token:
         raise RuntimeError("GH_TOKEN is required to publish review ledger")
@@ -935,6 +952,7 @@ def main() -> int:
         install=install,
         fallback_status=fallback,
         terminal_envelope=terminal,
+        input_short_circuited=input_short_circuited,
     )
     all_entries = dedupe_entries([*prior_entries, entry])
     write_ledger(args.output, all_entries, max_entries=args.max_entries)

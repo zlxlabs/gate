@@ -334,6 +334,9 @@ def test_v2_review_preserves_result_and_recomputes_legacy_coverage(
 
 def _short_circuit_fail_audit(**kwargs):
     audit = _v2_audit("fail", runtime={"duration_s": 9.5}, **kwargs)
+    audit["attempts"] = [
+        {"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 9.5, "cost_usd": 0},
+    ]
     audit["result"]["findings"] = [
         {
             "id": "correctness.bad-state",
