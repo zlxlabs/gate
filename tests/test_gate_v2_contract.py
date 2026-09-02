@@ -1141,6 +1141,64 @@ def test_ledger_resolver_step_env_and_download_guard_literals():
     assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
 
 
+def test_ledger_build_step_forwards_input_short_circuited():
+    """W5: Build 步 with: 必须把解析器的 input_short_circuited 原样传进 action。"""
+    raw, _ = _load_workflow()
+    build = next(
+        s for s in raw["jobs"]["ledger"]["steps"]
+        if s.get("name") == "Build v2 review effectiveness ledger"
+    )
+    assert "input-short-circuited" in build.get("with", {})
+    assert build["with"]["input-short-circuited"] == (
+        "${{ steps.resolve-ledger-artifacts.outputs.input_short_circuited }}"
+    )
+
+
+def test_review_ledger_action_declares_and_forwards_input_short_circuited():
+    """W5: action.yml 声明 input，composite run 按字面量转发，不用 shell 兜底。"""
+    action = yaml.safe_load(
+        (REPO_ROOT / ".github" / "actions" / "review-ledger" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "input-short-circuited" in action.get("inputs", {})
+    spec = action["inputs"]["input-short-circuited"]
+    assert spec.get("required") in (None, False)
+    assert str(spec.get("default")) == "false"
+    run = action["runs"]["steps"][0]["run"]
+    assert "--input-short-circuited" in run
+    assert "${{ inputs.input-short-circuited }}" in run
+    assert "${x:-" not in run
+    assert ":-}" not in run
+
+
+@pytest.mark.parametrize(
+    "env_key,bad",
+    [
+        ("QUALITY_RESULT", "bogus"),
+        ("PRIMARY_RESULT", "timeout"),
+        ("QUALITY_RESULT", ""),
+        ("PRIMARY_RESULT", "SUCCESS"),
+        ("QUALITY_RESULT", "true"),
+        ("PRIMARY_RESULT", "0"),
+    ],
+)
+def test_ledger_resolver_result_domain_rejects_illegal_values(tmp_path, env_key, bad):
+    """W6: RESULT_DOMAIN 四值域；非法 QUALITY_RESULT / PRIMARY_RESULT 必须 fail-loud。"""
+    artifacts = [
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    extra = {"QUALITY_RESULT": "success", "PRIMARY_RESULT": "success"}
+    extra[env_key] = bad
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1, extra_env=extra,
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "must be one of" in combined
+    assert env_key in combined
+
+
 def test_ledger_persistence_steps_are_fail_closed():
     raw, _ = _load_workflow()
     ledger_steps = raw["jobs"]["ledger"]["steps"]
