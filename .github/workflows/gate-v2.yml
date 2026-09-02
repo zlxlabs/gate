@@ -117,6 +117,8 @@ jobs:
     # quality 走无凭据 ci 池（spec：gate-hub docs/designs/runner-ci-pool-split.md）。
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
+    outputs:
+      ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
     # Per-PR cancel of stale quality only. Group is independent of `primary`
     # (same-run jobs must not share a group) and of the gate/ledger writer
     # locks (those stay cancel-in-progress: false). Workflow identity prefix
@@ -328,8 +330,10 @@ jobs:
         run: uv cache prune --ci || true
 
       - name: Upload v2 review ledger inputs
+        id: ledger-input-upload
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -338,6 +342,36 @@ jobs:
             ${{ runner.temp }}/install-result.json
           if-no-files-found: error
           retention-days: 30
+
+      - name: Retry upload v2 review ledger inputs
+        id: ledger-input-upload-retry
+        if: always() && steps.ledger-input-upload.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pr-size-preflight.json
+            ${{ runner.temp }}/install-result.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Record ledger input upload outcome
+        id: ledger-input-upload-outcome
+        if: always()
+        env:
+          LEDGER_INPUT_UPLOAD: ${{ steps.ledger-input-upload.outcome }}
+          LEDGER_INPUT_UPLOAD_RETRY: ${{ steps.ledger-input-upload-retry.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$LEDGER_INPUT_UPLOAD" = "success" ] || [ "$LEDGER_INPUT_UPLOAD_RETRY" = "success" ]; then
+            echo "ledger_input_upload=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "ledger_input_upload=failure" >> "$GITHUB_OUTPUT"
+            echo "::error::review ledger input upload failed after one retry (network); gate / ledger will report the input missing"
+          fi
 
   # ── primary ──────────────────────────────────────────────────────────────
   # Runs review-primary (gate-hub, already merged) and writes+uploads the ONE
