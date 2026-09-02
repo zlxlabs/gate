@@ -1,3 +1,4 @@
+import argparse
 import base64
 import hashlib
 import importlib.util
@@ -323,6 +324,216 @@ def test_v2_review_preserves_result_and_recomputes_legacy_coverage(
     }
     assert review["shadows"] == {}
     assert review["finding_count"] == 1
+
+
+# ── gate#121: quality short-circuit must still write the ledger row ──────────
+# Production path: primary failure skips quality, Download is skipped, Build
+# still runs with a missing preflight file. main() maps that to {}. The new
+# cell is selected only by an explicit input_short_circuited boolean — empty
+# preflight without that flag must keep raising.
+
+
+def _short_circuit_fail_audit(**kwargs):
+    audit = _v2_audit("fail", runtime={"duration_s": 9.5}, **kwargs)
+    audit["attempts"] = [
+        {"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 9.5, "cost_usd": 0},
+    ]
+    audit["result"]["findings"] = [
+        {
+            "id": "correctness.bad-state",
+            "severity": "major",
+            "category": "correctness",
+            "trigger_kind": "measured",
+        },
+        {
+            "id": "security.leak",
+            "severity": "blocker",
+            "category": "security",
+            "trigger_kind": "inferred",
+        },
+    ]
+    return audit
+
+
+def _assert_short_circuit_audit_projection(review, *, audit):
+    assert review["coverage"] is None
+    assert review["severity_counts"] == {"blocker": 1, "major": 1}
+    assert review["category_counts"] == {"correctness": 1, "security": 1}
+    assert review["trigger_kind_counts"] == {"inferred": 1, "measured": 1}
+    assert review["finding_ids"] == ["correctness.bad-state", "security.leak"]
+    assert review["finding_count"] == 2
+    assert review["inferred_p1_count"] == 1
+    assert review["runtime"] == {"duration_s": 9.5}
+    assert review["reviewer"] == "codex-sub"
+    assert review["verdict"] == "fail"
+    assert review["status"] == "fail"
+    assert review["shadows"] == {}
+    assert review["result"] == audit["result"]
+
+
+def _run_ledger_main(module, tmp_path, monkeypatch, *, extra_argv=(), preflight=None, install=None, audit=None):
+    audit = audit or _short_circuit_fail_audit()
+    work = tmp_path
+    work.mkdir(parents=True, exist_ok=True)
+    audit_path = work / "audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    if preflight is None:
+        preflight_path = work / "missing" / "pr-size-preflight.json"
+    else:
+        preflight_path = work / "pr-size-preflight.json"
+        preflight_path.write_text(json.dumps(preflight), encoding="utf-8")
+    if install is None:
+        install_path = work / "missing" / "install-result.json"
+    else:
+        install_path = work / "install-result.json"
+        install_path.write_text(json.dumps(install), encoding="utf-8")
+    output = work / "ledger.jsonl"
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setattr(module, "fetch_prior_entries", lambda *a, **k: [])
+    monkeypatch.setattr(module, "fetch_comments", lambda *a, **k: [])
+    monkeypatch.setattr(module, "post_state_comment", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", [
+        "build_ledger.py",
+        "--audit-path", str(audit_path),
+        "--preflight-path", str(preflight_path),
+        "--install-path", str(install_path),
+        "--output", str(output),
+        "--repository", "zlxlabs/app",
+        "--pr-number", "7",
+        "--run-id", "10",
+        "--run-attempt", "1",
+        "--head-sha", "head",
+        "--expected-repository-id", "123",
+        "--expected-base-sha", "base",
+        "--expected-caller-sha", "b" * 40,
+        "--expected-reusable-workflow-sha", "c" * 40,
+        "--codex-expected", "true",
+        *extra_argv,
+    ])
+    rc = module.main()
+    return rc, output, audit
+
+
+def test_short_circuited_empty_preflight_writes_ledger_row():
+    """W1: short-circuit + empty/missing preflight → row written, coverage None."""
+    module = _module()
+    assert "input_short_circuited" in inspect.signature(module.build_entry).parameters
+    assert "input_short_circuited" in inspect.signature(module._review_summary).parameters
+    audit = _short_circuit_fail_audit()
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        install=None, expected_identity=EXPECTED_IDENTITY, input_short_circuited=True,
+    )
+    assert entry["preflight"] is None
+    assert entry["install"] is None
+    _assert_short_circuit_audit_projection(entry["review"], audit=audit)
+
+
+def test_input_short_circuited_option_is_registered_on_parser(monkeypatch):
+    """CLI option must be registered on ArgumentParser, not merely appear in source text."""
+    module = _module()
+    captured: list[str] = []
+
+    def grab(self, args=None, namespace=None):
+        captured.extend(
+            option
+            for action in self._actions
+            for option in action.option_strings
+        )
+        raise SystemExit("captured-parser")
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", grab)
+    monkeypatch.setattr(sys, "argv", ["build_ledger.py"])
+    with pytest.raises(SystemExit, match="captured-parser"):
+        module.main()
+    assert "--input-short-circuited" in captured
+
+
+def test_main_short_circuited_missing_preflight_writes_jsonl(tmp_path, monkeypatch):
+    """W1 main(): missing input files + --input-short-circuited true → jsonl row."""
+    module = _module()
+    rc, output, audit = _run_ledger_main(
+        module, tmp_path, monkeypatch,
+        extra_argv=["--input-short-circuited", "true"],
+    )
+    assert rc == 0
+    lines = output.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["preflight"] is None
+    _assert_short_circuit_audit_projection(row["review"], audit=audit)
+
+
+def test_primary_review_empty_preflight_without_short_circuit_still_raises():
+    """W2: non-short-circuit + empty preflight must keep raising. Do not relax."""
+    module = _module()
+    with pytest.raises(ValueError, match="canonical primary preflight has invalid coverage shape"):
+        module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+            head_sha="head", preflight={}, audit=_v2_audit("fail"),
+            prior_entries=[], dispositions={},
+        )
+    params = inspect.signature(module.build_entry).parameters
+    if "input_short_circuited" in params:
+        with pytest.raises(ValueError, match="canonical primary preflight has invalid coverage shape"):
+            module.build_entry(
+                repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+                head_sha="head", preflight={}, audit=_v2_audit("fail"),
+                prior_entries=[], dispositions={},
+                input_short_circuited=False,
+            )
+
+
+def test_short_circuited_valid_preflight_still_computes_coverage():
+    """W3: short-circuit flag is not a switch to ignore a present preflight."""
+    module = _module()
+    assert "input_short_circuited" in inspect.signature(module.build_entry).parameters
+    audit = _v2_audit("fail")
+    preflight = _preflight(100)
+    kwargs = dict(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=preflight, audit=audit, prior_entries=[],
+        dispositions={}, expected_identity=EXPECTED_IDENTITY,
+    )
+    normal = module.build_entry(**kwargs)
+    shorted = module.build_entry(**kwargs, input_short_circuited=True)
+    assert shorted["review"]["coverage"] == normal["review"]["coverage"]
+    assert shorted["review"]["coverage"]["complete"] is True
+    assert shorted["review"]["coverage"]["diff_lines"] == 100
+    assert shorted["preflight"] == preflight
+
+
+@pytest.mark.parametrize("raw", ["yes", "1", "TRUE", "True", "", "maybe", "false "])
+def test_input_short_circuited_illegal_value_is_fail_loud(tmp_path, monkeypatch, raw):
+    """W4: domain is exactly {true, false}; anything else SystemExit."""
+    module = _module()
+    with pytest.raises(SystemExit) as exc:
+        _run_ledger_main(
+            module, tmp_path, monkeypatch,
+            extra_argv=["--input-short-circuited", raw],
+        )
+    assert exc.value.code == "--input-short-circuited must be one of true, false"
+
+
+def test_omitted_input_short_circuited_matches_explicit_false(tmp_path, monkeypatch):
+    """W4: omitting the CLI flag must behave identically to passing false."""
+    module = _module()
+
+    def outcome(label, extra):
+        try:
+            _run_ledger_main(module, tmp_path / label, monkeypatch, extra_argv=extra)
+        except SystemExit as exc:
+            return ("systemexit", str(exc))
+        except ValueError as exc:
+            return ("valueerror", str(exc))
+        return ("ok", "")
+
+    omitted = outcome("omitted", ())
+    explicit = outcome("explicit-false", ("--input-short-circuited", "false"))
+    assert omitted == explicit
+    assert omitted[0] == "valueerror"
+    assert "canonical primary preflight has invalid coverage shape" in omitted[1]
 
 
 def test_v2_detached_shadows_are_recorded_as_unavailable_without_losing_expectations():

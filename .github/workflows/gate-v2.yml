@@ -1406,6 +1406,7 @@ jobs:
           expected-base-sha: ${{ github.event.pull_request.base.sha }}
           expected-caller-sha: ${{ github.workflow_sha }}
           expected-reusable-workflow-sha: ${{ job.workflow_sha }}
+          input-short-circuited: ${{ steps.resolve-ledger-artifacts.outputs.input_short_circuited }}
 
       - name: Upload v2 review effectiveness ledger
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

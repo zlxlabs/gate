@@ -22,6 +22,9 @@ inputs:
   expected-base-sha: { required: true }
   expected-caller-sha: { required: true }
   expected-reusable-workflow-sha: { required: true }
+  # Explicit boolean from the ledger resolver (gate#121). Default false so
+  # legacy callers that omit it keep the existing fail-loud preflight audit.
+  input-short-circuited: { required: false, default: "false" }
 runs:
   using: composite
   steps:
@@ -45,4 +48,5 @@ runs:
           --expected-caller-sha "${{ inputs.expected-caller-sha }}" \
           --expected-reusable-workflow-sha "${{ inputs.expected-reusable-workflow-sha }}" \
           --codex-expected "${{ inputs.codex-expected }}" \
-          --codex-waived "${{ inputs.codex-waived }}"
+          --codex-waived "${{ inputs.codex-waived }}" \
+          --input-short-circuited "${{ inputs.input-short-circuited }}"
