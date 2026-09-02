@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import io
 import json
 import math
 import os
 import re
+import socket
+import ssl
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -47,6 +52,16 @@ class CrossHostAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
+API_REQUEST_ATTEMPTS = 3
+API_REQUEST_BACKOFF_SECONDS = (1, 2)
+_RETRYABLE_CONNECTION_ERRORS = (
+    urllib.error.URLError,
+    ssl.SSLError,
+    ConnectionResetError,
+    http.client.IncompleteRead,
+    TimeoutError,
+    socket.timeout,
+)
 STATE_MARKER = "<!-- codex-review-ledger-state:v2 -->"
 STATE_RE = re.compile(r"<!-- codex-review-ledger-state:v2:([A-Za-z0-9_-]+={0,2}) -->")
 PRIMARY_STATUS_BY_VERDICT = {
@@ -709,8 +724,17 @@ def _api_request(token: str, url: str, *, method: str = "GET", payload: dict[str
             "Content-Type": "application/json",
         },
     )
-    with URL_OPENER.open(request, timeout=30) as response:
-        return response.read()
+    last_attempt = API_REQUEST_ATTEMPTS - 1
+    for attempt in range(API_REQUEST_ATTEMPTS):
+        try:
+            with URL_OPENER.open(request, timeout=30) as response:
+                return response.read()
+        except urllib.error.HTTPError:
+            raise
+        except _RETRYABLE_CONNECTION_ERRORS:
+            if attempt >= last_attempt:
+                raise
+            time.sleep(API_REQUEST_BACKOFF_SECONDS[attempt])
 
 
 def _api_json(token: str, url: str) -> Any:
