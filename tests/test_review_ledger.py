@@ -1323,6 +1323,51 @@ def test_review_summary_defaults_when_audit_missing():
     assert entry["review"]["reviewer"] is None
     assert entry["review"]["failover"] is False
     assert entry["review"]["attempts"] == []
+    assert entry["review"]["trigger_kind_counts"] == {}
+    assert entry["review"]["inferred_p1_count"] == 0
+
+
+def test_review_summary_counts_measured_inferred_and_missing_trigger_kind():
+    module = _module()
+    audit = _audit("sha", ["a", "b", "c"])
+    findings = audit["result"]["findings"]
+    findings[0]["trigger_kind"] = "measured"
+    findings[1]["trigger_kind"] = "inferred"
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    assert entry["review"]["trigger_kind_counts"] == {
+        "inferred": 1, "measured": 1, "unspecified": 1,
+    }
+
+
+def test_review_summary_inferred_p1_count_covers_blocker_and_major():
+    module = _module()
+    audit = _audit("sha", ["a", "b", "c", "d"])
+    findings = audit["result"]["findings"]
+    findings[0].update(severity="blocker", trigger_kind="inferred")
+    findings[1].update(severity="major", trigger_kind="inferred")
+    findings[2].update(severity="minor", trigger_kind="inferred")
+    findings[3].update(severity="blocker", trigger_kind="measured")
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    assert entry["review"]["inferred_p1_count"] == 2
+
+
+def test_review_summary_invalid_trigger_kind_counts_as_unspecified():
+    module = _module()
+    audit = _audit("sha", ["a", "b"])
+    findings = audit["result"]["findings"]
+    findings[0]["trigger_kind"] = "guess"
+    findings[1]["trigger_kind"] = 1
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+    )
+    assert entry["review"]["trigger_kind_counts"] == {"unspecified": 2}
 
 
 def test_state_comment_and_summary_mention_reviewer_on_failover():
