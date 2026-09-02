@@ -1,3 +1,4 @@
+import argparse
 import base64
 import hashlib
 import importlib.util
@@ -429,10 +430,29 @@ def test_short_circuited_empty_preflight_writes_ledger_row():
     _assert_short_circuit_audit_projection(entry["review"], audit=audit)
 
 
+def test_input_short_circuited_option_is_registered_on_parser(monkeypatch):
+    """CLI option must be registered on ArgumentParser, not merely appear in source text."""
+    module = _module()
+    captured: list[str] = []
+
+    def grab(self, args=None, namespace=None):
+        captured.extend(
+            option
+            for action in self._actions
+            for option in action.option_strings
+        )
+        raise SystemExit("captured-parser")
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", grab)
+    monkeypatch.setattr(sys, "argv", ["build_ledger.py"])
+    with pytest.raises(SystemExit, match="captured-parser"):
+        module.main()
+    assert "--input-short-circuited" in captured
+
+
 def test_main_short_circuited_missing_preflight_writes_jsonl(tmp_path, monkeypatch):
     """W1 main(): missing input files + --input-short-circuited true → jsonl row."""
     module = _module()
-    assert "--input-short-circuited" in MODULE_PATH.read_text(encoding="utf-8")
     rc, output, audit = _run_ledger_main(
         module, tmp_path, monkeypatch,
         extra_argv=["--input-short-circuited", "true"],
@@ -485,7 +505,7 @@ def test_short_circuited_valid_preflight_still_computes_coverage():
 
 
 @pytest.mark.parametrize("raw", ["yes", "1", "TRUE", "True", "", "maybe", "false "])
-def test_input_short_circuited_illegal_value_is_fail_loud(tmp_path, monkeypatch, capsys, raw):
+def test_input_short_circuited_illegal_value_is_fail_loud(tmp_path, monkeypatch, raw):
     """W4: domain is exactly {true, false}; anything else SystemExit."""
     module = _module()
     with pytest.raises(SystemExit) as exc:
@@ -493,9 +513,7 @@ def test_input_short_circuited_illegal_value_is_fail_loud(tmp_path, monkeypatch,
             module, tmp_path, monkeypatch,
             extra_argv=["--input-short-circuited", raw],
         )
-    captured = capsys.readouterr()
-    text = f"{exc.value} {captured.err} {captured.out}"
-    assert "must be one of" in text
+    assert exc.value.code == "--input-short-circuited must be one of true, false"
 
 
 def test_omitted_input_short_circuited_matches_explicit_false(tmp_path, monkeypatch):

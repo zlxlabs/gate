@@ -1144,10 +1144,12 @@ def test_ledger_resolver_step_env_and_download_guard_literals():
 def test_ledger_build_step_forwards_input_short_circuited():
     """W5: Build 步 with: 必须把解析器的 input_short_circuited 原样传进 action。"""
     raw, _ = _load_workflow()
-    build = next(
+    matches = [
         s for s in raw["jobs"]["ledger"]["steps"]
         if s.get("name") == "Build v2 review effectiveness ledger"
-    )
+    ]
+    assert len(matches) == 1
+    build = matches[0]
     assert "input-short-circuited" in build.get("with", {})
     assert build["with"]["input-short-circuited"] == (
         "${{ steps.resolve-ledger-artifacts.outputs.input_short_circuited }}"
@@ -1197,6 +1199,27 @@ def test_ledger_resolver_result_domain_rejects_illegal_values(tmp_path, env_key,
     assert result.returncode != 0
     assert "must be one of" in combined
     assert env_key in combined
+
+
+@pytest.mark.parametrize("quality_result", ["success", "failure", "cancelled", "skipped"])
+@pytest.mark.parametrize("primary_result", ["success", "failure", "cancelled", "skipped"])
+def test_ledger_resolver_result_domain_accepts_legal_values(
+    tmp_path, quality_result, primary_result,
+):
+    """W6 positive: every RESULT_DOMAIN value is accepted; domain check must not exit."""
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1,
+        extra_env={"QUALITY_RESULT": quality_result, "PRIMARY_RESULT": primary_result},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode == 0, combined
+    assert "must be one of" not in combined
+    assert "input_artifact_id=101" in output
+    assert "terminal_artifact_id=201" in output
 
 
 def test_ledger_persistence_steps_are_fail_closed():
