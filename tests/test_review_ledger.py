@@ -4,7 +4,9 @@ import importlib.util
 import inspect
 import io
 import json
+import ssl
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -939,6 +941,95 @@ def test_sticky_comment_sends_scrubbed_body(monkeypatch):
     body = writes[0]["body"]
     assert "runner-secret" not in body
     assert "[REDACTED:RUNNER_NAME]" in body
+
+
+class _ApiResponse:
+    def __init__(self, payload=b""):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.payload
+
+
+def _connection_urlerror() -> urllib.error.URLError:
+    return urllib.error.URLError(ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING"))
+
+
+def _http_404() -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://api.github.com/repos/org/repo",
+        404,
+        "Not Found",
+        hdrs={},
+        fp=io.BytesIO(b""),
+    )
+
+
+def test_api_request_retries_connection_error_then_succeeds(monkeypatch):
+    module = _module()
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_urlopen(request, timeout):
+        calls.append(timeout)
+        if len(calls) < 3:
+            raise _connection_urlerror()
+        return _ApiResponse(b'{"ok":true}')
+
+    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
+
+    body = module._api_request("token", "https://api.github.com/repos/org/repo")
+
+    assert body == b'{"ok":true}'
+    assert len(calls) == 3
+    assert sleeps == [1, 2]
+
+
+def test_api_request_does_not_retry_http_error(monkeypatch):
+    module = _module()
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_urlopen(request, timeout):
+        calls.append(timeout)
+        raise _http_404()
+
+    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        module._api_request("token", "https://api.github.com/repos/org/repo")
+
+    assert exc_info.value.code == 404
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_api_request_reraises_after_connection_error_retries_exhausted(monkeypatch):
+    module = _module()
+    calls = []
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_urlopen(request, timeout):
+        calls.append(timeout)
+        raise _connection_urlerror()
+
+    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
+
+    with pytest.raises(urllib.error.URLError) as exc_info:
+        module._api_request("token", "https://api.github.com/repos/org/repo")
+
+    assert type(exc_info.value) is urllib.error.URLError
+    assert len(calls) == 3
+    assert sleeps == [1, 2]
 
 
 def _pr_ledger_entries(module, count: int) -> list[dict]:
