@@ -218,6 +218,8 @@ def _review_summary(
             "finding_ids": [],
             "severity_counts": {},
             "category_counts": {},
+            "trigger_kind_counts": {},
+            "inferred_p1_count": 0,
             "coverage": None,
             "runtime": None,
             "shadows": {},
@@ -268,6 +270,15 @@ def _review_summary(
     status = PRIMARY_STATUS_BY_VERDICT[audit["verdict"]] if is_primary_v2 else audit.get("status", "unknown")
     # Failover = more than one hop was tried (a discarded hop precedes the adopted one).
     failover = len(attempts) > 1
+    trigger_kind_counts: Counter[str] = Counter()
+    inferred_p1_count = 0
+    for finding in findings:
+        kind = finding.get("trigger_kind")
+        if not isinstance(kind, str) or kind not in {"measured", "inferred", "unmeasurable"}:
+            kind = "unspecified"
+        trigger_kind_counts[kind] += 1
+        if kind == "inferred" and finding.get("severity") in {"blocker", "major"}:
+            inferred_p1_count += 1
     return {
         "status": status,
         "verdict": status if is_primary_v2 else result.get("verdict"),
@@ -278,6 +289,8 @@ def _review_summary(
         "finding_ids": sorted({finding.get("id", "") for finding in findings if finding.get("id")}),
         "severity_counts": dict(sorted(Counter(finding.get("severity", "unknown") for finding in findings).items())),
         "category_counts": dict(sorted(Counter(finding.get("category", "unknown") for finding in findings).items())),
+        "trigger_kind_counts": dict(sorted(trigger_kind_counts.items())),
+        "inferred_p1_count": inferred_p1_count,
         "coverage": coverage,
         "runtime": audit.get("runtime"),
         "shadows": shadows,
