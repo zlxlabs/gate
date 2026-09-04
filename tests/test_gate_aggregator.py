@@ -2225,6 +2225,29 @@ def _panel_row(run_id, run_attempt, gate_result, *, head_sha=None):
     }
 
 
+def _budget_exhausted_attempt(*, reason=None, exit_code=22, reviewer="reviewer"):
+    return {
+        "reviewer": reviewer,
+        "model": "model",
+        "exit_code": AGG.PRIMARY_BUDGET_EXHAUSTED_EXIT_CODE if reason is None else exit_code,
+        "reason": AGG.PRIMARY_BUDGET_EXHAUSTED_REASON if reason is None else reason,
+        "cost_usd": None,
+        "tokens": None,
+        "duration_s": 1.0,
+    }
+
+
+def _budget_exhausted_audit(*, attempts=None):
+    audit = _valid_primary_record(
+        verdict="unavailable",
+        attempts=attempts if attempts is not None else [
+            _budget_exhausted_attempt(reviewer="reviewer-a"),
+            _budget_exhausted_attempt(reviewer="reviewer-b"),
+        ],
+    )
+    return audit
+
+
 def test_panel_bucket_mapping_exhaustively_covers_current_gate_result_domain():
     assert set(AGG.PANEL_BUCKET_BY_GATE_RESULT) == set(AGG.GATE_RESULT_DOMAIN)
 
@@ -2245,6 +2268,100 @@ def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
     assert body.index("| [2]") < body.index("| [3]")
     assert body.index("| [2]") < body.index("| [2]") + 1
     assert "主审未跑，绿≠过审" in body
+
+
+@pytest.mark.parametrize(
+    "audit,expected",
+    [
+        (
+            _budget_exhausted_audit(),
+            "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
+        ),
+        (
+            _budget_exhausted_audit(
+                attempts=[
+                    _budget_exhausted_attempt(reviewer="reviewer-a"),
+                    _budget_exhausted_attempt(reason="认证或网络暂不可用", exit_code=21, reviewer="reviewer-b"),
+                ],
+            ),
+            "修基础设施",
+        ),
+        (
+            _budget_exhausted_audit(attempts=[]),
+            "修基础设施",
+        ),
+        (
+            {
+                **_budget_exhausted_audit(),
+                "attempts": [
+                    {**_budget_exhausted_attempt(reviewer="reviewer-a"), "exit_code": True},
+                    _budget_exhausted_attempt(reviewer="reviewer-b"),
+                ],
+            },
+            "修基础设施",
+        ),
+        (
+            {
+                **_budget_exhausted_audit(),
+                "attempts": [
+                    {**_budget_exhausted_attempt(reviewer="reviewer-a"), "exit_code": "22"},
+                    _budget_exhausted_attempt(reviewer="reviewer-b"),
+                ],
+            },
+            "修基础设施",
+        ),
+        (
+            {
+                **_budget_exhausted_audit(),
+                "attempts": [
+                    {
+                        **_budget_exhausted_attempt(reviewer="reviewer-a"),
+                        "reason": AGG.PRIMARY_BUDGET_EXHAUSTED_REASON + "x",
+                    },
+                    _budget_exhausted_attempt(reviewer="reviewer-b"),
+                ],
+            },
+            "修基础设施",
+        ),
+    ],
+    ids=[
+        "all-legs-exhausted", "mixed-failure", "no-attempts",
+        "exit-code-bool", "exit-code-string", "reason-extra-character",
+    ],
+)
+def test_budget_exhaustion_panel_action_is_rendered_from_primary_audit(audit, expected):
+    outcome = AGG.evaluate(**_base_kwargs(primary_result="failure", audit=audit))
+    assert (outcome.gate_result, outcome.classification, outcome.reason_code) == (
+        "unavailable", "review_unavailable", "primary_unavailable",
+    )
+    row = _panel_row(1, 1, "unavailable")
+    row["classification"] = "review_unavailable"
+    row["reason_code"] = "primary_unavailable"
+    row["primary_audit"] = audit
+    body = AGG.render_status_panel([row])
+    assert f"当前状态：**unavailable** · **{expected}**" in body
+    assert "0 个审查分片" not in body
+
+
+def test_budget_exhaustion_panel_action_rejects_non_unavailable_verdict():
+    audit = {**_budget_exhausted_audit(), "verdict": "pass"}
+    row = _panel_row(1, 1, "unavailable")
+    row["classification"] = "review_unavailable"
+    row["reason_code"] = "primary_unavailable"
+    row["primary_audit"] = audit
+    body = AGG.render_status_panel([row])
+    assert "当前状态：**unavailable** · **修基础设施**" in body
+
+
+def test_budget_exhaustion_action_keeps_terminal_decision_fields_unchanged():
+    audit = _budget_exhausted_audit()
+    outcome = AGG.evaluate(**_base_kwargs(primary_result="failure", audit=audit))
+    assert (outcome.gate_result, outcome.classification, outcome.reason_code) == (
+        "unavailable", "review_unavailable", "primary_unavailable",
+    )
+    summary = AGG.render_summary(outcome, primary_audit=audit)
+    assert "classification=`review_unavailable`, reason_code=`primary_unavailable`, gate_result=`unavailable`" in summary
+    assert "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。" in summary
 
 
 # ── false-positive disposition consumption (required verdict) ─────────────

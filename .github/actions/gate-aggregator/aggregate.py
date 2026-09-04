@@ -188,6 +188,13 @@ PANEL_BUCKET_BY_GATE_RESULT = {
     "unavailable": "修基础设施",
 }
 
+# Kept in sync with gate-hub's scripts/review/job_budget.py. The primary audit
+# is the cross-repository contract; importing gate-hub here would make this
+# action depend on a second checkout. Do not broaden this to a reason prefix:
+# an unavailable leg with another cause must keep the infrastructure guidance.
+PRIMARY_BUDGET_EXHAUSTED_EXIT_CODE = 22
+PRIMARY_BUDGET_EXHAUSTED_REASON = "评审总预算已耗尽，保留收尾空间"
+
 # The `runner` reusable-workflow input's only two legal values (see
 # gate-v2.yml's `inputs.runner`). A typo (e.g. "slef") must never be silently
 # treated as either value.
@@ -936,7 +943,7 @@ REASON_CODE_EXPLANATIONS = {
 
 def _action_sentence(
     outcome: Outcome, *, repository: Optional[str], identity: Optional[Identity],
-    is_draft: Optional[bool], runner: Optional[str],
+    is_draft: Optional[bool], runner: Optional[str], primary_audit: Any = None,
 ) -> Optional[str]:
     """The one-line "what do I do now" sentence rendered immediately after
     `**Result: …**` and BEFORE the machine codes — the aggregate mail/comment
@@ -978,6 +985,10 @@ def _action_sentence(
             sentence += f" Full details: {run_url}"
         return sentence
     if gate_result == "unavailable":
+        if outcome.classification == "review_unavailable" and outcome.reason_code == "primary_unavailable":
+            budget_action = _primary_budget_exhausted_action(primary_audit)
+            if budget_action:
+                return budget_action
         sentence = (
             "Action needed — the primary review outcome could not be determined (this is neither an "
             "approval nor a rejection): investigate the run before merging."
@@ -990,7 +1001,7 @@ def _action_sentence(
 
 def render_summary(
     outcome: Outcome, *, repository: Optional[str] = None, identity: Optional[Identity] = None,
-    is_draft: Optional[bool] = None, runner: Optional[str] = None,
+    is_draft: Optional[bool] = None, runner: Optional[str] = None, primary_audit: Any = None,
 ) -> str:
     lines = ["### Required Gate v2 — aggregate verdict", ""]
     # Top line shows the four-state gate_result (pass/fail/skipped/unavailable)
@@ -1004,7 +1015,10 @@ def render_summary(
     if outcome.classification is not None:
         # Human-first: the action sentence answers "what do I do now" BEFORE
         # the machine codes (never after), for every terminal gate_result.
-        action = _action_sentence(outcome, repository=repository, identity=identity, is_draft=is_draft, runner=runner)
+        action = _action_sentence(
+            outcome, repository=repository, identity=identity, is_draft=is_draft,
+            runner=runner, primary_audit=primary_audit,
+        )
         if action:
             lines.append(action)
         lines.append(
@@ -1048,9 +1062,35 @@ def render_summary(
     return "\n".join(lines) + "\n"
 
 
+def _primary_budget_exhausted_action(primary_audit: Any) -> Optional[str]:
+    """Return the split-PR action only for an entirely budget-exhausted chain."""
+    if not isinstance(primary_audit, dict) or primary_audit.get("verdict") != "unavailable":
+        return None
+    attempts = primary_audit.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return None
+    if not all(
+        isinstance(attempt, dict)
+        and _is_strict_int(attempt.get("exit_code"))
+        and attempt["exit_code"] == PRIMARY_BUDGET_EXHAUSTED_EXIT_CODE
+        and attempt.get("reason") == PRIMARY_BUDGET_EXHAUSTED_REASON
+        for attempt in attempts
+    ):
+        return None
+
+    return "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。"
+
+
 def _panel_action(row: dict[str, Any]) -> str:
     """Return the recipient-facing action for one validated panel row."""
     gate_result = row["gate_result"]
+    if gate_result == "unavailable":
+        if row.get("classification") == "review_unavailable" and row.get("reason_code") == "primary_unavailable":
+            budget_action = _primary_budget_exhausted_action(
+                row.get("primary_audit")
+            )
+            if budget_action:
+                return budget_action
     action = PANEL_BUCKET_BY_GATE_RESULT[gate_result]
     if gate_result == "skipped":
         return f"{action}（主审未跑，绿≠过审）"
@@ -1995,6 +2035,13 @@ def _publish_only(args: argparse.Namespace) -> int:
         )
         _panel_warning(phase="terminal artifact validation", exc=exc, reason_code="terminal_unavailable", category="configuration", http_status=None)
     else:
+        audit_dir = args.audit_dir
+        runner_temp = os.environ.get("RUNNER_TEMP")
+        if audit_dir is None and runner_temp:
+            audit_dir = Path(runner_temp) / "primary-audit"
+        primary_audit, _, _ = _read_audit_file(audit_dir)
+        if primary_audit is not None and not validate_audit_identity(primary_audit, identity):
+            current["primary_audit"] = primary_audit
         body, receipt = _post_status_panel_fail_open(
             current=current, repository=args.repository, repository_id=args.repository_id,
             pr_number=args.pr_number, identity=identity,
@@ -2056,6 +2103,7 @@ def _finish(
     outcome: Outcome, summary_path: Optional[str], *, terminal_path: Optional[str] = None, repository: Optional[str] = None,
     identity: Optional[Identity] = None, quality_result: Optional[str] = None, primary_result: Optional[str] = None,
     review_expected: Optional[bool] = None, is_draft: Optional[bool] = None, runner: Optional[str] = None,
+    primary_audit: Any = None,
     pr_number: Optional[int] = None, panel_delivery_path: Optional[str] = None,
     convergence_receipt_path: Optional[str] = None,
     convergence_missing_scope_fields: tuple[str, ...] = (),
@@ -2078,7 +2126,10 @@ def _finish(
             reason = outcome.reason_code or outcome.classification or "canonical primary round was unavailable"
             convergence_note = f"\nConvergence receipt: not produced (reason: `{reason}`).\n"
     summary = scrub_for_publish(
-        render_summary(outcome, repository=repository, identity=identity, is_draft=is_draft, runner=runner),
+        render_summary(
+            outcome, repository=repository, identity=identity, is_draft=is_draft,
+            runner=runner, primary_audit=primary_audit,
+        ),
         runtime_values=runtime_values_from_environment(),
     )
     summary += convergence_note
@@ -2271,6 +2322,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         review_expected=review_expected,
         is_draft=is_draft,
         runner=args.runner,
+        primary_audit=audit,
         pr_number=identity.pr,
         panel_delivery_path=args.panel_delivery_path,
         convergence_receipt_path=args.convergence_receipt_path,
