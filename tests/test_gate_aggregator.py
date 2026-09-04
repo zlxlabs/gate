@@ -2308,6 +2308,8 @@ def test_budget_exhaustion_panel_action_is_rendered_from_primary_audit(audit, ex
         "unavailable", "review_unavailable", "primary_unavailable",
     )
     row = _panel_row(1, 1, "unavailable")
+    row["classification"] = "review_unavailable"
+    row["reason_code"] = "primary_unavailable"
     row["primary_audit"] = audit
     body = AGG.render_status_panel([row])
     assert expected in body

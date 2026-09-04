@@ -985,9 +985,10 @@ def _action_sentence(
             sentence += f" Full details: {run_url}"
         return sentence
     if gate_result == "unavailable":
-        budget_action = _primary_budget_exhausted_action(primary_audit)
-        if budget_action:
-            return budget_action
+        if outcome.classification == "review_unavailable" and outcome.reason_code == "primary_unavailable":
+            budget_action = _primary_budget_exhausted_action(primary_audit)
+            if budget_action:
+                return budget_action
         sentence = (
             "Action needed — the primary review outcome could not be determined (this is neither an "
             "approval nor a rejection): investigate the run before merging."
@@ -1097,11 +1098,12 @@ def _panel_action(row: dict[str, Any]) -> str:
     """Return the recipient-facing action for one validated panel row."""
     gate_result = row["gate_result"]
     if gate_result == "unavailable":
-        budget_action = _primary_budget_exhausted_action(
-            row.get("primary_audit") or row.get("audit")
-        )
-        if budget_action:
-            return budget_action
+        if row.get("classification") == "review_unavailable" and row.get("reason_code") == "primary_unavailable":
+            budget_action = _primary_budget_exhausted_action(
+                row.get("primary_audit") or row.get("audit")
+            )
+            if budget_action:
+                return budget_action
     action = PANEL_BUCKET_BY_GATE_RESULT[gate_result]
     if gate_result == "skipped":
         return f"{action}（主审未跑，绿≠过审）"
