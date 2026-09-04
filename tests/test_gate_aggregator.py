@@ -2290,9 +2290,43 @@ def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
             _budget_exhausted_audit(attempts=[]),
             "修基础设施",
         ),
+        (
+            {
+                **_budget_exhausted_audit(),
+                "attempts": [
+                    {**_budget_exhausted_attempt(reviewer="reviewer-a"), "exit_code": True},
+                    _budget_exhausted_attempt(reviewer="reviewer-b"),
+                ],
+            },
+            "修基础设施",
+        ),
+        (
+            {
+                **_budget_exhausted_audit(),
+                "attempts": [
+                    {**_budget_exhausted_attempt(reviewer="reviewer-a"), "exit_code": "22"},
+                    _budget_exhausted_attempt(reviewer="reviewer-b"),
+                ],
+            },
+            "修基础设施",
+        ),
+        (
+            {
+                **_budget_exhausted_audit(),
+                "attempts": [
+                    {
+                        **_budget_exhausted_attempt(reviewer="reviewer-a"),
+                        "reason": AGG.PRIMARY_BUDGET_EXHAUSTED_REASON + "x",
+                    },
+                    _budget_exhausted_attempt(reviewer="reviewer-b"),
+                ],
+            },
+            "修基础设施",
+        ),
     ],
     ids=[
         "all-legs-exhausted", "mixed-failure", "no-attempts",
+        "exit-code-bool", "exit-code-string", "reason-extra-character",
     ],
 )
 def test_budget_exhaustion_panel_action_is_rendered_from_primary_audit(audit, expected):
@@ -2305,8 +2339,18 @@ def test_budget_exhaustion_panel_action_is_rendered_from_primary_audit(audit, ex
     row["reason_code"] = "primary_unavailable"
     row["primary_audit"] = audit
     body = AGG.render_status_panel([row])
-    assert expected in body
+    assert f"当前状态：**unavailable** · **{expected}**" in body
     assert "0 个审查分片" not in body
+
+
+def test_budget_exhaustion_panel_action_rejects_non_unavailable_verdict():
+    audit = {**_budget_exhausted_audit(), "verdict": "pass"}
+    row = _panel_row(1, 1, "unavailable")
+    row["classification"] = "review_unavailable"
+    row["reason_code"] = "primary_unavailable"
+    row["primary_audit"] = audit
+    body = AGG.render_status_panel([row])
+    assert "当前状态：**unavailable** · **修基础设施**" in body
 
 
 def test_budget_exhaustion_action_keeps_terminal_decision_fields_unchanged():
