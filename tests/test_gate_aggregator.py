@@ -2284,6 +2284,14 @@ def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
             "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
         ),
         (
+            {**_budget_exhausted_audit(), "coverage": {"diff_lines": 401, "reviewable_chars": 12003, "shards": 0}},
+            "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
+        ),
+        (
+            {**_budget_exhausted_audit(), "coverage": {"diff_lines": 401, "shards": 3}},
+            "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
+        ),
+        (
             _budget_exhausted_audit(
                 attempts=[
                     _budget_exhausted_attempt(reviewer="reviewer-a"),
@@ -2299,6 +2307,7 @@ def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
     ],
     ids=[
         "all-legs-exhausted-with-coverage", "all-legs-exhausted-without-coverage",
+        "zero-shards-falls-back", "missing-reviewable-chars-falls-back",
         "mixed-failure", "no-attempts",
     ],
 )
@@ -2313,6 +2322,7 @@ def test_budget_exhaustion_panel_action_is_rendered_from_primary_audit(audit, ex
     row["primary_audit"] = audit
     body = AGG.render_status_panel([row])
     assert expected in body
+    assert "0 个审查分片" not in body
 
 
 def test_budget_exhaustion_action_keeps_terminal_decision_fields_unchanged():

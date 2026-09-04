@@ -1100,7 +1100,7 @@ def _panel_action(row: dict[str, Any]) -> str:
     if gate_result == "unavailable":
         if row.get("classification") == "review_unavailable" and row.get("reason_code") == "primary_unavailable":
             budget_action = _primary_budget_exhausted_action(
-                row.get("primary_audit") or row.get("audit")
+                row.get("primary_audit")
             )
             if budget_action:
                 return budget_action
