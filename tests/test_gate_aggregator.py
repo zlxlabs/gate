@@ -2237,7 +2237,7 @@ def _budget_exhausted_attempt(*, reason=None, exit_code=22, reviewer="reviewer")
     }
 
 
-def _budget_exhausted_audit(*, coverage="present", attempts=None):
+def _budget_exhausted_audit(*, attempts=None):
     audit = _valid_primary_record(
         verdict="unavailable",
         attempts=attempts if attempts is not None else [
@@ -2245,8 +2245,6 @@ def _budget_exhausted_audit(*, coverage="present", attempts=None):
             _budget_exhausted_attempt(reviewer="reviewer-b"),
         ],
     )
-    if coverage == "present":
-        audit["coverage"] = {"diff_lines": 401, "reviewable_chars": 12003, "shards": 3}
     return audit
 
 
@@ -2277,18 +2275,6 @@ def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
     [
         (
             _budget_exhausted_audit(),
-            "本 PR 规模超出单次评审预算（401 行 / 12003 字符，需 3 个审查分片），本次未能评审完。请拆成更小的增量 PR 后重试。",
-        ),
-        (
-            _budget_exhausted_audit(coverage=None),
-            "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
-        ),
-        (
-            {**_budget_exhausted_audit(), "coverage": {"diff_lines": 401, "reviewable_chars": 12003, "shards": 0}},
-            "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
-        ),
-        (
-            {**_budget_exhausted_audit(), "coverage": {"diff_lines": 401, "shards": 3}},
             "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
         ),
         (
@@ -2306,9 +2292,7 @@ def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
         ),
     ],
     ids=[
-        "all-legs-exhausted-with-coverage", "all-legs-exhausted-without-coverage",
-        "zero-shards-falls-back", "missing-reviewable-chars-falls-back",
-        "mixed-failure", "no-attempts",
+        "all-legs-exhausted", "mixed-failure", "no-attempts",
     ],
 )
 def test_budget_exhaustion_panel_action_is_rendered_from_primary_audit(audit, expected):
@@ -2333,7 +2317,7 @@ def test_budget_exhaustion_action_keeps_terminal_decision_fields_unchanged():
     )
     summary = AGG.render_summary(outcome, primary_audit=audit)
     assert "classification=`review_unavailable`, reason_code=`primary_unavailable`, gate_result=`unavailable`" in summary
-    assert "本 PR 规模超出单次评审预算（401 行 / 12003 字符，需 3 个审查分片）" in summary
+    assert "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。" in summary
 
 
 # ── false-positive disposition consumption (required verdict) ─────────────

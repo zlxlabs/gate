@@ -1078,19 +1078,6 @@ def _primary_budget_exhausted_action(primary_audit: Any) -> Optional[str]:
     ):
         return None
 
-    coverage = primary_audit.get("coverage")
-    coverage_fields = ("diff_lines", "reviewable_chars", "shards")
-    if isinstance(coverage, dict) and all(
-        _is_strict_int(coverage.get(field))
-        and coverage[field] >= (1 if field == "shards" else 0)
-        for field in coverage_fields
-    ):
-        return (
-            "本 PR 规模超出单次评审预算（"
-            f"{coverage['diff_lines']} 行 / {coverage['reviewable_chars']} 字符，"
-            f"需 {coverage['shards']} 个审查分片），本次未能评审完。"
-            "请拆成更小的增量 PR 后重试。"
-        )
     return "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。"
 
 
