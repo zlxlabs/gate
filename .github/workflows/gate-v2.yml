@@ -684,14 +684,27 @@ jobs:
             exit 1
           fi
           jobs_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs"
+          max_attempts=3
+          retry_delay_seconds=1
           rc=0
-          api_json="$(gh_api "$jobs_api" --paginate)" || rc=$?
+          api_json=""
+          for attempt in 1 2 3; do
+            rc=0
+            api_json="$(gh_api "$jobs_api" --paginate)" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$retry_delay_seconds"
+              retry_delay_seconds=$((retry_delay_seconds * 2))
+            fi
+          done
           if [ "$rc" -ne 0 ]; then
-            echo "::error::resolve-job-id: Jobs API call failed for ${jobs_api} (exit=${rc})"
+            echo "::error::resolve-job-id: Jobs API call failed after ${max_attempts} attempts for ${jobs_api} (exit=${rc})"
             exit 1
           fi
           if [ -z "$api_json" ]; then
-            echo "::error::resolve-job-id: Jobs API returned empty body for ${jobs_api}"
+            echo "::error::resolve-job-id: Jobs API succeeded but returned an empty response body for ${jobs_api}"
             exit 1
           fi
           MAX_CANDIDATE_NAMES=50
@@ -708,7 +721,7 @@ jobs:
                 "candidate job names (\($total)): \($shown)"
               end
             ')"
-            echo "::error::resolve-job-id: no matching job for JOB_NAME_SUFFIX='${JOB_NAME_SUFFIX}' (${candidate_info})"
+            echo "::error::resolve-job-id: Jobs API succeeded but no matching job for JOB_NAME_SUFFIX='${JOB_NAME_SUFFIX}' (${candidate_info})"
             exit 1
           fi
           echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
