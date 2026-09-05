@@ -416,6 +416,37 @@ def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
     assert "exit=42" in output, output
 
 
+@pytest.mark.parametrize("job_name", ["primary", "ocr"])
+def test_job_id_resolution_retries_with_timeout_and_separates_empty_result(job_name):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"][job_name]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+
+    assert "max_attempts=3" in run
+    assert "for attempt in 1 2 3; do" in run
+    assert "timeout --foreground" in run
+    assert '|| rc=$?' in run
+    assert 'sleep "$retry_delay_seconds"' in run
+    assert "retry_delay_seconds=$((retry_delay_seconds * 2))" in run
+    assert 'if [ "$rc" -ne 0 ]; then' in run
+    assert "exit 1" in run
+    assert "while true" not in run
+    assert "until true" not in run
+
+    api_failure = next(
+        line.strip() for line in run.splitlines()
+        if "::error::" in line and "Jobs API call failed after" in line
+    )
+    no_match = next(
+        line.strip() for line in run.splitlines()
+        if "::error::" in line and "no matching job" in line
+    )
+    assert api_failure != no_match
+
+
 # ── concurrency contract ─────────────────────────────────────────────────────
 # Two job-level locks, no workflow-level group: quality/primary cancel stale
 # work per PR; gate/ledger keep cancel-in-progress: false so writers finish.
@@ -1831,4 +1862,3 @@ def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
     assert "pull-requests: write" not in text
     assert "secrets." not in non_comment_text
     assert "environment:" not in text
-

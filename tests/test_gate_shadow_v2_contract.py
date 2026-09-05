@@ -619,6 +619,36 @@ def test_shadow_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
     assert "exit=42" in output, output
 
 
+def test_shadow_job_id_resolution_retries_with_timeout_and_separates_empty_result():
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+
+    assert "max_attempts=3" in run
+    assert "for attempt in 1 2 3; do" in run
+    assert "timeout --foreground" in run
+    assert '|| rc=$?' in run
+    assert 'sleep "$retry_delay_seconds"' in run
+    assert "retry_delay_seconds=$((retry_delay_seconds * 2))" in run
+    assert 'if [ "$rc" -ne 0 ]; then' in run
+    assert "exit 1" in run
+    assert "while true" not in run
+    assert "until true" not in run
+
+    api_failure = next(
+        line.strip() for line in run.splitlines()
+        if "::error::" in line and "Jobs API call failed after" in line
+    )
+    no_match = next(
+        line.strip() for line in run.splitlines()
+        if "::error::" in line and "no matching job" in line
+    )
+    assert api_failure != no_match
+
+
 # ── axis 2: shadow leg outcomes × summary conclusion (contract pins) ─────────
 
 @pytest.mark.parametrize(
