@@ -417,7 +417,7 @@ def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
 
 
 @pytest.mark.parametrize("job_name", ["primary", "ocr"])
-def test_job_id_resolution_retries_with_timeout_and_separates_empty_result(job_name):
+def test_job_id_resolution_retries_with_timeout(job_name):
     raw, _ = _load_workflow()
     step = next(
         s for s in raw["jobs"][job_name]["steps"]
@@ -436,6 +436,16 @@ def test_job_id_resolution_retries_with_timeout_and_separates_empty_result(job_n
     assert "while true" not in run
     assert "until true" not in run
 
+
+@pytest.mark.parametrize("job_name", ["primary", "ocr"])
+def test_job_id_resolution_separates_api_failure_from_empty_result(job_name):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"][job_name]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+
     api_failure = next(
         line.strip() for line in run.splitlines()
         if "::error::" in line and "Jobs API call failed after" in line
@@ -445,6 +455,22 @@ def test_job_id_resolution_retries_with_timeout_and_separates_empty_result(job_n
         if "::error::" in line and "no matching job" in line
     )
     assert api_failure != no_match
+
+
+@pytest.mark.parametrize("job_name", ["primary", "ocr"])
+def test_job_id_resolution_retries_remain_fail_closed(job_name):
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"][job_name]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+
+    assert "for attempt in 1 2 3; do" in run
+    assert 'if [ "$rc" -ne 0 ]; then' in run
+    assert "exit 1" in run
+    assert "while true" not in run
+    assert "until true" not in run
 
 
 # ── concurrency contract ─────────────────────────────────────────────────────
