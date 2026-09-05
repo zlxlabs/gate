@@ -619,6 +619,64 @@ def test_shadow_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
     assert "exit=42" in output, output
 
 
+def test_shadow_job_id_resolution_retries_with_timeout():
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+
+    assert "max_attempts=3" in run
+    assert "for attempt in 1 2 3; do" in run
+    assert "timeout --foreground" in run
+    assert '|| rc=$?' in run
+    assert 'sleep "$retry_delay_seconds"' in run
+    assert "retry_delay_seconds=$((retry_delay_seconds * 2))" in run
+    assert 'if [ "$rc" -ne 0 ]; then' in run
+    assert "exit 1" in run
+    assert "while true" not in run
+    assert "until true" not in run
+
+
+def test_shadow_job_id_resolution_separates_api_failure_from_empty_result():
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+
+    api_failures = [
+        line.strip() for line in run.splitlines()
+        if "::error::" in line and "Jobs API call failed after" in line
+    ]
+    no_matches = [
+        line.strip() for line in run.splitlines()
+        if "::error::" in line and "no matching job" in line
+    ]
+    assert api_failures, "missing API-failure error message"
+    assert no_matches, "missing successful-empty-result error message"
+    api_failure = api_failures[0]
+    no_match = no_matches[0]
+    assert api_failure != no_match
+
+
+def test_shadow_job_id_resolution_retries_remain_fail_closed():
+    raw, _ = _load_workflow()
+    step = next(
+        s for s in raw["jobs"]["shadow"]["steps"]
+        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
+    )
+    run = step["run"]
+
+    assert "for attempt in 1 2 3; do" in run
+    assert 'if [ "$rc" -ne 0 ]; then' in run
+    assert "exit 1" in run
+    assert "while true" not in run
+    assert "until true" not in run
+
+
 # ── axis 2: shadow leg outcomes × summary conclusion (contract pins) ─────────
 
 @pytest.mark.parametrize(
