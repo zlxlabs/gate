@@ -1,5 +1,5 @@
-# Required Gate v2 (reusable workflow) — primary → quality (skipped on primary
-# failure, gate#105 A) ∥ ocr → gate aggregator.
+# Required Gate v2 (reusable workflow) — primary ∥ quality ∥ ocr → gate
+# aggregator.
 # Workspace lifecycle audit: only `quality` runs caller checks after a gate-source
 # checkout; `gate` and `ledger` run gate-owned code only and keep separate source
 # directories for their own control-plane steps.
@@ -56,11 +56,10 @@
 # keeps its failure out of the run-level conclusion; gate / gate is the only
 # verdict check — do not read run.conclusion downstream.
 #
-# Job graph note (gate#105 方案 A, owner 2026-09-02): quality needs primary
-# and runs only when primary did not fail — a primary failure short-circuits
-# quality to skipped so the gate verdict is not held hostage by the slowest
-# job; the trade-off is the green path serializes behind primary (~1.8 min
-# median). See the quality job's own comment for the mandatory `always()`.
+# Job graph note (gate#129, owner 2026-09-07): primary and quality are
+# independent again, so a passing run does not pay a primary-before-quality
+# serialization tax. The trade-off is that a primary failure no longer
+# short-circuits quality; the gate still fails closed from the primary result.
 name: gate
 
 on:
@@ -116,18 +115,9 @@ jobs:
   # separate gate job can combine them with the primary audit without relying
   # on job-local runner.temp state.
   quality:
-    # gate#105 方案 A (owner decision 2026-09-02): quality depends on primary
-    # so a primary FAILURE short-circuits quality to `skipped` and `gate /
-    # gate` concludes immediately instead of waiting on the slowest job
-    # (primary median ~1.8 min vs quality ~8 min; observed primary-failure
-    # runs dragged on 4.2–31.1 min). The `always()` is mandatory: with the
-    # default success() gate, a primary that is cancelled (concurrency
-    # supersede on a newer head) or skipped (draft / fork / hosted — see the
-    # primary job's own `if:`) would skip quality too; `!= 'failure'` keeps
-    # quality running in those cases. Cost: the green path now waits for
-    # primary (~1.8 min median) before quality starts.
-    needs: [primary]
-    if: always() && needs.primary.result != 'failure'
+    # gate#129: keep quality independent from primary so both expensive jobs
+    # start without waiting for the other. `gate` still needs both terminal
+    # results and aggregates them fail-closed.
     # Same self-hosted/hosted fork-guard expression legacy's single `gate` job
     # uses verbatim (see legacy .github/workflows/gate.yml and
     # tests/test_gate_contract.py's FORK_GUARD): non-pull_request events
