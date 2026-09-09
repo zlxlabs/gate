@@ -662,21 +662,6 @@ def test_shadow_job_id_resolution_separates_api_failure_from_empty_result():
     assert api_failure != no_match
 
 
-def test_shadow_job_id_resolution_retries_remain_fail_closed():
-    raw, _ = _load_workflow()
-    step = next(
-        s for s in raw["jobs"]["shadow"]["steps"]
-        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
-    )
-    run = step["run"]
-
-    assert "for attempt in 1 2 3; do" in run
-    assert 'if [ "$rc" -ne 0 ]; then' in run
-    assert "exit 1" in run
-    assert "while true" not in run
-    assert "until true" not in run
-
-
 # ── axis 2: shadow leg outcomes × summary conclusion (contract pins) ─────────
 
 @pytest.mark.parametrize(

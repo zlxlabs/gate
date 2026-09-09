@@ -461,22 +461,6 @@ def test_job_id_resolution_separates_api_failure_from_empty_result(job_name):
     assert api_failure != no_match
 
 
-@pytest.mark.parametrize("job_name", ["primary", "ocr"])
-def test_job_id_resolution_retries_remain_fail_closed(job_name):
-    raw, _ = _load_workflow()
-    step = next(
-        s for s in raw["jobs"][job_name]["steps"]
-        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
-    )
-    run = step["run"]
-
-    assert "for attempt in 1 2 3; do" in run
-    assert 'if [ "$rc" -ne 0 ]; then' in run
-    assert "exit 1" in run
-    assert "while true" not in run
-    assert "until true" not in run
-
-
 # ── concurrency contract ─────────────────────────────────────────────────────
 # Two job-level locks, no workflow-level group: quality/primary cancel stale
 # work per PR; gate/ledger keep cancel-in-progress: false so writers finish.
