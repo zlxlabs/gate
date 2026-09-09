@@ -1763,6 +1763,16 @@ def test_notify_webhook_secret_first_var_fallback():
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
 
 
+def test_notify_validates_feishu_business_response():
+    text = WORKFLOW.read_text()
+    assert "response = json.loads(response_body)" in text
+    assert "code = response.get(\"code\")" in text
+    assert "if code != 0:" in text
+    assert "::error::Feishu business response rejected: code=" in text
+    assert "except (TypeError, ValueError):" in text
+    assert "::error::Feishu response is not valid JSON" in text
+
+
 # ── caller template ──────────────────────────────────────────────────────────
 
 def test_caller_declares_ready_for_review_and_converted_to_draft():
