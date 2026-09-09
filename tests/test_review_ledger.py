@@ -1182,7 +1182,7 @@ def _http_404() -> urllib.error.HTTPError:
     )
 
 
-def test_api_request_retries_connection_error_then_succeeds(monkeypatch):
+def test_api_request_retries_connection_error_then_succeeds(monkeypatch, capsys):
     module = _module()
     calls = []
     sleeps = []
@@ -1201,6 +1201,9 @@ def test_api_request_retries_connection_error_then_succeeds(monkeypatch):
     assert body == b'{"ok":true}'
     assert len(calls) == 3
     assert sleeps == [1, 2]
+    output = capsys.readouterr().out
+    assert "GitHub API request retry: path=/repos/org/repo attempt=2/3 error=URLError delay=1s" in output
+    assert "GitHub API request retry: path=/repos/org/repo attempt=3/3 error=URLError delay=2s" in output
 
 
 def test_api_request_does_not_retry_http_error(monkeypatch):
@@ -1223,7 +1226,7 @@ def test_api_request_does_not_retry_http_error(monkeypatch):
     assert sleeps == []
 
 
-def test_api_request_reraises_after_connection_error_retries_exhausted(monkeypatch):
+def test_api_request_reraises_after_connection_error_retries_exhausted(monkeypatch, capsys):
     module = _module()
     calls = []
     sleeps = []
@@ -1241,6 +1244,10 @@ def test_api_request_reraises_after_connection_error_retries_exhausted(monkeypat
     assert type(exc_info.value) is urllib.error.URLError
     assert len(calls) == 3
     assert sleeps == [1, 2]
+    output = capsys.readouterr().out
+    assert output.count("GitHub API request retry:") == 2
+    assert "attempt=2/3" in output
+    assert "attempt=3/3" in output
 
 
 def _pr_ledger_entries(module, count: int) -> list[dict]:

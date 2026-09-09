@@ -763,6 +763,33 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error"} and "continue-on-error" not in terminal_upload
 
 
+@pytest.mark.parametrize(
+    ("job_name", "step_name"),
+    [
+        ("gate", "Resolve canonical primary audit artifact"),
+        ("ledger", "Resolve v2 ledger artifacts"),
+    ],
+)
+def test_artifact_listing_resolvers_retry_with_bounded_timeout(job_name, step_name):
+    raw, _ = _load_workflow()
+    step = next(s for s in raw["jobs"][job_name]["steps"] if s.get("name") == step_name)
+    run = step["run"]
+
+    assert "artifacts_api=\"repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts\"" in run
+    assert "max_attempts=3" in run
+    assert "retry_delay_seconds=1" in run
+    assert "for attempt in 1 2 3; do" in run
+    assert "timeout --foreground 15s gh api \"$artifacts_api\" --paginate --slurp" in run
+    assert '|| rc=$?' in run
+    assert "GitHub API request retry:" in run
+    assert "path=${artifacts_api} attempt=$((attempt + 1))/${max_attempts} error=exit_${rc}" in run
+    assert 'sleep "$retry_delay_seconds"' in run
+    assert 'if [ "$rc" -ne 0 ]; then' in run
+    assert 'exit "$rc"' in run
+    assert "while true" not in run
+    assert "until true" not in run
+
+
 def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
     raw, _ = _load_workflow()
     aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
