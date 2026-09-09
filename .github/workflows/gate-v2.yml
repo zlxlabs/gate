@@ -993,7 +993,24 @@ jobs:
           echo "artifact_name=" >> "$GITHUB_OUTPUT"
           artifact_listing="$(mktemp)"
           trap 'rm -f "$artifact_listing"' EXIT
-          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$artifact_listing"
+          artifacts_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
+          max_attempts=3
+          retry_delay_seconds=1
+          rc=0
+          for attempt in 1 2 3; do
+            rc=0
+            timeout --foreground 15s gh api "$artifacts_api" --paginate --slurp > "$artifact_listing" 2>/dev/null || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "::warning::GitHub API request retry: path=${artifacts_api} attempt=$((attempt + 1))/${max_attempts} error=exit_${rc}"
+              sleep "$retry_delay_seconds"
+            fi
+          done
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
           selected="$(python3 - "$artifact_listing" "$AUDIT_PREFIX" "$CURRENT_ATTEMPT" <<'PY'
           import json
           import re
@@ -1204,7 +1221,24 @@ jobs:
           set -euo pipefail
           listing="$(mktemp)"
           trap 'rm -f "$listing"' EXIT
-          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate --slurp > "$listing"
+          artifacts_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
+          max_attempts=3
+          retry_delay_seconds=1
+          rc=0
+          for attempt in 1 2 3; do
+            rc=0
+            timeout --foreground 15s gh api "$artifacts_api" --paginate --slurp > "$listing" 2>/dev/null || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "::warning::GitHub API request retry: path=${artifacts_api} attempt=$((attempt + 1))/${max_attempts} error=exit_${rc}"
+              sleep "$retry_delay_seconds"
+            fi
+          done
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
           python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$TERMINAL_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
