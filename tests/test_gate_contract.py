@@ -6,8 +6,10 @@ fork-PR 防护是公开仓安全的承重墙:公开仓任何人都能开 fork PR
 防护(gate.runs-on / codex step if / notify.runs-on)钉成契约,误删任何一处
 都在 PR 时 fail。
 """
+import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -406,7 +408,22 @@ def test_notify_validates_feishu_business_response():
     text = WORKFLOW.read_text()
     assert "response = json.loads(response_body)" in text
     assert "code = response.get(\"code\")" in text
-    assert "if code != 0:" in text
+    assert (
+        "if not (isinstance(code, int) and not isinstance(code, bool) and code == 0):"
+        in text
+    )
     assert "::error::Feishu business response rejected: code=" in text
     assert "except (TypeError, ValueError):" in text
     assert "::error::Feishu response is not valid JSON" in text
+
+
+@pytest.mark.parametrize("response_body", ['{"code": false}', '{"code": 0.0}'])
+def test_notify_rejects_non_integer_zero_response_codes(response_body):
+    text = WORKFLOW.read_text()
+    code = json.loads(response_body)["code"]
+    assert code == 0  # Both values pass Python's loose equality check.
+    assert not (isinstance(code, int) and not isinstance(code, bool) and code == 0)
+    assert (
+        "if not (isinstance(code, int) and not isinstance(code, bool) and code == 0):"
+        in text
+    )
