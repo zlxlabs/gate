@@ -1132,6 +1132,45 @@ def test_reason_code_wording_cannot_be_misread(kwargs, must_say, must_not_say):
 
 
 @pytest.mark.parametrize(
+    "primary_result,must_say,must_not_say",
+    [
+        (
+            "failure",
+            [
+                "primary job failed",
+                "usually because of a reviewer rejection",
+                "canonical audit artifact could NOT be read",
+                "cannot be confirmed programmatically",
+                "check the primary job logs for the verdict line",
+            ],
+            ["NOT a reviewer rejection", "not a reviewer rejection"],
+        ),
+        (
+            "success",
+            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
+            ["primary job failed", "cannot be confirmed programmatically"],
+        ),
+    ],
+    ids=["primary_failure", "primary_success"],
+)
+def test_audit_missing_wording_tracks_primary_job_result(
+    tmp_path, primary_result, must_say, must_not_say,
+):
+    # The terminal classification remains fail-closed in both cases; only the
+    # recipient-facing explanation changes with needs.primary.result.
+    _, summary_path, args = _visible_scenario(
+        tmp_path, {"primary_result": primary_result}, None,
+    )
+    assert AGG.main(args) == 1
+    text = summary_path.read_text()
+    assert "classification=`integration_error`, reason_code=`audit_missing`, gate_result=`unavailable`" in text
+    for phrase in must_say:
+        assert phrase in text
+    for phrase in must_not_say:
+        assert phrase not in text
+
+
+@pytest.mark.parametrize(
     "kwargs",
     [
         {"audit": None, "audit_error": "missing"},
