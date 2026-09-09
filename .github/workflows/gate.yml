@@ -500,7 +500,7 @@ jobs:
                           code = response.get("code")
                       else:
                           code = None
-                      if code != 0:
+                      if not (isinstance(code, int) and not isinstance(code, bool) and code == 0):
                           print(f"::error::Feishu business response rejected: code={code}")
                           print(f"feishu notify failed: business code={code}")
           except Exception as e:
