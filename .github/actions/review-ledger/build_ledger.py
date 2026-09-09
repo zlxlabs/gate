@@ -752,10 +752,18 @@ def _api_request(token: str, url: str, *, method: str = "GET", payload: dict[str
                 return response.read()
         except urllib.error.HTTPError:
             raise
-        except _RETRYABLE_CONNECTION_ERRORS:
+        except _RETRYABLE_CONNECTION_ERRORS as error:
             if attempt >= last_attempt:
                 raise
-            time.sleep(API_REQUEST_BACKOFF_SECONDS[attempt])
+            delay = API_REQUEST_BACKOFF_SECONDS[attempt]
+            print(
+                "GitHub API request retry: "
+                f"path={urllib.parse.urlsplit(url).path} "
+                f"attempt={attempt + 2}/{API_REQUEST_ATTEMPTS} "
+                f"error={type(error).__name__} delay={delay}s",
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 def _api_json(token: str, url: str) -> Any:
