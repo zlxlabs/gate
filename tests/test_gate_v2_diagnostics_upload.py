@@ -20,28 +20,17 @@ def _primary_steps():
 
 def test_primary_writes_restricted_manifest_before_diagnostics_upload():
     steps = _primary_steps()
-    manifest_index = next(
-        i for i, step in enumerate(steps)
-        if step.get("name") == "Write primary review diagnostics manifest"
-    )
-    upload_index = next(
-        i for i, step in enumerate(steps)
-        if step.get("name") == "Upload primary review diagnostics"
-    )
-    manifest = steps[manifest_index]
-    upload = steps[upload_index]
-    audit_index = next(
-        i for i, step in enumerate(steps)
-        if step.get("name") == "Upload canonical primary audit"
-    )
+    indexes = {step.get("name"): i for i, step in enumerate(steps)}
+    manifest_index = indexes["Write primary review diagnostics manifest"]
+    audit_index = indexes["Upload canonical primary audit"]
+    upload_index = indexes["Upload primary review diagnostics"]
+    manifest, upload = steps[manifest_index], steps[upload_index]
     assert manifest_index < audit_index < upload_index
     assert manifest["if"] == "always()"
     assert manifest["continue-on-error"] is True
     assert manifest["shell"] == "bash"
-    assert manifest["env"] == {
-        "DIAGNOSTICS_DIR": "${{ runner.temp }}/primary-review-diagnostics",
-        "RUN_ATTEMPT": "${{ github.run_attempt }}",
-    }
+    assert manifest["env"]["DIAGNOSTICS_DIR"] == "${{ runner.temp }}/primary-review-diagnostics"
+    assert manifest["env"]["RUN_ATTEMPT"] == "${{ github.run_attempt }}"
     run = manifest["run"]
     for field in ("directory_exists", "file_count", "other_file_count", '"name"', '"bytes"', '"mtime"'):
         assert field in run
@@ -55,11 +44,11 @@ def test_primary_writes_restricted_manifest_before_diagnostics_upload():
 
 
 def _manifest_program():
-    manifest_step = next(
+    step = next(
         step for step in _primary_steps()
         if step.get("name") == "Write primary review diagnostics manifest"
     )
-    run_script = manifest_step["run"]
+    run_script = step["run"]
     assert "<<'PY'\n" in run_script and "\nPY\n" in run_script
     return run_script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
 
@@ -71,31 +60,22 @@ def _run_manifest(program, diagnostics_dir, attempt):
 
 def test_manifest_producer_emits_absent_empty_and_populated_payloads(tmp_path):
     program = _manifest_program()
-    absent = _run_manifest(program, tmp_path / "absent", 4)
-    assert absent["attempt"] == 4
-    assert absent["directory_exists"] is False
-    assert absent["file_count"] == absent["other_file_count"] == 0
-    assert absent["files"] == []
-
-    empty_dir = tmp_path / "empty"
-    empty_dir.mkdir()
-    empty = _run_manifest(program, empty_dir, 5)
-    assert empty["attempt"] == 5
-    assert empty["directory_exists"] is True
-    assert empty["file_count"] == empty["other_file_count"] == 0
-    assert empty["files"] == []
-
-    populated_dir = tmp_path / "populated"
-    populated_dir.mkdir()
-    raw_output = populated_dir / "attempt-01-codex-sub-raw-output.txt"
-    raw_output.write_bytes(b"{}")
-    (populated_dir / "unexpected-provider.stderr").write_text("provider secret", encoding="utf-8")
-    populated = _run_manifest(program, populated_dir, 6)
-    assert populated["attempt"] == 6
-    assert populated["directory_exists"] is True
-    assert populated["file_count"] == populated["other_file_count"] == 1
-    assert populated["files"] == [{
-        "name": raw_output.name,
-        "bytes": 2,
-        "mtime": raw_output.stat().st_mtime,
-    }]
+    for name, attempt in (("absent", 4), ("empty", 5), ("populated", 6)):
+        diagnostics_dir = tmp_path / name
+        expected_files = []
+        if name != "absent":
+            diagnostics_dir.mkdir()
+        if name == "populated":
+            raw_output = diagnostics_dir / "attempt-01-codex-sub-raw-output.txt"
+            raw_output.write_bytes(b"{}")
+            (diagnostics_dir / "unexpected-provider.stderr").write_text("provider secret", encoding="utf-8")
+            expected_files = [{"name": raw_output.name, "bytes": 2, "mtime": raw_output.stat().st_mtime}]
+        manifest = _run_manifest(program, diagnostics_dir, attempt)
+        assert manifest == {
+            "schema_version": 1,
+            "attempt": attempt,
+            "directory_exists": name != "absent",
+            "file_count": len(expected_files),
+            "other_file_count": int(name == "populated"),
+            "files": expected_files,
+        }
