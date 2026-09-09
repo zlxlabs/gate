@@ -488,7 +488,21 @@ jobs:
               hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
           try:
               with urllib.request.urlopen(req, timeout=10) as r:
-                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
+                  response_body = r.read(300).decode("utf-8", "replace")
+                  print("feishu resp:", r.status, response_body)
+                  try:
+                      response = json.loads(response_body)
+                  except (TypeError, ValueError):
+                      print("::error::Feishu response is not valid JSON")
+                      print("feishu notify failed: response body was not valid JSON")
+                  else:
+                      if isinstance(response, dict):
+                          code = response.get("code")
+                      else:
+                          code = None
+                      if code != 0:
+                          print(f"::error::Feishu business response rejected: code={code}")
+                          print(f"feishu notify failed: business code={code}")
           except Exception as e:
               print("feishu notify failed (swallowed):", e)
           PY
