@@ -447,19 +447,15 @@ def test_job_id_resolution_separates_api_failure_from_empty_result(job_name):
     )
     run = step["run"]
 
-    api_failures = [
-        line.strip() for line in run.splitlines()
-        if "::error::" in line and "Jobs API call failed after" in line
-    ]
-    no_matches = [
-        line.strip() for line in run.splitlines()
-        if "::error::" in line and "no matching job" in line
-    ]
-    assert api_failures, "missing API-failure error message"
-    assert no_matches, "missing successful-empty-result error message"
-    api_failure = api_failures[0]
-    no_match = no_matches[0]
-    assert api_failure != no_match
+    api_failure_start = run.index('if [ "$rc" -ne 0 ]; then')
+    api_failure_branch = run[api_failure_start:run.index("\nfi", api_failure_start)]
+    no_match_start = run.index('if [ -z "$job_id" ]; then')
+    no_match_branch = run[no_match_start:run.index("\nfi", no_match_start)]
+
+    assert "Jobs API call failed after" in api_failure_branch
+    assert "no matching job" not in api_failure_branch
+    assert "no matching job" in no_match_branch
+    assert "Jobs API call failed after" not in no_match_branch
 
 
 # ── concurrency contract ─────────────────────────────────────────────────────
