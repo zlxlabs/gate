@@ -2643,6 +2643,16 @@ def test_no_receipts_keeps_required_fail_byte_identical_to_baseline():
     assert "resolved_findings" not in without.convergence_envelope
 
 
+def test_measured_p1_receipt_cannot_resolve_required_gate():
+    audit = _failing_scoped_audit()
+    audit["result"]["findings"][0]["trigger_kind"] = "measured"
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope)
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    assert outcome.gate_result == "fail"
+    assert outcome.resolved_findings == []
+
+
 def test_partial_disposition_leaves_remaining_finding_blocking():
     audit = _valid_scoped_primary_record(
         verdict="fail",
