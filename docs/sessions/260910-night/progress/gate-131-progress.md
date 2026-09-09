@@ -14,3 +14,6 @@
 - 实现提交：`2f4c84c`；后续仅补充了 malformed `p1_findings` 的 fail-closed 类型守卫，待提交。
 - 全量首次运行：`855 passed, 4 failed`；4 项均来自 `tests/test_review_ledger.py` 共用 producer
   fixture 缺失 `trigger_kind`，不是生产逻辑失败。已将该 fixture 明确标为 `inferred`，保持原测试意图。
+- 全量复跑：`859 passed in 47.04s`，退出码 `0`；日志 `/tmp/gate-night-260910/gate-131-full-tests.log`。
+- pin 检查：退出码 `0`，输出 `OK: checked 8 live workflow/action metadata file(s)`；日志
+  `/tmp/gate-night-260910/gate-131-pins.log`。
