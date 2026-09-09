@@ -560,26 +560,27 @@ jobs:
           # keeps an unexpected finalizer error from changing primary's result.
           if ! python3 - "$DIAGNOSTICS_DIR" "$RUN_ATTEMPT" <<'PY'
           import json
-          import os
+          import re
           import sys
           from pathlib import Path
 
           diagnostics_dir = Path(sys.argv[1])
           attempt = int(sys.argv[2])
           manifest_name = "manifest.json"
-          allowed_names = {"primary-review-diagnostics.json", "provider-diagnostics.json", "provider-status.json"}
+          temporary_name = ".manifest.json.tmp"
+          raw_output_pattern = re.compile(r"^attempt-[0-9]+-[A-Za-z0-9_.-]+-raw-output\.txt$")
           directory_exists = diagnostics_dir.is_dir()
           files = []
+          other_file_count = 0
           if directory_exists:
-              for name in sorted(allowed_names):
-                  path = diagnostics_dir / name
-                  if path.is_file():
-                      stat = path.stat()
-                      files.append({
-                          "name": name,
-                          "bytes": stat.st_size,
-                          "mtime": stat.st_mtime,
-                      })
+              for path in sorted(diagnostics_dir.iterdir()):
+                  if not path.is_file() or path.name in {manifest_name, temporary_name}:
+                      continue
+                  stat = path.stat()
+                  if raw_output_pattern.fullmatch(path.name):
+                      files.append({"name": path.name, "bytes": stat.st_size, "mtime": stat.st_mtime})
+                  else:
+                      other_file_count += 1
 
           diagnostics_dir.mkdir(parents=True, exist_ok=True)
           payload = {
@@ -587,13 +588,11 @@ jobs:
               "attempt": attempt,
               "directory_exists": directory_exists,
               "file_count": len(files),
+              "other_file_count": other_file_count,
               "files": files,
           }
-          temporary_manifest = diagnostics_dir / ".manifest.json.tmp"
-          temporary_manifest.write_text(
-              json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n",
-              encoding="utf-8",
-          )
+          temporary_manifest = diagnostics_dir / temporary_name
+          temporary_manifest.write_text(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n", encoding="utf-8")
           temporary_manifest.replace(diagnostics_dir / manifest_name)
           PY
           then
