@@ -629,6 +629,7 @@ def test_shadow_job_id_resolution_retries_with_timeout():
 
     assert "max_attempts=3" in run
     assert "for attempt in 1 2 3; do" in run
+    assert 'if [ "$rc" -eq 0 ]; then\n    break\n  fi' in run
     assert "timeout --foreground" in run
     assert '|| rc=$?' in run
     assert 'sleep "$retry_delay_seconds"' in run
