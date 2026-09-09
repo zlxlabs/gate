@@ -2,7 +2,7 @@
 """Issue immutable disposition artifacts from a canonical primary audit.
 
 audit_digest is SHA-256 of the stable audit subset (scope fields + sorted
-finding id/severity/file/line + verdict) via convergence.canonical_audit_digest.
+finding id/severity/trigger_kind/file/line + verdict) via convergence.canonical_audit_digest.
 The audit file's raw bytes are not stable across reruns (duration/tokens/
 timestamps), so they are not hashed here.
 """

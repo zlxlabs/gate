@@ -171,6 +171,36 @@ def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
     )
 
 
+def test_aggregate_cli_p1_receipt_bytes_validate_and_replay(tmp_path):
+    audit = _scoped_audit(verdict="fail")
+    audit["result"]["findings"] = [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]
+    audit_dir = tmp_path / "primary-audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_bytes(json.dumps(audit, indent=2).encode() + b"\n")
+    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
+    completed = subprocess.run(
+        [
+            sys.executable, str(AGGREGATE_PATH), "--quality-result", "success",
+            "--primary-result", "failure", "--runner", "self", "--is-draft", "false",
+            "--review-expected", "true", "--repository-id", "123", "--repository", "zlxlabs/gate",
+            "--head-sha", SCOPE.head_sha, "--run-id", "77", "--run-attempt", "1",
+            "--pr-number", "42", "--audit-source-attempt", "1",
+            "--audit-artifact-name", "primary-audit-v2-123-h-77-1", "--audit-dir", str(audit_dir),
+            "--convergence-receipt-path", str(receipt_path),
+        ],
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 1
+    payload_bytes = receipt_path.read_bytes()
+    payload = json.loads(payload_bytes)
+    assert payload["p1_findings"] == [["p1", "major", "inferred"]]
+    assert payload_bytes == json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    receipt = _receipt_from_payload(payload)
+    CONV.validate_receipt(receipt, SCOPE)
+    replayed = CONV.replay_receipts(scope=SCOPE, receipts=(receipt,))
+    assert (replayed.clean_streak, replayed.eligible_rounds) == (0, 1)
+
+
 def test_producer_payload_preserves_all_attempt_guards(tmp_path):
     audit = {
         "kind": "primary_review", "schema_version": 1,
