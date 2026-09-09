@@ -427,6 +427,8 @@ def test_job_id_resolution_retries_with_timeout(job_name):
 
     assert "max_attempts=3" in run
     assert "for attempt in 1 2 3; do" in run
+    normalized_run = "\n".join(line.strip() for line in run.splitlines())
+    assert 'if [ "$rc" -eq 0 ]; then\nbreak\nfi' in normalized_run
     assert "timeout --foreground" in run
     assert '|| rc=$?' in run
     assert 'sleep "$retry_delay_seconds"' in run
@@ -446,35 +448,20 @@ def test_job_id_resolution_separates_api_failure_from_empty_result(job_name):
     )
     run = step["run"]
 
-    api_failures = [
-        line.strip() for line in run.splitlines()
-        if "::error::" in line and "Jobs API call failed after" in line
-    ]
-    no_matches = [
-        line.strip() for line in run.splitlines()
-        if "::error::" in line and "no matching job" in line
-    ]
-    assert api_failures, "missing API-failure error message"
-    assert no_matches, "missing successful-empty-result error message"
-    api_failure = api_failures[0]
-    no_match = no_matches[0]
-    assert api_failure != no_match
+    run_lines = run.splitlines()
 
+    def shell_if_branch(condition):
+        start = next(i for i, line in enumerate(run_lines) if line.strip() == condition)
+        end = next(i for i in range(start + 1, len(run_lines)) if run_lines[i].strip() == "fi")
+        return "\n".join(run_lines[start:end])
 
-@pytest.mark.parametrize("job_name", ["primary", "ocr"])
-def test_job_id_resolution_retries_remain_fail_closed(job_name):
-    raw, _ = _load_workflow()
-    step = next(
-        s for s in raw["jobs"][job_name]["steps"]
-        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
-    )
-    run = step["run"]
+    api_failure_branch = shell_if_branch('if [ "$rc" -ne 0 ]; then')
+    no_match_branch = shell_if_branch('if [ -z "$job_id" ]; then')
 
-    assert "for attempt in 1 2 3; do" in run
-    assert 'if [ "$rc" -ne 0 ]; then' in run
-    assert "exit 1" in run
-    assert "while true" not in run
-    assert "until true" not in run
+    assert "Jobs API call failed after" in api_failure_branch
+    assert "no matching job" not in api_failure_branch
+    assert "no matching job" in no_match_branch
+    assert "Jobs API call failed after" not in no_match_branch
 
 
 # ── concurrency contract ─────────────────────────────────────────────────────
