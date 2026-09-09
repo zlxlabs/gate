@@ -545,6 +545,60 @@ jobs:
         # treats that text as an inert string literal instead of shell source.
         run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
 
+      - name: Write primary review diagnostics manifest
+        # Best-effort finalizer for failed/cancelled review-primary; it records
+        # metadata only and never reads provider bodies or stderr.
+        if: always()
+        continue-on-error: true
+        env:
+          DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The inline warning covers generator failure; continue-on-error also
+          # keeps an unexpected finalizer error from changing primary's result.
+          if ! python3 - "$DIAGNOSTICS_DIR" "$RUN_ATTEMPT" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          diagnostics_dir = Path(sys.argv[1])
+          attempt = int(sys.argv[2])
+          manifest_name = "manifest.json"
+          temporary_name = ".manifest.json.tmp"
+          raw_output_pattern = re.compile(r"^attempt-[0-9]+-[A-Za-z0-9_.-]+-raw-output\.txt$")
+          directory_exists = diagnostics_dir.is_dir()
+          files = []
+          other_file_count = 0
+          if directory_exists:
+              for path in sorted(diagnostics_dir.iterdir()):
+                  if not path.is_file() or path.name in {manifest_name, temporary_name}:
+                      continue
+                  stat = path.stat()
+                  if raw_output_pattern.fullmatch(path.name):
+                      files.append({"name": path.name, "bytes": stat.st_size, "mtime": stat.st_mtime})
+                  else:
+                      other_file_count += 1
+
+          diagnostics_dir.mkdir(parents=True, exist_ok=True)
+          payload = {
+              "schema_version": 1,
+              "attempt": attempt,
+              "directory_exists": directory_exists,
+              "file_count": len(files),
+              "other_file_count": other_file_count,
+              "files": files,
+          }
+          temporary_manifest = diagnostics_dir / temporary_name
+          temporary_manifest.write_text(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          temporary_manifest.replace(diagnostics_dir / manifest_name)
+          PY
+          then
+            echo "::warning::primary review diagnostics manifest generation failed; diagnostics upload may have no files"
+          fi
+
       - name: Upload canonical primary audit
         # Fail-closed by design: if the audit can't be uploaded, the aggregator
         # must never see a "success" primary job without a matching artifact
@@ -564,6 +618,9 @@ jobs:
           retention-days: 30
 
       - name: Upload primary review diagnostics
+        # The finalizer creates manifest.json for an absent/empty producer
+        # directory; `ignore` keeps this best-effort path from changing the
+        # primary result if the finalizer itself was killed or failed.
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
