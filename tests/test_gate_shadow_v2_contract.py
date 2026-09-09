@@ -629,7 +629,8 @@ def test_shadow_job_id_resolution_retries_with_timeout():
 
     assert "max_attempts=3" in run
     assert "for attempt in 1 2 3; do" in run
-    assert 'if [ "$rc" -eq 0 ]; then\n    break\n  fi' in run
+    normalized_run = "\n".join(line.strip() for line in run.splitlines())
+    assert 'if [ "$rc" -eq 0 ]; then\nbreak\nfi' in normalized_run
     assert "timeout --foreground" in run
     assert '|| rc=$?' in run
     assert 'sleep "$retry_delay_seconds"' in run
@@ -648,10 +649,15 @@ def test_shadow_job_id_resolution_separates_api_failure_from_empty_result():
     )
     run = step["run"]
 
-    api_failure_start = run.index('if [ "$rc" -ne 0 ]; then')
-    api_failure_branch = run[api_failure_start:run.index("\nfi", api_failure_start)]
-    no_match_start = run.index('if [ -z "$job_id" ]; then')
-    no_match_branch = run[no_match_start:run.index("\nfi", no_match_start)]
+    run_lines = run.splitlines()
+
+    def shell_if_branch(condition):
+        start = next(i for i, line in enumerate(run_lines) if line.strip() == condition)
+        end = next(i for i in range(start + 1, len(run_lines)) if run_lines[i].strip() == "fi")
+        return "\n".join(run_lines[start:end])
+
+    api_failure_branch = shell_if_branch('if [ "$rc" -ne 0 ]; then')
+    no_match_branch = shell_if_branch('if [ -z "$job_id" ]; then')
 
     assert "Jobs API call failed after" in api_failure_branch
     assert "no matching job" not in api_failure_branch
