@@ -10,3 +10,5 @@
   canonical digest 绑定 `trigger_kind`，issue producer 拒绝非 `inferred`。
 - 受影响测试：四个 Gate 测试文件共 `475 passed`；新增聚合终态矩阵、producer 非 inferred 拒绝、
   receipt 字节/replay 与 digest 绑定覆盖。
+- 收尾验证：`475 passed in 16.56s`；`python3 scripts/check_pinned_uses.py` 输出 `OK`。
+- 实现提交：`2f4c84c`；后续仅补充了 malformed `p1_findings` 的 fail-closed 类型守卫，待提交。

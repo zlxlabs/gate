@@ -27,7 +27,6 @@ TERMINAL_DECISIONS = frozenset(
 )
 RECEIPT_KIND = "canonical_primary"
 DISPOSITION_KINDS = frozenset({"false-positive"})
-TRIGGER_KINDS = frozenset({"inferred", "measured", "unmeasurable"})
 DISPOSITION_RECEIPT_SCHEMA_VERSION = 2
 DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}"
 DISPOSITION_REASON_DISPLAY_MAX = 500
@@ -555,9 +554,12 @@ def validate_disposition_receipt(
     if receipt.finding_id not in primary.p1_ids:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_not_current_p1")
     finding = next(
-        (item for item in primary.p1_findings if item[0] == receipt.finding_id),
+        (
+            item for item in primary.p1_findings
+            if isinstance(item, tuple) and len(item) == 3 and item[0] == receipt.finding_id
+        ),
         None,
-    )
+    ) if isinstance(primary.p1_findings, tuple) else None
     if finding is None or finding[1] not in P1_SEVERITIES or finding[2] != "inferred":
         return _disposition_status(
             receipt, valid=False, active=False, consumable=False,
@@ -1023,6 +1025,7 @@ def _primary_errors(*, scope: Scope, primary: CanonicalPrimary) -> list[str]:
                 or len(finding) != 3
                 or not isinstance(finding[0], str)
                 or not finding[0]
+                or not isinstance(finding[1], str)
                 or finding[1] not in P1_SEVERITIES
                 or (finding[2] is not None and not isinstance(finding[2], str))
             ):
@@ -1534,6 +1537,7 @@ def validate_receipt(receipt: Receipt, scope: Scope) -> None:
                 not isinstance(finding, tuple)
                 or len(finding) != 3
                 or not _nonempty_text(finding[0])
+                or not isinstance(finding[1], str)
                 or finding[1] not in P1_SEVERITIES
                 or (finding[2] is not None and not isinstance(finding[2], str))
             ):
