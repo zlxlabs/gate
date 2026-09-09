@@ -2,7 +2,7 @@
 """Issue immutable disposition artifacts from a canonical primary audit.
 
 audit_digest is SHA-256 of the stable audit subset (scope fields + sorted
-finding id/severity/file/line + verdict) via convergence.canonical_audit_digest.
+finding id/severity/trigger_kind/file/line + verdict) via convergence.canonical_audit_digest.
 The audit file's raw bytes are not stable across reruns (duration/tokens/
 timestamps), so they are not hashed here.
 """
@@ -166,6 +166,8 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         raise ValueError("finding_id must identify exactly one canonical audit finding")
     if matching[0].get("severity") not in P1_SEVERITIES:
         raise ValueError("finding_id must identify a P1 finding")
+    if matching[0].get("trigger_kind") != "inferred":
+        raise ValueError("finding_id must identify an inferred P1 finding")
     fields = {
         "schema_version": SCHEMA_VERSION,
         "disposition": "false-positive",

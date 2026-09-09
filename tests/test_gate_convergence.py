@@ -64,6 +64,7 @@ def _primary(scope=SCOPE, *, run_id=1, run_attempt=1, verdict="pass", p1_ids=())
         run_attempt=run_attempt,
         verdict=verdict,
         p1_ids=tuple(p1_ids),
+        p1_findings=tuple((finding_id, "major", "inferred") for finding_id in p1_ids),
     )
 
 
@@ -100,6 +101,7 @@ def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="1", verdict="pass"
         audit_digest=audit_digest,
         verdict=verdict,
         p1_ids=tuple(p1_ids),
+        p1_findings=tuple((finding_id, "major", "inferred") for finding_id in p1_ids),
         source_attempt=run_attempt if source_attempt is None else source_attempt,
         artifact_id=artifact,
         reported_decision=reported,
@@ -381,6 +383,12 @@ def test_canonical_audit_digest_changes_with_findings_or_verdict():
     assert digest != CONV.canonical_audit_digest(moved)
     assert digest != CONV.canonical_audit_digest(other)
     assert digest != CONV.canonical_audit_digest(passed)
+
+
+def test_canonical_audit_digest_binds_finding_trigger_kind():
+    base = _runtime_audit(findings=[{"id": "p1", "severity": "major", "trigger_kind": "inferred"}])
+    measured = _runtime_audit(findings=[{"id": "p1", "severity": "major", "trigger_kind": "measured"}])
+    assert CONV.canonical_audit_digest(base) != CONV.canonical_audit_digest(measured)
 
 
 def test_legacy_raw_bytes_digest_still_consumes_current_file():
