@@ -545,24 +545,6 @@ jobs:
         # treats that text as an inert string literal instead of shell source.
         run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
 
-      - name: Upload canonical primary audit
-        # Fail-closed by design: if the audit can't be uploaded, the aggregator
-        # must never see a "success" primary job without a matching artifact
-        # to validate — so this step deliberately has NO `continue-on-error`.
-        # P1 fix (2026-07-26, canary probe #2): an earlier draft of this step relied on
-        # actions/upload-artifact v4's DEFAULT `if-no-files-found` behavior, which is
-        # `warn` — NOT `ignore`, but also NOT `error`: canary observed primary fail to
-        # write an audit at all, yet this step still concluded `success` (a warning
-        # annotation, not a job failure). `if-no-files-found: error` below is the actual
-        # fail-closed setting; "no if-no-files-found: ignore" alone was never sufficient.
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/primary-review-audit.json
-          if-no-files-found: error
-          retention-days: 30
-
       - name: Write primary review diagnostics manifest
         # Best-effort finalizer for failed/cancelled review-primary; it records
         # metadata only and never reads provider bodies or stderr.
@@ -618,16 +600,34 @@ jobs:
             echo "::warning::primary review diagnostics manifest generation failed; diagnostics upload may have no files"
           fi
 
+      - name: Upload canonical primary audit
+        # Fail-closed by design: if the audit can't be uploaded, the aggregator
+        # must never see a "success" primary job without a matching artifact
+        # to validate — so this step deliberately has NO `continue-on-error`.
+        # P1 fix (2026-07-26, canary probe #2): an earlier draft of this step relied on
+        # actions/upload-artifact v4's DEFAULT `if-no-files-found` behavior, which is
+        # `warn` — NOT `ignore`, but also NOT `error`: canary observed primary fail to
+        # write an audit at all, yet this step still concluded `success` (a warning
+        # annotation, not a job failure). `if-no-files-found: error` below is the actual
+        # fail-closed setting; "no if-no-files-found: ignore" alone was never sufficient.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/primary-review-audit.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload primary review diagnostics
         # The finalizer creates manifest.json for an absent/empty producer
-        # directory; `error` makes a missing manifest mean finalizer failure,
-        # while its fields preserve the explicit no-diagnostics state.
+        # directory; `ignore` keeps this best-effort path from changing the
+        # primary result if the finalizer itself was killed or failed.
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/primary-review-diagnostics/
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 30
 
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────

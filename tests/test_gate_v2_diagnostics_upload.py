@@ -32,6 +32,11 @@ def test_primary_writes_restricted_manifest_before_diagnostics_upload():
     manifest = steps[manifest_index]
     upload = steps[upload_index]
     assert manifest_index < upload_index
+    audit_index = next(
+        i for i, step in enumerate(steps)
+        if step.get("name") == "Upload canonical primary audit"
+    )
+    assert manifest_index < audit_index < upload_index
     assert manifest["if"] == "always()"
     assert manifest["continue-on-error"] is True
     assert manifest["env"] == {
@@ -47,7 +52,7 @@ def test_primary_writes_restricted_manifest_before_diagnostics_upload():
     assert upload["if"] == "always()"
     assert upload["uses"] == UPLOAD_ACTION
     assert upload["with"]["path"] == DIAGNOSTICS_PATH
-    assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["if-no-files-found"] == "ignore"
 
 
 def test_manifest_producer_emits_metadata_only_payload(tmp_path):
