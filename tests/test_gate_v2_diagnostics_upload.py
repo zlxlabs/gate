@@ -71,7 +71,6 @@ def test_manifest_producer_emits_metadata_only_payload(tmp_path):
     assert payload["directory_exists"] is False
     assert payload["file_count"] == 0
     assert payload["files"] == []
-
     (diagnostics_dir / "provider-diagnostics.json").write_bytes(b"{}")
     (diagnostics_dir / "provider.stderr").write_text("provider secret", encoding="utf-8")
     subprocess.run([sys.executable, "-c", program, str(diagnostics_dir), "5"], check=True)
