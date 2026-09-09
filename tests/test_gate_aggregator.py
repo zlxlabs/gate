@@ -2413,7 +2413,7 @@ _DIGEST_B = "b" * 64
 def _failing_scoped_audit(*, finding_id="p1", severity="major"):
     return _valid_scoped_primary_record(
         verdict="fail",
-        result={"findings": [{"id": finding_id, "severity": severity}]},
+        result={"findings": [{"id": finding_id, "severity": severity, "trigger_kind": "inferred"}]},
     )
 
 
@@ -2653,13 +2653,43 @@ def test_measured_p1_receipt_cannot_resolve_required_gate():
     assert outcome.resolved_findings == []
 
 
+@pytest.mark.parametrize("trigger_kind", ["inferred", "measured", "unmeasurable", None, "unknown"])
+def test_p1_receipt_trigger_kind_controls_gate_and_terminal_payload(trigger_kind):
+    audit = _failing_scoped_audit()
+    finding = audit["result"]["findings"][0]
+    if trigger_kind is None:
+        finding.pop("trigger_kind")
+    else:
+        finding["trigger_kind"] = trigger_kind
+    scope = _scope_for(audit)
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(_false_positive_receipt(scope),))
+    terminal = _terminal_for(outcome)
+    block = terminal["disposition_receipt_consumption"]
+    if trigger_kind == "inferred":
+        assert outcome.gate_result == "pass"
+        assert len(block["resolved"]) == 1
+    else:
+        assert outcome.gate_result == "fail"
+        assert block["resolved"] == []
+        assert block["rejected_reasons"] == {"finding_trigger_not_inferred": 1}
+
+
+def test_malformed_receipt_stays_blocked_in_terminal_payload():
+    audit = _failing_scoped_audit()
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=({"finding_id": "p1"},))
+    block = _terminal_for(outcome)["disposition_receipt_consumption"]
+    assert outcome.gate_result == "fail"
+    assert block["rejected_reasons"] == {"malformed_receipt": 1}
+    assert block["fail_closed"] is True
+
+
 def test_partial_disposition_leaves_remaining_finding_blocking():
     audit = _valid_scoped_primary_record(
         verdict="fail",
         result={
             "findings": [
                 {"id": "keep", "severity": "major"},
-                {"id": "drop", "severity": "blocker"},
+                {"id": "drop", "severity": "blocker", "trigger_kind": "inferred"},
             ]
         },
     )

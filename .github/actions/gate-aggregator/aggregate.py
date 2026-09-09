@@ -442,12 +442,12 @@ def build_terminal_envelope(
     return envelope
 
 
-def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
-    """Project only canonical P1 evidence; never infer severity from prose."""
+def _canonical_p1_findings(audit: dict[str, Any]) -> Optional[tuple[tuple[str, str, str | None], ...]]:
+    """Project canonical P1 ``(id, severity, trigger_kind)`` evidence."""
     result = audit.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
         return None
-    p1_ids: list[str] = []
+    p1_findings: list[tuple[str, str, str | None]] = []
     for finding in result["findings"]:
         if not isinstance(finding, dict):
             return None
@@ -459,8 +459,11 @@ def _canonical_p1_ids(audit: dict[str, Any]) -> Optional[tuple[str, ...]]:
         finding_id = finding.get("id")
         if not isinstance(finding_id, str) or not finding_id:
             return None
-        p1_ids.append(finding_id)
-    return tuple(sorted(p1_ids))
+        trigger_kind = finding.get("trigger_kind")
+        if trigger_kind is not None and not isinstance(trigger_kind, str):
+            trigger_kind = None
+        p1_findings.append((finding_id, severity, trigger_kind))
+    return tuple(sorted(p1_findings, key=lambda item: item[0]))
 
 
 _CONVERGENCE_SCOPE_FIELDS = (
@@ -796,14 +799,15 @@ def evaluate(
     # evaluator.  It runs only after the existing audit identity/job verdict
     # checks have succeeded; the old Outcome fields remain single-round facts.
     if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
-        p1_ids = _canonical_p1_ids(audit)
-        if p1_ids is None:
+        p1_findings = _canonical_p1_findings(audit)
+        if p1_findings is None:
             outcome.ok = False
             outcome.classification = "integration_error"
             outcome.reason_code = "audit_invalid"
             outcome.gate_result = "unavailable"
             outcome.problems.append("canonical finding severity is missing, unknown, or malformed — fail-closed")
             return outcome
+        p1_ids = tuple(item[0] for item in p1_findings)
         primary = _CONVERGENCE.CanonicalPrimary(
             schema_version=1,
             repository_id=identity.repository_id,
@@ -813,6 +817,7 @@ def evaluate(
             run_attempt=identity.run_attempt,
             verdict=audit["verdict"],
             p1_ids=p1_ids,
+            p1_findings=p1_findings,
         )
         processing_key = _CONVERGENCE.ProcessingKey(
             identity.repository_id, identity.pr, identity.run_id, identity.run_attempt,

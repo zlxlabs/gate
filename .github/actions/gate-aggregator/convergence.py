@@ -27,6 +27,7 @@ TERMINAL_DECISIONS = frozenset(
 )
 RECEIPT_KIND = "canonical_primary"
 DISPOSITION_KINDS = frozenset({"false-positive"})
+TRIGGER_KINDS = frozenset({"inferred", "measured", "unmeasurable"})
 DISPOSITION_RECEIPT_SCHEMA_VERSION = 2
 DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}"
 DISPOSITION_REASON_DISPLAY_MAX = 500
@@ -126,9 +127,9 @@ class RoundKey:
 class CanonicalPrimary:
     """The minimal canonical primary projection consumed by the reducer.
 
-    ``p1_ids`` is evidence from the current canonical audit.  The evaluator
-    never infers severity from finding text; a producer must have projected
-    only the frozen P1 severity set into this field.
+    ``p1_findings`` carries the canonical ``(id, severity, trigger_kind)``
+    tuple for each P1.  A disposition can consume only an ``inferred`` tuple;
+    missing or unknown trigger kinds remain blocking.
     """
 
     schema_version: int
@@ -139,6 +140,7 @@ class CanonicalPrimary:
     run_attempt: int
     verdict: str
     p1_ids: tuple[str, ...] = ()
+    p1_findings: tuple[tuple[str, str, str | None], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -150,6 +152,7 @@ class CanonicalPrimary:
             "run_attempt": self.run_attempt,
             "verdict": self.verdict,
             "p1_ids": list(self.p1_ids),
+            "p1_findings": [list(item) for item in self.p1_findings],
         }
 
 
@@ -247,6 +250,7 @@ class Receipt:
     audit_digest: str
     verdict: str
     p1_ids: tuple[str, ...] = ()
+    p1_findings: tuple[tuple[str, str, str | None], ...] = ()
     source_attempt: int | None = None
     artifact_id: str | None = None
     artifact_name: str | None = None
@@ -268,6 +272,7 @@ class Receipt:
             "audit_digest": self.audit_digest,
             "verdict": self.verdict,
             "p1_ids": list(self.p1_ids),
+            "p1_findings": [list(item) for item in self.p1_findings],
             "source_attempt": self.source_attempt,
             "artifact_id": self.artifact_id,
             "artifact_name": self.artifact_name,
@@ -391,7 +396,7 @@ CANONICAL_AUDIT_DIGEST_SCOPE_FIELDS = (
     "reusable_workflow_sha",
     "tier",
 )
-CANONICAL_AUDIT_DIGEST_FINDING_FIELDS = ("id", "severity", "file", "line")
+CANONICAL_AUDIT_DIGEST_FINDING_FIELDS = ("id", "severity", "trigger_kind", "file", "line")
 
 
 def _canonical_finding_sort_key(item: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -549,6 +554,15 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_target_not_exact")
     if receipt.finding_id not in primary.p1_ids:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_not_current_p1")
+    finding = next(
+        (item for item in primary.p1_findings if item[0] == receipt.finding_id),
+        None,
+    )
+    if finding is None or finding[1] not in P1_SEVERITIES or finding[2] != "inferred":
+        return _disposition_status(
+            receipt, valid=False, active=False, consumable=False,
+            reason="finding_trigger_not_inferred",
+        )
     return _disposition_status(receipt, valid=True, active=True, consumable=True, reason="active_false_positive")
 
 
@@ -578,6 +592,7 @@ _DISPOSITION_FAIL_CLOSED_REASONS = frozenset(
         "pr_mismatch", "epoch_mismatch_stale", "head_sha_mismatch",
         "audit_digest_mismatch",
         "finding_target_not_exact", "finding_not_current_p1",
+        "finding_trigger_not_inferred",
         "malformed_primary",
     }
 )
@@ -998,6 +1013,24 @@ def _primary_errors(*, scope: Scope, primary: CanonicalPrimary) -> list[str]:
             if finding_id in seen:
                 errors.append(f"primary p1 finding id repeated: {finding_id!r}")
             seen.add(finding_id)
+    if not isinstance(primary.p1_findings, tuple):
+        errors.append("primary p1_findings must be an immutable tuple")
+    elif primary.p1_findings:
+        finding_ids: list[str] = []
+        for finding in primary.p1_findings:
+            if (
+                not isinstance(finding, tuple)
+                or len(finding) != 3
+                or not isinstance(finding[0], str)
+                or not finding[0]
+                or finding[1] not in P1_SEVERITIES
+                or (finding[2] is not None and not isinstance(finding[2], str))
+            ):
+                errors.append("primary p1_findings must contain (id, P1 severity, trigger_kind)")
+                continue
+            finding_ids.append(finding[0])
+        if tuple(finding_ids) != primary.p1_ids:
+            errors.append("primary p1_findings ids must match p1_ids")
     return errors
 
 
@@ -1427,6 +1460,7 @@ def receipt_for_round(
         audit_digest=audit_digest,
         verdict=primary.verdict,
         p1_ids=primary.p1_ids,
+        p1_findings=primary.p1_findings,
         source_attempt=primary.run_attempt if source_attempt is None else source_attempt,
         artifact_id=artifact_id,
         artifact_name=artifact_name,
@@ -1446,6 +1480,7 @@ def _receipt_round_fingerprint(receipt: Receipt) -> str:
             "audit_digest": receipt.audit_digest,
             "verdict": receipt.verdict,
             "p1_ids": list(receipt.p1_ids),
+            "p1_findings": [list(item) for item in receipt.p1_findings],
             "source_attempt": receipt.source_attempt,
             "artifact_id": receipt.artifact_id,
             "artifact_name": receipt.artifact_name,
@@ -1490,6 +1525,23 @@ def validate_receipt(receipt: Receipt, scope: Scope) -> None:
         errors.append(f"receipt verdict {receipt.verdict!r} is not canonical")
     if not isinstance(receipt.p1_ids, tuple) or any(not _nonempty_text(item) for item in receipt.p1_ids):
         errors.append("receipt p1_ids must be an immutable tuple of non-empty strings")
+    if not isinstance(receipt.p1_findings, tuple):
+        errors.append("receipt p1_findings must be an immutable tuple")
+    elif receipt.p1_findings:
+        finding_ids: list[str] = []
+        for finding in receipt.p1_findings:
+            if (
+                not isinstance(finding, tuple)
+                or len(finding) != 3
+                or not _nonempty_text(finding[0])
+                or finding[1] not in P1_SEVERITIES
+                or (finding[2] is not None and not isinstance(finding[2], str))
+            ):
+                errors.append("receipt p1_findings must contain (id, P1 severity, trigger_kind)")
+                continue
+            finding_ids.append(finding[0])
+        if tuple(finding_ids) != receipt.p1_ids:
+            errors.append("receipt p1_findings ids must match p1_ids")
     if not isinstance(receipt.processing_key, ProcessingKey):
         errors.append("receipt processing_key has invalid type")
     else:
@@ -1616,6 +1668,7 @@ def replay_receipts(*, scope: Scope, receipts: Sequence[Receipt]) -> Convergence
             run_attempt=receipt.run_attempt,
             verdict=receipt.verdict,
             p1_ids=receipt.p1_ids,
+            p1_findings=receipt.p1_findings,
         )
         result = evaluate_round(
             state=state,

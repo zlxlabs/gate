@@ -68,6 +68,7 @@ def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="a", verdict="pass"
         audit_digest=digest,
         verdict=verdict,
         p1_ids=tuple(p1_ids),
+        p1_findings=tuple((finding_id, "major", "inferred") for finding_id in p1_ids),
         source_attempt=run_attempt if source_attempt is None else source_attempt,
         artifact_id=artifact,
         reported_decision=reported,
@@ -102,6 +103,7 @@ def _receipt_from_payload(payload):
         audit_digest=payload["audit_digest"],
         verdict=payload["verdict"],
         p1_ids=tuple(payload["p1_ids"]),
+        p1_findings=tuple(tuple(item) for item in payload.get("p1_findings", ())),
         source_attempt=payload["source_attempt"],
         artifact_id=payload["artifact_id"],
         artifact_name=payload["artifact_name"],
@@ -174,7 +176,7 @@ def test_producer_payload_preserves_all_attempt_guards(tmp_path):
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "head_sha": SCOPE.head_sha, "run_id": 77,
         "run_attempt": 1, "pr": 42, "verdict": "pass", "reviewer": "codex",
-        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
     }
     audit_bytes = json.dumps(audit, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     audit_path = tmp_path / "primary-audit.json"
@@ -229,7 +231,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
         "tier": SCOPE.tier,
         "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
-        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
     }
     audit_bytes = json.dumps(audit, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
     audit_path = tmp_path / "canonical-audit.json"
@@ -276,6 +278,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     primary = CONV.CanonicalPrimary(
         schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
         head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
+        p1_findings=(("p1", "major", "inferred"),),
     )
     status = CONV.validate_disposition_receipt(
         parsed, scope=SCOPE, primary=primary, audit_digest=digest,
@@ -314,7 +317,7 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
         "tier": SCOPE.tier,
         "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
-        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
     }
     audit_path = tmp_path / "canonical-audit.json"
     audit_path.write_bytes(json.dumps(audit, indent=2).encode("utf-8") + b"\n")
@@ -344,6 +347,7 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
     primary = CONV.CanonicalPrimary(
         schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
         head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
+        p1_findings=(("p1", "major", "inferred"),),
     )
     status = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary,
@@ -374,7 +378,7 @@ def test_disposition_producer_rejects_malformed_auth_fields(tmp_path, override, 
         "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
         "tier": SCOPE.tier,
         "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
-        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
     }
     audit_path = tmp_path / "audit.json"
     audit_path.write_text(json.dumps(audit, sort_keys=True))
@@ -398,7 +402,10 @@ def test_disposition_producer_rejects_malformed_auth_fields(tmp_path, override, 
     assert needle in failed.stderr
 
 
-def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="locked upstream behavior"):
+def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="locked upstream behavior", trigger_kind="inferred"):
+    finding = {"id": "p1", "severity": "major"}
+    if trigger_kind is not None:
+        finding["trigger_kind"] = trigger_kind
     audit = {
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
@@ -407,7 +414,7 @@ def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="lock
         "tier": SCOPE.tier,
         "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
-        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+        "result": {"findings": [finding]},
     }
     audit_path = tmp_path / "canonical-audit.json"
     audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
@@ -448,8 +455,33 @@ def test_disposition_producer_reason_change_still_conflicts(tmp_path):
     assert "immutable artifact conflict" in second.stderr
 
 
+@pytest.mark.parametrize("trigger_kind", ["measured", "unmeasurable", None, "unknown"])
+def test_disposition_producer_rejects_non_inferred_trigger_kind(tmp_path, trigger_kind):
+    argv, env = _p1_issue_argv(tmp_path, trigger_kind=trigger_kind)
+    failed = subprocess.run(argv, capture_output=True, text=True, env=env)
+    assert failed.returncode == 1
+    assert "finding_id must identify an inferred P1 finding" in failed.stderr
+
+
+def test_convergence_receipt_bytes_preserve_trigger_kind_for_replay():
+    audit = _scoped_audit(verdict="fail")
+    audit["result"]["findings"] = [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]
+    identity = AGG.Identity(123, SCOPE.head_sha, 77, 1, 42)
+    digest = CONV.canonical_audit_digest(audit)
+    outcome = AGG.evaluate(
+        quality_result="success", primary_result="failure", runner="self",
+        is_draft=False, review_expected=True, audit=audit, audit_error=None,
+        identity=identity, audit_source_attempt=1, audit_artifact_name="primary-audit-v2-1",
+        scope=SCOPE, audit_digest=digest,
+    )
+    payload = outcome.convergence_receipt.as_dict()
+    assert payload["p1_findings"] == [["p1", "major", "inferred"]]
+    replayed = CONV.replay_receipts(scope=SCOPE, receipts=(_receipt_from_payload(payload),))
+    assert (replayed.clean_streak, replayed.eligible_rounds) == (0, 1)
+
+
 def _failing_runtime_audit(*, duration_ms, run_attempt, findings=None):
-    findings = findings or [{"id": "p1", "severity": "major", "file": "lock.py", "line": 12}]
+    findings = findings or [{"id": "p1", "severity": "major", "trigger_kind": "inferred", "file": "lock.py", "line": 12}]
     return {
         "kind": "primary_review", "schema_version": 1,
         "repository_id": SCOPE.repository_id, "pr": SCOPE.pr_number,
@@ -497,7 +529,7 @@ def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_pat
     assert outcome.resolved_findings
     other = _failing_runtime_audit(
         duration_ms=99, run_attempt=4,
-        findings=[{"id": "p2", "severity": "major", "file": "lock.py", "line": 12}],
+        findings=[{"id": "p2", "severity": "major", "trigger_kind": "inferred", "file": "lock.py", "line": 12}],
     )
     mismatched = AGG.evaluate(
         quality_result="success", primary_result="failure", runner="self",
@@ -543,7 +575,7 @@ def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "head_sha": SCOPE.head_sha, "run_id": 77,
         "run_attempt": 1, "pr": 42, "verdict": "pass", "reviewer": "codex",
-        "result": {"findings": [{"id": "p1", "severity": "major"}, {"id": "p2", "severity": "minor"}]},
+        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}, {"id": "p2", "severity": "minor"}]},
     }
     raw = json.dumps(audit, indent=2).encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()
