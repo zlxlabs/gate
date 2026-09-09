@@ -12,3 +12,5 @@
   receipt 字节/replay 与 digest 绑定覆盖。
 - 收尾验证：`475 passed in 16.56s`；`python3 scripts/check_pinned_uses.py` 输出 `OK`。
 - 实现提交：`2f4c84c`；后续仅补充了 malformed `p1_findings` 的 fail-closed 类型守卫，待提交。
+- 全量首次运行：`855 passed, 4 failed`；4 项均来自 `tests/test_review_ledger.py` 共用 producer
+  fixture 缺失 `trigger_kind`，不是生产逻辑失败。已将该 fixture 明确标为 `inferred`，保持原测试意图。

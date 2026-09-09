@@ -1638,7 +1638,7 @@ def _producer_terminal(*, receipts=(), run_attempt=1):
         "tier": "personal",
         "caller_sha": "c" * 40,
         "reusable_workflow_sha": "w" * 40,
-        "result": {"findings": [{"id": "p1", "severity": "major"}]},
+        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
     }
     scope, missing = agg._convergence_scope_from_audit(audit, identity)
     assert not missing and scope is not None
