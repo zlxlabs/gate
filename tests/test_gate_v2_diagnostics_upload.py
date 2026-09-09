@@ -48,7 +48,6 @@ def test_primary_writes_restricted_manifest_before_diagnostics_upload():
     assert upload["uses"] == UPLOAD_ACTION
     assert upload["with"]["path"] == DIAGNOSTICS_PATH
     assert upload["with"]["if-no-files-found"] == "error"
-    assert "directory_exists/file_count" in WORKFLOW.read_text(encoding="utf-8")
 
 
 def test_manifest_producer_emits_metadata_only_payload(tmp_path):
@@ -56,7 +55,9 @@ def test_manifest_producer_emits_metadata_only_payload(tmp_path):
         step for step in _primary_steps()
         if step.get("name") == "Write primary review diagnostics manifest"
     )
-    program = manifest_step["run"].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    run_script = manifest_step["run"]
+    assert "<<'PY'\n" in run_script and "\nPY\n" in run_script
+    program = run_script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
     diagnostics_dir = tmp_path / "primary-review-diagnostics"
 
     subprocess.run([sys.executable, "-c", program, str(diagnostics_dir), "4"], check=True)

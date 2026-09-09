@@ -564,16 +564,18 @@ jobs:
           retention-days: 30
 
       - name: Write primary review diagnostics manifest
-        # This best-effort finalizer must still run after a failed or cancelled
-        # review-primary. It records metadata only; provider output bodies and
-        # stderr are deliberately never read into the manifest.
+        # Best-effort finalizer for failed/cancelled review-primary; it records
+        # metadata only and never reads provider bodies or stderr.
         if: always()
         continue-on-error: true
         env:
           DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
           RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
         run: |
           set -euo pipefail
+          # The inline warning covers generator failure; continue-on-error also
+          # keeps an unexpected finalizer error from changing primary's result.
           if ! python3 - "$DIAGNOSTICS_DIR" "$RUN_ATTEMPT" <<'PY'
           import json
           import os
@@ -583,11 +585,7 @@ jobs:
           diagnostics_dir = Path(sys.argv[1])
           attempt = int(sys.argv[2])
           manifest_name = "manifest.json"
-          allowed_names = {
-              "primary-review-diagnostics.json",
-              "provider-diagnostics.json",
-              "provider-status.json",
-          }
+          allowed_names = {"primary-review-diagnostics.json", "provider-diagnostics.json", "provider-status.json"}
           directory_exists = diagnostics_dir.is_dir()
           files = []
           if directory_exists:
@@ -621,10 +619,9 @@ jobs:
           fi
 
       - name: Upload primary review diagnostics
-        # The finalizer creates manifest.json even when the producer directory
-        # was absent or empty. `error` therefore makes a missing manifest mean
-        # finalizer failure, while the manifest's directory_exists/file_count
-        # fields preserve the producer's explicit no-diagnostics state.
+        # The finalizer creates manifest.json for an absent/empty producer
+        # directory; `error` makes a missing manifest mean finalizer failure,
+        # while its fields preserve the explicit no-diagnostics state.
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
