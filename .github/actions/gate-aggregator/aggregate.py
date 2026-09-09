@@ -1002,6 +1002,7 @@ def _action_sentence(
 def render_summary(
     outcome: Outcome, *, repository: Optional[str] = None, identity: Optional[Identity] = None,
     is_draft: Optional[bool] = None, runner: Optional[str] = None, primary_audit: Any = None,
+    primary_result: Optional[str] = None,
 ) -> str:
     lines = ["### Required Gate v2 — aggregate verdict", ""]
     # Top line shows the four-state gate_result (pass/fail/skipped/unavailable)
@@ -1025,7 +1026,16 @@ def render_summary(
             f"Terminal state: classification=`{outcome.classification}`, "
             f"reason_code=`{outcome.reason_code}`, gate_result=`{outcome.gate_result}`"
         )
-    explanation = REASON_CODE_EXPLANATIONS.get(outcome.reason_code or "")
+    if primary_result == "failure" and outcome.reason_code in (
+        "audit_missing", "audit_invalid", "audit_source_mismatch",
+    ):
+        explanation = (
+            "The primary job failed (usually because of a reviewer rejection), but the canonical "
+            "audit artifact could NOT be read, so the result cannot be confirmed programmatically "
+            "— check the primary job logs for the verdict line."
+        )
+    else:
+        explanation = REASON_CODE_EXPLANATIONS.get(outcome.reason_code or "")
     if explanation:
         lines.append("")
         lines.append(explanation)
@@ -1050,10 +1060,18 @@ def render_summary(
             "**Synthetic audit generated** (no valid canonical primary audit was available for this run):"
         )
         lines.append("")
-        lines.append(
-            '`"verdict": null` below means the primary conclusion could not be read — '
-            "it is NOT a reviewer rejection. Check the primary job logs for the real cause."
-        )
+        if primary_result == "failure":
+            lines.append(
+                '`"verdict": null` below means the primary job failed (usually because of a '
+                "reviewer rejection), but the canonical audit artifact could NOT be read, so the "
+                "result cannot be confirmed programmatically. Check the primary job logs for the "
+                "verdict line."
+            )
+        else:
+            lines.append(
+                '`"verdict": null` below means the primary conclusion could not be read — '
+                "it is NOT a reviewer rejection. Check the primary job logs for the real cause."
+            )
         lines.append("")
         lines.append("```json")
         lines.append(json.dumps(outcome.synthetic_audit, ensure_ascii=False, indent=2))
@@ -2128,7 +2146,7 @@ def _finish(
     summary = scrub_for_publish(
         render_summary(
             outcome, repository=repository, identity=identity, is_draft=is_draft,
-            runner=runner, primary_audit=primary_audit,
+            runner=runner, primary_audit=primary_audit, primary_result=primary_result,
         ),
         runtime_values=runtime_values_from_environment(),
     )
