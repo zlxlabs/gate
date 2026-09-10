@@ -34,6 +34,15 @@ AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "agg
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
 RUNNER_GUARD = "inputs.runner == 'self'"
+CLASSIFY_GUARD = "needs.classify_pr_paths.outputs.review_expected != 'false'"
+CLASSIFY_JOB_ID = "classify_pr_paths"
+CLASSIFY_SCRIPT = "_gate-classify-src/scripts/classify_pr_reviewable_paths.py"
+REVIEW_EXPECTED_IF = (
+    "${{ github.event.pull_request.draft != true && "
+    "github.event.pull_request.head.repo.full_name == github.repository && "
+    "inputs.runner == 'self' && "
+    "needs.classify_pr_paths.outputs.review_expected != 'false' }}"
+)
 ARTIFACT_NAME_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -323,8 +332,108 @@ def test_control_runner_input_defaults_to_follow_runner():
 def test_all_required_jobs_present():
     raw, _ = _load_workflow()
     assert set(raw["jobs"].keys()) == {
-        "quality", "primary", "resolve_advisory", "ocr", "gate", "ledger", "notify",
+        "classify_pr_paths", "quality", "primary", "resolve_advisory", "ocr", "gate", "ledger", "notify",
     }
+
+
+def test_classify_job_always_runs_and_exposes_review_expected():
+    raw, _ = _load_workflow()
+    job = raw["jobs"][CLASSIFY_JOB_ID]
+    assert job.get("if") == "always()"
+    assert "needs" not in job
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["outputs"]["review_expected"] == "${{ steps.classify.outputs.review_expected }}"
+    step = next(s for s in job["steps"] if s.get("id") == "classify")
+    run = step["run"]
+    assert CLASSIFY_SCRIPT in run
+    assert 'echo "review_expected=true" >> "$GITHUB_OUTPUT"' in run
+    assert "review_expected=false" not in run
+    assert "exit 0" in run
+    assert "compare/" in run
+    assert "pulls/" not in run
+    assert step["env"]["BASE_SHA"] == "${{ github.event.pull_request.base.sha }}"
+    assert step["env"]["HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+    assert "== 'true'" not in str(raw["jobs"]["primary"].get("if", ""))
+    assert CLASSIFY_GUARD in str(raw["jobs"]["primary"].get("if", ""))
+
+
+def test_classify_job_checks_out_this_workflow_commit():
+    raw, _ = _load_workflow()
+    checkout = next(
+        s for s in raw["jobs"][CLASSIFY_JOB_ID]["steps"]
+        if s.get("name") == "Checkout classify script at this workflow's own commit"
+    )
+    assert checkout["uses"] == CHECKOUT_ACTION
+    assert checkout["with"] == {
+        "repository": "${{ job.workflow_repository }}",
+        "ref": "${{ job.workflow_sha }}",
+        "path": "_gate-classify-src",
+    }
+
+
+def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_if():
+    raw, _ = _load_workflow()
+    primary_if = raw["jobs"]["primary"]["if"]
+    assert primary_if == REVIEW_EXPECTED_IF
+    assert raw["jobs"]["primary"]["needs"] == [CLASSIFY_JOB_ID]
+    assert raw["jobs"]["resolve_advisory"]["needs"] == [CLASSIFY_JOB_ID]
+    assert raw["jobs"]["resolve_advisory"]["if"] == primary_if
+    aggregate = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
+    publish = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Publish gate status panel")
+    resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
+    download_audit = next(
+        s for s in raw["jobs"]["ledger"]["steps"]
+        if s.get("name") == "Download canonical primary audit for ledger"
+    )
+    build = next(
+        s for s in raw["jobs"]["ledger"]["steps"]
+        if s.get("name") == "Build v2 review effectiveness ledger"
+    )
+    copies = [
+        aggregate["env"]["REVIEW_EXPECTED"],
+        publish["env"]["REVIEW_EXPECTED"],
+        resolver["env"]["REVIEW_EXPECTED"],
+        download_audit["if"],
+        build["with"]["codex-expected"],
+    ]
+    for copy in copies:
+        assert copy == primary_if
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    assert workflow_text.count(CLASSIFY_GUARD) == 7
+    assert "outputs.review_expected == 'true'" not in workflow_text
+
+
+def test_classify_listing_failure_does_not_output_false(tmp_path):
+    raw, _ = _load_workflow()
+    step = next(s for s in raw["jobs"][CLASSIFY_JOB_ID]["steps"] if s.get("id") == "classify")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text("#!/bin/bash\necho gh-failed >&2\nexit 42\n", encoding="utf-8")
+    gh.chmod(0o755)
+    output = tmp_path / "github_output"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "GITHUB_OUTPUT": str(output),
+        "GH_TOKEN": "x",
+        "REPOSITORY": "zlxlabs/gate",
+        "BASE_SHA": "0" * 40,
+        "HEAD_SHA": "a" * 40,
+    }
+    proc = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    text = output.read_text(encoding="utf-8") if output.is_file() else ""
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "review_expected=false" not in text
+    assert "review_expected=true" in text
+    assert "exit=42" in proc.stdout + proc.stderr + text or "listing PR files failed" in proc.stdout + proc.stderr
 
 
 def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
@@ -391,7 +500,7 @@ def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
     assert "no matching job for JOB_NAME_SUFFIX=" in run
     assert "timeout --foreground" in run
     assert "${{ matrix.reviewer }}" not in run
-    assert raw["jobs"]["gate"]["needs"] == ["quality", "primary"]
+    assert raw["jobs"]["gate"]["needs"] == ["quality", "primary", "classify_pr_paths"]
 
 
 def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
@@ -637,7 +746,9 @@ def test_gate_job_id_is_literally_gate_and_runs_always():
     gate_job = raw["jobs"]["gate"]
     assert str(gate_job.get("if", "")) == "always()"
     needs = gate_job.get("needs")
-    assert set(needs if isinstance(needs, list) else [needs]) == {"quality", "primary"}
+    assert set(needs if isinstance(needs, list) else [needs]) == {
+        "quality", "primary", "classify_pr_paths",
+    }
 
 
 def test_gate_and_notify_runs_on_use_the_same_guarded_control_plane_route():
@@ -799,7 +910,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     build_index = next(i for i, step in enumerate(steps) if step.get("name") == "Build v2 review effectiveness ledger")
     upload_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload v2 review effectiveness ledger")
 
-    assert ledger["needs"] == ["quality", "primary", "gate"]
+    assert ledger["needs"] == ["quality", "primary", "gate", "classify_pr_paths"]
     assert ledger["if"] == "always()"
     assert not any(step.get("name") == "Build v2 review effectiveness ledger" for step in gate_steps)
     assert not any(step.get("name") == "Upload v2 review effectiveness ledger" for step in gate_steps)
@@ -869,9 +980,7 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
     resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
     assert resolver["if"] == "always()"
     assert resolver["env"]["CURRENT_ATTEMPT"] == "${{ github.run_attempt }}"
-    assert resolver["env"]["REVIEW_EXPECTED"] == (
-        "${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}"
-    )
+    assert resolver["env"]["REVIEW_EXPECTED"] == raw["jobs"]["primary"]["if"]
     run = resolver["run"]
     for marker in (
         "--paginate", "expired", "<= current",
@@ -1318,7 +1427,7 @@ def test_gate_job_review_expected_matches_primary_jobs_own_condition():
     # short-circuit semantics).
     raw, _ = _load_workflow()
     primary_if = str(raw["jobs"]["primary"].get("if", ""))
-    for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD):
+    for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD, CLASSIFY_GUARD):
         assert guard in primary_if, f"primary job if is missing {guard!r}"
 
     aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
@@ -1410,6 +1519,8 @@ def test_primary_job_if_gates_draft_fork_and_runner():
     assert DRAFT_GUARD in primary_if
     assert FORK_GUARD in primary_if
     assert RUNNER_GUARD in primary_if
+    assert CLASSIFY_GUARD in primary_if
+    assert primary_if == REVIEW_EXPECTED_IF
 
 
 def test_primary_runs_on_has_fork_guard_and_hosted_fallback():
@@ -1443,7 +1554,7 @@ def test_non_quality_jobs_do_not_use_ci_pool_label():
     # uncredentialed CI pool. Assert on parsed fromJSON labels, not bare
     # substring match (would false-positive on words containing "ci").
     raw, _ = _load_workflow()
-    for job_name in ("gate", "ledger", "notify", "primary", "resolve_advisory", "ocr"):
+    for job_name in ("gate", "ledger", "notify", "primary", "resolve_advisory", "ocr", "classify_pr_paths"):
         runs_on = str(raw["jobs"][job_name]["runs-on"])
         for labels in _fromjson_label_sets(runs_on):
             assert "ci" not in labels, (

@@ -22,6 +22,10 @@
 # templates/caller-gate-shadow-v2.yml) — no existing caller references this file.
 #
 # Job layout (see plan's "Shadow Calibration" state machine):
+#   classify_pr_paths — same script and skip semantics as gate-v2.yml: list PR
+#              files, output review_expected, always run. resolve's `if:` is
+#              byte-identical to gate-v2.yml's primary `if:` (includes the
+#              classify output).
 #   resolve  — resolves this repo's `review_policy.*.shadow` reviewer list (via
 #              gate-hub's resolve_policy.py, the SAME resolver review-shadow itself uses
 #              internally — this job re-runs it standalone purely to get the list BEFORE
@@ -124,14 +128,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── classify_pr_paths (ledger-only PRs skip shadow resolve) ─────────────
+  classify_pr_paths:
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      review_expected: ${{ steps.classify.outputs.review_expected }}
+    steps:
+      - name: Checkout classify script at this workflow's own commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-classify-src
+
+      - name: Classify whether model review is expected
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "review_expected=true" >> "$GITHUB_OUTPUT"
+          if [ -z "${BASE_SHA}" ] || [ -z "${HEAD_SHA}" ]; then
+            echo "::notice::classify_pr_paths: no compare shas; review remains expected"
+            exit 0
+          fi
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          compare_api="repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}"
+          rc=0
+          timeout --foreground 30s gh api "$compare_api" > "$listing" 2>/dev/null || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::notice::classify_pr_paths: listing PR files failed (exit=${rc}); review remains expected"
+            exit 0
+          fi
+          if ! python3 "_gate-classify-src/scripts/classify_pr_reviewable_paths.py" \
+            --github-output "$GITHUB_OUTPUT" \
+            "$listing"
+          then
+            echo "::notice::classify_pr_paths: classifier failed; review remains expected"
+            echo "review_expected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
   # ── resolve ──────────────────────────────────────────────────────────────
   resolve:
     # Byte-identical to gate-v2.yml's `primary` job's `if:` (tests/test_gate_shadow_v2_contract.py
     # pins this equality) — deliberately the PRIMARY-shaped expression (draft/fork/runner
-    # only), not quality's (which additionally allows non-pull_request events): Shadow
-    # Calibration only ever triggers on `pull_request` (see the caller template), so the
-    # non-pull_request carve-out quality's expression needs is not applicable here.
-    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+    # plus classify_pr_paths != false), not quality's (which additionally allows
+    # non-pull_request events): Shadow Calibration only ever triggers on
+    # `pull_request` (see the caller template), so the non-pull_request carve-out
+    # quality's expression needs is not applicable here.
+    needs: [classify_pr_paths]
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
     # Byte-identical to gate-v2.yml's `primary` job's `runs-on:` ternary (same defense-in-depth
     # rationale as that job's own comment: even if the `if:` above were ever weakened, a
     # fork PR still can never land on the self-hosted pool). resolve_policy.py and
