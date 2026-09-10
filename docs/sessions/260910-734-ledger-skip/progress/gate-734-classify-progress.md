@@ -34,3 +34,10 @@
 - 本段结论：分类步骤改为 `repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}`（event 的 base/head sha），不再打 `pulls/{n}/files`。分类器同时接受 files 数组与 compare `{files, truncated}`；`truncated: true` 与 `--has-next-page` 同义，必须仍要审。契约测试锁死两份工作流 classify run 含 `compare/`、不含 `pulls/`。Verify-Command 四文件 473 passed。
 - 关键决策与已否决方案：不给影子 caller 加 `pull-requests`（禁改 caller，且现网 caller 不会一起更新）。用 `contents: read` 即可的 compare 接口让影子腿在现网也能 SKIPPED。
 - 下一步唯一动作：红验（把 compare 路径改回 pulls/files，契约测试必须断言失败）后全量 pytest。
+
+## 2026-09-10 compare 红验与全量
+
+- 当前阶段：repairing / 收口
+- 本段结论：把 `gate-v2.yml` 分类 URL 改回 `pulls/${PR_NUMBER}/files` 后，`test_classify_job_always_runs_and_exposes_review_expected` 以 `assert 'compare/' in run` 转红（AssertionError），影子契约因两份 run 不再同文也转红。只还原该一行。全量 `python -m pytest -q` 888 passed；`check_pinned_uses.py` OK。durations 回填 1.20s。
+- 关键决策与已否决方案：无新决策。
+- 下一步唯一动作：停在 `card/gate-734-classify` 等主脑验收；合并必须用 merge commit，禁 squash。
