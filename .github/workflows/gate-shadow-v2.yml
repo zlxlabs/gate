@@ -148,22 +148,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           echo "review_expected=true" >> "$GITHUB_OUTPUT"
-          case "$PR_NUMBER" in
-            [1-9]|[1-9][0-9]*) ;;
-            *)
-              echo "::notice::classify_pr_paths: no pull request number; review remains expected"
-              exit 0
-              ;;
-          esac
+          if [ -z "${BASE_SHA}" ] || [ -z "${HEAD_SHA}" ]; then
+            echo "::notice::classify_pr_paths: no compare shas; review remains expected"
+            exit 0
+          fi
           listing="$(mktemp)"
           trap 'rm -f "$listing"' EXIT
-          files_api="repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100"
+          compare_api="repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}"
           rc=0
-          timeout --foreground 30s gh api --paginate "$files_api" > "$listing" 2>/dev/null || rc=$?
+          timeout --foreground 30s gh api "$compare_api" > "$listing" 2>/dev/null || rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "::notice::classify_pr_paths: listing PR files failed (exit=${rc}); review remains expected"
             exit 0

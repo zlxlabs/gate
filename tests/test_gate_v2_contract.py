@@ -349,6 +349,10 @@ def test_classify_job_always_runs_and_exposes_review_expected():
     assert 'echo "review_expected=true" >> "$GITHUB_OUTPUT"' in run
     assert "review_expected=false" not in run
     assert "exit 0" in run
+    assert "compare/" in run
+    assert "pulls/" not in run
+    assert step["env"]["BASE_SHA"] == "${{ github.event.pull_request.base.sha }}"
+    assert step["env"]["HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
     assert "== 'true'" not in str(raw["jobs"]["primary"].get("if", ""))
     assert CLASSIFY_GUARD in str(raw["jobs"]["primary"].get("if", ""))
 
@@ -414,7 +418,8 @@ def test_classify_listing_failure_does_not_output_false(tmp_path):
         "GITHUB_OUTPUT": str(output),
         "GH_TOKEN": "x",
         "REPOSITORY": "zlxlabs/gate",
-        "PR_NUMBER": "201",
+        "BASE_SHA": "0" * 40,
+        "HEAD_SHA": "a" * 40,
     }
     proc = subprocess.run(
         ["bash", "-c", step["run"]],

@@ -27,3 +27,10 @@
 - 本段结论：`docs/sessions/260910-734-ledger-skip/design.md` 与 `/tmp/hub734-ledger-skip/design.md` 逐字节相同。全量 `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` 881 passed；`python3 scripts/check_pinned_uses.py` OK。`tests/pytest-test-durations.json` 回填分类器测试文件 0.77s。
 - 关键决策与已否决方案：durations 基线只记本卡新增测试文件（本仓原先没有该文件，也不做分片）。已否决项未重开。
 - 下一步唯一动作：停在 `card/gate-734-classify` 等主脑验收；合并必须用 merge commit，禁 squash。
+
+## 2026-09-10 分类改走 compare API
+
+- 当前阶段：repairing / 影子腿现网权限
+- 本段结论：分类步骤改为 `repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}`（event 的 base/head sha），不再打 `pulls/{n}/files`。分类器同时接受 files 数组与 compare `{files, truncated}`；`truncated: true` 与 `--has-next-page` 同义，必须仍要审。契约测试锁死两份工作流 classify run 含 `compare/`、不含 `pulls/`。Verify-Command 四文件 473 passed。
+- 关键决策与已否决方案：不给影子 caller 加 `pull-requests`（禁改 caller，且现网 caller 不会一起更新）。用 `contents: read` 即可的 compare 接口让影子腿在现网也能 SKIPPED。
+- 下一步唯一动作：红验（把 compare 路径改回 pulls/files，契约测试必须断言失败）后全量 pytest。

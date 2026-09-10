@@ -164,6 +164,10 @@ def test_shadow_classify_job_matches_required_gate_classifier():
     assert CLASSIFY_SCRIPT in shadow_classify["run"]
     assert 'echo "review_expected=true" >> "$GITHUB_OUTPUT"' in shadow_classify["run"]
     assert "review_expected=false" not in shadow_classify["run"]
+    assert "compare/" in shadow_classify["run"]
+    assert "pulls/" not in shadow_classify["run"]
+    assert shadow_classify["env"]["BASE_SHA"] == "${{ github.event.pull_request.base.sha }}"
+    assert shadow_classify["env"]["HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
     shadow_checkout = next(
         s for s in shadow_job["steps"]
         if s.get("name") == "Checkout classify script at this workflow's own commit"
