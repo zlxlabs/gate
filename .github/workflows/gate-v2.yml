@@ -16,17 +16,23 @@
 # templates/caller-gate-v2.yml) — no existing caller references this file.
 #
 # Job layout:
+#   classify_pr_paths — lists this PR's changed paths via the GitHub files
+#              API and outputs review_expected. Always runs (never skip on
+#              draft/fork/hosted). Only `false` skips model jobs; listing
+#              failures stay non-false (fail closed). ubuntu-latest so this
+#              cheap API job never waits on a self-hosted slot.
 #   quality  — lint / jscpd / dependency-cruiser / tests / PR-size preflight.
 #              Everything from legacy gate.yml's single job EXCEPT the model
 #              review itself. Runs on the same self-hosted/hosted pool legacy
 #              uses, with the same fork-PR → hosted-fallback guard.
 #   primary  — runs `review-primary` (gate-hub, already merged) when the PR is
-#              non-draft, same-repo (not a fork), and `runner: self`. Skips
-#              the WHOLE job otherwise (draft / fork / hosted-tier) — see the
+#              non-draft, same-repo (not a fork), `runner: self`, and
+#              classify_pr_paths did not output false. Skips the WHOLE job
+#              otherwise (draft / fork / hosted / ledger-only) — see the
 #              job's own comment for what's deliberately NOT wired up yet.
 #   resolve_advisory — resolves the registry's policy.advisory reviewer list
 #              before the OCR matrix is expanded. Skips with the same draft /
-#              fork / hosted guard as primary.
+#              fork / hosted / classify guard as primary.
 #   ocr      — runs one `review-shadow` advisory matrix leg per resolved
 #              policy.advisory reviewer and posts its non-empty comment artifact
 #              to the PR. It is never a dependency of the required gate.
@@ -109,6 +115,59 @@ permissions:
   pull-requests: write
 
 jobs:
+  # ── classify_pr_paths (ledger-only PRs skip model jobs) ─────────────────
+  classify_pr_paths:
+    # Must always run: a skipped classifier leaves outputs empty, and the
+    # model-job `if:` treats empty as not-false (still review). Failures
+    # inside the step also stay non-false. Never skip this job for draft /
+    # fork / hosted — those guards stay on primary / resolve_advisory.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      review_expected: ${{ steps.classify.outputs.review_expected }}
+    steps:
+      - name: Checkout classify script at this workflow's own commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-classify-src
+
+      - name: Classify whether model review is expected
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          echo "review_expected=true" >> "$GITHUB_OUTPUT"
+          case "$PR_NUMBER" in
+            [1-9]|[1-9][0-9]*) ;;
+            *)
+              echo "::notice::classify_pr_paths: no pull request number; review remains expected"
+              exit 0
+              ;;
+          esac
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          files_api="repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100"
+          rc=0
+          timeout --foreground 30s gh api --paginate "$files_api" > "$listing" 2>/dev/null || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::notice::classify_pr_paths: listing PR files failed (exit=${rc}); review remains expected"
+            exit 0
+          fi
+          if ! python3 "_gate-classify-src/scripts/classify_pr_reviewable_paths.py" \
+            --github-output "$GITHUB_OUTPUT" \
+            "$listing"
+          then
+            echo "::notice::classify_pr_paths: classifier failed; review remains expected"
+            echo "review_expected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
   # ── quality ──────────────────────────────────────────────────────────────
   # Every legacy gate.yml step EXCEPT the model review chain (see "primary"
   # below). Its ledger inputs are uploaded at the end of this job so the
@@ -406,12 +465,15 @@ jobs:
   primary:
     # Whole-job skip (clean `skipped` conclusion, not a same-verdict "success
     # with nothing done") whenever review should not run at all: draft PR,
-    # fork PR (head repo != this repo), or `runner: hosted`. The `gate`
-    # aggregator recomputes this SAME expression (as `REVIEW_EXPECTED`, see
-    # the `gate` job below) to decide whether a `skipped` result is an
-    # accepted no-op or a fail-closed anomaly — tests/test_gate_v2_contract.py
-    # pins that both copies stay identical.
-    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+    # fork PR (head repo != this repo), `runner: hosted`, or classify_pr_paths
+    # output false (exactly retro/acceptance-log.jsonl). The `gate` aggregator
+    # recomputes this SAME expression (as `REVIEW_EXPECTED`, see the `gate`
+    # job below) to decide whether a `skipped` result is an accepted no-op or
+    # a fail-closed anomaly — tests/test_gate_v2_contract.py pins that both
+    # copies stay identical. `!= 'false'` so a missing/empty classify output
+    # still reviews.
+    needs: [classify_pr_paths]
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
     # Defense in depth (belt-and-suspenders, same rationale as legacy's
     # runs-on ternary + per-step `if` pair — see legacy gate.yml's fork-PR
     # protection comment): even if the `if:` above were ever weakened by a
@@ -631,9 +693,10 @@ jobs:
 
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
   resolve_advisory:
-    # Same primary-shaped guard as `primary`: draft/fork/hosted callers must
-    # skip the advisory path before any reviewer job can be created.
-    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+    # Same primary-shaped guard as `primary`: draft/fork/hosted/ledger-only
+    # callers must skip the advisory path before any reviewer job can be created.
+    needs: [classify_pr_paths]
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
     # Same self-hosted/fork guard as `primary`. The hosted fallback is kept for
     # defense in depth, although this job-level `if:` prevents it in normal
     # execution and the registry is supplied by the self-hosted image.
@@ -996,7 +1059,7 @@ jobs:
 
   # ── gate (final aggregator — required check) ────────────────────────────
   gate:
-    needs: [quality, primary]
+    needs: [quality, primary, classify_pr_paths]
     # always(): an aggregator gated by the default `success()` would itself be
     # skipped whenever a dependency fails/is skipped, and GitHub treats a
     # skipped required job as a passing check — exactly the hole the plan's
@@ -1138,7 +1201,7 @@ jobs:
           # job's comment) — recomputed here because a skipped job's `if:`
           # condition is not itself exposed via `needs.*`, only its `result`.
           # tests/test_gate_v2_contract.py pins these two copies identical.
-          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
           REPOSITORY_ID: ${{ github.repository_id }}
           REPOSITORY: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -1205,7 +1268,7 @@ jobs:
           PRIMARY_RESULT: ${{ needs.primary.result }}
           RUNNER_MODE: ${{ inputs.runner }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
           REPOSITORY_ID: ${{ github.repository_id }}
           REPOSITORY: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -1244,7 +1307,7 @@ jobs:
 
   # ── ledger (independent persistence health check) ───────────────────────
   ledger:
-    needs: [quality, primary, gate]
+    needs: [quality, primary, gate, classify_pr_paths]
     if: always()
     concurrency:
       group: gate-required-v2-ledger-${{ github.repository_id }}
@@ -1270,7 +1333,7 @@ jobs:
           AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           TERMINAL_PREFIX: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
-          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
           QUALITY_LEDGER_INPUT_UPLOAD: ${{ needs.quality.outputs.ledger_input_upload }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           PRIMARY_RESULT: ${{ needs.primary.result }}
@@ -1490,7 +1553,7 @@ jobs:
           path: ${{ runner.temp }}/review-ledger-input
 
       - name: Download canonical primary audit for ledger
-        if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+        if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
@@ -1512,7 +1575,7 @@ jobs:
           install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
           terminal-path: ${{ runner.temp }}/gate-terminal/gate-terminal.json
           token: ${{ github.token }}
-          codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' }}
+          codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
           codex-waived: false
           expected-repository-id: ${{ github.repository_id }}
           expected-base-sha: ${{ github.event.pull_request.base.sha }}

@@ -35,6 +35,9 @@ REQUIRED_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
 RUNNER_GUARD = "inputs.runner == 'self'"
+CLASSIFY_GUARD = "needs.classify_pr_paths.outputs.review_expected != 'false'"
+CLASSIFY_JOB_ID = "classify_pr_paths"
+CLASSIFY_SCRIPT = "_gate-classify-src/scripts/classify_pr_reviewable_paths.py"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 EXPECTED_ACTION_REFS = {
@@ -90,7 +93,7 @@ def test_no_secrets_declared():
 
 def test_all_three_jobs_present_and_no_notify_job():
     raw, _ = _load_workflow()
-    assert set(raw["jobs"].keys()) == {"resolve", "shadow", "summary"}
+    assert set(raw["jobs"].keys()) == {"classify_pr_paths", "resolve", "shadow", "summary"}
     assert "notify" not in raw["jobs"]
 
 
@@ -134,7 +137,7 @@ def test_resolve_if_is_byte_identical_to_gate_v2_primary_if():
     required_raw = _load_required_workflow()
     resolve_if = str(raw["jobs"]["resolve"].get("if", ""))
     primary_if = str(required_raw["jobs"]["primary"].get("if", ""))
-    for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD):
+    for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD, CLASSIFY_GUARD):
         assert guard in resolve_if, f"resolve job if is missing {guard!r}"
     assert resolve_if == primary_if, (
         "gate-shadow-v2.yml's `resolve` job if: must be byte-for-byte identical to "
@@ -142,6 +145,37 @@ def test_resolve_if_is_byte_identical_to_gate_v2_primary_if():
         f"resolve if:  {resolve_if!r}\n"
         f"primary if:  {primary_if!r}"
     )
+    assert raw["jobs"]["resolve"]["needs"] == [CLASSIFY_JOB_ID]
+
+
+def test_shadow_classify_job_matches_required_gate_classifier():
+    raw, _ = _load_workflow()
+    required_raw = _load_required_workflow()
+    shadow_job = raw["jobs"][CLASSIFY_JOB_ID]
+    required_job = required_raw["jobs"][CLASSIFY_JOB_ID]
+    assert shadow_job.get("if") == "always()"
+    assert required_job.get("if") == "always()"
+    assert "needs" not in shadow_job
+    assert shadow_job["runs-on"] == required_job["runs-on"] == "ubuntu-latest"
+    assert shadow_job["outputs"] == required_job["outputs"]
+    shadow_classify = next(s for s in shadow_job["steps"] if s.get("id") == "classify")
+    required_classify = next(s for s in required_job["steps"] if s.get("id") == "classify")
+    assert shadow_classify["run"] == required_classify["run"]
+    assert CLASSIFY_SCRIPT in shadow_classify["run"]
+    assert 'echo "review_expected=true" >> "$GITHUB_OUTPUT"' in shadow_classify["run"]
+    assert "review_expected=false" not in shadow_classify["run"]
+    shadow_checkout = next(
+        s for s in shadow_job["steps"]
+        if s.get("name") == "Checkout classify script at this workflow's own commit"
+    )
+    required_checkout = next(
+        s for s in required_job["steps"]
+        if s.get("name") == "Checkout classify script at this workflow's own commit"
+    )
+    assert shadow_checkout["uses"] == required_checkout["uses"] == CHECKOUT_ACTION
+    assert shadow_checkout["with"] == required_checkout["with"]
+    assert shadow_checkout["with"]["repository"] == "${{ job.workflow_repository }}"
+    assert shadow_checkout["with"]["ref"] == "${{ job.workflow_sha }}"
 
 
 def test_resolve_runs_on_is_byte_identical_to_gate_v2_primary_runs_on():
