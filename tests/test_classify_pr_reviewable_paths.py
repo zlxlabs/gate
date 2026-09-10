@@ -139,6 +139,30 @@ def _review_expected_from_output(written: str, stdout: str) -> str:
             (),
             "true",
         ),
+        (
+            "compare_ledger_only",
+            {"url": "https://api.github.com/repos/zlxlabs/AiUsageMonitor/compare/aaa...bbb", "files": PR201_FILES_API, "truncated": False},
+            (),
+            "false",
+        ),
+        (
+            "compare_truncated_looks_like_ledger_only",
+            {"files": PR201_FILES_API, "truncated": True},
+            (),
+            "true",
+        ),
+        (
+            "compare_ledger_plus_other",
+            {"files": [_file_obj(LEDGER_PATH), _file_obj("scripts/gate-quality")], "truncated": False},
+            (),
+            "true",
+        ),
+        (
+            "compare_empty_files",
+            {"files": [], "truncated": False},
+            (),
+            "true",
+        ),
     ],
 )
 def test_table_driven_files_api_payloads(tmp_path, name, payload, extra_args, want):
@@ -158,6 +182,9 @@ def test_table_driven_files_api_payloads(tmp_path, name, payload, extra_args, wa
         ("missing_filename_field", json.dumps([{"sha": "abc", "status": "modified"}]), ()),
         ("filename_not_string", json.dumps([{"filename": 1}]), ()),
         ("mixed_page_and_object", json.dumps([{"filename": LEDGER_PATH}, "nope"]), ()),
+        ("compare_files_missing", json.dumps({"truncated": False, "filename": LEDGER_PATH}), ()),
+        ("compare_files_not_array", json.dumps({"files": {"filename": LEDGER_PATH}, "truncated": False}), ()),
+        ("compare_truncated_not_bool", json.dumps({"files": PR201_FILES_API, "truncated": "true"}), ()),
     ],
 )
 def test_unusable_payloads_are_not_false(tmp_path, name, payload_text, extra_args):
