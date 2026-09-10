@@ -20,3 +20,10 @@
 - 本段结论：`classify_pr_paths` 已接入两份可复用工作流。job `if: always()`、`runs-on: ubuntu-latest`、步骤预写 `review_expected=true` 且失败仍 exit 0。`primary.if` / 影子 `resolve.if` / 三处 `REVIEW_EXPECTED` / ledger 下载 if / `codex-expected` 共 8 处同文，子句为 `needs.classify_pr_paths.outputs.review_expected != 'false'`。`gate.needs` 与 `ledger.needs` 已纳入分类 job。Verify-Command 四文件 466 passed。
 - 关键决策与已否决方案：分类跑 ubuntu-latest（不占自建 codex 槽，fork/hosted 也能列出文件）。不给影子 callee 加 `pull-requests: read`——caller 模板禁止改，交集仍无该权限；403 走 fail-closed 仍要审（报告里点明与「影子也 SKIPPED」目标的缺口）。不新增 reason_code。
 - 下一步唯一动作：落盘 `docs/sessions/260910-734-ledger-skip/design.md`（/tmp 原文），跑全量 pytest，回填 durations。
+
+## 2026-09-10 design 落盘与全量验证
+
+- 当前阶段：implementing / milestone ④ design + 全量
+- 本段结论：`docs/sessions/260910-734-ledger-skip/design.md` 与 `/tmp/hub734-ledger-skip/design.md` 逐字节相同。全量 `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` 881 passed；`python3 scripts/check_pinned_uses.py` OK。`tests/pytest-test-durations.json` 回填分类器测试文件 0.77s。
+- 关键决策与已否决方案：durations 基线只记本卡新增测试文件（本仓原先没有该文件，也不做分片）。已否决项未重开。
+- 下一步唯一动作：停在 `card/gate-734-classify` 等主脑验收；合并必须用 merge commit，禁 squash。
