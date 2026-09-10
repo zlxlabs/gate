@@ -4,14 +4,16 @@
 Single source of truth for `.github/workflows/gate-v2.yml` and
 `.github/workflows/gate-shadow-v2.yml`.
 
-Reads GitHub Pull Request Files API JSON (an array of objects with
-`filename`, or a `--paginate --slurp` array of such pages). Writes
+Reads GitHub compare API JSON (`{ "files": [ { "filename": ... }, ... ],
+"truncated": bool }`) or Pull Request Files API JSON (an array of objects
+with `filename`, or a `--paginate --slurp` array of such pages). Writes
 `review_expected=true|false` to stdout and to `--github-output` /
 `$GITHUB_OUTPUT`.
 
 `review_expected=false` if and only if the path set is exactly
 `{retro/acceptance-log.jsonl}`. Empty lists, any other path, truncated
-pagination, and unusable input all yield `true` (fail closed: still review).
+compare listings (`truncated: true` or `--has-next-page`), and unusable
+input all yield `true` (fail closed: still review).
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ LEDGER_ONLY_PATH = "retro/acceptance-log.jsonl"
 
 
 class ClassifyError(ValueError):
-    """Input is not usable GitHub pulls-files JSON."""
+    """Input is not usable GitHub compare or pulls-files JSON."""
 
 
 def _filenames_from_file_objects(items: list[Any]) -> list[str]:
@@ -43,20 +45,30 @@ def _filenames_from_file_objects(items: list[Any]) -> list[str]:
     return filenames
 
 
-def extract_filenames(payload: Any) -> list[str]:
-    """Return `filename` values from pulls files API JSON.
+def parse_listing(payload: Any) -> tuple[list[str], bool]:
+    """Return filenames and truncation from compare or files API JSON.
 
-    Accepts a JSON array of file objects, or an array of such arrays (gh
-    `--paginate --slurp`). Anything else raises ClassifyError.
+    Compare objects are `{ "files": [ { "filename": ... }, ... ], "truncated":
+    bool }`. Files API payloads are a JSON array of file objects, or an array
+    of such arrays (gh `--paginate --slurp`). Anything else raises
+    ClassifyError.
     """
+    if isinstance(payload, dict):
+        files = payload.get("files")
+        if not isinstance(files, list):
+            raise ClassifyError("compare payload files must be an array")
+        truncated_field = payload.get("truncated", False)
+        if truncated_field not in (True, False):
+            raise ClassifyError("compare payload truncated must be a boolean")
+        return _filenames_from_file_objects(files), bool(truncated_field)
     if not isinstance(payload, list):
         raise ClassifyError("files API payload must be a JSON array")
     if payload and all(isinstance(item, list) for item in payload):
         filenames: list[str] = []
         for page in payload:
             filenames.extend(_filenames_from_file_objects(page))
-        return filenames
-    return _filenames_from_file_objects(payload)
+        return filenames, False
+    return _filenames_from_file_objects(payload), False
 
 
 def review_expected(filenames: list[str], *, has_next_page: bool = False) -> bool:
@@ -108,8 +120,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raw = sys.stdin.read()
         payload = json.loads(raw)
-        filenames = extract_filenames(payload)
-        expected = review_expected(filenames, has_next_page=args.has_next_page)
+        filenames, truncated = parse_listing(payload)
+        expected = review_expected(
+            filenames, has_next_page=args.has_next_page or truncated
+        )
     except (OSError, json.JSONDecodeError, ClassifyError, UnicodeError):
         _write_result("true", github_output)
         return 1
