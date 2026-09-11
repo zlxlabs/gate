@@ -182,6 +182,33 @@ def test_shadow_classify_job_matches_required_gate_classifier():
     assert shadow_checkout["with"]["ref"] == "${{ job.workflow_sha }}"
 
 
+def test_workflow_call_inputs_include_review_exempt_paths():
+    raw, trigger = _load_workflow()
+    assert set(trigger["workflow_call"]["inputs"]) == {
+        "tier",
+        "runner",
+        "design_doc",
+        "max_diff_lines",
+        "max_review_shards",
+        "shadow_timeout_minutes",
+        "review_exempt_paths",
+    }
+    declared = trigger["workflow_call"]["inputs"]["review_exempt_paths"]
+    assert declared["type"] == "string"
+    assert declared["default"] == ""
+    shadow_classify = next(
+        s for s in raw["jobs"][CLASSIFY_JOB_ID]["steps"] if s.get("id") == "classify"
+    )
+    required_classify = next(
+        s for s in _load_required_workflow()["jobs"][CLASSIFY_JOB_ID]["steps"]
+        if s.get("id") == "classify"
+    )
+    assert shadow_classify["env"]["REVIEW_EXEMPT_PATHS"] == "${{ inputs.review_exempt_paths }}"
+    assert required_classify["env"]["REVIEW_EXEMPT_PATHS"] == "${{ inputs.review_exempt_paths }}"
+    assert "${{ inputs.review_exempt_paths }}" not in shadow_classify["run"]
+    assert "${{ inputs.review_exempt_paths }}" not in required_classify["run"]
+
+
 def test_resolve_runs_on_is_byte_identical_to_gate_v2_primary_runs_on():
     raw, _ = _load_workflow()
     required_raw = _load_required_workflow()

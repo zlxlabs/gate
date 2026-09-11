@@ -63,5 +63,7 @@ jobs:
       # Optional overrides: design_doc: docs/DESIGN.md, max_diff_lines: 4000, max_review_shards: 8
       # — should match this repo's gate.yml caller's own values, so primary and shadow
       # reviewers are judged against the same diff/coverage budget.
+      # review_exempt_paths is an optional multiline string (same contract as gate-v2).
+      # Do not default any exempt paths here; undeclared callers stay identical.
     # No `secrets:` block: gate-shadow-v2.yml declares none (see that file's own
     # `workflow_call` comment).

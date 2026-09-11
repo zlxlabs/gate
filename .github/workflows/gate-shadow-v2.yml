@@ -23,9 +23,10 @@
 #
 # Job layout (see plan's "Shadow Calibration" state machine):
 #   classify_pr_paths — same script and skip semantics as gate-v2.yml: list PR
-#              files, output review_expected, always run. resolve's `if:` is
-#              byte-identical to gate-v2.yml's primary `if:` (includes the
-#              classify output).
+#              files, output review_expected, always run. Skip when every
+#              changed path is in {retro/acceptance-log.jsonl} ∪ the caller
+#              review_exempt_paths input. resolve's `if:` is byte-identical
+#              to gate-v2.yml's primary `if:` (includes the classify output).
 #   resolve  — resolves this repo's `review_policy.*.shadow` reviewer list (via
 #              gate-hub's resolve_policy.py, the SAME resolver review-shadow itself uses
 #              internally — this job re-runs it standalone purely to get the list BEFORE
@@ -84,6 +85,9 @@ on:
       max_diff_lines:    { type: number, default: 4000 } # per-review-turn diff budget — same default as gate-v2.yml
       max_review_shards: { type: number, default: 8 }    # total large-PR coverage budget — same default as gate-v2.yml
       shadow_timeout_minutes: { type: number, default: 15 } # shadow job hard timeout; 2 minutes are reserved for setup/upload
+      # Extra paths that skip shadow resolve when EVERY changed path is in
+      # {retro/acceptance-log.jsonl} ∪ this set. Same contract as gate-v2.yml.
+      review_exempt_paths: { type: string, default: "" }
       # Deliberately NOT mirrored from gate-v2.yml: `has_ui`, `timeout_minutes`,
       # `pr_size_warn_lines`, `primary_timeout_minutes`, `control_runner`. Those are all
       # quality-job- or aggregator-specific inputs with no Shadow Calibration analogue —
@@ -128,7 +132,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── classify_pr_paths (ledger-only PRs skip shadow resolve) ─────────────
+  # ── classify_pr_paths (exempt-path PRs skip shadow resolve) ─────────────
   classify_pr_paths:
     if: always()
     runs-on: ubuntu-latest
@@ -150,6 +154,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_EXEMPT_PATHS: ${{ inputs.review_exempt_paths }}
         run: |
           set -euo pipefail
           echo "review_expected=true" >> "$GITHUB_OUTPUT"

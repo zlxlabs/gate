@@ -353,8 +353,30 @@ def test_classify_job_always_runs_and_exposes_review_expected():
     assert "pulls/" not in run
     assert step["env"]["BASE_SHA"] == "${{ github.event.pull_request.base.sha }}"
     assert step["env"]["HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+    assert step["env"]["REVIEW_EXEMPT_PATHS"] == "${{ inputs.review_exempt_paths }}"
+    assert "${{ inputs.review_exempt_paths }}" not in run
     assert "== 'true'" not in str(raw["jobs"]["primary"].get("if", ""))
     assert CLASSIFY_GUARD in str(raw["jobs"]["primary"].get("if", ""))
+
+
+def test_workflow_call_inputs_include_review_exempt_paths():
+    _, trigger = _load_workflow()
+    assert set(trigger["workflow_call"]["inputs"]) == {
+        "tier",
+        "runner",
+        "has_ui",
+        "design_doc",
+        "max_diff_lines",
+        "timeout_minutes",
+        "max_review_shards",
+        "pr_size_warn_lines",
+        "primary_timeout_minutes",
+        "control_runner",
+        "review_exempt_paths",
+    }
+    declared = trigger["workflow_call"]["inputs"]["review_exempt_paths"]
+    assert declared["type"] == "string"
+    assert declared["default"] == ""
 
 
 def test_classify_job_checks_out_this_workflow_commit():
