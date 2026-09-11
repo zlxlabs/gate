@@ -19,6 +19,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "classify_pr_reviewable_paths.py"
 LEDGER_PATH = "retro/acceptance-log.jsonl"
 
+
+def _load_classifier():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("classify_pr_reviewable_paths", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+classifier = _load_classifier()
+REVIEW_EXEMPT_PATHS_ENV = classifier.REVIEW_EXEMPT_PATHS_ENV
+parse_exempt_declaration = classifier.parse_exempt_declaration
+review_expected = classifier.review_expected
+
 # Sanitized copy of the live AiUsageMonitor PR 201 files API payload: patch
 # bodies (ledger rows) stripped; GitHub's object shape and `filename` kept.
 PR201_FILES_API = [
@@ -72,6 +88,7 @@ def _run_cli(
     output_path = tmp_path / "github_output"
     argv = [sys.executable, str(SCRIPT), *extra_args]
     env = os.environ.copy()
+    env.pop(REVIEW_EXEMPT_PATHS_ENV, None)
     if extra_env:
         env.update(extra_env)
     if github_output:
@@ -252,3 +269,204 @@ def test_missing_input_file_is_not_false(tmp_path):
     assert "review_expected=false" not in combined
     if "review_expected=" in combined:
         assert _review_expected_from_output(written, proc.stdout) == "true"
+
+
+# --- review_exempt_paths (fleet default ∪ caller declaration) -----------------
+
+
+def _classifier_env(extra: dict | None = None) -> dict:
+    env = os.environ.copy()
+    env.pop(REVIEW_EXEMPT_PATHS_ENV, None)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def test_parse_exempt_declaration_skips_blank_lines_and_strips():
+    entries, illegal = parse_exempt_declaration("  \n docs/** \n\nmemory/**\n")
+    assert illegal is None
+    assert entries == ["docs/**", "memory/**"]
+
+
+def test_empty_declaration_review_expected_matches_fleet_default():
+    assert review_expected([LEDGER_PATH]) is False
+    assert review_expected([LEDGER_PATH], exempt=[]) is False
+    assert review_expected([]) is True
+    assert review_expected([LEDGER_PATH, "scripts/x.py"]) is True
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "*.md",
+        "docs/*",
+        "docs/**/x",
+        "a?b",
+        "[ab]",
+        "/abs",
+        "./rel",
+        "a/../b",
+        ".github/workflows/x.yml",
+        ".github/**",
+    ],
+)
+def test_illegal_exempt_entry_forms_force_review(tmp_path, entry):
+    payload = [_file_obj(LEDGER_PATH)]
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: entry},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _review_expected_from_output(written, proc.stdout) == "true"
+    assert "::warning::" in proc.stderr
+    assert "invalid review_exempt_paths entry:" in proc.stderr
+    assert " ".join(entry.split()) in proc.stderr
+    assert "::error::" not in proc.stderr
+    parsed, illegal = parse_exempt_declaration(entry)
+    assert parsed == []
+    assert illegal == entry
+
+
+def test_docs_prefix_does_not_match_docs_old(tmp_path):
+    payload = [_file_obj("docs-old/x.md")]
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _review_expected_from_output(written, proc.stdout) == "true"
+
+
+def test_docs_prefix_does_not_match_same_name_file(tmp_path):
+    payload = [_file_obj("docs")]
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _review_expected_from_output(written, proc.stdout) == "true"
+
+
+def test_docs_prefix_does_not_match_xdocs(tmp_path):
+    payload = [_file_obj("xdocs/a")]
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _review_expected_from_output(written, proc.stdout) == "true"
+
+
+def test_exact_path_does_not_match_child_or_prefix(tmp_path):
+    declaration = "docs/readme.md"
+    for index, filename in enumerate(("docs/readme.md/nested", "docs/readme", "docs/readme.mdx")):
+        case_dir = tmp_path / f"nonmatch-{index}"
+        case_dir.mkdir()
+        proc, written = _run_cli(
+            case_dir,
+            [_file_obj(filename)],
+            extra_env={REVIEW_EXEMPT_PATHS_ENV: declaration},
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert _review_expected_from_output(written, proc.stdout) == "true", filename
+    hit_dir = tmp_path / "exact-hit"
+    hit_dir.mkdir()
+    proc, written = _run_cli(
+        hit_dir,
+        [_file_obj("docs/readme.md")],
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: declaration},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _review_expected_from_output(written, proc.stdout) == "false"
+
+
+def test_declared_docs_and_memory_subset_skips_review(tmp_path):
+    payload = [
+        _file_obj("docs/a.md"),
+        _file_obj("memory/b.md"),
+        _file_obj(LEDGER_PATH),
+    ]
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**\nmemory/**"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert written.strip() == "review_expected=false"
+    assert _review_expected_from_output(written, proc.stdout) == "false"
+
+
+def test_declared_docs_and_memory_mixed_with_scripts_still_reviews(tmp_path):
+    payload = [
+        _file_obj("docs/a.md"),
+        _file_obj("memory/b.md"),
+        _file_obj(LEDGER_PATH),
+        _file_obj("scripts/x.py"),
+    ]
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**\nmemory/**"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _review_expected_from_output(written, proc.stdout) == "true"
+
+
+def test_subprocess_env_declaration_writes_github_output_false(tmp_path):
+    """Cross-process: workflow passes REVIEW_EXEMPT_PATHS via env, not argv."""
+    output_path = tmp_path / "github_output"
+    listing = tmp_path / "files.json"
+    listing.write_text(
+        json.dumps(
+            [
+                _file_obj("docs/a.md"),
+                _file_obj("memory/b.md"),
+                _file_obj(LEDGER_PATH),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = _classifier_env({REVIEW_EXEMPT_PATHS_ENV: "docs/**\nmemory/**"})
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--github-output", str(output_path), str(listing)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert output_path.read_text(encoding="utf-8") == "review_expected=false\n"
+
+
+def test_illegal_declaration_voids_fleet_default_skip(tmp_path):
+    payload = [_file_obj(LEDGER_PATH)]
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "*.md\ndocs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _review_expected_from_output(written, proc.stdout) == "true"
+    assert "*.md" in proc.stderr
+
+
+def test_warning_collapses_whitespace_and_truncates(tmp_path):
+    huge = "x" * 300 + "*"
+    proc, written = _run_cli(
+        tmp_path,
+        [_file_obj(LEDGER_PATH)],
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: huge},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _review_expected_from_output(written, proc.stdout) == "true"
+    warning_lines = [ln for ln in proc.stderr.splitlines() if ln.startswith("::warning::")]
+    assert len(warning_lines) == 1
+    assert "\n" not in warning_lines[0]
+    # "::warning::" (11) + prefix (48) + 200 chars of entry
+    assert len(warning_lines[0]) <= 11 + 80 + 200
+

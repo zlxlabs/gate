@@ -10,10 +10,12 @@ with `filename`, or a `--paginate --slurp` array of such pages). Writes
 `review_expected=true|false` to stdout and to `--github-output` /
 `$GITHUB_OUTPUT`.
 
-`review_expected=false` if and only if the path set is exactly
-`{retro/acceptance-log.jsonl}`. Empty lists, any other path, truncated
-compare listings (`truncated: true` or `--has-next-page`), and unusable
-input all yield `true` (fail closed: still review).
+`review_expected=false` if and only if the path set is non-empty and every
+path is in the effective exempt set: the fleet default
+`{retro/acceptance-log.jsonl}` union the caller-declared
+`REVIEW_EXEMPT_PATHS` entries. Empty lists, any other path, truncated
+compare listings (`truncated: true` or `--has-next-page`), unusable input,
+and an illegal declaration all yield `true` (fail closed: still review).
 """
 
 from __future__ import annotations
@@ -23,10 +25,17 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
-LEDGER_ONLY_PATH = "retro/acceptance-log.jsonl"
+FLEET_DEFAULT_EXEMPT: frozenset[str] = frozenset({"retro/acceptance-log.jsonl"})
+REVIEW_EXEMPT_PATHS_ENV = "REVIEW_EXEMPT_PATHS"
+_DIR_PREFIX_SUFFIX = "/**"
+_WILDCARD_CHARS = frozenset("*?[")
+_WARNING_ENTRY_MAX = 200
+_INVALID_ENTRY_WARNING = (
+    "classify_pr_paths: invalid review_exempt_paths entry: "
+)
 
 
 class ClassifyError(ValueError):
@@ -71,11 +80,75 @@ def parse_listing(payload: Any) -> tuple[list[str], bool]:
     return _filenames_from_file_objects(payload), False
 
 
-def review_expected(filenames: list[str], *, has_next_page: bool = False) -> bool:
-    """True unless the path set is exactly the acceptance ledger file."""
-    if has_next_page:
+def _is_legal_exempt_entry(entry: str) -> bool:
+    if entry.startswith("/") or entry.startswith("./"):
+        return False
+    if entry.startswith(".github/"):
+        return False
+    if any(part == ".." for part in entry.split("/")):
+        return False
+    if entry.endswith(_DIR_PREFIX_SUFFIX):
+        directory = entry[: -len(_DIR_PREFIX_SUFFIX)]
+        if not directory:
+            return False
+        return not any(ch in _WILDCARD_CHARS for ch in directory)
+    return not any(ch in _WILDCARD_CHARS for ch in entry)
+
+
+def parse_exempt_declaration(text: str) -> tuple[list[str], str | None]:
+    """Return (legal entries, first illegal entry or None).
+
+    Illegal entries void the whole declaration: the list is empty.
+    Blank lines and surrounding whitespace are ignored.
+    """
+    entries: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if not _is_legal_exempt_entry(line):
+            return [], line
+        entries.append(line)
+    return entries, None
+
+
+def _path_matches_entry(filename: str, entry: str) -> bool:
+    if entry.endswith(_DIR_PREFIX_SUFFIX):
+        directory = entry[: -len(_DIR_PREFIX_SUFFIX)]
+        return filename.startswith(directory + "/")
+    return filename == entry
+
+
+def _path_is_exempt(filename: str, exempt: Sequence[str]) -> bool:
+    for entry in (*FLEET_DEFAULT_EXEMPT, *exempt):
+        if _path_matches_entry(filename, entry):
+            return True
+    return False
+
+
+def review_expected(
+    filenames: list[str],
+    *,
+    exempt: list[str] = (),
+    has_next_page: bool = False,
+) -> bool:
+    """True unless every changed path is in the effective exempt set."""
+    if has_next_page or not filenames:
         return True
-    return set(filenames) != {LEDGER_ONLY_PATH}
+    return not all(_path_is_exempt(name, exempt) for name in filenames)
+
+
+def _sanitize_warning_entry(entry: str) -> str:
+    display = " ".join(entry.split())
+    if len(display) > _WARNING_ENTRY_MAX:
+        return display[:_WARNING_ENTRY_MAX]
+    return display
+
+
+def _emit_invalid_entry_warning(entry: str) -> None:
+    display = _sanitize_warning_entry(entry)
+    sys.stderr.write(f"::warning::{_INVALID_ENTRY_WARNING}{display}\n")
+    sys.stderr.flush()
 
 
 def _write_result(value: str, github_output: Path | None) -> None:
@@ -114,6 +187,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     github_output = Path(args.github_output) if args.github_output else None
+    declaration = os.environ.get(REVIEW_EXEMPT_PATHS_ENV) or ""
+    exempt, illegal = parse_exempt_declaration(declaration)
+    if illegal is not None:
+        _emit_invalid_entry_warning(illegal)
     try:
         if args.json_file:
             raw = Path(args.json_file).read_text(encoding="utf-8")
@@ -121,9 +198,14 @@ def main(argv: list[str] | None = None) -> int:
             raw = sys.stdin.read()
         payload = json.loads(raw)
         filenames, truncated = parse_listing(payload)
-        expected = review_expected(
-            filenames, has_next_page=args.has_next_page or truncated
-        )
+        if illegal is not None:
+            expected = True
+        else:
+            expected = review_expected(
+                filenames,
+                exempt=exempt,
+                has_next_page=args.has_next_page or truncated,
+            )
     except (OSError, json.JSONDecodeError, ClassifyError, UnicodeError):
         _write_result("true", github_output)
         return 1
