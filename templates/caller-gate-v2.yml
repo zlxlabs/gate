@@ -96,6 +96,8 @@ jobs:
       # plan's "Required Gate" section has passed its promotion gate.
       # Optional overrides: max_diff_lines: 4000, max_review_shards: 8,
       # pr_size_warn_lines: 8000, timeout_minutes: 45
+      # review_exempt_paths is an optional multiline string (docs/**, memory/**).
+      # Do not default any exempt paths here; undeclared callers stay identical.
     secrets:
       # Public repos MUST pass this as a repo SECRET (fork PR runs cannot read
       # secrets); private repos may omit it and rely on the same-name repo

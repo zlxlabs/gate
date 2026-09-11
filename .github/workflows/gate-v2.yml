@@ -20,7 +20,9 @@
 #              API and outputs review_expected. Always runs (never skip on
 #              draft/fork/hosted). Only `false` skips model jobs; listing
 #              failures stay non-false (fail closed). ubuntu-latest so this
-#              cheap API job never waits on a self-hosted slot.
+#              cheap API job never waits on a self-hosted slot. Skip when
+#              every changed path is in {retro/acceptance-log.jsonl} ∪ the
+#              caller-declared review_exempt_paths input.
 #   quality  — lint / jscpd / dependency-cruiser / tests / PR-size preflight.
 #              Everything from legacy gate.yml's single job EXCEPT the model
 #              review itself. Runs on the same self-hosted/hosted pool legacy
@@ -92,6 +94,11 @@ on:
       # 控制面 runner：留空（默认）跟随 runner；github-hosted 强制控制面留在
       # GitHub-hosted，作为单仓回滚逃生舱；保留遗留 self-hosted-control 取值兼容。
       control_runner: { type: string, default: "" }  # 留空跟随 runner；github-hosted 回滚逃生舱；兼容 self-hosted-control
+      # Extra paths that skip model review when EVERY changed path is in
+      # {retro/acceptance-log.jsonl} ∪ this set. One entry per line:
+      # `docs/**` (directory prefix) or an exact file path. Empty = fleet
+      # default only. Any illegal entry voids the whole declaration (still review).
+      review_exempt_paths: { type: string, default: "" }
     secrets:
       FEISHU_CI_WEBHOOK:
         # Optional: public repos MUST pass this as a repo SECRET (fork PR runs
@@ -115,7 +122,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  # ── classify_pr_paths (ledger-only PRs skip model jobs) ─────────────────
+  # ── classify_pr_paths (exempt-path PRs skip model jobs) ─────────────────
   classify_pr_paths:
     # Must always run: a skipped classifier leaves outputs empty, and the
     # model-job `if:` treats empty as not-false (still review). Failures
@@ -141,6 +148,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_EXEMPT_PATHS: ${{ inputs.review_exempt_paths }}
         run: |
           set -euo pipefail
           echo "review_expected=true" >> "$GITHUB_OUTPUT"
