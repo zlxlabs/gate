@@ -499,6 +499,16 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
     assert upload_step["with"]["path"] == "${{ runner.temp }}/shadow-events/advisory"
 
 
+def test_advisory_event_upload_declares_three_day_retention():
+    raw, _ = _load_workflow()
+    upload = next(
+        step
+        for step in raw["jobs"]["ocr"]["steps"]
+        if step.get("name") == "Upload advisory review event"
+    )
+    assert upload["with"]["retention-days"] == 3
+
+
 def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
     # Same matrix-leg naming pattern as gate-shadow-v2.yml's shadow job — must pass
     # JOB_NAME_SUFFIX via jq --arg and fail-loud with categorized diagnostics.
@@ -699,6 +709,16 @@ def test_gate_status_panel_publish_happens_after_terminal_upload():
     assert "--publish-only" in publish["run"]
 
 
+def test_gate_terminal_upload_declares_explicit_retention():
+    raw, _ = _load_workflow()
+    upload = next(
+        step
+        for step in raw["jobs"]["gate"]["steps"]
+        if step.get("name") == "Upload gate terminal envelope"
+    )
+    assert upload["with"]["retention-days"] == 30
+
+
 def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication():
     raw, _ = _load_workflow()
     steps = raw["jobs"]["gate"]["steps"]
@@ -726,7 +746,7 @@ def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication(
         "name": CONVERGENCE_RECEIPT_NAME_EXPR,
         "path": CONVERGENCE_RECEIPT_PATH,
         "if-no-files-found": "error",
-        "retention-days": 30,
+        "retention-days": 3,
     }
 
 
@@ -828,7 +848,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert "continue-on-error" not in upload
     assert upload["with"]["if-no-files-found"] == "error"
     assert upload["with"]["path"] == "${{ runner.temp }}/primary-review-audit.json"
-    assert upload["with"]["retention-days"] == 30
+    assert upload["with"]["retention-days"] == 14
 
 
 def test_primary_uploads_review_diagnostics_after_canonical_audit():
@@ -847,7 +867,7 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
             "name": DIAGNOSTICS_NAME_EXPR,
             "path": DIAGNOSTICS_PATH,
             "if-no-files-found": "ignore",
-            "retention-days": 30,
+            "retention-days": 3,
         },
     }
 
@@ -880,7 +900,7 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
     terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
-    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error"} and "continue-on-error" not in terminal_upload
+    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error", "retention-days": 30} and "continue-on-error" not in terminal_upload
 
 
 @pytest.mark.parametrize(
@@ -974,6 +994,21 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
         "if-no-files-found": "error",
         "retention-days": 30,
     }
+
+
+def test_review_ledger_input_uploads_declare_one_day_retention():
+    raw, _ = _load_workflow()
+    quality_steps = raw["jobs"]["quality"]["steps"]
+    upload = next(
+        step for step in quality_steps if step.get("name") == "Upload v2 review ledger inputs"
+    )
+    retry = next(
+        step
+        for step in quality_steps
+        if step.get("name") == "Retry upload v2 review ledger inputs"
+    )
+    assert upload["with"]["retention-days"] == 1
+    assert retry["with"]["retention-days"] == 1
 
 
 def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
@@ -1520,7 +1555,7 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
         "name": PANEL_DELIVERY_NAME_EXPR,
         "path": "${{ runner.temp }}/gate-status-panel-delivery.json",
         "if-no-files-found": "error",
-        "retention-days": 30,
+        "retention-days": 3,
     }
     assert "continue-on-error" not in upload
     assert upload["with"]["path"] == publish_step["env"]["PANEL_DELIVERY_PATH"]
