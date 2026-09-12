@@ -340,8 +340,8 @@ def main() -> int:
     if token and result["pr_number"]:
         try:
             post_sticky_comment(result, token=token, repository=result["repository"], pr_number=result["pr_number"])
-        except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as error:
-            print(f"::warning::could not update PR size comment: {error}")
+        except Exception as error:
+            print(f"::warning::could not update PR size comment ({type(error).__name__}): {error}")
 
     if result["classification"] == "blocked":
         print("::error::PR exceeds complete Codex review capacity; split it into small or stacked PRs")
