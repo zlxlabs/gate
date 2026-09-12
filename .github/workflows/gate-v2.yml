@@ -1595,7 +1595,7 @@ jobs:
           name: codex-review-ledger-v2
           path: ${{ runner.temp }}/review-ledger/ledger.jsonl
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 30
 
   # ── notify (registry-routed, required-gate-failure only) ────────────────
   # Same fail-only semantics as legacy gate.yml's notify job (see that file
