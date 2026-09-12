@@ -126,9 +126,12 @@ class RoundKey:
 class CanonicalPrimary:
     """The minimal canonical primary projection consumed by the reducer.
 
-    ``p1_findings`` carries the canonical ``(id, severity, trigger_kind)``
-    tuple for each P1.  A disposition can consume only an ``inferred`` tuple;
-    missing or unknown trigger kinds remain blocking.
+    ``p1_findings`` carries either the legacy v2
+    ``(id, severity, trigger_kind)`` tuple or the stable-key projection
+    ``(id, severity, trigger_kind, file, line, category)`` for each P1.  A
+    disposition can consume only an ``inferred`` tuple; missing or unknown
+    trigger kinds remain blocking.  The six-field form is required when a
+    stable-key disposition is validated.
     """
 
     schema_version: int
@@ -139,7 +142,7 @@ class CanonicalPrimary:
     run_attempt: int
     verdict: str
     p1_ids: tuple[str, ...] = ()
-    p1_findings: tuple[tuple[str, str, str | None], ...] = ()
+    p1_findings: tuple[tuple[Any, ...], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -157,7 +160,12 @@ class CanonicalPrimary:
 
 @dataclass(frozen=True)
 class DispositionReceipt:
-    """Immutable disposition bound to one current canonical audit round."""
+    """Immutable disposition bound to one current canonical audit round.
+
+    ``finding_key`` is populated by the stable-key format.  An empty
+    ``finding_key`` identifies the in-flight v2 format, whose ``finding_id``
+    remains intentionally supported until its artifact window expires.
+    """
 
     schema_version: int = DISPOSITION_RECEIPT_SCHEMA_VERSION
     disposition: str = "none"
@@ -167,6 +175,7 @@ class DispositionReceipt:
     head_sha: str = ""
     audit_digest: str = ""
     finding_id: str = ""
+    finding_key: str = ""
     reason: str = ""
     approver: str = ""
     approver_id: int = 0
@@ -182,6 +191,7 @@ class DispositionReceipt:
             "head_sha": self.head_sha,
             "audit_digest": self.audit_digest,
             "finding_id": self.finding_id,
+            "finding_key": self.finding_key,
             "reason": self.reason,
             "approver": self.approver,
             "approver_id": self.approver_id,
@@ -198,6 +208,7 @@ class DispositionStatus:
     active: bool
     consumable: bool
     reason: str
+    reason_code: str = ""
 
     @property
     def accepted(self) -> bool:
@@ -205,7 +216,13 @@ class DispositionStatus:
 
     @property
     def finding_id(self) -> str:
-        return self.receipt.finding_id
+        return self.receipt.finding_key or self.receipt.finding_id
+
+    @property
+    def message(self) -> str:
+        """Return the actionable diagnostic text (same value as ``reason``)."""
+
+        return self.reason
 
 @dataclass(frozen=True)
 class DispositionConsumption:
@@ -249,7 +266,7 @@ class Receipt:
     audit_digest: str
     verdict: str
     p1_ids: tuple[str, ...] = ()
-    p1_findings: tuple[tuple[str, str, str | None], ...] = ()
+    p1_findings: tuple[tuple[Any, ...], ...] = ()
     source_attempt: int | None = None
     artifact_id: str | None = None
     artifact_name: str | None = None
@@ -395,17 +412,38 @@ CANONICAL_AUDIT_DIGEST_SCOPE_FIELDS = (
     "reusable_workflow_sha",
     "tier",
 )
-CANONICAL_AUDIT_DIGEST_FINDING_FIELDS = ("id", "severity", "trigger_kind", "file", "line")
+CANONICAL_AUDIT_DIGEST_FINDING_FIELDS = ("file", "line", "category", "severity")
+CANONICAL_FINDING_KEY_FIELDS = ("file", "line", "category", "severity")
 
 
-def _canonical_finding_sort_key(item: dict[str, Any]) -> tuple[str, str, str, str]:
-    line = item["line"]
-    return (
-        "" if item["id"] is None else str(item["id"]),
-        "" if item["severity"] is None else str(item["severity"]),
-        "" if item["file"] is None else str(item["file"]),
-        "" if line is None else str(line),
-    )
+def canonical_finding_key(finding: Any) -> str:
+    """Return the sole canonical key for a finding disposition target.
+
+    The key contains exactly ``file``, ``line``, ``category``, and
+    ``severity`` in that order.  A missing field is encoded as the tagged
+    value ``["missing"]``; an explicit JSON ``null`` is ``["null"]``; every
+    other value, including the empty string, is encoded as ``["value", V]``.
+    Consequently missing, ``None``, and ``""`` never collapse to one key.
+    The compact JSON representation is deliberate: file paths may contain
+    slashes and delimiter characters, so artifact names must hash this full
+    key instead of embedding or reparsing it.
+    """
+
+    if not isinstance(finding, dict):
+        raise ValueError("canonical finding key requires an object")
+    components: dict[str, list[Any]] = {}
+    for field in CANONICAL_FINDING_KEY_FIELDS:
+        if field not in finding:
+            components[field] = ["missing"]
+        elif finding[field] is None:
+            components[field] = ["null"]
+        else:
+            components[field] = ["value", finding[field]]
+    return _canonical_json(components).decode("utf-8")
+
+
+def _canonical_finding_sort_key(item: dict[str, Any]) -> str:
+    return canonical_finding_key(item)
 
 
 def canonical_audit_binding(audit: Any) -> dict[str, Any]:
@@ -464,6 +502,93 @@ def _receipt_audit_digest_matches(
     )
 
 
+def _primary_finding_record(finding: Any) -> dict[str, Any] | None:
+    """Normalize one primary tuple without reimplementing key serialization."""
+
+    if not isinstance(finding, tuple):
+        return None
+    if len(finding) == 3:
+        return {
+            "id": finding[0],
+            "severity": finding[1],
+            "trigger_kind": finding[2],
+        }
+    if len(finding) == 6:
+        return {
+            "id": finding[0],
+            "severity": finding[1],
+            "trigger_kind": finding[2],
+            "file": finding[3],
+            "line": finding[4],
+            "category": finding[5],
+        }
+    return None
+
+
+def _current_p1_keys(primary: CanonicalPrimary) -> tuple[str, ...]:
+    """List current P1 stable keys, or legacy ids for a v2 projection."""
+
+    if isinstance(primary.p1_findings, tuple):
+        keys = []
+        for finding in primary.p1_findings:
+            record = _primary_finding_record(finding)
+            if record is not None and record.get("severity") in P1_SEVERITIES and len(finding) == 6:
+                keys.append(canonical_finding_key(record))
+        if keys:
+            return tuple(keys)
+    return tuple(primary.p1_ids)
+
+
+def _stable_primary_matches(
+    finding_key: str,
+    primary: CanonicalPrimary,
+) -> list[tuple[str, dict[str, Any]]]:
+    matches: list[tuple[str, dict[str, Any]]] = []
+    if not isinstance(primary.p1_findings, tuple):
+        return matches
+    for finding in primary.p1_findings:
+        record = _primary_finding_record(finding)
+        if record is None or len(finding) != 6 or record.get("severity") not in P1_SEVERITIES:
+            continue
+        if canonical_finding_key(record) == finding_key:
+            matches.append((record["id"], record))
+    return matches
+
+
+def _actionable_disposition_reason(
+    code: str,
+    receipt: DispositionReceipt,
+    *,
+    scope: Scope,
+    primary: CanonicalPrimary,
+    audit_digest: str,
+) -> str:
+    """Explain a stale target with the values needed for the next action."""
+
+    target = receipt.finding_key or receipt.finding_id
+    current_keys = json.dumps(list(_current_p1_keys(primary)), ensure_ascii=False, separators=(",", ":"))
+    if code == "epoch_mismatch_stale":
+        return (
+            f"{code}: finding key {target!r} was registered for head_sha {receipt.head_sha!r}, "
+            f"but the current head_sha is {scope.head_sha!r}; the code changed, so register this "
+            f"key again for the new head. Current P1 keys: {current_keys}"
+        )
+    if code == "audit_digest_mismatch":
+        return (
+            f"{code}: finding set (or its verdict/scope) differs from the registered audit; "
+            f"finding key {target!r}, registered audit_digest {receipt.audit_digest!r}, current "
+            f"audit_digest {audit_digest!r}, current head_sha {scope.head_sha!r}. Re-register after "
+            f"checking the changed finding set. Current P1 keys: {current_keys}"
+        )
+    if code == "finding_not_current_p1":
+        return (
+            f"{code}: finding key {target!r} is absent from the current P1 set or is no longer P1; "
+            f"current head_sha {scope.head_sha!r}. Register only a current P1 key. Current P1 keys: "
+            f"{current_keys}"
+        )
+    return code
+
+
 def _disposition_status(
     receipt: DispositionReceipt,
     *,
@@ -471,13 +596,15 @@ def _disposition_status(
     active: bool,
     consumable: bool,
     reason: str,
+    message: str | None = None,
 ) -> DispositionStatus:
     return DispositionStatus(
         receipt=receipt,
         valid=valid,
         active=active,
         consumable=consumable,
-        reason=reason,
+        reason=reason if message is None else message,
+        reason_code=reason,
     )
 
 
@@ -527,7 +654,8 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="schema_version_mismatch")
     if receipt.disposition not in DISPOSITION_KINDS:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="unknown_disposition")
-    required_text = ("repository_id", "epoch", "head_sha", "audit_digest", "finding_id", "reason")
+    target_field = "finding_key" if receipt.finding_key else "finding_id"
+    required_text = ("repository_id", "epoch", "head_sha", "audit_digest", target_field, "reason")
     if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
     if not isinstance(receipt.approver, str) or not receipt.approver.strip():
@@ -544,23 +672,79 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="pr_mismatch")
     expected_epoch = derive_epoch(scope)
     if receipt.epoch != expected_epoch:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="epoch_mismatch_stale")
+        return _disposition_status(
+            receipt, valid=False, active=False, consumable=False, reason="epoch_mismatch_stale",
+            message=_actionable_disposition_reason(
+                "epoch_mismatch_stale", receipt, scope=scope, primary=primary,
+                audit_digest=audit_digest,
+            ),
+        )
     if receipt.head_sha != scope.head_sha:
         return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="head_sha_mismatch")
     if not _receipt_audit_digest_matches(receipt.audit_digest, audit_digest, legacy_raw_audit_digest):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="audit_digest_mismatch")
-    if receipt.finding_id in {"*", "all"} or any(character in receipt.finding_id for character in "?[]"):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_target_not_exact")
-    if receipt.finding_id not in primary.p1_ids:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_not_current_p1")
-    finding = next(
-        (
-            item for item in primary.p1_findings
-            if isinstance(item, tuple) and len(item) == 3 and item[0] == receipt.finding_id
-        ),
-        None,
-    ) if isinstance(primary.p1_findings, tuple) else None
-    if finding is None or finding[1] not in P1_SEVERITIES or finding[2] != "inferred":
+        return _disposition_status(
+            receipt, valid=False, active=False, consumable=False, reason="audit_digest_mismatch",
+            message=_actionable_disposition_reason(
+                "audit_digest_mismatch", receipt, scope=scope, primary=primary,
+                audit_digest=audit_digest,
+            ),
+        )
+
+    if receipt.finding_key:
+        matches = _stable_primary_matches(receipt.finding_key, primary)
+        if len(matches) > 1:
+            return _disposition_status(
+                receipt, valid=False, active=False, consumable=False,
+                reason="finding_key_ambiguous",
+                message=(
+                    f"finding_key_ambiguous: finding key {receipt.finding_key!r} matches "
+                    f"{len(matches)} current P1 findings, so the disposition target cannot be "
+                    f"determined; current head_sha {scope.head_sha!r}. Register only after the "
+                    f"duplicate key is resolved. Current P1 keys: "
+                    f"{json.dumps(list(_current_p1_keys(primary)), ensure_ascii=False, separators=(",", ":"))}"
+                ),
+            )
+        if len(matches) == 0:
+            return _disposition_status(
+                receipt, valid=False, active=False, consumable=False,
+                reason="finding_not_current_p1",
+                message=_actionable_disposition_reason(
+                    "finding_not_current_p1", receipt, scope=scope, primary=primary,
+                    audit_digest=audit_digest,
+                ),
+            )
+        _, finding = matches[0]
+    else:
+        # Expand-then-contract for gate#150: an in-flight v2 receipt has no
+        # finding_key and remains bound to its legacy finding_id.  Remove this
+        # branch after the v2 artifact TTL has elapsed and all v2 receipts have
+        # been reissued with finding_key.
+        if receipt.finding_id in {"*", "all"} or any(character in receipt.finding_id for character in "?[]"):
+            return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_target_not_exact")
+        if receipt.finding_id not in primary.p1_ids:
+            return _disposition_status(
+                receipt, valid=False, active=False, consumable=False,
+                reason="finding_not_current_p1",
+                message=_actionable_disposition_reason(
+                    "finding_not_current_p1", receipt, scope=scope, primary=primary,
+                    audit_digest=audit_digest,
+                ),
+            )
+        finding = next(
+            (
+                item for item in primary.p1_findings
+                if isinstance(item, tuple) and len(item) == 3 and item[0] == receipt.finding_id
+            ),
+            None,
+        ) if isinstance(primary.p1_findings, tuple) else None
+
+    if isinstance(finding, dict):
+        finding_severity = finding.get("severity")
+        finding_trigger_kind = finding.get("trigger_kind")
+    else:
+        finding_severity = finding[1] if isinstance(finding, tuple) and len(finding) >= 2 else None
+        finding_trigger_kind = finding[2] if isinstance(finding, tuple) and len(finding) >= 3 else None
+    if finding is None or finding_severity not in P1_SEVERITIES or finding_trigger_kind != "inferred":
         return _disposition_status(
             receipt, valid=False, active=False, consumable=False,
             reason="finding_trigger_not_inferred",
@@ -593,7 +777,7 @@ _DISPOSITION_FAIL_CLOSED_REASONS = frozenset(
         "malformed_pr_number", "repository_mismatch",
         "pr_mismatch", "epoch_mismatch_stale", "head_sha_mismatch",
         "audit_digest_mismatch",
-        "finding_target_not_exact", "finding_not_current_p1",
+        "finding_target_not_exact", "finding_not_current_p1", "finding_key_ambiguous",
         "finding_trigger_not_inferred",
         "malformed_primary",
     }
@@ -630,7 +814,7 @@ def consume_dispositions(
                 legacy_raw_audit_digest=legacy_raw_audit_digest,
             )
             statuses.append(status)
-            rejected.append((status.receipt, status.reason))
+            rejected.append((status.receipt, status.reason_code))
             fail_closed = True
             continue
         if _legacy_disposition_stub(receipt):
@@ -647,14 +831,19 @@ def consume_dispositions(
         )
         statuses.append(status)
         if status.consumable:
-            if receipt.finding_id in remaining:
-                remaining.remove(receipt.finding_id)
+            target_id = receipt.finding_id
+            if receipt.finding_key:
+                stable_matches = _stable_primary_matches(receipt.finding_key, primary)
+                if len(stable_matches) == 1:
+                    target_id = stable_matches[0][0]
+            if target_id in remaining:
+                remaining.remove(target_id)
                 consumed.append(receipt)
             else:
                 rejected.append((receipt, "finding_already_consumed"))
-        elif status.reason != "absent_legacy_stub":
-            rejected.append((receipt, status.reason))
-            if status.reason in _DISPOSITION_FAIL_CLOSED_REASONS:
+        elif status.reason_code != "absent_legacy_stub":
+            rejected.append((receipt, status.reason_code))
+            if status.reason_code in _DISPOSITION_FAIL_CLOSED_REASONS:
                 fail_closed = True
     return DispositionConsumption(
         remaining_p1_ids=tuple(remaining),
@@ -669,9 +858,14 @@ def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
     """Reconstruct the producer artifact name bound to one receipt payload."""
 
     digest_prefix = receipt.audit_digest[:12]
+    target_component = (
+        hashlib.sha256(receipt.finding_key.encode("utf-8")).hexdigest()[:12]
+        if receipt.finding_key
+        else receipt.finding_id
+    )
     return (
         f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}-"
-        f"{receipt.epoch}-{digest_prefix}-{receipt.finding_id}"
+        f"{receipt.epoch}-{digest_prefix}-{target_component}"
     )
 
 
@@ -683,8 +877,9 @@ def required_disposition_lines(consumption: DispositionConsumption) -> tuple[str
         collapsed = " ".join(receipt.reason.split())
         if len(collapsed) > DISPOSITION_REASON_DISPLAY_MAX:
             collapsed = collapsed[:DISPOSITION_REASON_DISPLAY_MAX]
+        target = receipt.finding_key or receipt.finding_id
         lines.append(
-            f"finding {receipt.finding_id} ({receipt.disposition}, approved by {receipt.approver}) "
+            f"finding {target} ({receipt.disposition}, approved by {receipt.approver}) "
             f"resolved by receipt {disposition_receipt_artifact_name(receipt)}: {collapsed}"
         )
     return tuple(lines)
@@ -708,6 +903,7 @@ def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
             head_sha=str(payload["head_sha"]),
             audit_digest=str(payload["audit_digest"]),
             finding_id=str(payload["finding_id"]),
+            finding_key=str(payload["finding_key"]) if "finding_key" in payload else "",
             reason=str(payload["reason"]),
             approver=payload["approver"] if "approver" in payload else "",
             approver_id=payload["approver_id"] if "approver_id" in payload else 0,
@@ -1020,18 +1216,21 @@ def _primary_errors(*, scope: Scope, primary: CanonicalPrimary) -> list[str]:
     elif primary.p1_findings:
         finding_ids: list[str] = []
         for finding in primary.p1_findings:
+            record = _primary_finding_record(finding)
             if (
-                not isinstance(finding, tuple)
-                or len(finding) != 3
-                or not isinstance(finding[0], str)
-                or not finding[0]
-                or not isinstance(finding[1], str)
-                or finding[1] not in P1_SEVERITIES
-                or (finding[2] is not None and not isinstance(finding[2], str))
+                record is None
+                or not isinstance(record.get("id"), str)
+                or not record["id"]
+                or not isinstance(record.get("severity"), str)
+                or record["severity"] not in P1_SEVERITIES
+                or (record.get("trigger_kind") is not None and not isinstance(record["trigger_kind"], str))
             ):
-                errors.append("primary p1_findings must contain (id, P1 severity, trigger_kind)")
+                errors.append(
+                    "primary p1_findings must contain (id, P1 severity, trigger_kind) "
+                    "or (id, P1 severity, trigger_kind, file, line, category)"
+                )
                 continue
-            finding_ids.append(finding[0])
+            finding_ids.append(record["id"])
         if tuple(finding_ids) != primary.p1_ids:
             errors.append("primary p1_findings ids must match p1_ids")
     return errors
@@ -1533,17 +1732,20 @@ def validate_receipt(receipt: Receipt, scope: Scope) -> None:
     elif receipt.p1_findings:
         finding_ids: list[str] = []
         for finding in receipt.p1_findings:
+            record = _primary_finding_record(finding)
             if (
-                not isinstance(finding, tuple)
-                or len(finding) != 3
-                or not _nonempty_text(finding[0])
-                or not isinstance(finding[1], str)
-                or finding[1] not in P1_SEVERITIES
-                or (finding[2] is not None and not isinstance(finding[2], str))
+                record is None
+                or not _nonempty_text(record.get("id"))
+                or not isinstance(record.get("severity"), str)
+                or record["severity"] not in P1_SEVERITIES
+                or (record.get("trigger_kind") is not None and not isinstance(record["trigger_kind"], str))
             ):
-                errors.append("receipt p1_findings must contain (id, P1 severity, trigger_kind)")
+                errors.append(
+                    "receipt p1_findings must contain (id, P1 severity, trigger_kind) "
+                    "or (id, P1 severity, trigger_kind, file, line, category)"
+                )
                 continue
-            finding_ids.append(finding[0])
+            finding_ids.append(record["id"])
         if tuple(finding_ids) != receipt.p1_ids:
             errors.append("receipt p1_findings ids must match p1_ids")
     if not isinstance(receipt.processing_key, ProcessingKey):

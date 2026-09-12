@@ -158,6 +158,49 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
     return replace(receipt, **changes)
 
 
+def _stable_primary(scope=SCOPE, *, run_id=7, run_attempt=2, verdict="fail", ids=("p1",), line=12):
+    findings = tuple(
+        (finding_id, "major", "inferred", "src/lock.py", line, "correctness")
+        for finding_id in ids
+    )
+    return CONV.CanonicalPrimary(
+        schema_version=1,
+        repository_id=scope.repository_id,
+        pr_number=scope.pr_number,
+        head_sha=scope.head_sha,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        verdict=verdict,
+        p1_ids=tuple(ids),
+        p1_findings=findings,
+    )
+
+
+def _stable_disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
+    primary = primary or _stable_primary(scope)
+    audit_digest = audit_digest or "a" * 64
+    finding = primary.p1_findings[0]
+    key = CONV.canonical_finding_key(
+        {"file": finding[3], "line": finding[4], "category": finding[5], "severity": finding[1]}
+    )
+    receipt = CONV.DispositionReceipt(
+        schema_version=CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION,
+        disposition="false-positive",
+        repository_id=str(scope.repository_id),
+        pr_number=scope.pr_number,
+        epoch=CONV.derive_epoch(scope),
+        head_sha=scope.head_sha,
+        audit_digest=audit_digest,
+        finding_id=key,
+        finding_key=key,
+        reason="locked upstream behavior",
+        approver="octocat",
+        approver_id=1,
+        approved_at="2026-08-30T12:00:00Z",
+    )
+    return replace(receipt, **changes)
+
+
 def _state_for(name):
     state = CONV.initial_state(SCOPE)
     if name == "C":
@@ -193,16 +236,26 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     receipt = _disposition(primary=primary)
     changed_scope = replace(SCOPE, head_sha="x" * 40)
-    assert CONV.validate_disposition_receipt(
+    stale = CONV.validate_disposition_receipt(
         receipt, scope=changed_scope, primary=replace(primary, head_sha=changed_scope.head_sha),
         audit_digest="a" * 64,
-    ).reason == "epoch_mismatch_stale"
-    assert CONV.validate_disposition_receipt(
+    )
+    assert stale.reason_code == "epoch_mismatch_stale"
+    assert receipt.finding_id in stale.reason
+    assert changed_scope.head_sha in stale.reason
+    mismatched_digest = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="b" * 64,
-    ).reason == "audit_digest_mismatch"
-    assert CONV.validate_disposition_receipt(
+    )
+    assert mismatched_digest.reason_code == "audit_digest_mismatch"
+    assert receipt.finding_id in mismatched_digest.reason
+    assert SCOPE.head_sha in mismatched_digest.reason
+    missing = CONV.validate_disposition_receipt(
         replace(receipt, finding_id="other"), scope=SCOPE, primary=primary, audit_digest="a" * 64,
-    ).reason == "finding_not_current_p1"
+    )
+    assert missing.reason_code == "finding_not_current_p1"
+    assert "other" in missing.reason
+    assert SCOPE.head_sha in missing.reason
+    assert "p1" in missing.reason
 
 
 @pytest.mark.parametrize(
@@ -377,7 +430,7 @@ def test_canonical_audit_digest_ignores_runtime_noise():
 def test_canonical_audit_digest_changes_with_findings_or_verdict():
     base = _runtime_audit()
     moved = _runtime_audit(findings=[{"id": "p1", "severity": "major", "file": "lock.py", "line": 13}])
-    other = _runtime_audit(findings=[{"id": "p2", "severity": "major", "file": "lock.py", "line": 12}])
+    other = _runtime_audit(findings=[{"id": "p2", "severity": "major", "file": "other.py", "line": 12}])
     passed = _runtime_audit(verdict="pass")
     digest = CONV.canonical_audit_digest(base)
     assert digest != CONV.canonical_audit_digest(moved)
@@ -385,10 +438,50 @@ def test_canonical_audit_digest_changes_with_findings_or_verdict():
     assert digest != CONV.canonical_audit_digest(passed)
 
 
-def test_canonical_audit_digest_binds_finding_trigger_kind():
+def test_canonical_audit_digest_ignores_finding_id_and_trigger_kind():
     base = _runtime_audit(findings=[{"id": "p1", "severity": "major", "trigger_kind": "inferred"}])
     measured = _runtime_audit(findings=[{"id": "p1", "severity": "major", "trigger_kind": "measured"}])
-    assert CONV.canonical_audit_digest(base) != CONV.canonical_audit_digest(measured)
+    renamed = _runtime_audit(findings=[{"id": "renamed", "severity": "major", "trigger_kind": "inferred"}])
+    assert CONV.canonical_audit_digest(base) == CONV.canonical_audit_digest(measured)
+    assert CONV.canonical_audit_digest(base) == CONV.canonical_audit_digest(renamed)
+
+
+def test_canonical_finding_key_distinguishes_missing_null_and_empty_values():
+    base = {"file": "src/lock.py", "line": 12, "category": "correctness", "severity": "major"}
+    assert CONV.canonical_finding_key(base) != CONV.canonical_finding_key({**base, "category": ""})
+    assert CONV.canonical_finding_key(base) != CONV.canonical_finding_key({**base, "category": None})
+    assert CONV.canonical_finding_key(base) != CONV.canonical_finding_key({key: value for key, value in base.items() if key != "category"})
+
+
+def test_stable_disposition_survives_finding_id_change_but_not_line_change():
+    first = _stable_primary()
+    receipt = _stable_disposition(primary=first)
+    renamed = _stable_primary(ids=("model-renamed",))
+    active = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=renamed, audit_digest="a" * 64,
+    )
+    assert (active.valid, active.active, active.reason) == (True, True, "active_false_positive")
+    consumed = CONV.consume_dispositions(
+        renamed.p1_ids, (receipt,), scope=SCOPE, primary=renamed, audit_digest="a" * 64,
+    )
+    assert consumed.remaining_p1_ids == ()
+    moved = _stable_primary(ids=("model-renamed",), line=13)
+    stale = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=moved, audit_digest="a" * 64,
+    )
+    assert stale.reason_code == "finding_not_current_p1"
+    assert receipt.finding_key in stale.reason
+
+
+def test_stable_disposition_rejects_ambiguous_current_key():
+    primary = _stable_primary(ids=("p1", "p2"))
+    receipt = _stable_disposition(primary=primary)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert status.reason_code == "finding_key_ambiguous"
+    assert "2" in status.reason
+    assert receipt.finding_key in status.reason
 
 
 def test_legacy_raw_bytes_digest_still_consumes_current_file():
@@ -406,7 +499,9 @@ def test_legacy_raw_bytes_digest_still_consumes_current_file():
         receipt, scope=SCOPE, primary=primary, audit_digest=canonical,
     )
     assert (matched.consumable, matched.reason) == (True, "active_false_positive")
-    assert rejected.reason == "audit_digest_mismatch"
+    assert rejected.reason_code == "audit_digest_mismatch"
+    assert receipt.finding_id in rejected.reason
+    assert SCOPE.head_sha in rejected.reason
 
 
 def test_only_false_positive_resolves_matching_current_finding():
