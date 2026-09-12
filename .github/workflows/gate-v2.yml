@@ -417,7 +417,7 @@ jobs:
             ${{ runner.temp }}/pr-size-preflight.json
             ${{ runner.temp }}/install-result.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
       - name: Retry upload v2 review ledger inputs
         id: ledger-input-upload-retry
@@ -431,7 +431,7 @@ jobs:
             ${{ runner.temp }}/pr-size-preflight.json
             ${{ runner.temp }}/install-result.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
           overwrite: true
 
       - name: Record ledger input upload outcome
@@ -683,7 +683,7 @@ jobs:
           name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/primary-review-audit.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
 
       - name: Upload primary review diagnostics
         # The finalizer creates manifest.json for an absent/empty producer
@@ -695,7 +695,7 @@ jobs:
           name: primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/primary-review-diagnostics/
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 3
 
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
   resolve_advisory:
@@ -1061,7 +1061,7 @@ jobs:
           name: advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shadow-events/advisory
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
 
   # ── gate (final aggregator — required check) ────────────────────────────
   gate:
@@ -1255,7 +1255,7 @@ jobs:
           name: gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/convergence-receipt
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
 
       - name: Upload gate terminal envelope
         if: always()
@@ -1265,6 +1265,7 @@ jobs:
           name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-terminal.json
           if-no-files-found: error
+          retention-days: 30
 
       - name: Publish gate status panel
         if: always() && steps.upload-gate-terminal.outcome == 'success'
@@ -1309,7 +1310,7 @@ jobs:
           name: gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-status-panel-delivery.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
 
   # ── ledger (independent persistence health check) ───────────────────────
   ledger:
