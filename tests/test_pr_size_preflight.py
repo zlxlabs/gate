@@ -1,4 +1,5 @@
 import importlib.util
+import http.client
 import json
 import subprocess
 import sys
@@ -445,3 +446,66 @@ def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, mon
     assert b"Reviewable text: 10 lines" in summary_bytes
     assert b"`exports/survey.doc.html`" not in summary_bytes
     assert b'"exports/survey.doc.html"' in summary_bytes
+
+
+@pytest.mark.parametrize(
+    ("thresholds", "expected_classification", "expected_code"),
+    [
+        ((20, 40, 3), "single", 0),
+        ((5, 40, 3), "sharded", 0),
+        ((5, 8, 3), "warning", 0),
+        ((3, 4, 3), "blocked", 1),
+    ],
+)
+def test_main_preserves_size_decision_when_sticky_comment_disconnects(
+    tmp_path, monkeypatch, capsys, thresholds, expected_classification, expected_code
+):
+    module = _module()
+    repo, base, head = _fixture_repo(tmp_path)
+    result_path = tmp_path / "main-result.json"
+    output_path = tmp_path / "github-output"
+    summary_path = tmp_path / "github-summary.md"
+    max_diff_lines, warn_lines, max_review_shards = thresholds
+
+    def fail_post(*args, **kwargs):
+        raise http.client.RemoteDisconnected("connection reset")
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "fixture/repo")
+    monkeypatch.setenv("PR_NUMBER", "1")
+    monkeypatch.setenv("GH_TOKEN", "token")
+    monkeypatch.setattr(module, "post_sticky_comment", fail_post)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "preflight.py",
+            "--base-sha", base,
+            "--head-sha", head,
+            "--max-diff-lines", str(max_diff_lines),
+            "--warn-lines", str(warn_lines),
+            "--max-review-shards", str(max_review_shards),
+            "--output", str(result_path),
+        ],
+    )
+
+    assert module.main() == expected_code
+
+    result = json.loads(result_path.read_text())
+    assert result["classification"] == expected_classification
+    assert result["reviewable_lines"] == 10
+    assert result["raw_patch_lines"] == 5041
+    assert result["changed_lines"] == 5013
+    assert result["excluded_files"] == [
+        {"path": "assets/payload.bin", "rule": "R1", "raw_lines": 10},
+        {"path": "docs.pdf", "rule": "R2", "raw_lines": 9},
+        {"path": "exports/survey.doc.html", "rule": "R3", "raw_lines": 5012},
+    ]
+    assert f"Status: `{expected_classification}`" in summary_path.read_text()
+    assert "reviewable-lines=10\n" in output_path.read_text()
+    assert "excluded-files=" in output_path.read_text()
+    captured = capsys.readouterr()
+    assert "RemoteDisconnected" in captured.out
+    assert "connection reset" in captured.out
