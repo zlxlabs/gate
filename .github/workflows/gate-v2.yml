@@ -683,7 +683,7 @@ jobs:
           name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/primary-review-audit.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
 
       - name: Upload primary review diagnostics
         # The finalizer creates manifest.json for an absent/empty producer

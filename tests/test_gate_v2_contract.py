@@ -499,6 +499,16 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
     assert upload_step["with"]["path"] == "${{ runner.temp }}/shadow-events/advisory"
 
 
+def test_advisory_event_upload_declares_three_day_retention():
+    raw, _ = _load_workflow()
+    upload = next(
+        step
+        for step in raw["jobs"]["ocr"]["steps"]
+        if step.get("name") == "Upload advisory review event"
+    )
+    assert upload["with"]["retention-days"] == 3
+
+
 def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
     # Same matrix-leg naming pattern as gate-shadow-v2.yml's shadow job — must pass
     # JOB_NAME_SUFFIX via jq --arg and fail-loud with categorized diagnostics.
@@ -838,7 +848,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert "continue-on-error" not in upload
     assert upload["with"]["if-no-files-found"] == "error"
     assert upload["with"]["path"] == "${{ runner.temp }}/primary-review-audit.json"
-    assert upload["with"]["retention-days"] == 7
+    assert upload["with"]["retention-days"] == 14
 
 
 def test_primary_uploads_review_diagnostics_after_canonical_audit():
@@ -984,6 +994,21 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
         "if-no-files-found": "error",
         "retention-days": 30,
     }
+
+
+def test_review_ledger_input_uploads_declare_one_day_retention():
+    raw, _ = _load_workflow()
+    quality_steps = raw["jobs"]["quality"]["steps"]
+    upload = next(
+        step for step in quality_steps if step.get("name") == "Upload v2 review ledger inputs"
+    )
+    retry = next(
+        step
+        for step in quality_steps
+        if step.get("name") == "Retry upload v2 review ledger inputs"
+    )
+    assert upload["with"]["retention-days"] == 1
+    assert retry["with"]["retention-days"] == 1
 
 
 def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
