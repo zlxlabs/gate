@@ -286,13 +286,25 @@ def test_disposition_checkout_uses_reusable_workflow_identity():
 
 
 def test_disposition_workflow_call_accepts_legacy_gate_ref_both_ways():
-    _, trigger = _load_disposition_workflow()
-    declared = trigger["workflow_call"]["inputs"]
-    required = {name for name, spec in declared.items() if spec.get("required")}
-    business_inputs = set(declared) - {"gate_ref"}
-    assert required == business_inputs
-    for supplied in (business_inputs, set(declared)):
-        assert required <= supplied
+    _, callee_trigger = _load_disposition_workflow()
+    callee_declared = callee_trigger["workflow_call"]["inputs"]
+    callee_required = {name for name, spec in callee_declared.items() if spec.get("required")}
+
+    caller_raw, _ = _load_disposition_caller()
+    caller_inputs = set(caller_raw["jobs"]["disposition"]["with"].keys())
+    assert "gate_ref" not in caller_inputs
+
+    # New caller: caller omits gate_ref; callee required inputs must be satisfied
+    # and caller must stay within declared callee inputs.
+    assert callee_required <= caller_inputs
+    assert caller_inputs <= set(callee_declared)
+
+    # Legacy caller: caller still supplies gate_ref; callee required inputs are
+    # satisfied and callee must still accept gate_ref without schema rejection.
+    legacy_caller_inputs = caller_inputs | {"gate_ref"}
+    assert callee_required <= legacy_caller_inputs
+    assert legacy_caller_inputs <= set(callee_declared)
+
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
