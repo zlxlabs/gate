@@ -1,0 +1,60 @@
+name: v2 tag sync
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: v2-tag-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history and tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Evaluate migration switch and breaker
+        id: guard
+        env:
+          V2_TAG_SYNC_ENABLED: ${{ vars.V2_TAG_SYNC_ENABLED }}
+          EVENT_BEFORE: ${{ github.event.before || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${EVENT_BEFORE}" ] && [ "${EVENT_BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            commit_messages="$(git log --format=%B "${EVENT_BEFORE}..${GITHUB_SHA}")"
+          else
+            commit_messages="$(git log -1 --format=%B "${GITHUB_SHA}")"
+          fi
+          if python3 scripts/v2_tag_guard.py \
+            --enabled "${V2_TAG_SYNC_ENABLED:-}" \
+            --commit-message "${commit_messages}"
+          then
+            echo "advance=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "advance=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch the remote v2 tag for the contract check
+        if: steps.guard.outputs.advance == 'true'
+        run: git fetch --force origin refs/tags/v2:refs/tags/v2
+
+      - name: Install contract-check dependencies
+        if: steps.guard.outputs.advance == 'true'
+        run: python3 -m pip install --disable-pip-version-check --no-input pytest pyyaml
+
+      - name: Verify the v2 caller contract before moving the tag
+        if: steps.guard.outputs.advance == 'true'
+        run: python3 -m pytest -q tests/test_gate_caller_contract_guard.py
+
+      - name: Move v2 to this main commit
+        if: steps.guard.outputs.advance == 'true'
+        run: git push origin "HEAD:refs/tags/v2" --force
