@@ -1356,6 +1356,8 @@ def _fetch_pr_draft(*, token: Optional[str], repository: str, pr_number: Optiona
             if attempt >= PR_DRAFT_FETCH_ATTEMPTS - 1:
                 return None
             time.sleep(PR_DRAFT_FETCH_BACKOFF_SECONDS[attempt])
+        except Exception:
+            return None
     if not isinstance(payload, dict) or type(payload.get("draft")) is not bool:
         return None
     return payload["draft"]
