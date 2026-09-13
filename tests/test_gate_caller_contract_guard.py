@@ -10,11 +10,23 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WORKFLOW_PATHS = (
-    ".github/workflows/gate-v2.yml",
-    ".github/workflows/gate-shadow-v2.yml",
-    ".github/workflows/gate.yml",
-)
+
+
+def _caller_workflow_paths() -> tuple[str, ...]:
+    paths = set()
+    for template in sorted((REPO_ROOT / "templates").glob("caller-*.yml")):
+        document = yaml.safe_load(template.read_text()) or {}
+        for job in (document.get("jobs", {}) or {}).values():
+            uses = job.get("uses") if isinstance(job, dict) else None
+            prefix = "zlxlabs/gate/"
+            if isinstance(uses, str) and uses.startswith(prefix):
+                path = uses[len(prefix) :].split("@", 1)[0]
+                if path.startswith(".github/workflows/") and path.endswith(".yml"):
+                    paths.add(path)
+    return tuple(sorted(paths))
+
+
+WORKFLOW_PATHS = _caller_workflow_paths()
 PERMISSION_SCOPES = (
     "actions",
     "attestations",
@@ -144,6 +156,10 @@ def _load_at_ref(ref: str, path: str):
     return yaml.safe_load(result.stdout)
 
 
+def _workflow_path(filename: str) -> str:
+    return next(path for path in WORKFLOW_PATHS if path.endswith(f"/{filename}"))
+
+
 def test_v2_contract_does_not_break_existing_callers():
     tag_commit = _tag_commit()
     failures = []
@@ -156,17 +172,29 @@ def test_v2_contract_does_not_break_existing_callers():
 
 def test_contract_guard_rejects_removed_input():
     tag_commit = _tag_commit()
-    baseline = _load_at_ref(tag_commit, WORKFLOW_PATHS[0])
-    current = yaml.safe_load((REPO_ROOT / WORKFLOW_PATHS[0]).read_text())
+    path = _workflow_path("gate-v2.yml")
+    baseline = _load_at_ref(tag_commit, path)
+    current = yaml.safe_load((REPO_ROOT / path).read_text())
     current_call = _workflow_call(current)
     del current_call["inputs"]["tier"]
     assert "input removed: tier" in contract_violations(baseline, current)
 
 
+def test_contract_guard_rejects_removed_disposition_input():
+    tag_commit = _tag_commit()
+    path = _workflow_path("gate-v2-disposition.yml")
+    baseline = _load_at_ref(tag_commit, path)
+    current = yaml.safe_load((REPO_ROOT / path).read_text())
+    current_call = _workflow_call(current)
+    del current_call["inputs"]["finding_id"]
+    assert "input removed: finding_id" in contract_violations(baseline, current)
+
+
 def test_contract_guard_rejects_permission_expansion():
     tag_commit = _tag_commit()
-    baseline = _load_at_ref(tag_commit, WORKFLOW_PATHS[0])
-    current = yaml.safe_load((REPO_ROOT / WORKFLOW_PATHS[0]).read_text())
+    path = _workflow_path("gate-v2.yml")
+    baseline = _load_at_ref(tag_commit, path)
+    current = yaml.safe_load((REPO_ROOT / path).read_text())
     current["permissions"]["contents"] = "write"
     assert "permission expanded at workflow: contents 1->2" in contract_violations(
         baseline, current

@@ -20,14 +20,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enabled", required=True)
     parser.add_argument("--commit-message", required=True)
     args = parser.parse_args(argv)
+    if should_advance(args.enabled, args.commit_message):
+        print("v2 tag sync enabled and no breaker marker found")
+        return 0
     if args.enabled != "true":
         print("v2 tag sync disabled; set V2_TAG_SYNC_ENABLED=true after migration")
         return 1
-    if HOLD_MARKER in args.commit_message:
-        print(f"v2 tag sync held by commit marker {HOLD_MARKER}")
-        return 1
-    print("v2 tag sync enabled and no breaker marker found")
-    return 0
+    print(f"v2 tag sync held by commit marker {HOLD_MARKER}")
+    return 1
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import yaml
 
-from scripts.v2_tag_guard import HOLD_MARKER, should_advance
+from scripts.v2_tag_guard import HOLD_MARKER, main
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -34,12 +34,14 @@ def test_sync_workflow_has_migration_switch_and_contract_before_push():
 
 
 def test_breaker_marker_blocks_advancement():
-    assert not should_advance("true", f"fix caller {HOLD_MARKER}")
+    assert main(
+        ["--enabled", "true", "--commit-message", f"fix caller {HOLD_MARKER}"]
+    ) == 1
 
 
 def test_enabled_clean_commit_advances():
-    assert should_advance("true", "fix implementation")
+    assert main(["--enabled", "true", "--commit-message", "fix implementation"]) == 0
 
 
 def test_disabled_migration_switch_blocks_advancement():
-    assert not should_advance("", "fix implementation")
+    assert main(["--enabled", "", "--commit-message", "fix implementation"]) == 1
