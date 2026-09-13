@@ -217,7 +217,7 @@ class DispositionStatus:
 
     @property
     def finding_id(self) -> str:
-        return self.receipt.finding_key or self.receipt.finding_id
+        return self.receipt.finding_id
 
     @property
     def message(self) -> str:

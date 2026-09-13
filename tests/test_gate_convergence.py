@@ -485,6 +485,16 @@ def test_stable_disposition_uses_finding_key_when_human_id_differs():
     assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
 
 
+def test_disposition_status_finding_id_is_human_readable_id():
+    primary = _stable_primary(ids=("current-id",))
+    receipt = _stable_disposition(primary=primary)
+    status = CONV.disposition_status(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert status.finding_id == "current-id"
+    assert status.finding_id != receipt.finding_key
+
+
 def test_stable_primary_with_null_line_is_consumable():
     primary = _stable_primary(line=None)
     receipt = _stable_disposition(primary=primary)
