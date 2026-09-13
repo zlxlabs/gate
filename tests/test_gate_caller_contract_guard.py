@@ -102,8 +102,8 @@ def contract_violations(baseline, current) -> list[str]:
     )
     old_permissions = _permission_declarations(baseline)
     new_permissions = _permission_declarations(current)
-    for location, old_decl in old_permissions.items():
-        if location not in new_permissions and any(_permission_map(old_decl).values()):
+    for location in old_permissions:
+        if location not in new_permissions:
             violations.append(f"permissions declaration removed at {location}")
     for location, current_decl in new_permissions.items():
         old_decl = old_permissions.get(location, {})
