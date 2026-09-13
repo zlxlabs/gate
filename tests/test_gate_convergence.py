@@ -503,6 +503,68 @@ def test_legacy_id_disposition_remains_usable_with_stable_primary_projection():
     assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
 
 
+def test_legacy_id_disposition_rejects_ambiguous_stable_primary_and_consumption_fails_closed():
+    primary = _stable_primary(ids=("p1", "p2"), line=None)
+    receipts = tuple(
+        _disposition(primary=primary, finding_id=finding_id)
+        for finding_id in primary.p1_ids
+    )
+
+    statuses = tuple(
+        CONV.validate_disposition_receipt(
+            receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        )
+        for receipt in receipts
+    )
+    assert all(
+        (status.valid, status.consumable, status.reason_code)
+        == (False, False, "finding_key_ambiguous")
+        for status in statuses
+    )
+
+    consumed = CONV.consume_dispositions(
+        primary.p1_ids, receipts, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert consumed.remaining_p1_ids == primary.p1_ids
+    assert consumed.fail_closed is True
+
+
+@pytest.mark.parametrize(
+    "primary, receipt, expected",
+    [
+        (
+            _stable_primary(ids=("p1", "p2"), line=None),
+            _stable_disposition(primary=_stable_primary(ids=("p1", "p2"), line=None)),
+            (False, False),
+        ),
+        (
+            _stable_primary(ids=("p1",), line=13),
+            _stable_disposition(
+                primary=_stable_primary(ids=("p1",), line=12),
+                finding_id="missing",
+            ),
+            (False, False),
+        ),
+        (
+            _stable_primary(ids=("p1",), line=12),
+            _stable_disposition(primary=_stable_primary(ids=("p1",), line=12)),
+            (True, True),
+        ),
+    ],
+)
+def test_legacy_path_is_never_more_permissive_than_stable_key_path(primary, receipt, expected):
+    with_key = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    without_key = CONV.validate_disposition_receipt(
+        replace(receipt, finding_key=""),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+
+    assert (with_key.valid, with_key.consumable) == expected
+    assert (without_key.valid, without_key.consumable) == expected
+
+
 def test_primary_errors_describe_legacy_and_stable_finding_shapes():
     malformed = replace(
         _stable_primary(),

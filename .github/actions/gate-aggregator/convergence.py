@@ -616,6 +616,29 @@ def _disposition_status(
     )
 
 
+def _ambiguous_finding_key_status(
+    receipt: DispositionReceipt,
+    *,
+    finding_key: str,
+    matches: list[tuple[str, dict[str, Any]]],
+    scope: Scope,
+    primary: CanonicalPrimary,
+) -> DispositionStatus | None:
+    if len(matches) <= 1:
+        return None
+    return _disposition_status(
+        receipt, valid=False, active=False, consumable=False,
+        reason="finding_key_ambiguous",
+        message=(
+            f"finding_key_ambiguous: finding key {finding_key!r} matches "
+            f"{len(matches)} current P1 findings, so the disposition target cannot be "
+            f"determined; current head_sha {scope.head_sha!r}. Register only after the "
+            f"duplicate key is resolved. Current P1 keys: "
+            f"{json.dumps(list(_current_p1_keys(primary)), ensure_ascii=False, separators=(",", ":"))}"
+        ),
+    )
+
+
 def _legacy_disposition_stub(receipt: DispositionReceipt) -> bool:
     return (
         isinstance(receipt, DispositionReceipt)
@@ -700,18 +723,12 @@ def validate_disposition_receipt(
 
     if receipt.finding_key:
         matches = _stable_primary_matches(receipt.finding_key, primary)
-        if len(matches) > 1:
-            return _disposition_status(
-                receipt, valid=False, active=False, consumable=False,
-                reason="finding_key_ambiguous",
-                message=(
-                    f"finding_key_ambiguous: finding key {receipt.finding_key!r} matches "
-                    f"{len(matches)} current P1 findings, so the disposition target cannot be "
-                    f"determined; current head_sha {scope.head_sha!r}. Register only after the "
-                    f"duplicate key is resolved. Current P1 keys: "
-                    f"{json.dumps(list(_current_p1_keys(primary)), ensure_ascii=False, separators=(",", ":"))}"
-                ),
-            )
+        ambiguous = _ambiguous_finding_key_status(
+            receipt, finding_key=receipt.finding_key, matches=matches,
+            scope=scope, primary=primary,
+        )
+        if ambiguous is not None:
+            return ambiguous
         if len(matches) == 0:
             return _disposition_status(
                 receipt, valid=False, active=False, consumable=False,
@@ -745,6 +762,16 @@ def validate_disposition_receipt(
             ),
             None,
         ) if isinstance(primary.p1_findings, tuple) else None
+        if isinstance(finding, tuple) and len(finding) == 6:
+            stable_record = _primary_finding_record(finding)
+            stable_key = canonical_finding_key(stable_record)
+            ambiguous = _ambiguous_finding_key_status(
+                receipt, finding_key=stable_key,
+                matches=_stable_primary_matches(stable_key, primary),
+                scope=scope, primary=primary,
+            )
+            if ambiguous is not None:
+                return ambiguous
 
     if isinstance(finding, dict):
         finding_severity = finding.get("severity")
