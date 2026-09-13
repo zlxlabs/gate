@@ -1,6 +1,6 @@
 # Business-repo caller for gate-v2-disposition.yml.
-# Copy to .github/workflows/gate-disposition.yml. Replace BOTH the uses
-# @__PINNED_GATE_SHA__ and with.gate_ref with the same 40-hex of zlxlabs/gate.
+# Copy to .github/workflows/gate-disposition.yml. Replace
+# @__PINNED_GATE_SHA__ with the desired ref of zlxlabs/gate.
 name: gate-disposition
 
 on:
@@ -31,4 +31,3 @@ jobs:
       primary_run_attempt: ${{ inputs.primary_run_attempt }}
       finding_id: ${{ inputs.finding_id }}
       reason: ${{ inputs.reason }}
-      gate_ref: __PINNED_GATE_SHA__

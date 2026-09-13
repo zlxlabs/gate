@@ -160,7 +160,7 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert set(trigger["workflow_call"]["inputs"]) == expected_inputs
     for kind in ("workflow_dispatch", "workflow_call"):
         gate_ref = trigger[kind]["inputs"]["gate_ref"]
-        assert gate_ref["required"] is True
+        assert gate_ref["required"] is False
         assert gate_ref["type"] == "string"
     text = DISPOSITION_WORKFLOW.read_text()
     assert "issue_receipt.py issue" in text
@@ -272,34 +272,27 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
     assert checkout["with"].get("sparse-checkout-cone-mode") is False
 
 
-def test_disposition_checkout_pins_zlxlabs_gate_at_gate_ref():
+def test_disposition_checkout_uses_reusable_workflow_identity():
     raw, _ = _load_disposition_workflow()
     checkout = next(
         step
         for step in raw["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
     )
-    assert checkout["with"]["repository"] == "zlxlabs/gate"
-    assert checkout["with"]["ref"] == "${{ inputs.gate_ref }}"
+    assert checkout["with"]["repository"] == "${{ job.workflow_repository }}"
+    assert checkout["with"]["ref"] == "${{ job.workflow_sha }}"
+    assert not any(step.get("name") == "Require 40-hex gate_ref" for step in raw["jobs"]["control"]["steps"])
+    assert "inputs." + "gate_ref" not in DISPOSITION_WORKFLOW.read_text()
 
 
-def test_disposition_requires_lowercase_40_hex_gate_ref_before_checkout():
-    raw, _ = _load_disposition_workflow()
-    steps = raw["jobs"]["control"]["steps"]
-    names = [step.get("name") for step in steps]
-    validate_name = "Require 40-hex gate_ref"
-    checkout_name = "Checkout disposition producer"
-    assert validate_name in names
-    assert names.index(validate_name) < names.index(checkout_name)
-    validate = next(step for step in steps if step.get("name") == validate_name)
-    assert validate["env"]["GATE_REF"] == "${{ inputs.gate_ref }}"
-    run = validate["run"]
-    assert "^[0-9a-f]{40}$" in run
-    assert '[[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]' in run
-    assert "::error::" in run
-    assert "exit 1" in run
-    assert "rev-parse" not in run
-    assert "git " not in run
+def test_disposition_workflow_call_accepts_legacy_gate_ref_both_ways():
+    _, trigger = _load_disposition_workflow()
+    declared = trigger["workflow_call"]["inputs"]
+    required = {name for name, spec in declared.items() if spec.get("required")}
+    business_inputs = set(declared) - {"gate_ref"}
+    assert required == business_inputs
+    for supplied in (business_inputs, set(declared)):
+        assert required <= supplied
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
@@ -2060,7 +2053,7 @@ def test_diff_coverage_advisory_never_gates_quality_job():
     assert "exit 1" not in advisory.get("run", "")
 
 
-def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
+def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
     raw, trigger = _load_disposition_caller()
     assert raw["name"] == "gate-disposition"
     assert set(trigger["workflow_dispatch"]["inputs"]) == {
@@ -2084,12 +2077,10 @@ def test_disposition_caller_forwards_business_inputs_and_pins_gate_ref():
     assert uses == (
         "zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@" + DISPOSITION_CALLER_PIN
     )
-    pin = uses.rsplit("@", 1)[1]
-    assert job["with"]["gate_ref"] == pin
     for key in ("pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason"):
         assert job["with"][key] == "${{ inputs." + key + " }}"
     assert set(job["with"]) == {
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
     }
     text = DISPOSITION_CALLER_TEMPLATE.read_text()
     non_comment_text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
