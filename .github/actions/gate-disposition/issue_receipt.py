@@ -123,19 +123,31 @@ def _matching_finding(findings: list[dict[str, Any]], target: str) -> dict[str, 
     """Resolve either the old finding id or the new exact stable key."""
 
     by_id = [finding for finding in findings if finding.get("id") == target]
-    if len(by_id) == 1:
-        return by_id[0]
     by_key = [
         finding for finding in findings
         if _CONVERGENCE.canonical_finding_key(finding) == target
     ]
-    if len(by_key) == 1:
-        return by_key[0]
+    if len(by_id) > 1:
+        raise ValueError(
+            f"finding target {target!r} matches {len(by_id)} finding ids, "
+            "cannot determine the disposition target"
+        )
     if len(by_key) > 1:
         raise ValueError(
             f"finding key {target!r} matches {len(by_key)} findings, "
             "cannot determine the disposition target"
         )
+    if by_id and by_key:
+        if by_id[0] is by_key[0]:
+            return by_id[0]
+        raise ValueError(
+            f"finding target {target!r} matches both a finding id and a different stable key; "
+            "cannot determine the disposition target"
+        )
+    if len(by_id) == 1:
+        return by_id[0]
+    if len(by_key) == 1:
+        return by_key[0]
     raise ValueError("finding_id must identify exactly one canonical audit finding")
 
 

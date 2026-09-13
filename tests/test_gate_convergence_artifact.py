@@ -386,6 +386,46 @@ def test_disposition_producer_rejects_stable_key_collision(tmp_path):
     assert "cannot determine" in failed.stderr
 
 
+def test_disposition_producer_rejects_id_and_different_key_collision(tmp_path):
+    findings = [
+        {
+            "id": "placeholder",
+            "severity": "major", "trigger_kind": "inferred",
+            "file": "src/a.py", "line": 10, "category": "correctness",
+        },
+        {
+            "id": "p2",
+            "severity": "major", "trigger_kind": "inferred",
+            "file": "src/b.py", "line": 20, "category": "security",
+        },
+    ]
+    target = CONV.canonical_finding_key(findings[1])
+    findings[0]["id"] = target
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
+        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
+        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
+        "tier": SCOPE.tier, "caller_sha": SCOPE.caller_sha,
+        "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "run_id": 77, "run_attempt": 1, "result": {"findings": findings},
+    }
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue",
+        "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--finding-id", target, "--reason", "reason", "--approver", "octocat",
+        "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
+        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+    ]
+    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert failed.returncode == 1
+    assert "matches both a finding id and a different stable key" in failed.stderr
+    assert "cannot determine" in failed.stderr
+
+
 def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
     audit = {
         "kind": "primary_review", "schema_version": 1,
