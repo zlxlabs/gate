@@ -173,7 +173,10 @@ def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
 
 def test_aggregate_cli_p1_receipt_bytes_validate_and_replay(tmp_path):
     audit = _scoped_audit(verdict="fail")
-    audit["result"]["findings"] = [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]
+    audit["result"]["findings"] = [{
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "src/lock.py", "line": 12, "category": "correctness",
+    }]
     audit_dir = tmp_path / "primary-audit"
     audit_dir.mkdir()
     (audit_dir / "primary-review-audit.json").write_bytes(json.dumps(audit, indent=2).encode() + b"\n")
@@ -193,7 +196,7 @@ def test_aggregate_cli_p1_receipt_bytes_validate_and_replay(tmp_path):
     assert completed.returncode == 1
     payload_bytes = receipt_path.read_bytes()
     payload = json.loads(payload_bytes)
-    assert payload["p1_findings"] == [["p1", "major", "inferred"]]
+    assert payload["p1_findings"] == [["p1", "major", "inferred", "src/lock.py", 12, "correctness"]]
     assert payload_bytes == json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     receipt = _receipt_from_payload(payload)
     CONV.validate_receipt(receipt, SCOPE)
@@ -206,7 +209,10 @@ def test_producer_payload_preserves_all_attempt_guards(tmp_path):
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "head_sha": SCOPE.head_sha, "run_id": 77,
         "run_attempt": 1, "pr": 42, "verdict": "pass", "reviewer": "codex",
-        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
+        "result": {"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
     }
     audit_bytes = json.dumps(audit, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     audit_path = tmp_path / "primary-audit.json"
@@ -543,7 +549,10 @@ def test_disposition_producer_rejects_non_inferred_trigger_kind(tmp_path, trigge
 
 def test_convergence_receipt_bytes_preserve_trigger_kind_for_replay():
     audit = _scoped_audit(verdict="fail")
-    audit["result"]["findings"] = [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]
+    audit["result"]["findings"] = [{
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "src/lock.py", "line": 12, "category": "correctness",
+    }]
     identity = AGG.Identity(123, SCOPE.head_sha, 77, 1, 42)
     digest = CONV.canonical_audit_digest(audit)
     outcome = AGG.evaluate(
@@ -553,7 +562,7 @@ def test_convergence_receipt_bytes_preserve_trigger_kind_for_replay():
         scope=SCOPE, audit_digest=digest,
     )
     payload = outcome.convergence_receipt.as_dict()
-    assert payload["p1_findings"] == [["p1", "major", "inferred"]]
+    assert payload["p1_findings"] == [["p1", "major", "inferred", "src/lock.py", 12, "correctness"]]
     replayed = CONV.replay_receipts(scope=SCOPE, receipts=(_receipt_from_payload(payload),))
     assert (replayed.clean_streak, replayed.eligible_rounds) == (0, 1)
 
@@ -673,7 +682,10 @@ def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "head_sha": SCOPE.head_sha, "run_id": 77,
         "run_attempt": 1, "pr": 42, "verdict": "pass", "reviewer": "codex",
-        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}, {"id": "p2", "severity": "minor"}]},
+        "result": {"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }, {"id": "p2", "severity": "minor"}]},
     }
     raw = json.dumps(audit, indent=2).encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()

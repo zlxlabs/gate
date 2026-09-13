@@ -717,7 +717,10 @@ def test_cli_non_draft_skip_never_calls_pr_draft_fetch(tmp_path, monkeypatch):
 def test_cli_exit_nonzero_with_zero_streak_receipt_for_red_or_unavailable_round(tmp_path, verdict):
     audit = _valid_scoped_primary_record(
         verdict=verdict,
-        result={"findings": [{"id": "p1", "severity": "major"}]},
+        result={"findings": [{
+            "id": "p1", "severity": "major", "file": "src/lock.py", "line": 12,
+            "category": "correctness",
+        }]},
     )
     rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="failure")
 
@@ -2413,7 +2416,10 @@ _DIGEST_B = "b" * 64
 def _failing_scoped_audit(*, finding_id="p1", severity="major"):
     return _valid_scoped_primary_record(
         verdict="fail",
-        result={"findings": [{"id": finding_id, "severity": severity, "trigger_kind": "inferred"}]},
+        result={"findings": [{
+            "id": finding_id, "severity": severity, "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
     )
 
 
@@ -2470,6 +2476,67 @@ def _zip_receipt_bytes(payload):
     with zipfile.ZipFile(buf, "w") as bundle:
         bundle.writestr("receipt.json", json.dumps(payload, sort_keys=True, separators=(",", ":")))
     return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        {"id": "p1", "severity": "major", "line": 12, "category": "correctness"},
+        {"id": "p1", "severity": "major", "file": 12, "line": 12, "category": "correctness"},
+        {"id": "p1", "severity": "major", "file": "src/lock.py", "line": "12", "category": "correctness"},
+        {"id": "p1", "severity": "major", "file": "src/lock.py", "line": 12, "category": None},
+    ],
+)
+def test_canonical_p1_projection_rejects_missing_or_malformed_stable_fields(finding):
+    audit = _valid_scoped_primary_record(result={"findings": [finding]})
+    assert AGG._canonical_p1_findings(audit) is None
+
+
+def test_aggregate_projection_binds_stable_disposition_and_rejects_line_change():
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    projected = AGG._canonical_p1_findings(audit)
+    assert projected is not None
+    scope = _scope_for(audit)
+    digest = CONV.canonical_audit_digest(audit)
+    stable_key = CONV.canonical_finding_key(audit["result"]["findings"][0])
+    receipt = _false_positive_receipt(
+        scope, audit_digest=digest, finding_id=stable_key, finding_key=stable_key,
+    )
+    primary = CONV.CanonicalPrimary(
+        schema_version=1, repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
+        head_sha=IDENTITY.head_sha, run_id=IDENTITY.run_id, run_attempt=IDENTITY.run_attempt,
+        verdict=audit["verdict"], p1_ids=tuple(item[0] for item in projected),
+        p1_findings=projected,
+    )
+    active = CONV.validate_disposition_receipt(
+        receipt, scope=scope, primary=primary, audit_digest=digest,
+    )
+    assert (active.valid, active.active, active.reason) == (True, True, "active_false_positive")
+
+    moved_audit = {
+        **audit,
+        "result": {"findings": [{**audit["result"]["findings"][0], "line": 13}]},
+    }
+    moved_projected = AGG._canonical_p1_findings(moved_audit)
+    assert moved_projected is not None
+    moved_primary = CONV.CanonicalPrimary(
+        schema_version=1, repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
+        head_sha=IDENTITY.head_sha, run_id=IDENTITY.run_id, run_attempt=IDENTITY.run_attempt,
+        verdict=moved_audit["verdict"], p1_ids=tuple(item[0] for item in moved_projected),
+        p1_findings=moved_projected,
+    )
+    stale = CONV.validate_disposition_receipt(
+        receipt, scope=scope, primary=moved_primary, audit_digest=digest,
+    )
+    assert (stale.valid, stale.active, stale.reason_code) == (
+        False, False, "finding_not_current_p1",
+    )
 
 
 @pytest.mark.parametrize("severity", ["major", "blocker"])
@@ -2688,8 +2755,8 @@ def test_partial_disposition_leaves_remaining_finding_blocking():
         verdict="fail",
         result={
             "findings": [
-                {"id": "keep", "severity": "major"},
-                {"id": "drop", "severity": "blocker", "trigger_kind": "inferred"},
+                {"id": "keep", "severity": "major", "file": "src/keep.py", "line": 10, "category": "correctness"},
+                {"id": "drop", "severity": "blocker", "trigger_kind": "inferred", "file": "src/drop.py", "line": 12, "category": "correctness"},
             ]
         },
     )

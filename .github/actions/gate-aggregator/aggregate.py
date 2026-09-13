@@ -442,12 +442,14 @@ def build_terminal_envelope(
     return envelope
 
 
-def _canonical_p1_findings(audit: dict[str, Any]) -> Optional[tuple[tuple[str, str, str | None], ...]]:
-    """Project canonical P1 ``(id, severity, trigger_kind)`` evidence."""
+def _canonical_p1_findings(
+    audit: dict[str, Any],
+) -> Optional[tuple[tuple[str, str, str | None, str, int, str], ...]]:
+    """Project canonical P1 stable-key evidence."""
     result = audit.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
         return None
-    p1_findings: list[tuple[str, str, str | None]] = []
+    p1_findings: list[tuple[str, str, str | None, str, int, str]] = []
     for finding in result["findings"]:
         if not isinstance(finding, dict):
             return None
@@ -459,10 +461,15 @@ def _canonical_p1_findings(audit: dict[str, Any]) -> Optional[tuple[tuple[str, s
         finding_id = finding.get("id")
         if not isinstance(finding_id, str) or not finding_id:
             return None
+        file = finding.get("file")
+        line = finding.get("line")
+        category = finding.get("category")
+        if not isinstance(file, str) or type(line) is not int or not isinstance(category, str):
+            return None
         trigger_kind = finding.get("trigger_kind")
         if trigger_kind is not None and not isinstance(trigger_kind, str):
             trigger_kind = None
-        p1_findings.append((finding_id, severity, trigger_kind))
+        p1_findings.append((finding_id, severity, trigger_kind, file, line, category))
     return tuple(sorted(p1_findings, key=lambda item: item[0]))
 
 

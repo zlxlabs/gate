@@ -507,6 +507,10 @@ def _primary_finding_record(finding: Any) -> dict[str, Any] | None:
 
     if not isinstance(finding, tuple):
         return None
+    # Expand-then-contract: canonical_primary receipts already published in
+    # the v2 artifact window may still carry the legacy three-field shape.
+    # TODO(gate#150): remove this branch after no retained canonical_primary
+    # receipt can be read back with a three-field p1_findings projection.
     if len(finding) == 3:
         return {
             "id": finding[0],
@@ -733,7 +737,7 @@ def validate_disposition_receipt(
         finding = next(
             (
                 item for item in primary.p1_findings
-                if isinstance(item, tuple) and len(item) == 3 and item[0] == receipt.finding_id
+                if isinstance(item, tuple) and len(item) >= 3 and item[0] == receipt.finding_id
             ),
             None,
         ) if isinstance(primary.p1_findings, tuple) else None
@@ -1224,10 +1228,19 @@ def _primary_errors(*, scope: Scope, primary: CanonicalPrimary) -> list[str]:
                 or not isinstance(record.get("severity"), str)
                 or record["severity"] not in P1_SEVERITIES
                 or (record.get("trigger_kind") is not None and not isinstance(record["trigger_kind"], str))
+                or (
+                    len(finding) == 6
+                    and (
+                        not isinstance(record.get("file"), str)
+                        or type(record.get("line")) is not int
+                        or not isinstance(record.get("category"), str)
+                    )
+                )
             ):
                 errors.append(
-                    "primary p1_findings must contain (id, P1 severity, trigger_kind) "
-                    "or (id, P1 severity, trigger_kind, file, line, category)"
+                    "primary p1_findings must contain either legacy v2 "
+                    "(id, P1 severity, trigger_kind) or stable-key "
+                    "(id, P1 severity, trigger_kind, file, line, category)"
                 )
                 continue
             finding_ids.append(record["id"])
@@ -1739,10 +1752,19 @@ def validate_receipt(receipt: Receipt, scope: Scope) -> None:
                 or not isinstance(record.get("severity"), str)
                 or record["severity"] not in P1_SEVERITIES
                 or (record.get("trigger_kind") is not None and not isinstance(record["trigger_kind"], str))
+                or (
+                    len(finding) == 6
+                    and (
+                        not isinstance(record.get("file"), str)
+                        or type(record.get("line")) is not int
+                        or not isinstance(record.get("category"), str)
+                    )
+                )
             ):
                 errors.append(
-                    "receipt p1_findings must contain (id, P1 severity, trigger_kind) "
-                    "or (id, P1 severity, trigger_kind, file, line, category)"
+                    "receipt p1_findings must contain either legacy v2 "
+                    "(id, P1 severity, trigger_kind) or stable-key "
+                    "(id, P1 severity, trigger_kind, file, line, category)"
                 )
                 continue
             finding_ids.append(record["id"])

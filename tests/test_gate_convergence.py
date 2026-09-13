@@ -473,6 +473,28 @@ def test_stable_disposition_survives_finding_id_change_but_not_line_change():
     assert receipt.finding_key in stale.reason
 
 
+def test_legacy_id_disposition_remains_usable_with_stable_primary_projection():
+    primary = _stable_primary()
+    receipt = _disposition(primary=primary)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+
+
+def test_primary_errors_describe_legacy_and_stable_finding_shapes():
+    malformed = replace(
+        _stable_primary(),
+        p1_findings=(("p1", "major", "inferred", "src/lock.py", "12", "correctness"),),
+    )
+    errors = CONV._primary_errors(scope=SCOPE, primary=malformed)
+    assert (
+        "primary p1_findings must contain either legacy v2 "
+        "(id, P1 severity, trigger_kind) or stable-key "
+        "(id, P1 severity, trigger_kind, file, line, category)"
+    ) in errors
+
+
 def test_stable_disposition_rejects_ambiguous_current_key():
     primary = _stable_primary(ids=("p1", "p2"))
     receipt = _stable_disposition(primary=primary)
