@@ -1,4 +1,6 @@
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -46,13 +48,14 @@ def test_sync_workflow_has_migration_switch_and_contract_before_push():
     assert ".github/v2-tag-sync.hold" in guard_run
 
 
-def test_breaker_marker_blocks_advancement():
+def test_breaker_marker_blocks_advancement(capsys):
     assert main(
         ["--enabled", "true", "--commit-message", f"fix caller {HOLD_MARKER}"]
     ) == 1
+    assert f"held by commit message marker: {HOLD_MARKER}" in capsys.readouterr().out
 
 
-def test_squash_safe_breaker_file_blocks_advancement(tmp_path):
+def test_squash_safe_breaker_file_blocks_advancement(tmp_path, capsys):
     hold_file = tmp_path / ".github" / "v2-tag-sync.hold"
     hold_file.parent.mkdir()
     hold_file.write_text("hold this migration")
@@ -66,11 +69,13 @@ def test_squash_safe_breaker_file_blocks_advancement(tmp_path):
             str(hold_file),
         ]
     ) == 1
+    assert f"held by breaker file: {hold_file}" in capsys.readouterr().out
 
 
 def test_breaker_file_query_failure_is_hold(tmp_path, capsys):
     not_a_directory = tmp_path / "not-a-directory"
     not_a_directory.write_text("not a directory")
+    hold_file = not_a_directory / "v2-tag-sync.hold"
     assert main(
         [
             "--enabled",
@@ -78,10 +83,12 @@ def test_breaker_file_query_failure_is_hold(tmp_path, capsys):
             "--commit-message",
             "clean squashed message",
             "--hold-file",
-            str(not_a_directory / "v2-tag-sync.hold"),
+            str(hold_file),
         ]
     ) == 1
-    assert "held by breaker signal" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert f"held: breaker file query failed: {hold_file}" in output
+    assert "NotADirectoryError" in output
 
 
 def test_push_failure_is_success_when_remote_matches_intent(capsys):
@@ -111,12 +118,55 @@ def test_push_failure_is_failure_when_remote_does_not_match(remote_result, expec
     assert expected in capsys.readouterr().out
 
 
-def test_annotated_tag_output_still_reads_direct_ref(capsys):
-    intended = "a" * 40
-    peeled = "b" * 40
-    remote_result = f"{intended}\trefs/tags/v2\n{peeled}\trefs/tags/v2^{{}}\n"
-    assert verify_remote_tag(intended, 0, remote_result)
-    assert "remote v2 tag verified" in capsys.readouterr().out
+def _real_annotated_tag_producer(tmp_path: Path) -> tuple[str, str, str]:
+    repo_dir = tmp_path / "annotated_repo"
+    repo_dir.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "initial commit"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    commit_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True, env=env
+    ).strip()
+    subprocess.run(
+        ["git", "tag", "-a", "v2", "-m", "annotated v2 tag"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    tag_sha = subprocess.check_output(
+        ["git", "rev-parse", "v2"], cwd=repo_dir, text=True, env=env
+    ).strip()
+    ls_remote = subprocess.check_output(
+        ["git", "ls-remote", ".", "refs/tags/v2*"],
+        cwd=repo_dir,
+        text=True,
+        env=env,
+    )
+    return commit_sha, tag_sha, ls_remote
+
+
+def test_annotated_tag_output_still_reads_direct_ref(tmp_path, capsys):
+    commit_sha, tag_sha, remote_result = _real_annotated_tag_producer(tmp_path)
+    assert commit_sha != tag_sha
+    assert f"{tag_sha}\trefs/tags/v2\n" in remote_result
+    assert f"{commit_sha}\trefs/tags/v2^{{}}\n" in remote_result
+    assert not verify_remote_tag(commit_sha, 0, remote_result)
+    output = capsys.readouterr().out
+    assert f"expected {commit_sha}, found {tag_sha}" in output
+    assert "remote v2 verification failed" in output
 
 
 def test_missing_remote_tag_is_failure(capsys):
@@ -124,9 +174,11 @@ def test_missing_remote_tag_is_failure(capsys):
     assert "refs/tags/v2 was not returned" in capsys.readouterr().out
 
 
-def test_enabled_clean_commit_advances():
+def test_enabled_clean_commit_advances(capsys):
     assert main(["--enabled", "true", "--commit-message", "fix implementation"]) == 0
+    assert "v2 tag sync enabled and no breaker signal found" in capsys.readouterr().out
 
 
-def test_disabled_migration_switch_blocks_advancement():
+def test_disabled_migration_switch_blocks_advancement(capsys):
     assert main(["--enabled", "", "--commit-message", "fix implementation"]) == 1
+    assert "v2 tag sync disabled; set V2_TAG_SYNC_ENABLED=true after migration" in capsys.readouterr().out
