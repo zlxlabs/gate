@@ -8,7 +8,7 @@ on:
       primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
-      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
+      gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
   workflow_call:
     inputs:
       pr_number: { description: "pull request number", required: true, type: string }
@@ -16,7 +16,7 @@ on:
       primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
-      gate_ref: { description: "40-hex SHA of zlxlabs/gate to checkout (must match caller pin)", required: true, type: string }
+      gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
 
 permissions:
   actions: write
@@ -35,21 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Require 40-hex gate_ref
-        env:
-          GATE_REF: ${{ inputs.gate_ref }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$GATE_REF" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::gate_ref must be a 40-character lowercase hex SHA, not a branch or tag"
-            exit 1
-          fi
-
       - name: Checkout disposition producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: zlxlabs/gate
-          ref: ${{ inputs.gate_ref }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           sparse-checkout: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
