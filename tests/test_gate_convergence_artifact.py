@@ -173,7 +173,10 @@ def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
 
 def test_aggregate_cli_p1_receipt_bytes_validate_and_replay(tmp_path):
     audit = _scoped_audit(verdict="fail")
-    audit["result"]["findings"] = [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]
+    audit["result"]["findings"] = [{
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "src/lock.py", "line": 12, "category": "correctness",
+    }]
     audit_dir = tmp_path / "primary-audit"
     audit_dir.mkdir()
     (audit_dir / "primary-review-audit.json").write_bytes(json.dumps(audit, indent=2).encode() + b"\n")
@@ -193,7 +196,7 @@ def test_aggregate_cli_p1_receipt_bytes_validate_and_replay(tmp_path):
     assert completed.returncode == 1
     payload_bytes = receipt_path.read_bytes()
     payload = json.loads(payload_bytes)
-    assert payload["p1_findings"] == [["p1", "major", "inferred"]]
+    assert payload["p1_findings"] == [["p1", "major", "inferred", "src/lock.py", 12, "correctness"]]
     assert payload_bytes == json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     receipt = _receipt_from_payload(payload)
     CONV.validate_receipt(receipt, SCOPE)
@@ -206,7 +209,10 @@ def test_producer_payload_preserves_all_attempt_guards(tmp_path):
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "head_sha": SCOPE.head_sha, "run_id": 77,
         "run_attempt": 1, "pr": 42, "verdict": "pass", "reviewer": "codex",
-        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
+        "result": {"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
     }
     audit_bytes = json.dumps(audit, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     audit_path = tmp_path / "primary-audit.json"
@@ -261,7 +267,10 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
         "tier": SCOPE.tier,
         "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
-        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
+        "result": {"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
     }
     audit_bytes = json.dumps(audit, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
     audit_path = tmp_path / "canonical-audit.json"
@@ -287,11 +296,14 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     artifact_path = Path(result["path"])
     payload_bytes = artifact_path.read_bytes()
     payload = json.loads(payload_bytes)
-    assert result["artifact"] == f"gate-disposition-receipt-v2-{epoch}-{digest[:12]}-p1"
+    stable_key = CONV.canonical_finding_key(audit["result"]["findings"][0])
+    key_digest = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:12]
+    assert result["artifact"] == f"gate-disposition-receipt-v2-{epoch}-{digest[:12]}-{key_digest}"
     assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     assert payload["kind"] == CONV.DISPOSITION_RECEIPT_KIND
     assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__)
-    assert payload["audit_digest"] == digest and payload["finding_id"] == "p1"
+    assert payload["audit_digest"] == digest
+    assert payload["finding_id"] == "p1" and payload["finding_key"] == stable_key
     assert payload["approver"] == "octocat"
     assert payload["approver_id"] == 1
     assert payload["approved_at"] == "2026-08-30T12:00:00Z"
@@ -308,7 +320,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     primary = CONV.CanonicalPrimary(
         schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
         head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
-        p1_findings=(("p1", "major", "inferred"),),
+        p1_findings=(("p1", "major", "inferred", "src/lock.py", 12, "correctness"),),
     )
     status = CONV.validate_disposition_receipt(
         parsed, scope=SCOPE, primary=primary, audit_digest=digest,
@@ -338,6 +350,82 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
     assert "finding_id must identify a P1 finding" in failed.stderr
 
 
+def test_disposition_producer_rejects_stable_key_collision(tmp_path):
+    findings = [
+        {
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        },
+        {
+            "id": "p2", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        },
+    ]
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
+        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
+        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
+        "tier": SCOPE.tier, "caller_sha": SCOPE.caller_sha,
+        "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "run_id": 77, "run_attempt": 1, "result": {"findings": findings},
+    }
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue",
+        "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--finding-id", "p1", "--reason", "reason", "--approver", "octocat",
+        "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
+        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+    ]
+    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert failed.returncode == 1
+    assert "2" in failed.stderr
+    assert "cannot determine" in failed.stderr
+
+
+def test_disposition_producer_rejects_id_and_different_key_collision(tmp_path):
+    findings = [
+        {
+            "id": "placeholder",
+            "severity": "major", "trigger_kind": "inferred",
+            "file": "src/a.py", "line": 10, "category": "correctness",
+        },
+        {
+            "id": "p2",
+            "severity": "major", "trigger_kind": "inferred",
+            "file": "src/b.py", "line": 20, "category": "security",
+        },
+    ]
+    target = CONV.canonical_finding_key(findings[1])
+    findings[0]["id"] = target
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
+        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
+        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
+        "tier": SCOPE.tier, "caller_sha": SCOPE.caller_sha,
+        "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "run_id": 77, "run_attempt": 1, "result": {"findings": findings},
+    }
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    argv = [
+        sys.executable, str(DISPOSITION_PRODUCER), "issue",
+        "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--finding-id", target, "--reason", "reason", "--approver", "octocat",
+        "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
+        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+    ]
+    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    assert failed.returncode == 1
+    assert "matches both a finding id and a different stable key" in failed.stderr
+    assert "cannot determine" in failed.stderr
+
+
 def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
     audit = {
         "kind": "primary_review", "schema_version": 1,
@@ -347,7 +435,10 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
         "tier": SCOPE.tier,
         "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
-        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
+        "result": {"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
     }
     audit_path = tmp_path / "canonical-audit.json"
     audit_path.write_bytes(json.dumps(audit, indent=2).encode("utf-8") + b"\n")
@@ -377,7 +468,7 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
     primary = CONV.CanonicalPrimary(
         schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
         head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
-        p1_findings=(("p1", "major", "inferred"),),
+        p1_findings=(("p1", "major", "inferred", "src/lock.py", 12, "correctness"),),
     )
     status = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary,
@@ -433,7 +524,10 @@ def test_disposition_producer_rejects_malformed_auth_fields(tmp_path, override, 
 
 
 def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="locked upstream behavior", trigger_kind="inferred"):
-    finding = {"id": "p1", "severity": "major"}
+    finding = {
+        "id": "p1", "severity": "major", "file": "src/lock.py", "line": 12,
+        "category": "correctness",
+    }
     if trigger_kind is not None:
         finding["trigger_kind"] = trigger_kind
     audit = {
@@ -495,7 +589,10 @@ def test_disposition_producer_rejects_non_inferred_trigger_kind(tmp_path, trigge
 
 def test_convergence_receipt_bytes_preserve_trigger_kind_for_replay():
     audit = _scoped_audit(verdict="fail")
-    audit["result"]["findings"] = [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]
+    audit["result"]["findings"] = [{
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "src/lock.py", "line": 12, "category": "correctness",
+    }]
     identity = AGG.Identity(123, SCOPE.head_sha, 77, 1, 42)
     digest = CONV.canonical_audit_digest(audit)
     outcome = AGG.evaluate(
@@ -505,13 +602,16 @@ def test_convergence_receipt_bytes_preserve_trigger_kind_for_replay():
         scope=SCOPE, audit_digest=digest,
     )
     payload = outcome.convergence_receipt.as_dict()
-    assert payload["p1_findings"] == [["p1", "major", "inferred"]]
+    assert payload["p1_findings"] == [["p1", "major", "inferred", "src/lock.py", 12, "correctness"]]
     replayed = CONV.replay_receipts(scope=SCOPE, receipts=(_receipt_from_payload(payload),))
     assert (replayed.clean_streak, replayed.eligible_rounds) == (0, 1)
 
 
 def _failing_runtime_audit(*, duration_ms, run_attempt, findings=None):
-    findings = findings or [{"id": "p1", "severity": "major", "trigger_kind": "inferred", "file": "lock.py", "line": 12}]
+    findings = findings or [{
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "lock.py", "line": 12, "category": "correctness",
+    }]
     return {
         "kind": "primary_review", "schema_version": 1,
         "repository_id": SCOPE.repository_id, "pr": SCOPE.pr_number,
@@ -528,7 +628,13 @@ def _failing_runtime_audit(*, duration_ms, run_attempt, findings=None):
 
 def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_path):
     first = _failing_runtime_audit(duration_ms=11, run_attempt=2)
-    second = _failing_runtime_audit(duration_ms=99, run_attempt=4)
+    second = _failing_runtime_audit(
+        duration_ms=99, run_attempt=4,
+        findings=[{
+            "id": "model-renamed", "severity": "major", "trigger_kind": "inferred",
+            "file": "lock.py", "line": 12, "category": "correctness",
+        }],
+    )
     assert CONV.canonical_audit_digest(first) == CONV.canonical_audit_digest(second)
     assert hashlib.sha256(json.dumps(first).encode()).hexdigest() != hashlib.sha256(
         json.dumps(second).encode()
@@ -547,29 +653,40 @@ def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_pat
     produced = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
     payload = json.loads(Path(json.loads(produced.stdout)["path"]).read_bytes())
     receipt = CONV.parse_disposition_receipt(payload)
-    identity = AGG.Identity(123, SCOPE.head_sha, 77, 4, 42)
     digest = CONV.canonical_audit_digest(second)
-    outcome = AGG.evaluate(
-        quality_result="success", primary_result="failure", runner="self",
-        is_draft=False, review_expected=True, audit=second, audit_error=None,
-        identity=identity, audit_source_attempt=4, audit_artifact_name="primary-audit-v2-4",
-        scope=SCOPE, audit_digest=digest, waiver_receipts=(receipt,),
+    primary = CONV.CanonicalPrimary(
+        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
+        head_sha=SCOPE.head_sha, run_id=77, run_attempt=4, verdict="fail",
+        p1_ids=("model-renamed",),
+        p1_findings=(("model-renamed", "major", "inferred", "lock.py", 12, "correctness"),),
     )
-    assert outcome.gate_result == "pass"
-    assert outcome.resolved_findings
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest=digest,
+    )
+    assert status.reason == "active_false_positive"
+    consumed = CONV.consume_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest=digest,
+    )
+    assert consumed.remaining_p1_ids == ()
     other = _failing_runtime_audit(
         duration_ms=99, run_attempt=4,
-        findings=[{"id": "p2", "severity": "major", "trigger_kind": "inferred", "file": "lock.py", "line": 12}],
+        findings=[{
+            "id": "p2", "severity": "major", "trigger_kind": "inferred",
+            "file": "lock.py", "line": 13, "category": "correctness",
+        }],
     )
-    mismatched = AGG.evaluate(
-        quality_result="success", primary_result="failure", runner="self",
-        is_draft=False, review_expected=True, audit=other, audit_error=None,
-        identity=identity, audit_source_attempt=4, audit_artifact_name="primary-audit-v2-4",
-        scope=SCOPE, audit_digest=CONV.canonical_audit_digest(other),
-        waiver_receipts=(receipt,),
+    mismatched_primary = CONV.CanonicalPrimary(
+        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
+        head_sha=SCOPE.head_sha, run_id=77, run_attempt=4, verdict="fail",
+        p1_ids=("p2",),
+        p1_findings=(("p2", "major", "inferred", "lock.py", 13, "correctness"),),
     )
-    assert mismatched.gate_result == "fail"
-    assert mismatched.resolved_findings == []
+    mismatched = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=mismatched_primary,
+        audit_digest=CONV.canonical_audit_digest(other),
+    )
+    assert mismatched.reason_code == "audit_digest_mismatch"
+    assert receipt.finding_key in mismatched.reason
 
 
 def test_legacy_raw_bytes_receipt_still_consumes_same_audit_file():
@@ -605,7 +722,10 @@ def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "head_sha": SCOPE.head_sha, "run_id": 77,
         "run_attempt": 1, "pr": 42, "verdict": "pass", "reviewer": "codex",
-        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}, {"id": "p2", "severity": "minor"}]},
+        "result": {"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }, {"id": "p2", "severity": "minor"}]},
     }
     raw = json.dumps(audit, indent=2).encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()

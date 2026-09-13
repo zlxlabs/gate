@@ -2,7 +2,7 @@
 """Issue immutable disposition artifacts from a canonical primary audit.
 
 audit_digest is SHA-256 of the stable audit subset (scope fields + sorted
-finding id/severity/trigger_kind/file/line + verdict) via convergence.canonical_audit_digest.
+finding file/line/category/severity + verdict) via convergence.canonical_audit_digest.
 The audit file's raw bytes are not stable across reruns (duration/tokens/
 timestamps), so they are not hashed here.
 """
@@ -119,6 +119,38 @@ def _audit_findings(audit: Any) -> list[dict[str, Any]]:
     return findings
 
 
+def _matching_finding(findings: list[dict[str, Any]], target: str) -> dict[str, Any]:
+    """Resolve either the old finding id or the new exact stable key."""
+
+    by_id = [finding for finding in findings if finding.get("id") == target]
+    by_key = [
+        finding for finding in findings
+        if _CONVERGENCE.canonical_finding_key(finding) == target
+    ]
+    if len(by_id) > 1:
+        raise ValueError(
+            f"finding target {target!r} matches {len(by_id)} finding ids, "
+            "cannot determine the disposition target"
+        )
+    if len(by_key) > 1:
+        raise ValueError(
+            f"finding key {target!r} matches {len(by_key)} findings, "
+            "cannot determine the disposition target"
+        )
+    if by_id and by_key:
+        if by_id[0] is by_key[0]:
+            return by_id[0]
+        raise ValueError(
+            f"finding target {target!r} matches both a finding id and a different stable key; "
+            "cannot determine the disposition target"
+        )
+    if len(by_id) == 1:
+        return by_id[0]
+    if len(by_key) == 1:
+        return by_key[0]
+    raise ValueError("finding_id must identify exactly one canonical audit finding")
+
+
 def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repository_id: str, pr_number: int, head_sha: str) -> dict[str, Any]:
     raw_scope = _required(args, envelope, "scope_json", "DISPOSITION_SCOPE_JSON")
     scope = json.loads(raw_scope) if isinstance(raw_scope, str) else raw_scope
@@ -161,12 +193,21 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         args, envelope, repository_id=repository_id, pr_number=pr_number,
         head_sha=head_sha,
     )
-    matching = [finding for finding in _audit_findings(audit) if finding.get("id") == finding_id]
-    if len(matching) != 1:
-        raise ValueError("finding_id must identify exactly one canonical audit finding")
-    if matching[0].get("severity") not in P1_SEVERITIES:
+    matching = _matching_finding(_audit_findings(audit), finding_id)
+    stable_key = _CONVERGENCE.canonical_finding_key(matching)
+    p1_matches = [
+        finding for finding in _audit_findings(audit)
+        if finding.get("severity") in P1_SEVERITIES
+        and _CONVERGENCE.canonical_finding_key(finding) == stable_key
+    ]
+    if len(p1_matches) > 1:
+        raise ValueError(
+            f"finding key {stable_key!r} matches {len(p1_matches)} P1 findings, "
+            "cannot determine the disposition target"
+        )
+    if matching.get("severity") not in P1_SEVERITIES:
         raise ValueError("finding_id must identify a P1 finding")
-    if matching[0].get("trigger_kind") != "inferred":
+    if matching.get("trigger_kind") != "inferred":
         raise ValueError("finding_id must identify an inferred P1 finding")
     fields = {
         "schema_version": SCHEMA_VERSION,
@@ -176,7 +217,8 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         "epoch": _derive_epoch(scope),
         "head_sha": head_sha,
         "audit_digest": audit_digest,
-        "finding_id": finding_id,
+        "finding_id": matching["id"],
+        "finding_key": stable_key,
         "reason": reason,
         "approver": approver,
         "approver_id": approver_id,
@@ -227,8 +269,8 @@ def issue(args: argparse.Namespace, envelope: dict[str, Any]) -> int:
         **{key: fields[key] for key in _CONVERGENCE.DispositionReceipt.__dataclass_fields__}
     )
     _safe_component(fields["epoch"], "epoch")
-    _safe_component(fields["finding_id"], "finding_id")
     name = _CONVERGENCE.disposition_receipt_artifact_name(receipt)
+    _safe_component(name, "artifact name")
     output = Path(_required(args, envelope, "output_dir", "DISPOSITION_OUTPUT_DIR")) / name
     changed = _write_immutable(output, _canonical_json(payload))
     print(json.dumps({"artifact": name, "path": str(output), "written": changed}, sort_keys=True))

@@ -1,0 +1,12 @@
+# disposition 稳定键改绑进度
+
+- 2026-09-13：接手 `card/gate-20260913-03`，基线 `e74743b`，工作树初始干净。
+- 2026-09-13：新增唯一规范函数 `canonical_finding_key()`，稳定键严格取 `file + line + category + severity`；缺字段、`null`、空字符串使用不同标签编码。`CANONICAL_AUDIT_DIGEST_FINDING_FIELDS` 移除 `id` 与 `trigger_kind`。
+- 2026-09-13：新回执在 `finding_key` 写入完整稳定键，artifact 名使用稳定键短哈希；无 `finding_key` 的在途 v2 回执继续走旧 `finding_id` 分支，保留 gate#150 expand-then-contract TODO。
+- 2026-09-13：新增稳定键 rerun、line 变化、冲突、可操作拒收文案及 producer/consumer 跨进程契约测试；定向 `117 passed`，全量 `922 passed`，pin 检查通过。
+- 2026-09-13：提交 `a7cf3ec fix(disposition): bind receipts to stable finding keys`。
+- 2026-09-13：接通 aggregator 生产者：`_canonical_p1_findings()` 现在对 P1 finding 产出 `(id, severity, trigger_kind, file, line, category)` 六元组；`file`/`line`/`category` 缺失或错型沿 `audit_invalid` fail-closed。保留三元组仅用于在途 `canonical_primary` 回执跨轮读回，并写入 gate#150 expand-then-contract TODO；旧 `finding_id` 回执同时兼容当前六元生产投影。同步 primary/receipt 六元校验与错误文案，新增原始 audit 经真实生产投影到稳定键回执的正反接缝测试；定向 `362 passed`。
+- 2026-09-13：确认 `line` 字段缺失仍 fail-closed、显式 `null` 合法并编码为稳定键 `null`；新回执把人读 finding id 写入 `finding_id`、稳定键写入 `finding_key`，终端/账本 `resolved[]` 分列保存两者；保留无 `finding_key` 在途 v2 回执的旧消费路径，并补齐账本 fixture 必填字段。
+- 2026-09-13：修复兼容路径歧义守卫：稳定键路径与无 `finding_key` 的在途 v2 路径共享 `finding_key_ambiguous` 判定；稳定六元投影中重复四元键的缺 key 回执 fail-closed，不影响唯一命中的 `active_false_positive` 兼容回执。新增同一回执带/不带 key 的歧义、零命中、唯一命中三态不变式测试；提交 `d792378`。
+- 2026-09-13：修复签发侧 `_matching_finding()` 的 id/key 跨对象碰撞：target 同时匹配人读 id 与另一条 finding 的稳定键时拒绝，不按优先级猜；新增真实 producer 子进程契约测试；提交 `8092396`。
+- 2026-09-13：修复 `DispositionStatus.finding_id` 返回人读 finding id，与 `finding_key` 分工一致；提交 `30b531e`。本卡定向 `593 passed`，全量 `941 passed`，pin 检查通过。

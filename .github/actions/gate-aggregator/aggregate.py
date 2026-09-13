@@ -390,17 +390,22 @@ def project_disposition_receipt_consumption(consumption: Any) -> dict[str, Any]:
     """
     if consumption is None:
         return empty_disposition_receipt_consumption()
-    resolved = [
-        {
-            "finding_id": receipt.finding_id,
+    consumed_finding_ids = consumption.consumed_finding_ids
+    if len(consumed_finding_ids) != len(consumption.consumed_receipts):
+        raise ValueError("disposition consumption has mismatched resolved finding ids")
+    resolved = []
+    for index, receipt in enumerate(consumption.consumed_receipts):
+        item = {
+            "finding_id": consumed_finding_ids[index],
             "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
             "approver": receipt.approver,
             "approver_id": receipt.approver_id,
             "approved_at": receipt.approved_at,
             "reason": receipt.reason,
         }
-        for receipt in consumption.consumed_receipts
-    ]
+        if receipt.finding_key:
+            item["finding_key"] = receipt.finding_key
+        resolved.append(item)
     rejected_reasons: dict[str, int] = {}
     for _receipt, reason in consumption.rejected_receipts:
         rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
@@ -442,12 +447,14 @@ def build_terminal_envelope(
     return envelope
 
 
-def _canonical_p1_findings(audit: dict[str, Any]) -> Optional[tuple[tuple[str, str, str | None], ...]]:
-    """Project canonical P1 ``(id, severity, trigger_kind)`` evidence."""
+def _canonical_p1_findings(
+    audit: dict[str, Any],
+) -> Optional[tuple[tuple[str, str, str | None, str, int | None, str], ...]]:
+    """Project canonical P1 stable-key evidence."""
     result = audit.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
         return None
-    p1_findings: list[tuple[str, str, str | None]] = []
+    p1_findings: list[tuple[str, str, str | None, str, int | None, str]] = []
     for finding in result["findings"]:
         if not isinstance(finding, dict):
             return None
@@ -459,10 +466,17 @@ def _canonical_p1_findings(audit: dict[str, Any]) -> Optional[tuple[tuple[str, s
         finding_id = finding.get("id")
         if not isinstance(finding_id, str) or not finding_id:
             return None
+        file = finding.get("file")
+        if "line" not in finding:
+            return None
+        line = finding["line"]
+        category = finding.get("category")
+        if not isinstance(file, str) or (line is not None and type(line) is not int) or not isinstance(category, str):
+            return None
         trigger_kind = finding.get("trigger_kind")
         if trigger_kind is not None and not isinstance(trigger_kind, str):
             trigger_kind = None
-        p1_findings.append((finding_id, severity, trigger_kind))
+        p1_findings.append((finding_id, severity, trigger_kind, file, line, category))
     return tuple(sorted(p1_findings, key=lambda item: item[0]))
 
 
