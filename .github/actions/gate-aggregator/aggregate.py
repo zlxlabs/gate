@@ -444,12 +444,12 @@ def build_terminal_envelope(
 
 def _canonical_p1_findings(
     audit: dict[str, Any],
-) -> Optional[tuple[tuple[str, str, str | None, str, int, str], ...]]:
+) -> Optional[tuple[tuple[str, str, str | None, str, int | None, str], ...]]:
     """Project canonical P1 stable-key evidence."""
     result = audit.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
         return None
-    p1_findings: list[tuple[str, str, str | None, str, int, str]] = []
+    p1_findings: list[tuple[str, str, str | None, str, int | None, str]] = []
     for finding in result["findings"]:
         if not isinstance(finding, dict):
             return None
@@ -462,9 +462,11 @@ def _canonical_p1_findings(
         if not isinstance(finding_id, str) or not finding_id:
             return None
         file = finding.get("file")
-        line = finding.get("line")
+        if "line" not in finding:
+            return None
+        line = finding["line"]
         category = finding.get("category")
-        if not isinstance(file, str) or type(line) is not int or not isinstance(category, str):
+        if not isinstance(file, str) or (line is not None and type(line) is not int) or not isinstance(category, str):
             return None
         trigger_kind = finding.get("trigger_kind")
         if trigger_kind is not None and not isinstance(trigger_kind, str):

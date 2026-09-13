@@ -2492,6 +2492,24 @@ def test_canonical_p1_projection_rejects_missing_or_malformed_stable_fields(find
     assert AGG._canonical_p1_findings(audit) is None
 
 
+def test_canonical_p1_projection_rejects_missing_line():
+    audit = _valid_scoped_primary_record(result={"findings": [{
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "src/lock.py", "category": "correctness",
+    }]})
+    assert AGG._canonical_p1_findings(audit) is None
+
+
+def test_canonical_p1_projection_accepts_null_line():
+    audit = _valid_scoped_primary_record(result={"findings": [{
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "src/lock.py", "line": None, "category": "correctness",
+    }]})
+    assert AGG._canonical_p1_findings(audit) == (
+        ("p1", "major", "inferred", "src/lock.py", None, "correctness"),
+    )
+
+
 def test_aggregate_projection_binds_stable_disposition_and_rejects_line_change():
     audit = _valid_scoped_primary_record(
         verdict="fail",
