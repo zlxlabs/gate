@@ -171,6 +171,6 @@ summary_exists= False
 
 - 只审固定 H0，不纳入 H0 后的新提交；没有修改 `.github/actions/**` 或 `tests/**`。
 - 被审 worktree 只读运行；变异只使用临时 worktree，结束后已移除。
-- 本 verdict 是当前分支唯一新增文件，待提交到 delegate 分配的分支。
+- 本 verdict 是当前分支唯一新增文件，已提交到 delegate 分配的分支。
 
 outcome: pass
