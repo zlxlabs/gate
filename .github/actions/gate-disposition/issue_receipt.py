@@ -205,7 +205,7 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         "epoch": _derive_epoch(scope),
         "head_sha": head_sha,
         "audit_digest": audit_digest,
-        "finding_id": stable_key,
+        "finding_id": matching["id"],
         "finding_key": stable_key,
         "reason": reason,
         "approver": approver,

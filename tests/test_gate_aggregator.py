@@ -2648,6 +2648,19 @@ def test_terminal_structured_block_does_not_parse_g4_display_strings():
     assert g4 != block["resolved"][0]
 
 
+def test_terminal_stable_consumption_separates_human_id_and_finding_key():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    stable_key = CONV.canonical_finding_key(audit["result"]["findings"][0])
+    receipt = _false_positive_receipt(
+        scope, finding_id="p1", finding_key=stable_key,
+    )
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    resolved = _terminal_for(outcome)["disposition_receipt_consumption"]["resolved"]
+    assert resolved[0]["finding_id"] == "p1"
+    assert resolved[0]["finding_key"] == stable_key
+
+
 def test_terminal_empty_consumption_when_evaluate_sees_no_receipts():
     audit = _failing_scoped_audit()
     outcome = _evaluate_failing_primary(audit, waiver_receipts=())

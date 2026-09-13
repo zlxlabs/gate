@@ -191,7 +191,7 @@ def _stable_disposition(scope=SCOPE, *, primary=None, audit_digest=None, **chang
         epoch=CONV.derive_epoch(scope),
         head_sha=scope.head_sha,
         audit_digest=audit_digest,
-        finding_id=key,
+        finding_id=finding[0],
         finding_key=key,
         reason="locked upstream behavior",
         approver="octocat",
@@ -471,6 +471,27 @@ def test_stable_disposition_survives_finding_id_change_but_not_line_change():
     )
     assert stale.reason_code == "finding_not_current_p1"
     assert receipt.finding_key in stale.reason
+
+
+def test_stable_disposition_uses_finding_key_when_human_id_differs():
+    primary = _stable_primary(ids=("current-id",))
+    receipt = _stable_disposition(primary=primary)
+    assert receipt.finding_id == "current-id"
+    assert receipt.finding_id != receipt.finding_key
+    status = CONV.validate_disposition_receipt(
+        replace(receipt, finding_id="display-id"),
+        scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+
+
+def test_stable_primary_with_null_line_is_consumable():
+    primary = _stable_primary(line=None)
+    receipt = _stable_disposition(primary=primary)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
 
 
 def test_legacy_id_disposition_remains_usable_with_stable_primary_projection():

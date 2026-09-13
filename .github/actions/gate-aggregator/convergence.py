@@ -162,9 +162,10 @@ class CanonicalPrimary:
 class DispositionReceipt:
     """Immutable disposition bound to one current canonical audit round.
 
-    ``finding_key`` is populated by the stable-key format.  An empty
-    ``finding_key`` identifies the in-flight v2 format, whose ``finding_id``
-    remains intentionally supported until its artifact window expires.
+    ``finding_key`` is populated by the stable-key format and is the binding
+    target. ``finding_id`` remains the human audit id in new receipts. An
+    empty ``finding_key`` identifies the in-flight v2 format, whose
+    ``finding_id`` remains the legacy target until its artifact window expires.
     """
 
     schema_version: int = DISPOSITION_RECEIPT_SCHEMA_VERSION
@@ -233,6 +234,9 @@ class DispositionConsumption:
     rejected_receipts: tuple[tuple[DispositionReceipt, str], ...]
     fail_closed: bool
     statuses: tuple[DispositionStatus, ...] = ()
+    # The stable receipt target is not necessarily its human-facing finding
+    # id. Keep the id resolved during consumption for terminal/ledger output.
+    consumed_finding_ids: tuple[str, ...] = ()
 
     @property
     def p1_ids(self) -> tuple[str, ...]:
@@ -808,6 +812,7 @@ def consume_dispositions(
         return DispositionConsumption(tuple(remaining), (), (), True, ())
     statuses: list[DispositionStatus] = []
     consumed: list[DispositionReceipt] = []
+    consumed_finding_ids: list[str] = []
     rejected: list[tuple[DispositionReceipt, str]] = []
     fail_closed = False
     seen_payloads: set[str] = set()
@@ -843,6 +848,7 @@ def consume_dispositions(
             if target_id in remaining:
                 remaining.remove(target_id)
                 consumed.append(receipt)
+                consumed_finding_ids.append(target_id)
             else:
                 rejected.append((receipt, "finding_already_consumed"))
         elif status.reason_code != "absent_legacy_stub":
@@ -855,6 +861,7 @@ def consume_dispositions(
         rejected_receipts=tuple(rejected),
         fail_closed=fail_closed,
         statuses=tuple(statuses),
+        consumed_finding_ids=tuple(consumed_finding_ids),
     )
 
 
@@ -1232,7 +1239,7 @@ def _primary_errors(*, scope: Scope, primary: CanonicalPrimary) -> list[str]:
                     len(finding) == 6
                     and (
                         not isinstance(record.get("file"), str)
-                        or type(record.get("line")) is not int
+                        or (record.get("line") is not None and type(record.get("line")) is not int)
                         or not isinstance(record.get("category"), str)
                     )
                 )
@@ -1756,7 +1763,7 @@ def validate_receipt(receipt: Receipt, scope: Scope) -> None:
                     len(finding) == 6
                     and (
                         not isinstance(record.get("file"), str)
-                        or type(record.get("line")) is not int
+                        or (record.get("line") is not None and type(record.get("line")) is not int)
                         or not isinstance(record.get("category"), str)
                     )
                 )

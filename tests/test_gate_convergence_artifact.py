@@ -303,7 +303,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     assert payload["kind"] == CONV.DISPOSITION_RECEIPT_KIND
     assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__)
     assert payload["audit_digest"] == digest
-    assert payload["finding_id"] == stable_key and payload["finding_key"] == stable_key
+    assert payload["finding_id"] == "p1" and payload["finding_key"] == stable_key
     assert payload["approver"] == "octocat"
     assert payload["approver_id"] == 1
     assert payload["approved_at"] == "2026-08-30T12:00:00Z"
