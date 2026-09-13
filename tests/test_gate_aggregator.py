@@ -979,6 +979,30 @@ def test_main_malformed_pr_draft_response_writes_unverifiable_terminal(tmp_path,
     assert "::error::" in capsys.readouterr().out
 
 
+def test_main_deeply_nested_pr_draft_response_writes_unverifiable_terminal(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    nested_json = b"[" * 10000 + b"]" * 10000
+    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: nested_json)
+    summary_path = tmp_path / "summary.md"
+    terminal_path = tmp_path / "gate-terminal.json"
+
+    rc = AGG.main(
+        _cli_args(
+            tmp_path / "missing-audit",
+            summary_path,
+            primary_result="skipped",
+            is_draft="true",
+            review_expected="false",
+            terminal_path=str(terminal_path),
+        )
+    )
+
+    assert rc == 1
+    assert terminal_path.is_file()
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert terminal["reason_code"] == "pr_state_unverifiable"
+
+
 def test_terminal_publish_barrier_failures(tmp_path, monkeypatch):
     audit_dir = tmp_path / "audit"
     audit_dir.mkdir()
