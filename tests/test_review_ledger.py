@@ -1638,7 +1638,10 @@ def _producer_terminal(*, receipts=(), run_attempt=1):
         "tier": "personal",
         "caller_sha": "c" * 40,
         "reusable_workflow_sha": "w" * 40,
-        "result": {"findings": [{"id": "p1", "severity": "major", "trigger_kind": "inferred"}]},
+        "result": {"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
     }
     scope, missing = agg._convergence_scope_from_audit(audit, identity)
     assert not missing and scope is not None
@@ -1713,6 +1716,26 @@ def test_ledger_projects_real_producer_terminal_consumption():
         }
     ]
     assert "resolved by receipt" not in json.dumps(entry["disposition_receipt_consumption"])
+
+
+def test_ledger_preserves_separate_human_id_and_stable_key():
+    module = _module()
+    block = {
+        "resolved": [{
+            "finding_id": "p1",
+            "finding_key": "stable-key",
+            "receipt": "receipt-artifact",
+            "approver": "octocat",
+            "approver_id": 1,
+            "approved_at": "2026-08-30T12:00:00Z",
+            "reason": "locked upstream behavior",
+        }],
+        "consumed_count": 1,
+        "rejected_count": 0,
+        "rejected_reasons": {},
+        "fail_closed": False,
+    }
+    assert module.validate_disposition_receipt_consumption(block) == block
 
 
 def test_ledger_empty_consumption_when_producer_had_no_receipts():

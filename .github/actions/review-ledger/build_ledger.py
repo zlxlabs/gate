@@ -523,14 +523,19 @@ def validate_disposition_receipt_consumption(block: Any) -> dict[str, Any]:
                 raise ValueError("disposition_receipt_consumption.resolved item has an invalid text field")
         if not _strict_int(item["approver_id"]) or item["approver_id"] <= 0:
             raise ValueError("disposition_receipt_consumption.resolved item approver_id must be a positive integer")
-        projected.append({
+        projected_item = {
             "finding_id": item["finding_id"],
             "receipt": item["receipt"],
             "approver": item["approver"],
             "approver_id": item["approver_id"],
             "approved_at": item["approved_at"],
             "reason": item["reason"],
-        })
+        }
+        if "finding_key" in item:
+            if not isinstance(item["finding_key"], str) or not item["finding_key"]:
+                raise ValueError("disposition_receipt_consumption.resolved item has an invalid finding_key")
+            projected_item["finding_key"] = item["finding_key"]
+        projected.append(projected_item)
     consumed_count = block["consumed_count"]
     rejected_count = block["rejected_count"]
     if not _strict_int(consumed_count) or consumed_count < 0:
