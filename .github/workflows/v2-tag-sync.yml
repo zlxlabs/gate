@@ -36,7 +36,8 @@ jobs:
           fi
           if python3 scripts/v2_tag_guard.py \
             --enabled "${V2_TAG_SYNC_ENABLED:-}" \
-            --commit-message "${commit_messages}"
+            --commit-message "${commit_messages}" \
+            --hold-file ".github/v2-tag-sync.hold"
           then
             echo "advance=true" >> "$GITHUB_OUTPUT"
           else
@@ -57,4 +58,25 @@ jobs:
 
       - name: Move v2 to this main commit
         if: steps.guard.outputs.advance == 'true'
-        run: git push origin "HEAD:refs/tags/v2" --force
+        run: |
+          set -euo pipefail
+          intended_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          set +e
+          git push origin "HEAD:refs/tags/v2" --force
+          push_status=$?
+          set -e
+          if remote_result="$(git ls-remote origin refs/tags/v2)"; then
+            :
+          else
+            query_status=$?
+            echo "::error::remote v2 verification failed: git ls-remote exited ${query_status} after push (push exit code ${push_status})"
+            exit 1
+          fi
+          python3 - "${intended_sha}" "${push_status}" "${remote_result}" <<'PY'
+          import sys
+          from scripts.v2_tag_guard import verify_remote_tag
+
+          raise SystemExit(
+              0 if verify_remote_tag(sys.argv[1], int(sys.argv[2]), sys.argv[3]) else 1
+          )
+          PY

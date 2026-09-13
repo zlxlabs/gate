@@ -10,6 +10,8 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Distinguishes an omitted default from an explicit false/zero/empty default.
+_MISSING = object()
 
 
 def _caller_workflow_paths() -> tuple[str, ...]:
@@ -59,9 +61,30 @@ def _signature(document):
     inputs = call.get("inputs", {}) or {}
     secrets = call.get("secrets", {}) or {}
     return (
-        {name: _required(spec) for name, spec in inputs.items()},
+        {
+            name: {
+                "required": _required(spec),
+                "type": spec.get("type", _MISSING) if isinstance(spec, dict) else _MISSING,
+                "default": _effective_default(spec),
+            }
+            for name, spec in inputs.items()
+        },
         {name: _required(spec) for name, spec in secrets.items()},
     )
+
+
+def _effective_default(spec):
+    if not isinstance(spec, dict):
+        return _MISSING
+    if "default" in spec:
+        return spec["default"]
+    return {"boolean": False, "number": 0, "string": ""}.get(
+        spec.get("type"), _MISSING
+    )
+
+
+def _format_contract_value(value) -> str:
+    return "<missing>" if value is _MISSING else repr(value)
 
 
 def _permission_level(value) -> int:
@@ -88,15 +111,34 @@ def _permission_declarations(document):
     return declarations
 
 
+def _output_names(document) -> set[str]:
+    outputs = _workflow_call(document).get("outputs", {}) or {}
+    return set(outputs) if isinstance(outputs, dict) else set()
+
+
 def contract_violations(baseline, current) -> list[str]:
     violations = []
     old_inputs, old_secrets = _signature(baseline)
     new_inputs, new_secrets = _signature(current)
-    for name, required in old_inputs.items():
+    for name, old_spec in old_inputs.items():
         if name not in new_inputs:
             violations.append(f"input removed: {name}")
-        elif not required and new_inputs[name]:
+            continue
+        new_spec = new_inputs[name]
+        if not old_spec["required"] and new_spec["required"]:
             violations.append(f"input became required: {name}")
+        if old_spec["type"] != new_spec["type"]:
+            violations.append(
+                f"input type changed: {name} "
+                f"{_format_contract_value(old_spec['type'])}->"
+                f"{_format_contract_value(new_spec['type'])}"
+            )
+        if old_spec["default"] != new_spec["default"]:
+            violations.append(
+                f"input default changed: {name} "
+                f"{_format_contract_value(old_spec['default'])}->"
+                f"{_format_contract_value(new_spec['default'])}"
+            )
     for name, required in old_secrets.items():
         if name not in new_secrets:
             violations.append(f"secret removed: {name}")
@@ -104,8 +146,8 @@ def contract_violations(baseline, current) -> list[str]:
             violations.append(f"secret became required: {name}")
     violations.extend(
         f"required input added: {name}"
-        for name, required in new_inputs.items()
-        if name not in old_inputs and required
+        for name, spec in new_inputs.items()
+        if name not in old_inputs and spec["required"]
     )
     violations.extend(
         f"required secret added: {name}"
@@ -121,12 +163,24 @@ def contract_violations(baseline, current) -> list[str]:
         old_decl = old_permissions.get(location, {})
         old_map = _permission_map(old_decl)
         new_map = _permission_map(current_decl)
-        for scope, level in new_map.items():
-            if level > old_map.get(scope, 0):
+        for scope in sorted(set(old_map) | set(new_map)):
+            old_level = old_map.get(scope, 0)
+            new_level = new_map.get(scope, 0)
+            if new_level > old_level:
                 violations.append(
                     f"permission expanded at {location}: {scope} "
-                    f"{old_map.get(scope, 0)}->{level}"
+                    f"{old_level}->{new_level}"
                 )
+            elif new_level < old_level:
+                violations.append(
+                    f"permission restricted at {location}: {scope} "
+                    f"{old_level}->{new_level}"
+                )
+    old_outputs = _output_names(baseline)
+    new_outputs = _output_names(current)
+    violations.extend(
+        f"output removed: {name}" for name in sorted(old_outputs - new_outputs)
+    )
     return violations
 
 
@@ -199,3 +253,65 @@ def test_contract_guard_rejects_permission_expansion():
     assert "permission expanded at workflow: contents 1->2" in contract_violations(
         baseline, current
     )
+
+
+def test_contract_guard_rejects_permission_restriction():
+    baseline = {
+        "on": {"workflow_call": {}},
+        "permissions": {"contents": "write", "issues": "write"},
+    }
+    current = {"on": {"workflow_call": {}}, "permissions": {"contents": "read"}}
+    violations = contract_violations(baseline, current)
+    assert "permission restricted at workflow: contents 2->1" in violations
+    assert "permission restricted at workflow: issues 2->0" in violations
+
+
+def test_contract_guard_rejects_input_type_change():
+    baseline = {
+        "on": {"workflow_call": {"inputs": {"tier": {"type": "string"}}}}
+    }
+    current = {
+        "on": {"workflow_call": {"inputs": {"tier": {"type": "boolean"}}}}
+    }
+    assert "input type changed: tier 'string'->'boolean'" in contract_violations(
+        baseline, current
+    )
+
+
+def test_contract_guard_rejects_input_default_change():
+    baseline = {
+        "on": {
+            "workflow_call": {
+                "inputs": {"tier": {"type": "string", "default": "personal"}}
+            }
+        }
+    }
+    current = {
+        "on": {
+            "workflow_call": {
+                "inputs": {"tier": {"type": "string", "default": "saas"}}
+            }
+        }
+    }
+    assert (
+        "input default changed: tier 'personal'->'saas'"
+        in contract_violations(baseline, current)
+    )
+
+
+def test_contract_guard_rejects_removed_or_renamed_output():
+    baseline = {
+        "on": {
+            "workflow_call": {
+                "outputs": {"gate_result": {"description": "result"}}
+            }
+        }
+    }
+    current = {
+        "on": {
+            "workflow_call": {
+                "outputs": {"renamed_result": {"description": "result"}}
+            }
+        }
+    }
+    assert "output removed: gate_result" in contract_violations(baseline, current)
