@@ -2635,6 +2635,7 @@ def test_terminal_structured_block_does_not_parse_g4_display_strings():
         consumed_receipts=(receipt,),
         rejected_receipts=(),
         fail_closed=False,
+        consumed_finding_ids=("p1",),
     )
     outcome = AGG.Outcome(
         ok=True, classification="code_pass", reason_code="primary_pass", gate_result="pass",

@@ -390,17 +390,13 @@ def project_disposition_receipt_consumption(consumption: Any) -> dict[str, Any]:
     """
     if consumption is None:
         return empty_disposition_receipt_consumption()
-    consumed_finding_ids = getattr(consumption, "consumed_finding_ids", ())
-    if consumed_finding_ids and len(consumed_finding_ids) != len(consumption.consumed_receipts):
+    consumed_finding_ids = consumption.consumed_finding_ids
+    if len(consumed_finding_ids) != len(consumption.consumed_receipts):
         raise ValueError("disposition consumption has mismatched resolved finding ids")
     resolved = []
     for index, receipt in enumerate(consumption.consumed_receipts):
         item = {
-            "finding_id": (
-                consumed_finding_ids[index]
-                if consumed_finding_ids
-                else receipt.finding_id
-            ),
+            "finding_id": consumed_finding_ids[index],
             "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
             "approver": receipt.approver,
             "approver_id": receipt.approver_id,
