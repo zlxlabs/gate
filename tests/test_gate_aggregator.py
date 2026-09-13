@@ -908,6 +908,28 @@ def test_fetch_pr_draft_http_error_is_not_retried(monkeypatch):
     assert sleeps == []
 
 
+def test_fetch_pr_draft_malformed_json_fails_closed(monkeypatch):
+    calls, sleeps = _stub_github_json(
+        monkeypatch,
+        [json.JSONDecodeError("invalid JSON", "<html>not json</html>", 0)],
+    )
+
+    assert AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=42) is None
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_fetch_pr_draft_invalid_utf8_payload_fails_closed(monkeypatch):
+    calls, sleeps = _stub_github_json(
+        monkeypatch,
+        [UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")],
+    )
+
+    assert AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=42) is None
+    assert len(calls) == 1
+    assert sleeps == []
+
+
 def test_fetch_pr_draft_exhausts_connection_retries_and_fails_closed(monkeypatch):
     calls, sleeps = _stub_github_json(
         monkeypatch,
@@ -930,6 +952,32 @@ def test_fetch_pr_draft_without_token_or_pr_number_makes_no_request(monkeypatch)
     assert AGG._fetch_pr_draft(token=None, repository="zlxlabs/gate", pr_number=42) is None
     assert AGG._fetch_pr_draft(token="t", repository="zlxlabs/gate", pr_number=None) is None
     assert calls == []
+
+
+def test_main_malformed_pr_draft_response_writes_unverifiable_terminal(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setattr(AGG, "_github_request", lambda **kwargs: b"<html>not json</html>")
+    summary_path = tmp_path / "summary.md"
+    terminal_path = tmp_path / "gate-terminal.json"
+
+    rc = AGG.main(
+        _cli_args(
+            tmp_path / "missing-audit",
+            summary_path,
+            primary_result="skipped",
+            is_draft="true",
+            review_expected="false",
+            terminal_path=str(terminal_path),
+        )
+    )
+
+    assert rc == 1
+    assert terminal_path.is_file()
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert terminal["reason_code"] == "pr_state_unverifiable"
+    assert "pr_state_unverifiable" in summary_path.read_text(encoding="utf-8")
+    assert "::error::" in capsys.readouterr().out
+
 
 def test_terminal_publish_barrier_failures(tmp_path, monkeypatch):
     audit_dir = tmp_path / "audit"
