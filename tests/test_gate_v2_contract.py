@@ -905,7 +905,21 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
     terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
-    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error", "retention-days": 30} and "continue-on-error" not in terminal_upload
+    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error", "retention-days": 30} and terminal_upload["continue-on-error"] is True
+    terminal_retry = next(s for s in gate_steps if s.get("name") == "Retry upload gate terminal envelope")
+    assert terminal_retry["if"] == "always() && steps.upload-gate-terminal.outcome == 'failure'"
+    assert terminal_retry["id"] == "retry-upload-gate-terminal"
+    assert terminal_retry["continue-on-error"] is True
+    assert terminal_retry["uses"] == terminal_upload["uses"]
+    assert terminal_retry["with"] == {
+        **terminal_upload["with"],
+        "overwrite": True,
+    }
+    publish = next(s for s in gate_steps if s.get("name") == "Publish gate status panel")
+    assert publish["if"] == (
+        "always() && (steps.upload-gate-terminal.outcome == 'success' || "
+        "steps.retry-upload-gate-terminal.outcome == 'success')"
+    )
 
 
 @pytest.mark.parametrize(
@@ -959,6 +973,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
 
     assert ledger["needs"] == ["quality", "primary", "gate", "classify_pr_paths"]
     assert ledger["if"] == "always()"
+    assert ledger["continue-on-error"] is True
     assert not any(step.get("name") == "Build v2 review effectiveness ledger" for step in gate_steps)
     assert not any(step.get("name") == "Upload v2 review effectiveness ledger" for step in gate_steps)
     retry_upload = next(
@@ -1001,6 +1016,16 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     }
 
 
+def test_ledger_build_step_has_at_most_three_minutes():
+    raw, _ = _load_workflow()
+    build = next(
+        step for step in raw["jobs"]["ledger"]["steps"]
+        if step.get("name") == "Build v2 review effectiveness ledger"
+    )
+    assert isinstance(build.get("timeout-minutes"), int)
+    assert build["timeout-minutes"] <= 3
+
+
 def test_review_ledger_input_uploads_declare_one_day_retention():
     raw, _ = _load_workflow()
     quality_steps = raw["jobs"]["quality"]["steps"]
@@ -1031,10 +1056,10 @@ def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
     )
 
 
-def test_only_ocr_job_has_continue_on_error():
+def test_only_ocr_and_ledger_jobs_have_continue_on_error():
     raw, _ = _load_workflow()
     jobs = raw["jobs"]
-    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr"}
+    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger"}
 
 
 def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
@@ -1562,8 +1587,25 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
         "if-no-files-found": "error",
         "retention-days": 3,
     }
-    assert "continue-on-error" not in upload
+    assert upload["id"] == "upload-gate-status-panel-diagnostic"
+    assert upload["continue-on-error"] is True
     assert upload["with"]["path"] == publish_step["env"]["PANEL_DELIVERY_PATH"]
+    warning = next(
+        s for s in gate_steps
+        if s.get("name") == "Warn when gate status panel delivery diagnostic is unavailable"
+    )
+    assert warning["if"] == (
+        "always() && (steps.upload-gate-status-panel-diagnostic.outcome == 'failure' || "
+        "(steps.upload-gate-terminal.outcome == 'failure' && "
+        "steps.retry-upload-gate-terminal.outcome == 'failure'))"
+    )
+    assert warning["env"] == {
+        "PANEL_DIAGNOSTIC_OUTCOME": "${{ steps.upload-gate-status-panel-diagnostic.outcome }}",
+        "TERMINAL_UPLOAD_OUTCOME": "${{ steps.upload-gate-terminal.outcome }}",
+        "TERMINAL_RETRY_OUTCOME": "${{ steps.retry-upload-gate-terminal.outcome }}",
+    }
+    assert "::warning::" in warning["run"]
+    assert "Gate terminal envelope upload failed after retry" in warning["run"]
 
 
 def test_gate_job_timeout_matches_aggregate_publish_budget():
