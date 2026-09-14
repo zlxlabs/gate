@@ -1,5 +1,5 @@
 name: Review effectiveness ledger
-description: Build a cumulative JSONL ledger from PR size and Codex review audit artifacts.
+description: Build a single-row JSONL ledger from this run's review artifacts.
 inputs:
   audit-path: { required: true }
   preflight-path: { required: true }
@@ -15,7 +15,6 @@ inputs:
   # Optional: omitted by legacy gate.yml. When set (gate-v2), fail-loud G3
   # projection. Empty/absent must not error and must not add the field.
   terminal-path: { required: false, default: "" }
-  token: { required: true }
   codex-expected: { required: true }
   codex-waived: { required: true }
   expected-repository-id: { required: true }
@@ -29,8 +28,6 @@ runs:
   using: composite
   steps:
     - shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.token }}
       run: |
         python3 "$GITHUB_ACTION_PATH/build_ledger.py" \
           --audit-path "${{ inputs.audit-path }}" \

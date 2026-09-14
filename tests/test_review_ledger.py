@@ -1,19 +1,12 @@
 import argparse
-import base64
+import ast
 import hashlib
 import importlib.util
 import inspect
-import io
 import json
-import ssl
+import socket
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-import zipfile
 from pathlib import Path
-
-import pytest
 
 import pytest
 
@@ -91,80 +84,16 @@ EXPECTED_IDENTITY = {
     "reusable_workflow_sha": "c" * 40,
 }
 
-def test_new_head_comparison_tracks_persistent_resolved_and_new_findings():
-    module = _module()
-    previous = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="old", preflight={}, audit=_audit("old", ["a", "b"]), prior_entries=[], dispositions={},
-    )
-    current = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
-        head_sha="new", preflight={}, audit=_audit("new", ["b", "c"]), prior_entries=[previous], dispositions={},
-    )
-
-    assert current["comparison"]["kind"] == "new_head"
-    assert current["comparison"]["persistent_finding_ids"] == ["b"]
-    assert current["comparison"]["resolved_finding_ids"] == ["a"]
-    assert current["comparison"]["new_finding_ids"] == ["c"]
-    assert current["review_round"] == 2
-
-
-def test_same_head_rerun_is_recorded_as_stability_not_as_a_fix():
-    module = _module()
-    previous = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="same", preflight={}, audit=_audit("same", ["a", "b"]), prior_entries=[], dispositions={},
-    )
-    current = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=2,
-        head_sha="same", preflight={}, audit=_audit("same", ["b", "c"]), prior_entries=[previous], dispositions={},
-    )
-
-    assert current["comparison"]["kind"] == "same_head_rerun"
-    assert current["comparison"]["missing_finding_ids"] == ["a"]
-    assert current["comparison"]["appeared_finding_ids"] == ["c"]
-    assert "resolved_finding_ids" not in current["comparison"]
-
-
-def test_convergence_projection_is_observational_only():
-    module = _module()
-    disposition = {
-        "disposition": "false-positive",
-        "reason": "locked upstream behavior",
-        "status": "active_false_positive",
-    }
-    projected = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_audit("head", ["a"]),
-        prior_entries=[], dispositions={"a": disposition},
-    )
-    without_projection = dict(projected)
-    without_projection.pop("convergence_projection")
-    assert projected["convergence_projection"] == {
-        "source": "disposition-observation",
-        "required_gate_effect": "none",
-        "statuses": {
-            "a": {
-                "status": "active_false_positive",
-                "reason": "locked upstream behavior",
-            },
-        },
-    }
-    assert without_projection["review"] == projected["review"]
-    assert without_projection["comparison"] == projected["comparison"]
-    assert projected["false_positive_count"] == 1
-
-
 def test_install_metrics_flow_through_when_present_and_default_to_none():
     module = _module()
     with_install = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=_audit("sha", []),
         install={"ecosystem": "uv", "status": "ok", "duration_s": 42, "cache_hit": True},
     )
     without_install = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
-        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=_audit("sha", []),
     )
 
     assert with_install["install"] == {
@@ -191,37 +120,21 @@ def test_missing_install_result_file_yields_null_install_field(tmp_path):
 
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=_audit("sha", []),
         install=module._load_json(missing),
     )
     assert entry["install"] is None
     assert json.loads(json.dumps(entry))["install"] is None
 
 
-def test_disposition_comments_capture_false_positive_reason_and_author():
-    module = _module()
-    comments = [{
-        "body": "Codex finding disposition: correctness.bad-state = false-positive — 真实接口不会进入此路径",
-        "user": {"login": "owner"},
-        "created_at": "2026-07-12T00:00:00Z",
-        "html_url": "https://example.test/comment/1",
-    }]
-
-    dispositions = module.parse_dispositions(comments)
-
-    assert dispositions["correctness.bad-state"]["disposition"] == "false-positive"
-    assert dispositions["correctness.bad-state"]["reason"] == "真实接口不会进入此路径"
-    assert dispositions["correctness.bad-state"]["author"] == "owner"
-
-
 def test_ledger_deduplicates_run_attempts_and_writes_jsonl(tmp_path):
     module = _module()
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=_audit("sha", []),
     )
     output = tmp_path / "ledger.jsonl"
-    module.write_ledger(output, [entry, entry], max_entries=2000)
+    module.write_ledger(output, entry)
 
     lines = output.read_text().splitlines()
     assert len(lines) == 1
@@ -235,7 +148,6 @@ def test_v2_primary_audit_projects_verdict_and_identity(verdict):
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
         head_sha="head", preflight=_preflight(), audit=audit,
-        prior_entries=[], dispositions={},
     )
 
     assert entry["review"]["status"] == verdict
@@ -255,7 +167,7 @@ def test_review_ledger_consumes_real_primary_v2_tier_artifact_bytes():
     entry = module.build_entry(
         repository=audit["repository"], pr_number=audit["pr"], run_id=audit["run_id"],
         run_attempt=audit["run_attempt"], head_sha=audit["head_sha"], preflight=_preflight(),
-        audit=audit, prior_entries=[], dispositions={},
+        audit=audit,
     )
 
     assert audit["run_id"] == 32446501755, PRIMARY_REVIEW_V2_TIER_SOURCE_URL
@@ -272,7 +184,6 @@ def test_primary_v2_tier_accepts_domain_values_for_review_and_no_review(verdict,
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
         head_sha="head", preflight=_preflight(), audit=audit,
-        prior_entries=[], dispositions={},
     )
 
     assert entry["primary_identity"]["tier"] == tier
@@ -288,7 +199,6 @@ def test_primary_v2_tier_rejects_invalid_domain_values(tier):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
             head_sha="head", preflight=_preflight(), audit=audit,
-            prior_entries=[], dispositions={},
         )
 
 
@@ -301,7 +211,6 @@ def test_primary_v2_tier_does_not_allow_other_unknown_fields():
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
             head_sha="head", preflight=_preflight(), audit=audit,
-            prior_entries=[], dispositions={},
         )
 
 
@@ -312,7 +221,7 @@ def test_v2_review_preserves_result_and_recomputes_legacy_coverage(
     module = _module()
     audit = _v2_audit("fail", cost=1.25, tokens=[{"input": 3}], runtime={"duration_s": 12.5})
     audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 12.5, "cost_usd": 1.25}]
-    entry = module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(diff_lines, plan=plan), audit=audit, prior_entries=[], dispositions={})
+    entry = module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(diff_lines, plan=plan), audit=audit)
 
     review = entry["review"]
     assert review["result"] == audit["result"]
@@ -380,12 +289,6 @@ def _run_ledger_main(
     preflight=None,
     install=None,
     audit=None,
-    prior_entries_fetch=None,
-    fetch_comments_impl=None,
-    post_state_comment_impl=None,
-    monotonic_impl=None,
-    sleep_impl=None,
-    urlopen_impl=None,
 ):
     audit = audit or _short_circuit_fail_audit()
     work = tmp_path
@@ -403,27 +306,6 @@ def _run_ledger_main(
         install_path = work / "install-result.json"
         install_path.write_text(json.dumps(install), encoding="utf-8")
     output = work / "ledger.jsonl"
-    monkeypatch.setenv("GH_TOKEN", "test-token")
-    if prior_entries_fetch is not False:
-        monkeypatch.setattr(
-            module,
-            "fetch_prior_entries",
-            prior_entries_fetch or (lambda *a, **k: ([], "success")),
-        )
-    if fetch_comments_impl is not False:
-        monkeypatch.setattr(
-            module, "fetch_comments", fetch_comments_impl or (lambda *a, **k: ([], "success")),
-        )
-    if post_state_comment_impl is not False:
-        monkeypatch.setattr(
-            module, "post_state_comment", post_state_comment_impl or (lambda *a, **k: "success"),
-        )
-    if monotonic_impl is not None:
-        monkeypatch.setattr(module.time, "monotonic", monotonic_impl)
-    if sleep_impl is not None:
-        monkeypatch.setattr(module.time, "sleep", sleep_impl)
-    if urlopen_impl is not None:
-        monkeypatch.setattr(module.URL_OPENER, "open", urlopen_impl)
     monkeypatch.setattr(sys, "argv", [
         "build_ledger.py",
         "--audit-path", str(audit_path),
@@ -446,61 +328,61 @@ def _run_ledger_main(
     return rc, output, audit
 
 
-@pytest.mark.parametrize(
-    "comment_result,expected_status",
-    [
-        (([], "success"), "success"),
-        (([], "failure"), "failure"),
-    ],
-    ids=["comments_read_no_dispositions", "comments_unavailable"],
-)
-def test_main_records_disposition_channel_availability(
-    tmp_path, monkeypatch, comment_result, expected_status,
-):
+
+def test_main_no_network_writes_one_v2_row_with_current_fields(tmp_path, monkeypatch):
     module = _module()
 
-    rc, output, _ = _run_ledger_main(
+    def fail_socket(*args, **kwargs):
+        raise RuntimeError("network access is forbidden in ledger producer")
+
+    monkeypatch.setattr(socket, "socket", fail_socket)
+    rc, output, audit = _run_ledger_main(
         module,
         tmp_path,
         monkeypatch,
         preflight=_preflight(),
-        fetch_comments_impl=lambda *args, **kwargs: comment_result,
+        install={"ecosystem": "uv", "status": "ok", "duration_s": 2, "cache_hit": True},
     )
 
     assert rc == 0
-    rows = [json.loads(line) for line in output.read_text().splitlines()]
-    current = next(row for row in rows if row["run_id"] == 10)
-    assert current["disposition_status"] == expected_status
-    assert current["finding_dispositions"] == {}
-    assert current["false_positive_count"] == 0
+    lines = output.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert set(module.LEDGER_ENTRY_REQUIRED_FIELDS) <= set(row)
+    assert row["schema_version"] == 2
+    assert isinstance(row["recorded_at"], str) and row["recorded_at"]
+    assert row["repository"] == "zlxlabs/app"
+    assert row["pr_number"] == 7
+    assert row["run_id"] == 10
+    assert row["run_attempt"] == 1
+    assert row["head_sha"] == "head"
+    assert row["preflight"] == _preflight()
+    assert row["install"] == {"ecosystem": "uv", "status": "ok", "duration_s": 2, "cache_hit": True}
+    assert row["primary_identity"] is not None
+    assert row["review"]["finding_ids"] == [
+        "correctness.bad-state", "security.leak",
+    ]
+    assert row["review"]["result"] == audit["result"]
+    assert row["finding_dispositions"] == {}
+    assert row["false_positive_count"] == 0
+    assert row["disposition_status"] == "success"
+    assert not {"review_round", "comparison", "history_status", "ledger_conflict", "convergence_projection"} & row.keys()
+    assert not set(module.LEDGER_ENTRY_OPTIONAL_FIELDS) & row.keys()
 
 
-def test_main_real_collection_records_each_history_source_and_rejects_pending_new_source(
-    tmp_path, monkeypatch,
-):
-    module = _module()
-    captured: list[dict[str, str]] = []
-    original_build_entry = module.build_entry
-
-    def capture_history_sources(*args, **kwargs):
-        captured.append(kwargs["history_sources"])
-        return original_build_entry(*args, **kwargs)
-
-    monkeypatch.setattr(module, "build_entry", capture_history_sources)
-    rc, _, _ = _run_ledger_main(module, tmp_path, monkeypatch, preflight=_preflight())
-
-    assert rc == 0
-    assert captured == [{source: "success" for source in module.HISTORY_SOURCES}]
-
-    monkeypatch.setattr(
-        module,
-        "HISTORY_SOURCES",
-        (*module.HISTORY_SOURCES, "future_source"),
+def test_build_ledger_imports_have_no_network_modules():
+    tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+    imported = {
+        node.names[0].name.split(".", 1)[0]
+        for node in tree.body
+        if isinstance(node, ast.Import)
+    }
+    imported.update(
+        node.module.split(".", 1)[0]
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
     )
-    with pytest.raises(ValueError, match="not collected"):
-        _run_ledger_main(
-            module, tmp_path / "future-source", monkeypatch, preflight=_preflight(),
-        )
+    assert not imported & {"urllib", "http", "socket", "ssl"}
 
 
 def test_short_circuited_empty_preflight_writes_ledger_row():
@@ -511,7 +393,7 @@ def test_short_circuited_empty_preflight_writes_ledger_row():
     audit = _short_circuit_fail_audit()
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        head_sha="head", preflight={}, audit=audit,
         install=None, expected_identity=EXPECTED_IDENTITY, input_short_circuited=True,
     )
     assert entry["preflight"] is None
@@ -561,7 +443,6 @@ def test_primary_review_empty_preflight_without_short_circuit_still_raises():
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
             head_sha="head", preflight={}, audit=_v2_audit("fail"),
-            prior_entries=[], dispositions={},
         )
     params = inspect.signature(module.build_entry).parameters
     if "input_short_circuited" in params:
@@ -569,7 +450,6 @@ def test_primary_review_empty_preflight_without_short_circuit_still_raises():
             module.build_entry(
                 repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
                 head_sha="head", preflight={}, audit=_v2_audit("fail"),
-                prior_entries=[], dispositions={},
                 input_short_circuited=False,
             )
 
@@ -582,8 +462,7 @@ def test_short_circuited_valid_preflight_still_computes_coverage():
     preflight = _preflight(100)
     kwargs = dict(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight=preflight, audit=audit, prior_entries=[],
-        dispositions={}, expected_identity=EXPECTED_IDENTITY,
+        head_sha="head", preflight=preflight, audit=audit, expected_identity=EXPECTED_IDENTITY,
     )
     normal = module.build_entry(**kwargs)
     shorted = module.build_entry(**kwargs, input_short_circuited=True)
@@ -632,7 +511,6 @@ def test_v2_detached_shadows_are_recorded_as_unavailable_without_losing_expectat
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
         head_sha="head", preflight=_preflight(), audit=audit,
-        prior_entries=[], dispositions={},
     )
 
     assert entry["review"]["shadows"] == {
@@ -654,7 +532,6 @@ def test_v2_detached_shadows_reject_malformed_expected_names(value):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
             head_sha="head", preflight=_preflight(), audit=audit,
-            prior_entries=[], dispositions={},
         )
 
 
@@ -667,7 +544,6 @@ def test_v2_detached_shadows_reject_non_detached_mode():
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
             head_sha="head", preflight=_preflight(), audit=audit,
-            prior_entries=[], dispositions={},
         )
 
 
@@ -676,7 +552,7 @@ def test_v2_runtime_rejects_attempt_duration_sum_mismatch():
     audit = _v2_audit("pass", runtime={"duration_s": 1})
     audit["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2, "cost_usd": None}]
     with pytest.raises(ValueError, match="runtime"):
-        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit)
 
 
 def _ledger_runtime_case(schema_version, verdict, runtime_case):
@@ -707,7 +583,7 @@ def test_ledger_runtime_schema_upgrade_matrix(schema_version, runtime_case, verd
     audit = _ledger_runtime_case(schema_version, verdict, runtime_case)
     call = lambda: module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+        head_sha="head", preflight=_preflight(), audit=audit,
     )
     if expected:
         entry = call()
@@ -723,7 +599,7 @@ def test_ledger_consumes_historical_v1_fixture_without_runtime():
     entry = module.build_entry(
         repository=fixture["repository"], pr_number=fixture["pr"], run_id=fixture["run_id"],
         run_attempt=fixture["run_attempt"], head_sha=fixture["head_sha"], preflight=_preflight(),
-        audit=fixture, prior_entries=[], dispositions={},
+        audit=fixture,
     )
     assert entry["review"]["runtime"] is None
 
@@ -733,7 +609,7 @@ def test_v2_review_rejects_invalid_telemetry(field, value):
     module = _module()
     audit = _v2_audit("pass", **{field: value})
     with pytest.raises(ValueError, match="canonical primary"):
-        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit)
 
 
 @pytest.mark.parametrize("mutation", [lambda audit: audit["result"].pop("findings"), lambda audit: audit["result"]["findings"].append({"id": "broken"}), lambda audit: audit["attempts"].append({"reviewer": 3})])
@@ -742,7 +618,7 @@ def test_v2_review_rejects_malformed_consumed_payload(mutation):
     audit = _v2_audit("pass")
     mutation(audit)
     with pytest.raises(ValueError, match="canonical primary"):
-        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={})
+        module.build_entry(repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1, head_sha="head", preflight=_preflight(), audit=audit)
 
 
 def test_v2_primary_audit_rejects_mismatched_parent_identity():
@@ -753,7 +629,7 @@ def test_v2_primary_audit_rejects_mismatched_parent_identity():
     with pytest.raises(ValueError, match="primary audit identity mismatch"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit,
         )
 
 
@@ -766,7 +642,7 @@ def test_v2_primary_audit_binds_every_workflow_identity_field(field):
     with pytest.raises(ValueError, match="primary audit identity mismatch"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit,
             expected_identity=EXPECTED_IDENTITY,
         )
 
@@ -783,7 +659,7 @@ def test_v2_primary_audit_rejects_malformed_canonical_shape(field, value):
     with pytest.raises(ValueError, match="canonical primary"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit,
         )
 
 
@@ -800,1087 +676,16 @@ def test_v2_primary_audit_rejects_companion_fields_for_wrong_verdict(verdict, fi
     with pytest.raises(ValueError, match="canonical primary"):
         module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-            head_sha="head", preflight=_preflight(), audit=audit, prior_entries=[], dispositions={},
+            head_sha="head", preflight=_preflight(), audit=audit,
         )
 
-
-def test_fetch_prior_entries_fails_on_corrupt_artifact(monkeypatch):
-    module = _module()
-    monkeypatch.setattr(module, "_api_json", lambda token, url, **kwargs: {
-        "artifacts": [{"id": 1, "expired": False, "archive_download_url": "https://example.test/1"}]
-    })
-    monkeypatch.setattr(module, "_api_request", lambda token, url, **kwargs: b"not a zip")
-
-    with pytest.raises(zipfile.BadZipFile):
-        module.fetch_prior_entries("token", "zlxlabs/app")
-
-
-def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
-    module = _module()
-    requested = []
-
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self):
-            return b'{"artifacts": []}'
-
-    def fake_urlopen(request, timeout):
-        requested.append(request.full_url)
-        return Response()
-
-    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
-
-    entries, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
-    assert entries == []
-    assert history_status == "success"
-    assert len(requested) == 1
-    assert "name=codex-review-ledger-v2" in requested[0]
-    assert "per_page=3" in requested[0]
-    assert all("name=codex-review-ledger&" not in url for url in requested)
-
-
-def test_main_downgrades_prior_history_http_error_to_empty_history(tmp_path, monkeypatch, capsys):
-    module = _module()
-
-    def fail_fetch(*args, **kwargs):
-        raise urllib.error.HTTPError(
-            "https://api.github.com/repos/zlxlabs/app/actions/artifacts",
-            503,
-            "Service Unavailable",
-            hdrs={},
-            fp=io.BytesIO(b""),
-        )
-
-    rc, output, _ = _run_ledger_main(
-        module,
-        tmp_path,
-        monkeypatch,
-        preflight=_preflight(),
-        prior_entries_fetch=fail_fetch,
-    )
-
-    assert rc == 0
-    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    assert len(rows) == 1
-    assert rows[0]["history_status"] == "incomplete"
-    assert rows[0]["comparison"] == {
-        "kind": "history_incomplete",
-        "authoritative": False,
-    }
-    assert "::warning::could not load prior review ledger history" in capsys.readouterr().out
-
-
-def _ledger_zip_bytes(entries: list[dict]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as bundle:
-        bundle.writestr("ledger.jsonl", "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
-    return buf.getvalue()
-
-
-def _named_entry(run_id: int, sha: str) -> dict:
-    return {"repository": "zlxlabs/app", "run_id": run_id, "run_attempt": 1, "head_sha": sha}
-
-
-def _entry_keys(entries: list[dict]) -> set[tuple]:
-    return {(e.get("repository"), e.get("run_id"), e.get("run_attempt"), e.get("head_sha")) for e in entries}
-
-
-def _patch_named_artifact_api(module, monkeypatch, artifacts_by_name: dict[str, list[list[dict]]]):
-    archives, listed, artifact_id = {}, {}, 0
-    for name, artifacts in artifacts_by_name.items():
-        rows = []
-        for entries in artifacts:
-            artifact_id += 1
-            url = f"https://example.test/archive/{artifact_id}"
-            archives[url] = _ledger_zip_bytes(entries)
-            rows.append({"id": artifact_id, "expired": False, "archive_download_url": url})
-        listed[name] = rows
-
-    def fake_json(token, url, **kwargs):
-        name = (urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("name") or [""])[0]
-        return {"artifacts": listed.get(name, [])}
-
-    monkeypatch.setattr(module, "_api_json", fake_json)
-    monkeypatch.setattr(module, "_api_request", lambda token, url, **kwargs: archives[url])
-
-
-_V2, _V1, _SHARED, _V2U, _V1U = (
-    _named_entry(21, "v2-only"), _named_entry(11, "v1-only"),
-    _named_entry(10, "shared"), _named_entry(22, "v2-unique"), _named_entry(12, "v1-unique"),
-)
-
-
-@pytest.mark.parametrize(
-    "artifacts_by_name, expected",
-    [
-        ({"codex-review-ledger-v2": [[_V2]], "codex-review-ledger": []}, [_V2]),
-        ({"codex-review-ledger-v2": [], "codex-review-ledger": [[_V1]]}, []),
-        (
-            {"codex-review-ledger-v2": [[_SHARED, _V2U]], "codex-review-ledger": [[_SHARED, _V1U]]},
-            [_SHARED, _V2U],
-        ),
-        ({"codex-review-ledger-v2": [], "codex-review-ledger": []}, []),
-    ],
-    ids=["v2_only", "v1_only", "both_union_deduped", "neither"],
-)
-def test_fetch_prior_entries_reads_only_v2_artifact_name(artifacts_by_name, expected, monkeypatch):
-    module = _module()
-    _patch_named_artifact_api(module, monkeypatch, artifacts_by_name)
-    entries, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
-    assert _entry_keys(entries) == _entry_keys(expected)
-    assert history_status == "success"
-
-
-def test_fetch_prior_entries_returns_downloaded_part_when_time_budget_is_reached(monkeypatch, capsys):
-    module = _module()
-    _patch_named_artifact_api(
-        module,
-        monkeypatch,
-        {"codex-review-ledger-v2": [[_V2], [_V2U], [_SHARED]], "codex-review-ledger": []},
-    )
-    clock = iter([100.0, 100.0, 100.0, 110.0, 110.0, 200.0])
-    monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
-
-    prior, history_status = module.fetch_prior_entries("token", "zlxlabs/app", time_budget_seconds=90)
-
-    assert _entry_keys(prior) == _entry_keys([_V2, _V2U])
-    assert history_status == "incomplete"
-    assert "::warning::Stopped fetching prior ledger history after 2 artifact(s)" in capsys.readouterr().out
-
-
-def test_history_status_has_three_states_and_only_complete_history_can_compare():
-    module = _module()
-    previous = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="old", preflight={}, audit=_audit("old", ["a"]),
-        prior_entries=[], dispositions={},
-    )
-
-    cases = [
-        ({source: "success" for source in module.HISTORY_SOURCES}, [previous], "new_head", True),
-        ({module.HISTORY_SOURCE_ARTIFACT: "incomplete", module.HISTORY_SOURCE_STICKY_COMMENT: "success"}, [previous], "history_incomplete", False),
-        ({source: "success" for source in module.HISTORY_SOURCES}, [], "first_review", False),
-    ]
-    for history_sources, prior_entries, kind, authoritative in cases:
-        entry = module.build_entry(
-            repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
-            head_sha="new", preflight={}, audit=_audit("new", ["a", "b"]),
-            prior_entries=prior_entries, dispositions={}, history_sources=history_sources,
-        )
-
-        assert entry["history_status"] == ("complete" if kind == "new_head" else "none" if kind == "first_review" else "incomplete")
-        assert entry["comparison"]["kind"] == kind
-        assert entry["comparison"]["authoritative"] is authoritative
-        if not authoritative:
-            assert not {
-                "persistent_finding_ids", "resolved_finding_ids", "new_finding_ids",
-                "missing_finding_ids", "appeared_finding_ids",
-            }.intersection(entry["comparison"])
-
-
-@pytest.mark.parametrize("source", _module().HISTORY_SOURCES)
-@pytest.mark.parametrize("failure_mode", ["success", "truncated", "exception", "budget_skipped"])
-def test_history_source_axis_covers_every_source_and_failure_mode(source, failure_mode):
-    module = _module()
-    assert source in module.HISTORY_SOURCES
-    previous = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="old", preflight={}, audit=_audit("old", ["a"]),
-        prior_entries=[], dispositions={},
-    )
-    status_for_mode = {
-        "success": "success",
-        "truncated": "incomplete",
-        "exception": "failure",
-        "budget_skipped": "failure",
-    }
-    history_sources = {name: "success" for name in module.HISTORY_SOURCES}
-    history_sources[source] = status_for_mode[failure_mode]
-
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
-        head_sha="new", preflight={}, audit=_audit("new", ["a", "b"]),
-        prior_entries=[previous], dispositions={}, history_sources=history_sources,
-    )
-
-    expected_complete = failure_mode == "success"
-    assert entry["history_status"] == ("complete" if expected_complete else "incomplete")
-    assert entry["comparison"]["kind"] == ("new_head" if expected_complete else "history_incomplete")
-    assert entry["comparison"]["authoritative"] is expected_complete
-    if not expected_complete:
-        assert not {
-            "persistent_finding_ids", "resolved_finding_ids", "new_finding_ids",
-            "missing_finding_ids", "appeared_finding_ids",
-        }.intersection(entry["comparison"])
-
-
-@pytest.mark.parametrize(
-    "partial_entries",
-    [[], [_named_entry(9, "partial-history")]],
-    ids=["no_history_downloaded", "history_download_stopped_midway"],
-)
-def test_main_writes_current_row_when_history_is_incomplete(tmp_path, monkeypatch, partial_entries):
-    module = _module()
-
-    def fetch_partial(*args, **kwargs):
-        return partial_entries, "incomplete"
-
-    rc, output, _ = _run_ledger_main(
-        module,
-        tmp_path,
-        monkeypatch,
-        preflight=_preflight(),
-        prior_entries_fetch=fetch_partial,
-    )
-
-    assert rc == 0
-    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    current = next(row for row in rows if row["run_id"] == 10)
-    assert current["history_status"] == "incomplete"
-    assert current["comparison"] == {
-        "kind": "history_incomplete",
-        "authoritative": False,
-    }
-
-
-def test_history_fetch_retry_exhaustion_stays_below_step_budget(monkeypatch):
-    module = _module()
-    clock = [0.0]
-    calls: list[tuple[str, float]] = []
-    attempts_by_url: dict[str, int] = {}
-    archive_url = "https://example.test/archive/slow"
-
-    def fake_sleep(seconds):
-        clock[0] += seconds
-
-    def fake_urlopen(request, timeout):
-        url = request.full_url
-        key = "artifact-list" if "/actions/artifacts" in url else url
-        attempts_by_url[key] = attempts_by_url.get(key, 0) + 1
-        calls.append((url, timeout))
-        clock[0] += timeout
-        if key == "artifact-list":
-            success_attempt = 2 if timeout == 10 else 3
-            if attempts_by_url[key] < success_attempt:
-                raise _connection_urlerror()
-            return _ApiResponse(json.dumps({
-                "artifacts": [{
-                    "id": 1,
-                    "expired": False,
-                    "archive_download_url": archive_url,
-                }],
-            }).encode())
-        raise _connection_urlerror()
-
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(module.time, "sleep", fake_sleep)
-    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
-
-    with pytest.raises(urllib.error.URLError):
-        module.fetch_prior_entries("token", "zlxlabs/app")
-
-    assert clock[0] < 144
-    assert [timeout for _, timeout in calls] == [10, 10, 10, 10]
-
-
-@pytest.mark.parametrize(
-    "call_point,budget",
-    [
-        ("artifact_list", 20),
-        ("artifact_archive", 21),
-        ("comments", 100),
-        ("post_head", 120),
-        ("post_write", 120),
-    ],
-)
-def test_each_network_call_skips_when_remaining_budget_is_insufficient(
-    tmp_path, monkeypatch, call_point, budget,
-):
-    module = _module()
-    monkeypatch.setattr(module, "NETWORK_BUDGET_SECONDS", budget)
-    clock = [0.0]
-    calls: list[tuple[str, float]] = []
-    attempts_by_url: dict[str, int] = {}
-
-    previous = {**_named_entry(9, "old"), "pr_number": 7}
-    post_statuses = []
-    original_post = module.post_state_comment
-
-    def fake_sleep(seconds):
-        clock[0] += seconds
-
-    def fake_urlopen(request, timeout):
-        url = request.full_url
-        calls.append((url, timeout))
-        attempts_by_url[url] = attempts_by_url.get(url, 0) + 1
-        attempt = attempts_by_url[url]
-        attempt_limit = 2 if timeout == 10 else 3
-        clock[0] += timeout
-        if attempt < attempt_limit:
-            raise _connection_urlerror()
-        if "/actions/artifacts" in url:
-            artifacts = []
-            if call_point == "artifact_archive":
-                artifacts = [{
-                    "id": 1,
-                    "expired": False,
-                    "archive_download_url": "https://example.test/archive/1",
-                }]
-            return _ApiResponse(json.dumps({"artifacts": artifacts}).encode())
-        if "/issues/7/comments" in url and request.get_method() == "GET":
-            return _ApiResponse(b"[]")
-        if "/pulls/7" in url:
-            return _ApiResponse(b'{"head":{"sha":"head"}}')
-        return _ApiResponse(b"{}")
-
-    def post_wrapper(*args, **kwargs):
-        result = original_post(*args, **kwargs)
-        post_statuses.append(result)
-        return result
-
-    if call_point == "post_write":
-        prior_fetch = lambda *a, **k: ([previous], "success")
-        comments_fetch = lambda *a, **k: ([], "success")
-    else:
-        prior_fetch = False
-        comments_fetch = False if call_point in {"comments", "post_head"} else None
-
-    _run_ledger_main(
-        module,
-        tmp_path,
-        monkeypatch,
-        preflight=_preflight(),
-        prior_entries_fetch=prior_fetch,
-        fetch_comments_impl=comments_fetch,
-        post_state_comment_impl=post_wrapper if call_point in {"post_head", "post_write"} else None,
-        monotonic_impl=lambda: clock[0],
-        sleep_impl=fake_sleep,
-        urlopen_impl=fake_urlopen,
-    )
-
-    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
-    current = next(row for row in rows if row["run_id"] == 10)
-    assert current["run_id"] == 10
-    target = {
-        "artifact_list": "/actions/artifacts",
-        "artifact_archive": "example.test/archive",
-        "comments": "/issues/7/comments",
-        "post_head": "/pulls/7",
-        "post_write": "/issues/7/comments",
-    }[call_point]
-    assert not any(target in url for url, _ in calls)
-    if call_point in {"artifact_list", "artifact_archive", "comments"}:
-        assert current["history_status"] == "incomplete"
-    else:
-        assert post_statuses == ["failure"]
-
-
-def test_total_network_budget_is_bounded_and_current_row_is_written(tmp_path, monkeypatch):
-    module = _module()
-    clock = [0.0]
-    calls: list[tuple[str, float]] = []
-    attempts_by_url: dict[str, int] = {}
-
-    def fake_sleep(seconds):
-        clock[0] += seconds
-
-    def fake_urlopen(request, timeout):
-        url = request.full_url
-        calls.append((url, timeout))
-        attempts_by_url[url] = attempts_by_url.get(url, 0) + 1
-        attempt = attempts_by_url[url]
-        attempt_limit = 2 if timeout == module.HISTORY_REQUEST_TIMEOUT_SECONDS else 3
-        clock[0] += timeout
-        if attempt < attempt_limit:
-            raise _connection_urlerror()
-        if "/actions/artifacts" in url:
-            return _ApiResponse(b'{"artifacts":[]}')
-        if "/issues/7/comments" in url:
-            return _ApiResponse(b"[]")
-        return _ApiResponse(b"{}")
-
-    _run_ledger_main(
-        module,
-        tmp_path,
-        monkeypatch,
-        preflight=_preflight(),
-        prior_entries_fetch=False,
-        fetch_comments_impl=False,
-        post_state_comment_impl=False,
-        monotonic_impl=lambda: clock[0],
-        sleep_impl=fake_sleep,
-        urlopen_impl=fake_urlopen,
-    )
-
-    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
-    assert any(row["run_id"] == 10 for row in rows)
-    assert [timeout for _, timeout in calls] == [10, 10, 30, 30, 30]
-    assert clock[0] == (
-        module.HISTORY_REQUEST_WORST_CASE_SECONDS + module.API_REQUEST_WORST_CASE_SECONDS
-    )
-    assert clock[0] <= module.NETWORK_BUDGET_SECONDS < 144
-    max_allowed_windows = max(
-        4 * module.HISTORY_REQUEST_WORST_CASE_SECONDS,
-        module.HISTORY_REQUEST_WORST_CASE_SECONDS + module.API_REQUEST_WORST_CASE_SECONDS,
-    )
-    assert max_allowed_windows < 144
-
-
-def test_v2_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
-    module = _module()
-    historical, current = _pr_ledger_entries(module, 2)
-    zip_bytes = _ledger_zip_bytes([historical])
-    recorded: list[tuple[str, str, dict | None]] = []
-
-    def fake_api_request(token, url, *, method="GET", payload=None, **kwargs):
-        recorded.append((method, url, payload))
-        parsed = urllib.parse.urlparse(url)
-        name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
-        if parsed.path.endswith("/actions/artifacts"):
-            artifacts = ([{"id": 1, "expired": False, "archive_download_url": "https://example.test/v2"}]
-                         if name == "codex-review-ledger-v2" else [])
-            return json.dumps({"artifacts": artifacts}).encode()
-        if url == "https://example.test/v2":
-            return zip_bytes
-        if "/pulls/" in parsed.path:
-            return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
-        if method == "POST":
-            return b"{}"
-        raise AssertionError(f"unexpected request {method} {url}")
-
-    monkeypatch.setattr(module, "_api_request", fake_api_request)
-    prior, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
-    assert _entry_keys(prior) == _entry_keys([historical])
-    assert history_status == "success"
-    module.post_state_comment(
-        "token", "zlxlabs/app", 7, current["head_sha"],
-        module.dedupe_entries([*prior, current]), current, [],
-    )
-    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
-    assert "skip first-round review ledger state comment" not in capsys.readouterr().out
-    assert len(writes) == 1 and writes[0][0] == "POST"
-    assert writes[0][1] == "https://api.github.com/repos/zlxlabs/app/issues/7/comments"
-    assert writes[0][2] is not None and "codex-review-ledger-state:v2:" in writes[0][2]["body"]
-
-
-@pytest.mark.parametrize("max_entries", [0, -1])
-def test_write_ledger_rejects_nonpositive_capacity(tmp_path, max_entries):
-    module = _module()
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
-    )
-
-    with pytest.raises(ValueError, match="max_entries"):
-        module.write_ledger(tmp_path / "ledger.jsonl", [entry], max_entries=max_entries)
-
-
-@pytest.mark.parametrize("count,capacity", [(2000, 2000), (2001, 2000)])
-def test_write_ledger_capacity_boundary(tmp_path, count, capacity):
-    module = _module()
-    entries = [{"repository": "zlxlabs/app", "run_id": index, "run_attempt": 1,
-                "recorded_at": str(index)} for index in range(count)]
-    output = tmp_path / "ledger.jsonl"
-    if count == capacity:
-        module.write_ledger(output, entries, max_entries=capacity)
-        assert len(output.read_text().splitlines()) == capacity
-    else:
-        with pytest.raises(ValueError, match="max_entries"):
-            module.write_ledger(output, entries, max_entries=capacity)
-        assert not output.exists()
-
-
-def test_ledger_preserves_conflicting_run_attempt_variants():
-    module = _module()
-    first = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight=_preflight(), audit=_v2_audit("pass"),
-        prior_entries=[], dispositions={},
-    )
-    second = json.loads(json.dumps(first))
-    second["review"]["status"] = "fail"
-
-    variants = module.dedupe_entries([first, second])
-
-    assert len(variants) == 2
-    assert all(item["ledger_conflict"]["variant_count"] == 2 for item in variants)
-    survivor = module.dedupe_entries([variants[0]])
-    assert survivor[0]["ledger_conflict"]["present_variant_count"] == 1
-
-    current = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
-        head_sha="next", preflight={}, audit=_audit("next", []),
-        prior_entries=survivor, dispositions={},
-    )
-    assert current["comparison"]["kind"] == "prior_conflict"
-    assert current["review_round"] == 2
-    recovered = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=12, run_attempt=1, head_sha="later", preflight={}, audit=_audit("later", []), prior_entries=[*variants, current], dispositions={},
-    )
-    assert recovered["comparison"]["kind"] == "new_head"
-
-
-def test_cross_host_artifact_redirect_strips_github_authorization():
-    module = _module()
-    handler = module.CrossHostAuthStripRedirectHandler()
-    original = urllib.request.Request(
-        "https://api.github.com/repos/zlxlabs/app/actions/artifacts/1/zip",
-        headers={"Authorization": "Bearer secret", "Accept": "application/json"},
-    )
-
-    redirected = handler.redirect_request(
-        original,
-        None,
-        302,
-        "Found",
-        {"Location": "https://artifactcache.example.test/signed"},
-        "https://artifactcache.example.test/signed",
-    )
-
-    assert redirected is not None
-    assert redirected.get_header("Authorization") is None
-    assert redirected.get_header("Accept") == "application/json"
-
-
-def test_bot_sticky_state_survives_reruns_but_user_spoof_is_ignored():
-    module = _module()
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="same", preflight={}, audit=_audit("same", ["a"]), prior_entries=[], dispositions={},
-    )
-    body = module.render_state_comment([entry], entry)
-    comments = [
-        {"body": body, "user": {"login": "owner", "type": "User"}},
-        {"body": body, "user": {"login": "github-actions[bot]", "type": "Bot"}},
-    ]
-
-    restored = module.parse_state_entries(comments)
-
-    assert restored == [entry]
-    assert "Review ledger state" in body
-    assert "same" in body
-
-
-def _legacy_state_comment_body(module, entries, current):
-    """Frozen copy of the pre-humanize render_state_comment layout.
-
-    The sticky comment doubles as machine-readable cursor storage, and live PRs
-    already carry comments in this exact layout. This fixture pins that layout so
-    a renderer change can never silently break cursor recovery from old comments.
-    """
-    relevant = [
-        entry for entry in entries
-        if entry.get("repository") == current.get("repository")
-        and entry.get("pr_number") == current.get("pr_number")
-    ][-20:]
-    encoded = base64.urlsafe_b64encode(
-        json.dumps(relevant, ensure_ascii=False, separators=(",", ":")).encode()
-    ).decode()
-    review = current["review"]
-    comparison = current["comparison"]
-    comparison_line = comparison["kind"]
-    if comparison["kind"] == "new_head":
-        comparison_line += (
-            f"; persistent/resolved/new = {len(comparison['persistent_finding_ids'])}/"
-            f"{len(comparison['resolved_finding_ids'])}/{len(comparison['new_finding_ids'])}"
-        )
-    elif comparison["kind"] == "same_head_rerun":
-        comparison_line += (
-            f"; stable/missing/appeared = {len(comparison['persistent_finding_ids'])}/"
-            f"{len(comparison['missing_finding_ids'])}/{len(comparison['appeared_finding_ids'])}"
-        )
-    reviewer = review.get("reviewer") or "none"
-    failover = bool(review.get("failover"))
-    reviewer_line = f"{reviewer}" + (" (failover)" if failover else "")
-    return (
-        f"{module.STATE_MARKER}\n\n### 📒 Review ledger state\n\n"
-        f"- Commit: `{current['head_sha']}`\n"
-        f"- Round: **{current['review_round']}**\n"
-        f"- Status / findings: **{review['status']} / {review['finding_count']}**\n"
-        f"- Reviewer: **{reviewer_line}**\n"
-        f"- Comparison: `{comparison_line}`\n\n"
-        "完整数据保存在 `codex-review-ledger-v2` artifact；此 sticky comment 仅保存 v2 epoch 的跨 rerun 连续游标。\n\n"
-        f"<!-- codex-review-ledger-state:v2:{encoded} -->\n"
-    )
-
-
-def test_parse_state_entries_recovers_cursor_from_pre_humanize_comment():
-    """Backward compat: comments already posted in the old layout must still parse."""
-    module = _module()
-    previous = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="old", preflight={}, audit=_audit("old", ["a", "b"]), prior_entries=[], dispositions={},
-    )
-    current = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
-        head_sha="new", preflight={}, audit=_audit("new", ["b", "c"]), prior_entries=[previous], dispositions={},
-    )
-    body = _legacy_state_comment_body(module, [previous, current], current)
-    comments = [{"body": body, "user": {"login": "github-actions[bot]", "type": "Bot"}}]
-
-    restored = module.parse_state_entries(comments)
-
-    assert restored == [previous, current]
-
-
-def _details_block(body: str) -> str:
-    return body[body.index("<details>"):body.index("</details>")]
-
-
-@pytest.mark.parametrize(
-    "kind,fragment",
-    [
-        ("new_head", "persistent/resolved/new = 1/1/1"),
-        ("same_head_rerun", "stable/missing/appeared = 1/1/1"),
-    ],
-)
-def test_state_comment_folds_machine_details_behind_human_navigation(kind, fragment):
-    module = _module()
-    same_head = kind == "same_head_rerun"
-    # Non-default fixture values so rendered content is proven to come from render inputs.
-    repository = "acme/widget"
-    pr_number = 99
-    previous = module.build_entry(
-        repository=repository, pr_number=pr_number, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_audit("head", ["a", "b"]), prior_entries=[], dispositions={},
-    )
-    current = module.build_entry(
-        repository=repository, pr_number=pr_number, run_id=10 if same_head else 11,
-        run_attempt=2 if same_head else 1, head_sha="head" if same_head else "new",
-        preflight={}, audit=_audit("head" if same_head else "new", ["b", "c"]),
-        prior_entries=[previous], dispositions={},
-    )
-    body = module.render_state_comment([previous, current], current)
-
-    # First line stays the machine anchor — human navigation must not displace it.
-    assert body.splitlines()[0] == module.STATE_MARKER
-    # Human first screen: heading keeps the referenced name but cannot read as a verdict.
-    assert "### ⚙️ Review ledger state（机器状态记录，非评审结论）" in body
-    navigation = body[: body.index("<details>")]
-    assert "机器状态记录" in navigation
-    assert "不代表评审结论" in navigation
-    # Must not name gate-hub-only advisory comment titles (fleet-wide dangling pointer).
-    assert "Gate 当前状态" not in navigation
-    # Navigation must not point anywhere: no single surface can reliably answer
-    # "can this merge" across fleet deployment shapes — lock it with no-URL.
-    assert "http" not in navigation
-    # Machine details are folded but still complete (six items incl. artifact note).
-    assert "<details><summary>机器状态明细</summary>" in body
-    details = _details_block(body)
-    for item in ("- Commit:", "- Round:", "- Status / findings:", "- Reviewer:", "- Comparison:"):
-        assert item in details
-    assert fragment in details
-    assert "完整数据保存在 `codex-review-ledger-v2` artifact" in details
-    # Cursor comment stays last, byte-stable, and decodes back to the entry list.
-    match = module.STATE_RE.search(body)
-    assert match is not None
-    assert body.endswith(match.group(0) + "\n")
-    payload = base64.urlsafe_b64decode(match.group(1).encode())
-    assert json.loads(payload) == [previous, current]
-
-
-def test_state_comment_renders_failover_reviewer_inside_details():
-    module = _module()
-    audit = _audit("sha", [])
-    audit["reviewer"] = "codex-sub"
-    audit["attempts"] = [
-        {"reviewer": "claude-glm", "exit_code": 20, "reason": "限流", "duration_s": 1},
-        {"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2},
-    ]
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
-    )
-    body = module.render_state_comment([entry], entry)
-
-    details = _details_block(body)
-    assert "- Reviewer: **codex-sub (failover)**" in details
-
-
-def test_v2_state_marker_does_not_restore_the_legacy_epoch():
-    module = _module()
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="same", preflight={}, audit=_audit("same", ["a"]), prior_entries=[], dispositions={},
-    )
-    body = module.render_state_comment([entry], entry)
-
-    assert module.parse_state_entries([
-        {
-            "body": "<!-- codex-review-ledger-state:v1:W3sicmVwb3NpdG9yeSI6InpseGxhYnMvYXBwIiwicHJfbnVtYmVyIjo3LCJydW5faWQiOjEwfV0= -->",
-            "user": {"login": "github-actions[bot]", "type": "Bot"},
-        }
-    ]) == []
-    assert "codex-review-ledger-state:v2:" in body
-    assert "codex-review-ledger-state:v1:" not in body
-    assert "codex-review-ledger-v2" in body
-
-
-def test_sticky_comment_scrub_failure_prevents_github_write(monkeypatch):
-    module = _module()
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[], dispositions={},
-    )
-    calls = []
-
-    monkeypatch.setattr(module, "scrub_for_publish", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("scrub failed")))
-    monkeypatch.setattr(module, "_api_json", lambda *args, **kwargs: calls.append((args, kwargs)))
-    monkeypatch.setattr(module, "_api_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-
-    with pytest.raises(RuntimeError, match="scrub failed"):
-        module.post_state_comment(
-            "token", "org/repo", 7, "head", [entry], entry, [],
-        )
-
-    assert calls == []
-
-
-def test_sticky_comment_sends_scrubbed_body(monkeypatch):
-    module = _module()
-    previous = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=9, run_attempt=1,
-        head_sha="old", preflight={}, audit=_audit("old", []), prior_entries=[], dispositions={},
-    )
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[previous], dispositions={},
-    )
-    entry["review"]["reviewer"] = "runner-secret"
-    writes = []
-
-    class Response:
-        def __init__(self, payload=b""):
-            self.payload = payload
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self):
-            return self.payload
-
-    def fake_urlopen(request, timeout):
-        if request.get_method() == "GET":
-            return Response(b'{"head":{"sha":"head"}}')
-        writes.append(json.loads(request.data.decode()))
-        return Response(b"{}")
-
-    monkeypatch.setenv("RUNNER_NAME", "runner-secret")
-    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
-
-    module.post_state_comment("token", "org/repo", 7, "head", [previous, entry], entry, [])
-
-    assert len(writes) == 1
-    body = writes[0]["body"]
-    assert "runner-secret" not in body
-    assert "[REDACTED:RUNNER_NAME]" in body
-
-
-class _ApiResponse:
-    def __init__(self, payload=b""):
-        self.payload = payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        return self.payload
-
-
-def _connection_urlerror() -> urllib.error.URLError:
-    return urllib.error.URLError(ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING"))
-
-
-def _http_404() -> urllib.error.HTTPError:
-    return urllib.error.HTTPError(
-        "https://api.github.com/repos/org/repo",
-        404,
-        "Not Found",
-        hdrs={},
-        fp=io.BytesIO(b""),
-    )
-
-
-def test_api_request_retries_connection_error_then_succeeds(monkeypatch, capsys):
-    module = _module()
-    calls = []
-    sleeps = []
-    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
-
-    def fake_urlopen(request, timeout):
-        calls.append(timeout)
-        if len(calls) < 3:
-            raise _connection_urlerror()
-        return _ApiResponse(b'{"ok":true}')
-
-    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
-
-    body = module._api_request("token", "https://api.github.com/repos/org/repo")
-
-    assert body == b'{"ok":true}'
-    assert len(calls) == 3
-    assert sleeps == [1, 2]
-    output = capsys.readouterr().out
-    assert "GitHub API request retry: path=/repos/org/repo attempt=2/3 error=URLError delay=1s" in output
-    assert "GitHub API request retry: path=/repos/org/repo attempt=3/3 error=URLError delay=2s" in output
-
-
-def test_api_request_does_not_retry_http_error(monkeypatch):
-    module = _module()
-    calls = []
-    sleeps = []
-    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
-
-    def fake_urlopen(request, timeout):
-        calls.append(timeout)
-        raise _http_404()
-
-    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
-
-    with pytest.raises(urllib.error.HTTPError) as exc_info:
-        module._api_request("token", "https://api.github.com/repos/org/repo")
-
-    assert exc_info.value.code == 404
-    assert len(calls) == 1
-    assert sleeps == []
-
-
-def test_api_request_reraises_after_connection_error_retries_exhausted(monkeypatch, capsys):
-    module = _module()
-    calls = []
-    sleeps = []
-    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
-
-    def fake_urlopen(request, timeout):
-        calls.append(timeout)
-        raise _connection_urlerror()
-
-    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
-
-    with pytest.raises(urllib.error.URLError) as exc_info:
-        module._api_request("token", "https://api.github.com/repos/org/repo")
-
-    assert type(exc_info.value) is urllib.error.URLError
-    assert len(calls) == 3
-    assert sleeps == [1, 2]
-    output = capsys.readouterr().out
-    assert output.count("GitHub API request retry:") == 2
-    assert "attempt=2/3" in output
-    assert "attempt=3/3" in output
-
-
-def _pr_ledger_entries(module, count: int) -> list[dict]:
-    entries = []
-    for index in range(count):
-        sha = "head" if index == count - 1 else f"old{index}"
-        entries.append(
-            module.build_entry(
-                repository="zlxlabs/app",
-                pr_number=7,
-                run_id=10 + index,
-                run_attempt=1,
-                head_sha=sha,
-                preflight={},
-                audit=_audit(sha, []),
-                prior_entries=entries,
-                dispositions={},
-            )
-        )
-    return entries
-
-
-def _same_repo_other_pr_entry(module) -> dict:
-    """Noise that a repository-only filter would keep."""
-    return module.build_entry(
-        repository="zlxlabs/app",
-        pr_number=99,
-        run_id=1,
-        run_attempt=1,
-        head_sha="other-pr",
-        preflight={},
-        audit=_audit("other-pr", []),
-        prior_entries=[],
-        dispositions={},
-    )
-
-
-def _other_repo_same_pr_entry(module) -> dict:
-    """Noise that a pr_number-only filter would keep."""
-    return module.build_entry(
-        repository="other/repo",
-        pr_number=7,
-        run_id=2,
-        run_attempt=1,
-        head_sha="other-repo",
-        preflight={},
-        audit=_audit("other-repo", []),
-        prior_entries=[],
-        dispositions={},
-    )
-
-
-def _cross_key_noise_entries(module) -> list[dict]:
-    return [_same_repo_other_pr_entry(module), _other_repo_same_pr_entry(module)]
-
-
-@pytest.mark.parametrize(
-    "has_existing, entry_count, expected_write",
-    [
-        (False, 1, None),
-        (False, 2, "POST"),
-        (True, 1, "PATCH"),
-        (True, 2, "PATCH"),
-    ],
-    ids=[
-        "no_comment_one_entry",
-        "no_comment_two_entries",
-        "has_comment_one_entry",
-        "has_comment_two_entries",
-    ],
-)
-def test_post_state_comment_create_or_skip_matrix(
-    has_existing, entry_count, expected_write, monkeypatch, capsys,
-):
-    module = _module()
-    same_pr = _pr_ledger_entries(module, entry_count)
-    current = same_pr[-1]
-    entries = [*_cross_key_noise_entries(module), *same_pr]
-    comments = [{"id": 99, "body": f"{module.STATE_MARKER}\n\nold\n"}] if has_existing else []
-    recorded: list[tuple[str, str, dict | None]] = []
-
-    def fake_api_request(token, url, *, method="GET", payload=None):
-        recorded.append((method, url, payload))
-        if method == "GET":
-            return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
-        return b"{}"
-
-    monkeypatch.setattr(module, "_api_request", fake_api_request)
-    module.post_state_comment(
-        "token", "zlxlabs/app", 7, current["head_sha"], entries, current, comments,
-    )
-
-    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
-    output = capsys.readouterr().out
-    if expected_write is None:
-        assert writes == []
-        assert (
-            "::notice::skip first-round review ledger state comment; no prior history to persist"
-            in output
-        )
-        return
-
-    assert "skip first-round review ledger state comment" not in output
-    assert len(writes) == 1
-    method, url, payload = writes[0]
-    assert method == expected_write
-    assert payload is not None
-    if expected_write == "POST":
-        assert url == "https://api.github.com/repos/zlxlabs/app/issues/7/comments"
-        restored = module.parse_state_entries(
-            [{
-                "body": payload["body"],
-                "user": {"login": "github-actions[bot]", "type": "Bot"},
-            }]
-        )
-        assert restored == same_pr
-        assert "codex-review-ledger-state:v2:" in payload["body"]
-    else:
-        assert url == "https://api.github.com/repos/zlxlabs/app/issues/comments/99"
-        assert not any(item[0] == "POST" for item in recorded)
-
-
-def test_post_state_comment_skips_when_live_head_advanced(monkeypatch, capsys):
-    module = _module()
-    same_pr = _pr_ledger_entries(module, 2)
-    current = same_pr[-1]
-    entries = [*_cross_key_noise_entries(module), *same_pr]
-    recorded: list[tuple[str, str, dict | None]] = []
-
-    def fake_api_request(token, url, *, method="GET", payload=None):
-        recorded.append((method, url, payload))
-        if method == "GET":
-            return json.dumps({"head": {"sha": "live-new-head"}}).encode()
-        return b"{}"
-
-    monkeypatch.setattr(module, "_api_request", fake_api_request)
-    module.post_state_comment(
-        "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
-    )
-
-    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
-    assert writes == []
-    assert "skip stale review ledger state; PR head advanced" in capsys.readouterr().out
-
-
-def test_render_and_post_share_relevant_pr_entries_filter(monkeypatch, capsys):
-    module = _module()
-    noise = _cross_key_noise_entries(module)
-
-    def run_post(entries, current):
-        recorded: list[tuple[str, str, dict | None]] = []
-
-        def fake_api_request(token, url, *, method="GET", payload=None):
-            recorded.append((method, url, payload))
-            if method == "GET":
-                return json.dumps({"head": {"sha": current["head_sha"]}}).encode()
-            return b"{}"
-
-        monkeypatch.setattr(module, "_api_request", fake_api_request)
-        module.post_state_comment(
-            "token", "zlxlabs/app", 7, current["head_sha"], entries, current, [],
-        )
-        return recorded, capsys.readouterr().out
-
-    same_pr_one = _pr_ledger_entries(module, 1)
-    current_one = same_pr_one[-1]
-    recorded, output = run_post([*noise, *same_pr_one], current_one)
-    writes = [item for item in recorded if item[0] in {"POST", "PATCH", "PUT", "DELETE"}]
-    assert writes == []
-    assert (
-        "::notice::skip first-round review ledger state comment; no prior history to persist"
-        in output
-    )
-
-    same_pr = _pr_ledger_entries(module, 2)
-    current = same_pr[-1]
-    entries = [*noise, *same_pr]
-    expected = [
-        entry for entry in entries
-        if entry.get("repository") == current.get("repository")
-        and entry.get("pr_number") == current.get("pr_number")
-    ]
-    assert len(expected) >= 2
-    assert len(entries) > len(expected)
-    recorded, output = run_post(entries, current)
-    posts = [item for item in recorded if item[0] == "POST"]
-    assert len(posts) == 1
-    assert "skip first-round review ledger state comment" not in output
-    restored = module.parse_state_entries(
-        [{
-            "body": posts[0][2]["body"],
-            "user": {"login": "github-actions[bot]", "type": "Bot"},
-        }]
-    )
-    assert restored == expected
-    assert restored == same_pr
 
 
 def test_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
     module = _module()
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="head", preflight={}, audit=_audit("head", []), prior_entries=[], dispositions={},
+        head_sha="head", preflight={}, audit=_audit("head", []),
     )
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("RUNNER_NAME", "runner-secret")
@@ -1920,7 +725,7 @@ def test_review_summary_includes_reviewer_attempts_and_failover_from_audit():
     ]
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=audit,
     )
     review = entry["review"]
     assert review["reviewer"] == "codex-sub"
@@ -1954,7 +759,7 @@ def test_review_summary_no_failover_when_single_successful_hop():
     ]
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=audit,
     )
     assert entry["review"]["reviewer"] == "claude-glm"
     assert entry["review"]["failover"] is False
@@ -1965,7 +770,7 @@ def test_review_summary_defaults_when_audit_missing():
     module = _module()
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=None, prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=None,
         fallback_status="not_run",
     )
     assert entry["review"]["reviewer"] is None
@@ -1983,7 +788,7 @@ def test_review_summary_counts_measured_inferred_and_missing_trigger_kind():
     findings[1]["trigger_kind"] = "inferred"
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=audit,
     )
     assert entry["review"]["trigger_kind_counts"] == {
         "inferred": 1, "measured": 1, "unspecified": 1,
@@ -2000,7 +805,7 @@ def test_review_summary_inferred_p1_count_covers_blocker_and_major():
     findings[3].update(severity="blocker", trigger_kind="measured")
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=audit,
     )
     assert entry["review"]["inferred_p1_count"] == 2
 
@@ -2013,26 +818,9 @@ def test_review_summary_invalid_trigger_kind_counts_as_unspecified():
     findings[1]["trigger_kind"] = 1
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=audit,
     )
     assert entry["review"]["trigger_kind_counts"] == {"unspecified": 2}
-
-
-def test_state_comment_and_summary_mention_reviewer_on_failover():
-    module = _module()
-    audit = _audit("sha", [])
-    audit["reviewer"] = "codex-sub"
-    audit["attempts"] = [
-        {"reviewer": "claude-glm", "exit_code": 20, "reason": "限流", "duration_s": 1},
-        {"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 2},
-    ]
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=audit, prior_entries=[], dispositions={},
-    )
-    body = module.render_state_comment([entry], entry)
-    assert "codex-sub" in body
-    assert "failover" in body.lower() or "切换" in body
 
 
 def _aggregator():
@@ -2130,8 +918,6 @@ def test_ledger_projects_real_producer_terminal_consumption():
         head_sha=terminal["head_sha"],
         preflight={},
         audit=None,
-        prior_entries=[],
-        dispositions={},
         terminal_envelope=terminal,
     )
     assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
@@ -2179,8 +965,6 @@ def test_ledger_empty_consumption_when_producer_had_no_receipts():
         head_sha=terminal["head_sha"],
         preflight={},
         audit=None,
-        prior_entries=[],
-        dispositions={},
         terminal_envelope=terminal,
     )
     expected = module.empty_disposition_receipt_consumption()
@@ -2192,7 +976,7 @@ def test_ledger_omits_consumption_when_terminal_is_absent():
     module = _module()
     entry = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=_audit("sha", []), prior_entries=[], dispositions={},
+        head_sha="sha", preflight={}, audit=_audit("sha", []),
     )
     assert "disposition_receipt_consumption" not in entry
 
@@ -2208,8 +992,6 @@ def test_disposition_consumption_stays_out_of_review_summary_and_compact_attempt
         head_sha=terminal["head_sha"],
         preflight={},
         audit=None,
-        prior_entries=[],
-        dispositions={},
         terminal_envelope=terminal,
     )
     assert "disposition_receipt_consumption" in entry
@@ -2218,26 +1000,6 @@ def test_disposition_consumption_stays_out_of_review_summary_and_compact_attempt
         assert "disposition_receipt_consumption" not in attempt
     assert "disposition_receipt_consumption" not in inspect.getsource(module._review_summary)
     assert "disposition_receipt_consumption" not in inspect.getsource(module._compact_attempts)
-
-
-def test_comment_dispositions_remain_a_separate_channel_from_receipt_consumption():
-    module = _module()
-    dispositions = {
-        "p1": {
-            "disposition": "false-positive",
-            "reason": "comment observation",
-            "status": "active_false_positive",
-        }
-    }
-    entry = module.build_entry(
-        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
-        head_sha="sha", preflight={}, audit=_audit("sha", ["p1"]),
-        prior_entries=[], dispositions=dispositions,
-    )
-    assert entry["finding_dispositions"]["p1"]["reason"] == "comment observation"
-    assert entry["convergence_projection"]["source"] == "disposition-observation"
-    assert entry["convergence_projection"]["required_gate_effect"] == "none"
-    assert "disposition_receipt_consumption" not in entry
 
 
 def _write_terminal(tmp_path, payload):
@@ -2287,8 +1049,6 @@ def test_missing_consumption_block_is_fail_loud_not_empty_default():
             head_sha=terminal["head_sha"],
             preflight={},
             audit=None,
-            prior_entries=[],
-            dispositions={},
             terminal_envelope=terminal,
         )
 
@@ -2334,8 +1094,6 @@ def test_malformed_consumption_block_is_fail_loud():
             head_sha=terminal["head_sha"],
             preflight={},
             audit=None,
-            prior_entries=[],
-            dispositions={},
             terminal_envelope=terminal,
         )
 
@@ -2352,8 +1110,6 @@ def test_terminal_identity_mismatch_is_fail_loud():
             head_sha=terminal["head_sha"],
             preflight={},
             audit=None,
-            prior_entries=[],
-            dispositions={},
             terminal_envelope=terminal,
         )
 
@@ -2367,8 +1123,6 @@ def _build_from_terminal(module, terminal, **overrides):
         head_sha=terminal["head_sha"],
         preflight={},
         audit=None,
-        prior_entries=[],
-        dispositions={},
         terminal_envelope=terminal,
     )
     kwargs.update(overrides)
@@ -2377,10 +1131,9 @@ def _build_from_terminal(module, terminal, **overrides):
 
 _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS = {
     "schema_version", "recorded_at", "repository", "pr_number", "run_id",
-    "run_attempt", "head_sha", "review_round", "history_status", "disposition_status",
+    "run_attempt", "head_sha", "disposition_status",
     "preflight", "install",
-    "primary_identity", "review", "comparison", "finding_dispositions",
-    "convergence_projection", "false_positive_count",
+    "primary_identity", "review", "finding_dispositions", "false_positive_count",
     "disposition_receipt_consumption",
 }
 

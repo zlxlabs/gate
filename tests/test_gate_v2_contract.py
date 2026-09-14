@@ -974,6 +974,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert ledger["needs"] == ["quality", "primary", "gate", "classify_pr_paths"]
     assert ledger["if"] == "always()"
     assert ledger["continue-on-error"] is True
+    assert ledger["timeout-minutes"] == 3
     assert not any(step.get("name") == "Build v2 review effectiveness ledger" for step in gate_steps)
     assert not any(step.get("name") == "Upload v2 review effectiveness ledger" for step in gate_steps)
     retry_upload = next(
@@ -1005,6 +1006,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
     assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
     assert build["with"]["terminal-path"] == "${{ runner.temp }}/gate-terminal/gate-terminal.json"
+    assert "token" not in build["with"]
 
     upload = steps[upload_index]
     assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
@@ -1016,14 +1018,13 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     }
 
 
-def test_ledger_build_step_has_at_most_three_minutes():
+def test_ledger_build_step_has_one_minute_timeout():
     raw, _ = _load_workflow()
     build = next(
         step for step in raw["jobs"]["ledger"]["steps"]
         if step.get("name") == "Build v2 review effectiveness ledger"
     )
-    assert isinstance(build.get("timeout-minutes"), int)
-    assert build["timeout-minutes"] <= 3
+    assert build["timeout-minutes"] == 1
 
 
 def test_review_ledger_input_uploads_declare_one_day_retention():
