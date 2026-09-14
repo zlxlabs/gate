@@ -22,8 +22,25 @@ def test_sync_workflow_is_main_push_and_has_contents_write():
     raw, trigger = _load()
     assert trigger["push"] == {"branches": ["main"]}
     assert "workflow_dispatch" in trigger
+    assert trigger["workflow_dispatch"]["inputs"]["canary_run_id"]["required"] is True
+    assert trigger["schedule"] == [{"cron": "17 * * * *"}]
     assert raw["permissions"] == {"contents": "write"}
     assert raw["jobs"]["sync"]["if"] == "github.ref == 'refs/heads/main'"
+
+
+def test_permission_probe_is_dispatch_only_and_suppresses_responses():
+    raw, _ = _load()
+    steps = raw["jobs"]["sync"]["steps"]
+    probe = next(step for step in steps if step.get("name") == "Probe canary Actions API permissions")
+    assert probe["if"] == "github.event_name == 'workflow_dispatch'"
+    assert "V2_TAG_SYNC_ENABLED" not in probe["run"]
+    assert "github.token" in probe["env"]["GITHUB_TOKEN"]
+    assert probe["run"].count("--output /dev/null") == 1
+    assert probe["run"].count("--write-out '%{http_code}'") == 1
+    assert probe["run"].count("probe_canary_endpoint") == 4
+    assert "actions/runs?per_page=1" in probe["run"]
+    assert "/actions/runs/${CANARY_RUN_ID}" in probe["run"]
+    assert "/actions/runs/${CANARY_RUN_ID}/jobs?per_page=1" in probe["run"]
 
 
 def test_sync_workflow_has_migration_switch_and_contract_before_push():
@@ -31,21 +48,52 @@ def test_sync_workflow_has_migration_switch_and_contract_before_push():
     text = WORKFLOW.read_text()
     assert "vars.V2_TAG_SYNC_ENABLED" in text
     assert "scripts/v2_tag_guard.py" in text
-    assert raw["jobs"]["sync"]["steps"][-2]["run"].strip().endswith(
+    steps = raw["jobs"]["sync"]["steps"]
+    contract_step = next(step for step in steps if step.get("name") == "Verify the v2 caller contract before moving the tag")
+    move_step = next(step for step in steps if step.get("name") == "Move v2 to selected canary-verified main commit")
+    assert contract_step["run"].strip().endswith(
         "tests/test_gate_caller_contract_guard.py"
     )
-    assert "refs/tags/v2" in raw["jobs"]["sync"]["steps"][-1]["run"]
-    assert "git ls-remote origin refs/tags/v2" in raw["jobs"]["sync"]["steps"][-1]["run"]
-    assert "remote_result" in raw["jobs"]["sync"]["steps"][-1]["run"]
-    assert "intended_sha" in raw["jobs"]["sync"]["steps"][-1]["run"]
-    assert '"${push_status}" "${remote_result}"' in raw["jobs"]["sync"]["steps"][-1]["run"]
-    assert "push_status=$?" in raw["jobs"]["sync"]["steps"][-1]["run"]
-    assert "query_status=$?" in raw["jobs"]["sync"]["steps"][-1]["run"]
-    assert re.search(r"(?m)^\s*exit 1\s*$", raw["jobs"]["sync"]["steps"][-1]["run"])
+    assert steps.index(contract_step) < steps.index(move_step)
+    assert "refs/tags/v2" in move_step["run"]
+    assert '"${intended_sha}:refs/tags/v2" --force' in move_step["run"]
+    assert '"HEAD:refs/tags/v2"' not in move_step["run"]
+    assert "git ls-remote origin refs/tags/v2" in move_step["run"]
+    assert "remote_result" in move_step["run"]
+    assert "intended_sha" in move_step["run"]
+    assert '"${push_status}" "${remote_result}"' in move_step["run"]
+    assert "push_status=$?" in move_step["run"]
+    assert "query_status=$?" in move_step["run"]
+    assert re.search(r"(?m)^\s*exit 1\s*$", move_step["run"])
     guard = next(step for step in raw["jobs"]["sync"]["steps"] if step.get("id") == "guard")
     guard_run = guard["run"]
     assert "--hold-file" in guard_run
     assert ".github/v2-tag-sync.hold" in guard_run
+
+
+def test_evidence_selection_is_before_contract_and_move():
+    raw, _ = _load()
+    steps = raw["jobs"]["sync"]["steps"]
+    evidence = next(step for step in steps if step.get("id") == "evidence")
+    monotonicity = next(step for step in steps if step.get("id") == "monotonicity")
+    contract = next(step for step in steps if step.get("name") == "Verify the v2 caller contract before moving the tag")
+    move = next(step for step in steps if step.get("name") == "Move v2 to selected canary-verified main commit")
+    assert evidence["if"] == "steps.guard.outputs.advance == 'true'"
+    assert "scripts/v2_tag_promotion_evidence.py" in evidence["run"]
+    assert monotonicity["if"] == "steps.evidence.outputs.target_sha != ''"
+    assert contract["if"] == "steps.monotonicity.outputs.move == 'true'"
+    assert move["if"] == "steps.monotonicity.outputs.move == 'true'"
+    assert "TARGET_SHA" in move["env"]
+    assert steps.index(move) == len(steps) - 1
+
+
+def test_disabled_switch_skips_entire_evidence_step():
+    raw, _ = _load()
+    steps = raw["jobs"]["sync"]["steps"]
+    guard = next(step for step in steps if step.get("id") == "guard")
+    evidence = next(step for step in steps if step.get("id") == "evidence")
+    assert "V2_TAG_SYNC_ENABLED" in guard["env"]
+    assert evidence["if"] == "steps.guard.outputs.advance == 'true'"
 
 
 def test_breaker_marker_blocks_advancement(capsys):
