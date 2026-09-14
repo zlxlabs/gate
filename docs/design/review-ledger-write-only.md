@@ -8,9 +8,11 @@ preflight、install、canonical primary audit 和 gate terminal envelope，输�
 评论，也不调用 GitHub API；因此构建耗时只随本次输入体积变化。
 
 artifact 名 `codex-review-ledger-v2` 和文件名 `ledger.jsonl` 不变，内容
-schema 升为 2。`LEDGER_ENTRY_FIELDS` 是代码中的字段全集；其中终态 receipt
-缺席时，`disposition_receipt_consumption` 和跨 attempt 才有的
-`terminal_source_attempt` 按旧行为条件出现。
+schema 升为 2。代码中的 `LEDGER_ENTRY_REQUIRED_FIELDS` 是必有字段清单，
+`LEDGER_ENTRY_OPTIONAL_FIELDS` 是字段全集中按终态输入条件出现的部分，二者
+拼成 `LEDGER_ENTRY_FIELDS`。终态 receipt 缺席时，
+`disposition_receipt_consumption` 和跨 attempt 才有的 `terminal_source_attempt`
+按旧行为条件出现。
 
 ## v1 字段核销表
 
@@ -54,4 +56,3 @@ agent-config 采集层负责收集每次 run 的单行 artifact，并离线补�
 `scripts/consult/consult_trigger.py` 的采集层迁移，使 consult 从采集层读取
 多轮 finding；在此之前提前晋升会因缺少 artifact 内的 `review_round` 而报
 `DataUnavailable`。
-
