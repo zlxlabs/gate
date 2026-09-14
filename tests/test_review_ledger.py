@@ -446,6 +446,63 @@ def _run_ledger_main(
     return rc, output, audit
 
 
+@pytest.mark.parametrize(
+    "comment_result,expected_status",
+    [
+        (([], "success"), "success"),
+        (([], "failure"), "failure"),
+    ],
+    ids=["comments_read_no_dispositions", "comments_unavailable"],
+)
+def test_main_records_disposition_channel_availability(
+    tmp_path, monkeypatch, comment_result, expected_status,
+):
+    module = _module()
+
+    rc, output, _ = _run_ledger_main(
+        module,
+        tmp_path,
+        monkeypatch,
+        preflight=_preflight(),
+        fetch_comments_impl=lambda *args, **kwargs: comment_result,
+    )
+
+    assert rc == 0
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    current = next(row for row in rows if row["run_id"] == 10)
+    assert current["disposition_status"] == expected_status
+    assert current["finding_dispositions"] == {}
+    assert current["false_positive_count"] == 0
+
+
+def test_main_real_collection_records_each_history_source_and_rejects_pending_new_source(
+    tmp_path, monkeypatch,
+):
+    module = _module()
+    captured: list[dict[str, str]] = []
+    original_build_entry = module.build_entry
+
+    def capture_history_sources(*args, **kwargs):
+        captured.append(kwargs["history_sources"])
+        return original_build_entry(*args, **kwargs)
+
+    monkeypatch.setattr(module, "build_entry", capture_history_sources)
+    rc, _, _ = _run_ledger_main(module, tmp_path, monkeypatch, preflight=_preflight())
+
+    assert rc == 0
+    assert captured == [{source: "success" for source in module.HISTORY_SOURCES}]
+
+    monkeypatch.setattr(
+        module,
+        "HISTORY_SOURCES",
+        (*module.HISTORY_SOURCES, "future_source"),
+    )
+    with pytest.raises(ValueError, match="not collected"):
+        _run_ledger_main(
+            module, tmp_path / "future-source", monkeypatch, preflight=_preflight(),
+        )
+
+
 def test_short_circuited_empty_preflight_writes_ledger_row():
     """W1: short-circuit + empty/missing preflight → row written, coverage None."""
     module = _module()
@@ -926,11 +983,11 @@ def test_history_status_has_three_states_and_only_complete_history_can_compare()
             }.intersection(entry["comparison"])
 
 
-@pytest.mark.parametrize("source", ["artifact_snapshot", "sticky_state_comment"])
+@pytest.mark.parametrize("source", _module().HISTORY_SOURCES)
 @pytest.mark.parametrize("failure_mode", ["success", "truncated", "exception", "budget_skipped"])
 def test_history_source_axis_covers_every_source_and_failure_mode(source, failure_mode):
     module = _module()
-    assert set(["artifact_snapshot", "sticky_state_comment"]) == set(module.HISTORY_SOURCES)
+    assert source in module.HISTORY_SOURCES
     previous = module.build_entry(
         repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
         head_sha="old", preflight={}, audit=_audit("old", ["a"]),
@@ -2320,7 +2377,8 @@ def _build_from_terminal(module, terminal, **overrides):
 
 _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS = {
     "schema_version", "recorded_at", "repository", "pr_number", "run_id",
-    "run_attempt", "head_sha", "review_round", "history_status", "preflight", "install",
+    "run_attempt", "head_sha", "review_round", "history_status", "disposition_status",
+    "preflight", "install",
     "primary_identity", "review", "comparison", "finding_dispositions",
     "convergence_projection", "false_positive_count",
     "disposition_receipt_consumption",

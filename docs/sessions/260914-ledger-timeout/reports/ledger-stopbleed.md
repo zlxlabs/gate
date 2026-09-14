@@ -246,3 +246,92 @@
 `complete`/`none` 改为来源轴的 `success`，并把旧的单字符串测试参数改为显式来源状态，
 因为现在最终状态必须由来源集合合并得到。未修改 `.github/workflows/gate-v2.yml`、
 legacy `gate.yml`、ledger artifact 存储结构或 comparison 在完整历史路径的逻辑。
+
+## 第五轮修复：处置通道可用性与来源登记 fail-fast
+
+- Task-Id：`card/gate-20260914-04`
+- Dispatch：`dlg-20260914-102804-b94f46`
+- Executor：Codex / implementer
+- Root-cause group：同一个 `fetch_comments` 响应承载了两种语义（历史游标 + finding 处置），改轴时只给历史那一半建了可用性事实；而来源登记的“强制”是假的，字典推导会把新来源预填成成功。
+- Introduced-by-commit：`b5ecd7e`（`fix(gate-v2): model ledger history sources and shared budget`）
+- Open findings：R3-F1（评论通道失败时处置信息静默变成“零处置”）、R3-F3（轴表是手写副本 + main 预填 success 让登记保护永不触发）。R3-F2 按主脑裁决不修。
+
+### 完成条件对照
+
+1. **R3-F1 已修复。** `.github/actions/review-ledger/build_ledger.py:77-78,668-674`
+   定义独立的 `disposition_status` 合法状态（`success` / `failure`），并将其写入每条
+   ledger JSONL：`.github/actions/review-ledger/build_ledger.py:743-745`。`main()` 在
+   `fetch_comments` 成功返回（即使没有任何处置记录）时写入 `success`；评论 API 因预算
+   跳过或异常时写入 `failure`：`:1101-1113`。因此只读 JSONL 可以区分“评论已读且确实
+   没有处置”（`disposition_status=success`、`finding_dispositions={}`、计数为 0）和
+   “处置通道没读到”（`disposition_status=failure`、同样的空投影）。
+   `tests/test_review_ledger.py:449-475` 通过 `main()` 的真实生产路径覆盖这两种情况，
+   两例都断言最终写入的 JSONL 字段，而不是直接调用 `build_entry` 注入结果。
+
+2. **R3-F3 已修复。** `main()` 的 `history_sources` 初值改为
+   `dict.fromkeys(HISTORY_SOURCES, HISTORY_SOURCE_PENDING)`（`:1086-1088`），不再预填
+   `success`。`_merge_history_status()` 在发现任一来源仍为 pending 时于产出条目前抛出
+   `ValueError("history source status not collected: ...")`（`:116-131`）；已有来源的
+   artifact / sticky comment 真实采集路径仍分别写入状态（`:1091-1113`）。所以只增来源
+   常量而不补采集路径，不能进入 `complete` 或权威 comparison。
+
+3. **轴表改为生产来源集合驱动并覆盖 `main()`。**
+   `tests/test_review_ledger.py:986` 的参数直接来自 `_module().HISTORY_SOURCES`，不再手写
+   来源副本；该测试仍覆盖每个来源与四种状态模式。新增的
+   `test_main_real_collection_records_each_history_source_and_rejects_pending_new_source`
+   （`:478-503`）先运行 `main()`，拦截其传给 `build_entry` 的实际 `history_sources`，断言
+   生产来源集合的每一项都被真实采集路径写入 `success`；随后只向运行时生产来源集合增加
+   `future_source`，断言 pending guard 拦截。
+
+4. **“临时加第三来源”实验已真实执行。** 在正式测试前，目标测试
+   `test_main_real_collection_records_each_history_source_and_rejects_pending_new_source`
+   未加来源时通过，退出码 `0`；随后只修改生产常量 `HISTORY_SOURCES` 增加
+   `temporary_uncollected_source`，不改采集路径，目标测试失败并命中
+   `history source status not collected`，退出码 `1`；撤销该单行常量改动后同一目标测试
+   恢复通过，退出码 `0`。这验证了测试不是依赖手写来源副本的恒真保护。
+
+5. **新增测试已做 base 红验。** 以本轮实际修复前的引入点 `b5ecd7e` 为 base，临时
+   worktree 只带入本轮测试改动后运行新增测试：
+
+   - `test_main_records_disposition_channel_availability[comments_read_no_dispositions]`：退出码 `1`，旧产物没有 `disposition_status`。
+   - `test_main_records_disposition_channel_availability[comments_unavailable]`：退出码 `1`，旧产物没有 `disposition_status`。
+   - `test_main_real_collection_records_each_history_source_and_rejects_pending_new_source`：退出码 `1`，新增来源被旧的 `success` 推导放行。
+
+   三条均在实现前失败，且失败原因分别对应两个 finding；实现后定向测试通过。卡面给定的
+   `8b657fec36b247e7fe390673443dbd0704161270` 是本分支四个既有提交之前的更早 base，
+   不具备本轮来源轴前置契约，因此本轮红验以直接引入缺陷的 `b5ecd7e` 为有效基线。
+
+6. **R3-F2 按主脑裁决不修，原样记录如下。**
+
+   R3-F2 说 `120` 秒只是网络窗口上界，zip 解压 / JSON 解析 / `write_ledger` 没有时间上界，
+   所以总墙钟没有形式上界。机理成立，但按本仓 personal 档的 P1 两问不成立：
+
+   - 主脑实测过这部分 CPU 成本：10 份 artifact、12860 条、5.7 MB/份解压 + 全量
+     `json.loads` + 三次 `dedupe_entries`，合计约 **2 秒**（Python 3.12）。本轮
+     `artifact_limit` 已降到 3 份，成本更低。
+   - 网络窗口 114 秒之后，距卡面 144 秒有 30 秒余量、距 step 180 秒有 66 秒余量。
+     要吃掉 30 秒本地处理时间，需要 artifact 大到约当前规模的 15 倍以上，而 GitHub
+     的 artifact 上传本身会先失败。
+
+   因此“真实使用方式下会被触发吗”这一问答不出“会”。本卡不修这条，作为以后 artifact
+   规模变化时重新评估依据。
+
+7. **跨仓消费点已复核。** 本轮新增的是顶层 `disposition_status`，属于 additive 字段；
+   `gate-hub/scripts/review-ledger-report.py:425-430` 通过
+   `entry.get("finding_dispositions")` 读取处置，`:462-495` 的汇总也没有顶层字段闭集
+   白名单；`gate-hub/scripts/review-ledger-replay.py:252-268` 通过 `.get()` 读取
+   `comparison` / `review`，未知顶层字段不会被拒绝或丢弃。现有跨仓消费者不会因该字段
+   报错；需要识别处置通道可用性时可直接读取 `disposition_status`。本轮不改 gate-hub，
+   也不改变 `history_status` 三态或既有 comparison 枚举。
+
+8. **最终验证与范围。**
+
+   - 定向命令：`uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q tests/test_review_ledger.py tests/test_gate_v2_contract.py` → `377 passed in 27.87s`，退出码 `0`。
+   - 全量命令：`uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` → `1015 passed in 107.92s (0:01:47)`，退出码 `0`。
+   - pin 检查：`python3 scripts/check_pinned_uses.py` → 退出码 `0`，9 个 live workflow/action metadata 文件通过。
+   - `git diff --check` → 通过。最终实现 diff 为 `18` 行新增、`1` 行删除；测试 diff 为 `61` 行新增、`3` 行删除；仅触碰允许的 `build_ledger.py` 与 `test_review_ledger.py`，没有修改 workflow、review verdict 或 artifact 存储结构。
+
+既有测试没有删除或放宽；只更新了终端 envelope 精确字段集合以纳入新增的
+`disposition_status`，并把来源轴测试的生产来源参数改为动态生成。新增状态是 R3-F1 明确
+要求的最小独立事实源，替代了“空处置投影同时代表成功读取和读取失败”的歧义；未引入
+fallback、重试或新的出网路径。

@@ -72,7 +72,10 @@ NETWORK_BUDGET_SECONDS = 120
 HISTORY_SOURCE_ARTIFACT = "artifact_snapshot"
 HISTORY_SOURCE_STICKY_COMMENT = "sticky_state_comment"
 HISTORY_SOURCES = (HISTORY_SOURCE_ARTIFACT, HISTORY_SOURCE_STICKY_COMMENT)
+HISTORY_SOURCE_PENDING = "pending"
 HISTORY_SOURCE_STATUSES = frozenset({"success", "incomplete", "failure"})
+DISPOSITION_STATUS_PENDING = "pending"
+DISPOSITION_STATUSES = frozenset({"success", "failure"})
 _RETRYABLE_CONNECTION_ERRORS = (
     urllib.error.URLError,
     ssl.SSLError,
@@ -115,6 +118,12 @@ def _merge_history_status(
 ) -> str:
     if set(source_statuses) != set(HISTORY_SOURCES):
         raise ValueError("history source status set does not match HISTORY_SOURCES")
+    pending_sources = [
+        source for source in HISTORY_SOURCES
+        if source_statuses[source] == HISTORY_SOURCE_PENDING
+    ]
+    if pending_sources:
+        raise ValueError(f"history source status not collected: {sorted(pending_sources)}")
     if any(status not in HISTORY_SOURCE_STATUSES for status in source_statuses.values()):
         raise ValueError("history source status is invalid")
     if any(source_statuses[source] != "success" for source in HISTORY_SOURCES):
@@ -656,10 +665,13 @@ def build_entry(
     terminal_envelope: dict[str, Any] | None = None,
     input_short_circuited: bool = False,
     history_sources: dict[str, str] | None = None,
+    disposition_status: str = "success",
 ) -> dict[str, Any]:
     if history_sources is None:
         history_sources = {source: "success" for source in HISTORY_SOURCES}
     history_status = _merge_history_status(history_sources, prior_entries)
+    if disposition_status not in DISPOSITION_STATUSES:
+        raise ValueError("disposition status is invalid")
     relevant = [
         entry for entry in prior_entries
         if entry.get("repository") == repository and entry.get("pr_number") == pr_number
@@ -729,6 +741,7 @@ def build_entry(
         "head_sha": head_sha,
         "review_round": len({(entry.get("run_id"), entry.get("run_attempt")) for entry in relevant}) + 1,
         "history_status": history_status,
+        "disposition_status": disposition_status,
         "preflight": preflight or None,
         # D5(ci-cache-strategy.md 阶段 A):Install dependencies 步骤的度量信号 —
         # {ecosystem, status, duration_s, cache_hit}(见 gate.yml Install 步骤),
@@ -1071,7 +1084,8 @@ def main() -> int:
         fallback = "not_run"
 
     prior_entries: list[dict[str, Any]] = []
-    history_sources = {source: "success" for source in HISTORY_SOURCES}
+    history_sources = dict.fromkeys(HISTORY_SOURCES, HISTORY_SOURCE_PENDING)
+    disposition_status = DISPOSITION_STATUS_PENDING
     dispositions: dict[str, dict[str, Any]] = {}
     comments: list[dict[str, Any]] = []
     try:
@@ -1088,12 +1102,14 @@ def main() -> int:
                 token, args.repository, args.pr_number, deadline=network_deadline,
             )
             history_sources[HISTORY_SOURCE_STICKY_COMMENT] = comment_status
+            disposition_status = comment_status
             dispositions = parse_dispositions(comments)
             state_entries = parse_state_entries(comments)
             if state_entries:
                 prior_entries = dedupe_entries([*prior_entries, *state_entries])
         except Exception as error:
             history_sources[HISTORY_SOURCE_STICKY_COMMENT] = "failure"
+            disposition_status = "failure"
             print(f"::warning::could not load finding dispositions or PR ledger state: {error}")
 
     entry = build_entry(
@@ -1117,6 +1133,7 @@ def main() -> int:
         terminal_envelope=terminal,
         input_short_circuited=input_short_circuited,
         history_sources=history_sources,
+        disposition_status=disposition_status,
     )
     all_entries = dedupe_entries([*prior_entries, entry])
     write_ledger(args.output, all_entries, max_entries=args.max_entries)
