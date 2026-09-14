@@ -50,6 +50,12 @@ class PromotionResult:
     checked: tuple[CandidateResult, ...]
 
 
+@dataclass(frozen=True)
+class GateShaScan:
+    shas: tuple[str, ...] | None
+    has_unrecognized_path: bool
+
+
 ApiReader = Callable[[str], object]
 
 
@@ -118,23 +124,30 @@ def _load_runs(api_reader: ApiReader) -> list[object]:
     return runs
 
 
-def _gate_shas(detail: dict[str, object], endpoint: str) -> list[str] | None:
+def _gate_shas(detail: dict[str, object], endpoint: str) -> GateShaScan:
     references = detail.get("referenced_workflows")
     if references is None:
-        return None
+        return GateShaScan(None, False)
     if not isinstance(references, list):
         raise EvidenceQueryError(
             f"invalid JSON shape for {endpoint}: referenced_workflows"
         )
     shas: list[str] = []
+    has_unrecognized_path = False
+    gate_path_prefix = f"{GATE_WORKFLOW_REFERENCE}@"
     for reference in references:
         if not isinstance(reference, dict):
             raise EvidenceQueryError(
                 f"invalid JSON shape for {endpoint}: referenced_workflows entry"
             )
-        if reference.get("path") == GATE_WORKFLOW_REFERENCE:
-            shas.append(_validate_sha(reference.get("sha"), "gate reference sha"))
-    return shas
+        path = reference.get("path")
+        if not isinstance(path, str) or not path.startswith(GATE_WORKFLOW_REFERENCE):
+            continue
+        if not path.startswith(gate_path_prefix) or path == gate_path_prefix:
+            has_unrecognized_path = True
+            continue
+        shas.append(_validate_sha(reference.get("sha"), "gate reference sha"))
+    return GateShaScan(tuple(shas), has_unrecognized_path)
 
 
 def _is_primary_job(name: object) -> bool:
@@ -179,17 +192,22 @@ def _candidate_result(
                 f"run {run_id}: conclusion={conclusion!r}, required success"
             )
             continue
-        gate_shas = _gate_shas(detail, detail_endpoint)
-        if gate_shas is None:
+        gate_scan = _gate_shas(detail, detail_endpoint)
+        if gate_scan.shas is None:
             reasons.append(f"run {run_id}: referenced_workflows is absent")
             continue
-        if not gate_shas:
-            reasons.append(f"run {run_id}: gate-v2 reference is absent")
+        if gate_scan.has_unrecognized_path:
+            reasons.append(
+                f"run {run_id}: gate-v2 reference shape is unrecognized"
+            )
             continue
-        if any(gate_sha != candidate_sha for gate_sha in gate_shas):
+        if not gate_scan.shas:
+            reasons.append(f"run {run_id}: no gate-v2 reference found")
+            continue
+        if any(gate_sha != candidate_sha for gate_sha in gate_scan.shas):
             reasons.append(
                 f"run {run_id}: gate-v2 references inconsistent "
-                f"sha(s)={','.join(gate_shas)}, expected every reference to be "
+                f"sha(s)={','.join(gate_scan.shas)}, expected every reference to be "
                 f"{candidate_sha}"
             )
             continue

@@ -1,0 +1,12 @@
+{
+  "id": 34854213991,
+  "conclusion": "success",
+  "head_sha": "55d697e572a6227d5c18288f71bc959421203da9",
+  "referenced_workflows": [
+    {
+      "path": "zlxlabs/gate/.github/workflows/gate-v2.yml@main",
+      "ref": "refs/heads/main",
+      "sha": "b382411be9a6c261e60c9a261a7beaf80d0b9b41"
+    }
+  ]
+}
