@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from scripts import v2_tag_promotion_evidence as evidence
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
+FIXTURE_DIR = Path(__file__).parent / "fixtures/canary_referenced_workflows"
 
 
 class FakeAPI:
@@ -41,10 +43,19 @@ def _run(run_id):
     return {"id": run_id, "created_at": "2026-09-14T00:00:00Z"}
 
 
+def _load_fixture(name):
+    return json.loads((FIXTURE_DIR / name).read_text(encoding="utf-8"))
+
+
+def _gate_reference(sha):
+    real_reference = _load_fixture("run-34854213991.json")["referenced_workflows"][0]
+    return {**real_reference, "sha": sha}
+
+
 def _detail(*, conclusion="success", gate_sha=SHA_A, refs=True):
     references = [] if refs else None
     if refs and gate_sha is not None:
-        references = [{"path": evidence.GATE_WORKFLOW_REFERENCE, "sha": gate_sha}]
+        references = [_gate_reference(gate_sha)]
     return {"conclusion": conclusion, "referenced_workflows": references}
 
 
@@ -61,6 +72,34 @@ def test_latest_candidate_with_successful_gate_and_primary_is_selected():
     result = _select(api, [SHA_A, SHA_B])
     assert result.selected_sha == SHA_A
     assert result.checked[0].run_id == "1"
+
+
+@pytest.mark.parametrize(
+    ("run_id", "fixture_name", "candidate_sha"),
+    [
+        (
+            "31358374139",
+            "run-31358374139.json",
+            "7bd2bbd2e92c33d3e0381e38730beaff1f1d69e5",
+        ),
+        (
+            "34854213991",
+            "run-34854213991.json",
+            "b382411be9a6c261e60c9a261a7beaf80d0b9b41",
+        ),
+    ],
+)
+def test_real_canary_payloads_select_the_referenced_gate_sha(
+    run_id, fixture_name, candidate_sha
+):
+    api = FakeAPI(
+        [_run(run_id)],
+        {run_id: _load_fixture(fixture_name)},
+        {run_id: [{"name": "gate / primary", "conclusion": "success"}]},
+    )
+    result = _select(api, [candidate_sha])
+    assert result.selected_sha == candidate_sha
+    assert result.checked[0].run_id == run_id
 
 
 def test_latest_without_evidence_falls_back_to_next_candidate():
@@ -96,7 +135,7 @@ def test_successful_run_with_skipped_primary_is_ineligible():
 @pytest.mark.parametrize(
     ("gate_shas", "expected_sha", "reason_fragment"),
     [
-        ([], None, "gate-v2 reference is absent"),
+        ([], None, "no gate-v2 reference found"),
         ([SHA_A, SHA_B], None, "references inconsistent"),
         ([SHA_A, SHA_A], SHA_A, None),
     ],
@@ -108,7 +147,7 @@ def test_gate_references_must_all_match_candidate(gate_shas, expected_sha, reaso
             "1": {
                 "conclusion": "success",
                 "referenced_workflows": [
-                    {"path": evidence.GATE_WORKFLOW_REFERENCE, "sha": sha}
+                    _gate_reference(sha)
                     for sha in gate_shas
                 ],
             }
@@ -137,6 +176,53 @@ def test_successful_run_with_wrong_gate_sha_is_ineligible():
     result = _select(api, [SHA_A])
     assert result.selected_sha is None
     assert "expected" in result.checked[0].reason
+
+
+def test_other_referenced_workflow_reports_no_gate_reference():
+    api = FakeAPI(
+        [_run(1)],
+        {
+            "1": {
+                "conclusion": "success",
+                "referenced_workflows": [
+                    {
+                        "path": "zlxlabs/other/.github/workflows/other.yml@main",
+                        "sha": SHA_A,
+                    }
+                ],
+            }
+        },
+    )
+    result = _select(api, [SHA_A])
+    assert result.selected_sha is None
+    assert "no gate-v2 reference found" in result.checked[0].reason
+
+
+def test_gate_reference_with_unrecognized_path_shape_reports_shape():
+    api = FakeAPI(
+        [_run(1)],
+        {
+            "1": {
+                "conclusion": "success",
+                "referenced_workflows": [
+                    {
+                        "path": "zlxlabs/gate/.github/workflows/gate-v2.yml",
+                        "sha": SHA_A,
+                    }
+                ],
+            }
+        },
+    )
+    result = _select(api, [SHA_A])
+    assert result.selected_sha is None
+    assert "gate-v2 reference shape is unrecognized" in result.checked[0].reason
+
+
+def test_missing_referenced_workflows_preserves_absent_reason():
+    api = FakeAPI([_run(1)], {"1": _detail(refs=False)})
+    result = _select(api, [SHA_A])
+    assert result.selected_sha is None
+    assert "referenced_workflows is absent" in result.checked[0].reason
 
 
 def test_missing_primary_job_is_ineligible():
