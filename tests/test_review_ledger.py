@@ -371,7 +371,17 @@ def _assert_short_circuit_audit_projection(review, *, audit):
     assert review["result"] == audit["result"]
 
 
-def _run_ledger_main(module, tmp_path, monkeypatch, *, extra_argv=(), preflight=None, install=None, audit=None):
+def _run_ledger_main(
+    module,
+    tmp_path,
+    monkeypatch,
+    *,
+    extra_argv=(),
+    preflight=None,
+    install=None,
+    audit=None,
+    prior_entries_fetch=None,
+):
     audit = audit or _short_circuit_fail_audit()
     work = tmp_path
     work.mkdir(parents=True, exist_ok=True)
@@ -389,7 +399,7 @@ def _run_ledger_main(module, tmp_path, monkeypatch, *, extra_argv=(), preflight=
         install_path.write_text(json.dumps(install), encoding="utf-8")
     output = work / "ledger.jsonl"
     monkeypatch.setenv("GH_TOKEN", "test-token")
-    monkeypatch.setattr(module, "fetch_prior_entries", lambda *a, **k: [])
+    monkeypatch.setattr(module, "fetch_prior_entries", prior_entries_fetch or (lambda *a, **k: []))
     monkeypatch.setattr(module, "fetch_comments", lambda *a, **k: [])
     monkeypatch.setattr(module, "post_state_comment", lambda *a, **k: None)
     monkeypatch.setattr(sys, "argv", [
@@ -729,18 +739,53 @@ def test_fetch_prior_entries_fails_on_corrupt_artifact(monkeypatch):
 def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
     module = _module()
     requested = []
-    monkeypatch.setattr(
-        module,
-        "_api_json",
-        lambda token, url: requested.append(url) or {"artifacts": []},
-    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"artifacts": []}'
+
+    def fake_urlopen(request, timeout):
+        requested.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
 
     assert module.fetch_prior_entries("token", "zlxlabs/app") == []
-    assert len(requested) == 2
+    assert len(requested) == 1
     assert "name=codex-review-ledger-v2" in requested[0]
-    assert "name=codex-review-ledger&" not in requested[0]
-    assert "name=codex-review-ledger&" in requested[1]
-    assert "name=codex-review-ledger-v2" not in requested[1]
+    assert "per_page=3" in requested[0]
+    assert all("name=codex-review-ledger&" not in url for url in requested)
+
+
+def test_main_downgrades_prior_history_http_error_to_empty_history(tmp_path, monkeypatch, capsys):
+    module = _module()
+
+    def fail_fetch(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            "https://api.github.com/repos/zlxlabs/app/actions/artifacts",
+            503,
+            "Service Unavailable",
+            hdrs={},
+            fp=io.BytesIO(b""),
+        )
+
+    rc, output, _ = _run_ledger_main(
+        module,
+        tmp_path,
+        monkeypatch,
+        preflight=_preflight(),
+        prior_entries_fetch=fail_fetch,
+    )
+
+    assert rc == 0
+    assert len(output.read_text(encoding="utf-8").splitlines()) == 1
+    assert "::warning::could not load prior review ledger history" in capsys.readouterr().out
 
 
 def _ledger_zip_bytes(entries: list[dict]) -> bytes:
@@ -787,22 +832,38 @@ _V2, _V1, _SHARED, _V2U, _V1U = (
     "artifacts_by_name, expected",
     [
         ({"codex-review-ledger-v2": [[_V2]], "codex-review-ledger": []}, [_V2]),
-        ({"codex-review-ledger-v2": [], "codex-review-ledger": [[_V1]]}, [_V1]),
+        ({"codex-review-ledger-v2": [], "codex-review-ledger": [[_V1]]}, []),
         (
             {"codex-review-ledger-v2": [[_SHARED, _V2U]], "codex-review-ledger": [[_SHARED, _V1U]]},
-            [_SHARED, _V2U, _V1U],
+            [_SHARED, _V2U],
         ),
         ({"codex-review-ledger-v2": [], "codex-review-ledger": []}, []),
     ],
     ids=["v2_only", "v1_only", "both_union_deduped", "neither"],
 )
-def test_fetch_prior_entries_reads_v1_and_v2_artifact_names(artifacts_by_name, expected, monkeypatch):
+def test_fetch_prior_entries_reads_only_v2_artifact_name(artifacts_by_name, expected, monkeypatch):
     module = _module()
     _patch_named_artifact_api(module, monkeypatch, artifacts_by_name)
     assert _entry_keys(module.fetch_prior_entries("token", "zlxlabs/app")) == _entry_keys(expected)
 
 
-def test_v1_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
+def test_fetch_prior_entries_returns_downloaded_part_when_time_budget_is_reached(monkeypatch, capsys):
+    module = _module()
+    _patch_named_artifact_api(
+        module,
+        monkeypatch,
+        {"codex-review-ledger-v2": [[_V2], [_V2U], [_SHARED]], "codex-review-ledger": []},
+    )
+    clock = iter([100.0, 110.0, 200.0])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+
+    prior = module.fetch_prior_entries("token", "zlxlabs/app", time_budget_seconds=90)
+
+    assert _entry_keys(prior) == _entry_keys([_V2, _V2U])
+    assert "::warning::Stopped fetching prior ledger history after 2 artifact(s)" in capsys.readouterr().out
+
+
+def test_v2_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
     module = _module()
     historical, current = _pr_ledger_entries(module, 2)
     zip_bytes = _ledger_zip_bytes([historical])
@@ -813,10 +874,10 @@ def test_v1_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch
         parsed = urllib.parse.urlparse(url)
         name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
         if parsed.path.endswith("/actions/artifacts"):
-            artifacts = ([{"id": 1, "expired": False, "archive_download_url": "https://example.test/v1"}]
-                         if name == "codex-review-ledger" else [])
+            artifacts = ([{"id": 1, "expired": False, "archive_download_url": "https://example.test/v2"}]
+                         if name == "codex-review-ledger-v2" else [])
             return json.dumps({"artifacts": artifacts}).encode()
-        if url == "https://example.test/v1":
+        if url == "https://example.test/v2":
             return zip_bytes
         if "/pulls/" in parsed.path:
             return json.dumps({"head": {"sha": current["head_sha"]}}).encode()

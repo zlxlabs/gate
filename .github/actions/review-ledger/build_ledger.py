@@ -775,11 +775,24 @@ def _api_json(token: str, url: str) -> Any:
     return json.loads(_api_request(token, url))
 
 
-LEDGER_ARTIFACT_NAMES = ("codex-review-ledger-v2", "codex-review-ledger")
+LEDGER_ARTIFACT_NAMES = ("codex-review-ledger-v2",)
 
 
-def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10) -> list[dict[str, Any]]:
+def fetch_prior_entries(
+    token: str,
+    repository: str,
+    *,
+    artifact_limit: int = 3,
+    time_budget_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    # Optional environment override: LEDGER_HISTORY_BUDGET_SECONDS (default 90).
+    budget = (
+        float(os.environ.get("LEDGER_HISTORY_BUDGET_SECONDS", "90"))
+        if time_budget_seconds is None else time_budget_seconds
+    )
+    started_at = time.monotonic()
     entries: list[dict[str, Any]] = []
+    downloaded = 0
     for artifact_name in LEDGER_ARTIFACT_NAMES:
         query = urllib.parse.urlencode({"name": artifact_name, "per_page": artifact_limit})
         payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
@@ -789,6 +802,7 @@ def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10
             if artifact.get("expired"):
                 continue
             archive = _api_request(token, artifact["archive_download_url"])
+            downloaded += 1
             with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                 name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
                 if not name:
@@ -799,6 +813,12 @@ def fetch_prior_entries(token: str, repository: str, *, artifact_limit: int = 10
                         if not isinstance(entry, dict):
                             raise ValueError("prior ledger entry must be a JSON object")
                         entries.append(entry)
+            if time.monotonic() - started_at >= budget:
+                print(
+                    "::warning::Stopped fetching prior ledger history after "
+                    f"{downloaded} artifact(s): the {budget:g}-second time budget was exceeded"
+                )
+                return dedupe_entries(entries)
     return dedupe_entries(entries)
 
 
@@ -937,7 +957,10 @@ def main() -> int:
     prior_entries: list[dict[str, Any]] = []
     dispositions: dict[str, dict[str, Any]] = {}
     comments: list[dict[str, Any]] = []
-    prior_entries = fetch_prior_entries(token, args.repository)
+    try:
+        prior_entries = fetch_prior_entries(token, args.repository)
+    except Exception as error:
+        print(f"::warning::could not load prior review ledger history; continuing without history: {error}")
     if token:
         try:
             comments = fetch_comments(token, args.repository, args.pr_number)

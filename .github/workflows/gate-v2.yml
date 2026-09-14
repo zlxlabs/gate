@@ -1267,6 +1267,17 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Retry upload gate terminal envelope
+        if: always() && steps.upload-gate-terminal.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gate-terminal.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
       - name: Publish gate status panel
         if: always() && steps.upload-gate-terminal.outcome == 'success'
         env:
@@ -1305,6 +1316,8 @@ jobs:
 
       - name: Upload gate status panel delivery diagnostic
         if: always()
+        id: upload-gate-status-panel-diagnostic
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1312,10 +1325,16 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Warn when gate status panel delivery diagnostic is unavailable
+        if: always() && steps.upload-gate-status-panel-diagnostic.outcome == 'failure'
+        shell: bash
+        run: echo "::warning::Gate status panel delivery diagnostic was not uploaded; the required verdict was already aggregated"
+
   # ── ledger (independent persistence health check) ───────────────────────
   ledger:
     needs: [quality, primary, gate, classify_pr_paths]
     if: always()
+    continue-on-error: true
     concurrency:
       group: gate-required-v2-ledger-${{ github.repository_id }}
       cancel-in-progress: false
@@ -1575,6 +1594,7 @@ jobs:
           path: ${{ runner.temp }}/gate-terminal
 
       - name: Build v2 review effectiveness ledger
+        timeout-minutes: 3
         uses: ./_gate-aggregator-src/.github/actions/review-ledger
         with:
           audit-path: ${{ runner.temp }}/primary-audit/primary-review-audit.json
