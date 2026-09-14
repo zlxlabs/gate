@@ -178,6 +178,71 @@
      → `998 passed in 86.55s (0:01:26)`。
    - pin：`python3 scripts/check_pinned_uses.py` → 退出码 0，
      `OK: checked 9 live workflow/action metadata file(s); all internal uses are workspace-relative`。
-   - `git diff --check` → 通过；本轮代码/测试 diff 为 211 行（84 insertions/19 deletions
-     in `build_ledger.py`, 127 insertions/12 deletions in `test_review_ledger.py`），低于
-     `Diff-Lines-Target: 520` 与 `Diff-Lines-Hard: 760`，未产生允许范围外文件改动。
+- `git diff --check` → 通过；本轮代码/测试 diff 为 211 行（84 insertions/19 deletions
+  in `build_ledger.py`, 127 insertions/12 deletions in `test_review_ledger.py`），低于
+  `Diff-Lines-Target: 520` 与 `Diff-Lines-Hard: 760`，未产生允许范围外文件改动。
+
+## 第四轮修复：历史来源轴与统一时间预算
+
+- Task-Id：`card/gate-20260914-04`
+- Dispatch：`dlg-20260914-094811-76c19f`
+- Executor：Codex / implementer
+- Root-cause group：前两轮按枚举路径补保护，未把“历史来源集合”和“出网调用集合”建成轴。
+- Introduced-by-commit：`87b3ce8` 与 `9c049ad` 共同形成当前形态。
+- Open findings：R2-F1（sticky comment 读取失败仍可能显示完整）、R2-F2（评论读取和
+  状态评论窗口未纳入预算）、R2-F3（无生产者环境变量和静默钳制）。
+
+### 完成条件对照
+
+1. **轴 A 已落地。** `build_ledger.py` 定义 `HISTORY_SOURCES`，显式列出
+   `artifact_snapshot` 与 `sticky_state_comment`；`history_sources` 字典只允许这组
+   来源及 `success` / `incomplete` / `failure` 三种状态。`_merge_history_status` 统一
+   合并：所有来源成功且有历史才是 `complete`，任一来源非成功即为 `incomplete`，成功但
+   无历史为 `none`。`main()` 不再散落修改最终字符串；artifact 异常、artifact 截断、
+   sticky comment 异常和 sticky comment 预算跳过都通过来源状态进入同一合并点。
+
+2. **轴 B 已落地。** `main()` 在网络阶段开始时建立一个 120 秒总 deadline；历史列表、
+   每个 artifact 归档、评论读取、PR head 检查、状态评论写入五类出网调用均在发起前检查
+   自己的最坏重试窗口。历史窗口为 `10×2+1=21` 秒，普通 GitHub API 窗口为
+   `30×3+1+2=93` 秒；预算不足的调用直接跳过并返回不可用状态。`write_ledger` 仍在
+   `post_state_comment` 之前无条件执行，因此网络预算耗尽也会写出当前行。
+
+3. **轴表测试已覆盖完整叉积。** `test_history_source_axis_covers_every_source_and_failure_mode`
+   静态列出来源轴并先断言其集合与代码的 `HISTORY_SOURCES` 恒等，再对 2 个来源 × 4
+   个模式（成功、截断、异常、预算跳过）逐格断言 `history_status` 和 comparison；只有
+   双来源成功产生权威 `new_head`，其余均为非权威 `history_incomplete`。
+
+4. **每个出网调用点都有预算跳过例。** 参数化测试覆盖 artifact 列表、artifact 归档、
+   PR 评论读取、PR head 检查、状态评论写入五个调用点。每个例子都断言目标调用未发起、
+   当前 `run_id=10` 行仍存在；历史读取/评论读取跳过时条目为 `history_status=incomplete`，
+   状态评论两处跳过时返回 `failure`，且 ledger 行已先写出。
+
+5. **总上界测试已通过。** `test_total_network_budget_is_bounded_and_current_row_is_written`
+   用可控时钟让列表请求和评论请求各走满重试窗口，实际推进
+   `21+93=114` 秒，断言 `114 ≤ 120 < 144`，并断言当前行已经写入；代码中的最大允许
+   路径窗口 `max(4×21, 21+93)=114` 也小于 144 秒。
+
+6. **无生产者环境变量已删除。** 生产代码不再读取历史预算环境变量，也不再做静默
+   `min()` 钳制；`time_budget_seconds` 仅保留为测试可控的函数参数入口。排除历史报告和
+   verdict 文件后全仓检索无命中；本节保留历史背景中的原引用不作为生产配置。
+
+7. **跨仓消费点复核。** 本轮没有新增 ledger 输出字段，也没有新增 `history_status` 或
+   comparison 枚举值；因此 gate-hub 的 report/replay 消费面无需改动。现有 `complete`、
+   `incomplete`、`none` 语义保持不变，`history_incomplete` 仍是既有非权威 comparison
+   kind；无新增字段或闭集枚举风险。
+
+8. **Base 红验已完成。** 在 Base `8b657fec36b247e7fe390673443dbd0704161270`
+   的临时 worktree 中用当前新增测试反验：来源轴测试退出码 `1`，逐调用点预算测试退出码
+   `1`，总预算测试退出码 `1`。三条均为非恒真红验；当前实现对应测试通过。
+
+9. **最终验证已完成。** 指定定向命令
+   `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q tests/test_review_ledger.py tests/test_gate_v2_contract.py`
+   → `374 passed in 28.15s`。全量命令
+   `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q`
+   → `1012 passed in 88.39s (0:01:28)`。`python3 scripts/check_pinned_uses.py`
+   → 退出码 `0`，9 个 live workflow/action metadata 文件通过。`git diff --check` 通过。
+
+既有测试没有删除或放宽；仅将 `fetch_prior_entries` 的内部返回状态从旧的
+`complete`/`none` 改为来源轴的 `success`，并把旧的单字符串测试参数改为显式来源状态，
+因为现在最终状态必须由来源集合合并得到。未修改 `.github/workflows/gate-v2.yml`、
+legacy `gate.yml`、ledger artifact 存储结构或 comparison 在完整历史路径的逻辑。

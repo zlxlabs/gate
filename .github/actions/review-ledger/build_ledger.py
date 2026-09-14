@@ -54,6 +54,11 @@ class CrossHostAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
 URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
 API_REQUEST_ATTEMPTS = 3
 API_REQUEST_BACKOFF_SECONDS = (1, 2)
+API_REQUEST_TIMEOUT_SECONDS = 30
+API_REQUEST_WORST_CASE_SECONDS = (
+    API_REQUEST_TIMEOUT_SECONDS * API_REQUEST_ATTEMPTS
+    + sum(API_REQUEST_BACKOFF_SECONDS)
+)
 HISTORY_REQUEST_TIMEOUT_SECONDS = 10
 HISTORY_REQUEST_ATTEMPTS = 2
 HISTORY_REQUEST_BACKOFF_SECONDS = (1,)
@@ -61,7 +66,13 @@ HISTORY_REQUEST_WORST_CASE_SECONDS = (
     HISTORY_REQUEST_TIMEOUT_SECONDS * HISTORY_REQUEST_ATTEMPTS
     + sum(HISTORY_REQUEST_BACKOFF_SECONDS)
 )
-HISTORY_BUDGET_SECONDS = 90
+# 4 history requests can consume 84s; one comments request can consume 93s.
+# Either path fits within this bound, while a following request is skipped.
+NETWORK_BUDGET_SECONDS = 120
+HISTORY_SOURCE_ARTIFACT = "artifact_snapshot"
+HISTORY_SOURCE_STICKY_COMMENT = "sticky_state_comment"
+HISTORY_SOURCES = (HISTORY_SOURCE_ARTIFACT, HISTORY_SOURCE_STICKY_COMMENT)
+HISTORY_SOURCE_STATUSES = frozenset({"success", "incomplete", "failure"})
 _RETRYABLE_CONNECTION_ERRORS = (
     urllib.error.URLError,
     ssl.SSLError,
@@ -97,6 +108,34 @@ PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
 PRIMARY_VERDICTS = {"pass", "fail", "unavailable", "not_expected", "waived"}
 PRIMARY_REVIEWER_VERDICTS = {"pass", "fail", "unavailable"}
 PRIMARY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _merge_history_status(
+    source_statuses: dict[str, str], prior_entries: list[dict[str, Any]],
+) -> str:
+    if set(source_statuses) != set(HISTORY_SOURCES):
+        raise ValueError("history source status set does not match HISTORY_SOURCES")
+    if any(status not in HISTORY_SOURCE_STATUSES for status in source_statuses.values()):
+        raise ValueError("history source status is invalid")
+    if any(source_statuses[source] != "success" for source in HISTORY_SOURCES):
+        return "incomplete"
+    return "complete" if prior_entries else "none"
+
+
+def _request_fits_deadline(
+    deadline: float | None, worst_case_seconds: float, label: str,
+) -> bool:
+    if deadline is None:
+        return True
+    remaining = deadline - time.monotonic()
+    if remaining >= worst_case_seconds:
+        return True
+    print(
+        "::warning::Skipping GitHub API request before it starts: "
+        f"{label} has {max(remaining, 0):g}s remaining, but needs "
+        f"{worst_case_seconds:g}s for its worst-case retry window"
+    )
+    return False
 
 
 def parse_dispositions(comments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -616,12 +655,11 @@ def build_entry(
     fallback_status: str = "not_run",
     terminal_envelope: dict[str, Any] | None = None,
     input_short_circuited: bool = False,
-    history_status: str | None = None,
+    history_sources: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    if history_status is None:
-        history_status = "complete" if prior_entries else "none"
-    if history_status not in {"complete", "incomplete", "none"}:
-        raise ValueError("history_status must be one of complete, incomplete, none")
+    if history_sources is None:
+        history_sources = {source: "success" for source in HISTORY_SOURCES}
+    history_status = _merge_history_status(history_sources, prior_entries)
     relevant = [
         entry for entry in prior_entries
         if entry.get("repository") == repository and entry.get("pr_number") == pr_number
@@ -764,7 +802,7 @@ def _api_request(
     *,
     method: str = "GET",
     payload: dict[str, Any] | None = None,
-    timeout: float = 30,
+    timeout: float = API_REQUEST_TIMEOUT_SECONDS,
     attempts: int = API_REQUEST_ATTEMPTS,
     backoff_seconds: tuple[float, ...] = API_REQUEST_BACKOFF_SECONDS,
 ) -> bytes:
@@ -815,24 +853,21 @@ def fetch_prior_entries(
     *,
     artifact_limit: int = 3,
     time_budget_seconds: float | None = None,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    # Optional environment override: LEDGER_HISTORY_BUDGET_SECONDS (default 90).
-    configured_budget = (
-        float(os.environ.get("LEDGER_HISTORY_BUDGET_SECONDS", str(HISTORY_BUDGET_SECONDS)))
-        if time_budget_seconds is None else time_budget_seconds
-    )
-    if not math.isfinite(configured_budget) or configured_budget < 0:
-        raise ValueError("LEDGER_HISTORY_BUDGET_SECONDS must be finite and non-negative")
-    budget = min(configured_budget, HISTORY_BUDGET_SECONDS)
-    started_at = time.monotonic()
+    if time_budget_seconds is not None:
+        if not math.isfinite(time_budget_seconds) or time_budget_seconds < 0:
+            raise ValueError("time_budget_seconds must be finite and non-negative")
+        local_deadline = time.monotonic() + time_budget_seconds
+        deadline = local_deadline if deadline is None else min(deadline, local_deadline)
     entries: list[dict[str, Any]] = []
     downloaded = 0
     for artifact_name in LEDGER_ARTIFACT_NAMES:
-        if time.monotonic() - started_at + HISTORY_REQUEST_WORST_CASE_SECONDS > budget:
+        if not _request_fits_deadline(
+            deadline, HISTORY_REQUEST_WORST_CASE_SECONDS, "prior ledger artifact listing"
+        ):
             print(
-                "::warning::Stopped fetching prior ledger history before the next request: "
-                f"the {budget:g}-second time budget cannot cover its "
-                f"{HISTORY_REQUEST_WORST_CASE_SECONDS:g}-second worst-case request window"
+                "::warning::Stopped fetching prior ledger history before the next request"
             )
             return dedupe_entries(entries), "incomplete"
         query = urllib.parse.urlencode({"name": artifact_name, "per_page": artifact_limit})
@@ -848,11 +883,13 @@ def fetch_prior_entries(
         for artifact in payload.get("artifacts", [])[:artifact_limit]:
             if artifact.get("expired"):
                 continue
-            if time.monotonic() - started_at + HISTORY_REQUEST_WORST_CASE_SECONDS > budget:
+            if not _request_fits_deadline(
+                deadline, HISTORY_REQUEST_WORST_CASE_SECONDS,
+                f"prior ledger artifact {artifact.get('id')} download",
+            ):
                 print(
                     "::warning::Stopped fetching prior ledger history before artifact "
-                    f"{artifact.get('id')}: the {budget:g}-second time budget cannot cover "
-                    f"its {HISTORY_REQUEST_WORST_CASE_SECONDS:g}-second worst-case request window"
+                    f"{artifact.get('id')}"
                 )
                 return dedupe_entries(entries), "incomplete"
             archive = _api_request(
@@ -873,18 +910,27 @@ def fetch_prior_entries(
                         if not isinstance(entry, dict):
                             raise ValueError("prior ledger entry must be a JSON object")
                         entries.append(entry)
-            if time.monotonic() - started_at >= budget:
+            if deadline is not None and time.monotonic() >= deadline:
                 print(
                     "::warning::Stopped fetching prior ledger history after "
-                    f"{downloaded} artifact(s): the {budget:g}-second time budget was exceeded"
+                    f"{downloaded} artifact(s): the network deadline was reached"
                 )
                 return dedupe_entries(entries), "incomplete"
     deduped = dedupe_entries(entries)
-    return deduped, "complete" if deduped else "none"
+    return deduped, "success"
 
 
-def fetch_comments(token: str, repository: str, pr_number: int) -> list[dict[str, Any]]:
-    return _api_json(token, f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100")
+def fetch_comments(
+    token: str, repository: str, pr_number: int, *, deadline: float | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    if not _request_fits_deadline(deadline, API_REQUEST_WORST_CASE_SECONDS, "PR comments"):
+        return [], "failure"
+    comments = _api_json(
+        token, f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100"
+    )
+    if not isinstance(comments, list):
+        raise ValueError("PR comments response has invalid JSON shape")
+    return comments, "success"
 
 
 def post_state_comment(
@@ -895,24 +941,31 @@ def post_state_comment(
     entries: list[dict[str, Any]],
     current: dict[str, Any],
     comments: list[dict[str, Any]],
-) -> None:
+    *,
+    deadline: float | None = None,
+) -> str:
     body = scrub_for_publish(
         render_state_comment(entries, current),
         runtime_values=runtime_values_from_environment(),
     )
     api = f"https://api.github.com/repos/{repository}"
+    if not _request_fits_deadline(deadline, API_REQUEST_WORST_CASE_SECONDS, "PR head check"):
+        return "failure"
     pull = _api_json(token, f"{api}/pulls/{pr_number}")
     if pull.get("head", {}).get("sha") != head_sha:
         print("::notice::skip stale review ledger state; PR head advanced")
-        return
+        return "success"
     existing = next((comment for comment in comments if STATE_MARKER in comment.get("body", "")), None)
     if existing is None and len(relevant_pr_entries(entries, current)) <= 1:
         print("::notice::skip first-round review ledger state comment; no prior history to persist")
-        return
+        return "success"
+    if not _request_fits_deadline(deadline, API_REQUEST_WORST_CASE_SECONDS, "PR state comment write"):
+        return "failure"
     if existing:
         _api_request(token, f"{api}/issues/comments/{existing['id']}", method="PATCH", payload={"body": body})
     else:
         _api_request(token, f"{api}/issues/{pr_number}/comments", method="POST", payload={"body": body})
+    return "success"
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -1001,6 +1054,8 @@ def main() -> int:
     if not token:
         raise RuntimeError("GH_TOKEN is required to publish review ledger")
 
+    network_deadline = time.monotonic() + NETWORK_BUDGET_SECONDS
+
     preflight = _load_json(args.preflight_path) or {}
     audit = _load_json(args.audit_path)
     install = _load_json(args.install_path)
@@ -1016,23 +1071,29 @@ def main() -> int:
         fallback = "not_run"
 
     prior_entries: list[dict[str, Any]] = []
-    history_status = "incomplete"
+    history_sources = {source: "success" for source in HISTORY_SOURCES}
     dispositions: dict[str, dict[str, Any]] = {}
     comments: list[dict[str, Any]] = []
     try:
-        prior_entries, history_status = fetch_prior_entries(token, args.repository)
+        prior_entries, artifact_status = fetch_prior_entries(
+            token, args.repository, deadline=network_deadline,
+        )
+        history_sources[HISTORY_SOURCE_ARTIFACT] = artifact_status
     except Exception as error:
+        history_sources[HISTORY_SOURCE_ARTIFACT] = "failure"
         print(f"::warning::could not load prior review ledger history; continuing without history: {error}")
     if token:
         try:
-            comments = fetch_comments(token, args.repository, args.pr_number)
+            comments, comment_status = fetch_comments(
+                token, args.repository, args.pr_number, deadline=network_deadline,
+            )
+            history_sources[HISTORY_SOURCE_STICKY_COMMENT] = comment_status
             dispositions = parse_dispositions(comments)
             state_entries = parse_state_entries(comments)
             if state_entries:
                 prior_entries = dedupe_entries([*prior_entries, *state_entries])
-                if history_status == "none":
-                    history_status = "incomplete"
         except Exception as error:
+            history_sources[HISTORY_SOURCE_STICKY_COMMENT] = "failure"
             print(f"::warning::could not load finding dispositions or PR ledger state: {error}")
 
     entry = build_entry(
@@ -1055,7 +1116,7 @@ def main() -> int:
         fallback_status=fallback,
         terminal_envelope=terminal,
         input_short_circuited=input_short_circuited,
-        history_status=history_status,
+        history_sources=history_sources,
     )
     all_entries = dedupe_entries([*prior_entries, entry])
     write_ledger(args.output, all_entries, max_entries=args.max_entries)
@@ -1063,7 +1124,7 @@ def main() -> int:
         try:
             post_state_comment(
                 token, args.repository, args.pr_number, args.head_sha,
-                all_entries, entry, comments,
+                all_entries, entry, comments, deadline=network_deadline,
             )
         except Exception as error:
             print(f"::warning::could not update PR review ledger state: {error}")

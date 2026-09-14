@@ -381,6 +381,11 @@ def _run_ledger_main(
     install=None,
     audit=None,
     prior_entries_fetch=None,
+    fetch_comments_impl=None,
+    post_state_comment_impl=None,
+    monotonic_impl=None,
+    sleep_impl=None,
+    urlopen_impl=None,
 ):
     audit = audit or _short_circuit_fail_audit()
     work = tmp_path
@@ -399,13 +404,26 @@ def _run_ledger_main(
         install_path.write_text(json.dumps(install), encoding="utf-8")
     output = work / "ledger.jsonl"
     monkeypatch.setenv("GH_TOKEN", "test-token")
-    monkeypatch.setattr(
-        module,
-        "fetch_prior_entries",
-        prior_entries_fetch or (lambda *a, **k: ([], "none")),
-    )
-    monkeypatch.setattr(module, "fetch_comments", lambda *a, **k: [])
-    monkeypatch.setattr(module, "post_state_comment", lambda *a, **k: None)
+    if prior_entries_fetch is not False:
+        monkeypatch.setattr(
+            module,
+            "fetch_prior_entries",
+            prior_entries_fetch or (lambda *a, **k: ([], "success")),
+        )
+    if fetch_comments_impl is not False:
+        monkeypatch.setattr(
+            module, "fetch_comments", fetch_comments_impl or (lambda *a, **k: ([], "success")),
+        )
+    if post_state_comment_impl is not False:
+        monkeypatch.setattr(
+            module, "post_state_comment", post_state_comment_impl or (lambda *a, **k: "success"),
+        )
+    if monotonic_impl is not None:
+        monkeypatch.setattr(module.time, "monotonic", monotonic_impl)
+    if sleep_impl is not None:
+        monkeypatch.setattr(module.time, "sleep", sleep_impl)
+    if urlopen_impl is not None:
+        monkeypatch.setattr(module.URL_OPENER, "open", urlopen_impl)
     monkeypatch.setattr(sys, "argv", [
         "build_ledger.py",
         "--audit-path", str(audit_path),
@@ -762,7 +780,7 @@ def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
 
     entries, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
     assert entries == []
-    assert history_status == "none"
+    assert history_status == "success"
     assert len(requested) == 1
     assert "name=codex-review-ledger-v2" in requested[0]
     assert "per_page=3" in requested[0]
@@ -858,7 +876,7 @@ def test_fetch_prior_entries_reads_only_v2_artifact_name(artifacts_by_name, expe
     _patch_named_artifact_api(module, monkeypatch, artifacts_by_name)
     entries, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
     assert _entry_keys(entries) == _entry_keys(expected)
-    assert history_status == ("complete" if expected else "none")
+    assert history_status == "success"
 
 
 def test_fetch_prior_entries_returns_downloaded_part_when_time_budget_is_reached(monkeypatch, capsys):
@@ -887,18 +905,18 @@ def test_history_status_has_three_states_and_only_complete_history_can_compare()
     )
 
     cases = [
-        ("complete", [previous], "new_head", True),
-        ("incomplete", [previous], "history_incomplete", False),
-        ("none", [], "first_review", False),
+        ({source: "success" for source in module.HISTORY_SOURCES}, [previous], "new_head", True),
+        ({module.HISTORY_SOURCE_ARTIFACT: "incomplete", module.HISTORY_SOURCE_STICKY_COMMENT: "success"}, [previous], "history_incomplete", False),
+        ({source: "success" for source in module.HISTORY_SOURCES}, [], "first_review", False),
     ]
-    for history_status, prior_entries, kind, authoritative in cases:
+    for history_sources, prior_entries, kind, authoritative in cases:
         entry = module.build_entry(
             repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
             head_sha="new", preflight={}, audit=_audit("new", ["a", "b"]),
-            prior_entries=prior_entries, dispositions={}, history_status=history_status,
+            prior_entries=prior_entries, dispositions={}, history_sources=history_sources,
         )
 
-        assert entry["history_status"] == history_status
+        assert entry["history_status"] == ("complete" if kind == "new_head" else "none" if kind == "first_review" else "incomplete")
         assert entry["comparison"]["kind"] == kind
         assert entry["comparison"]["authoritative"] is authoritative
         if not authoritative:
@@ -906,6 +924,42 @@ def test_history_status_has_three_states_and_only_complete_history_can_compare()
                 "persistent_finding_ids", "resolved_finding_ids", "new_finding_ids",
                 "missing_finding_ids", "appeared_finding_ids",
             }.intersection(entry["comparison"])
+
+
+@pytest.mark.parametrize("source", ["artifact_snapshot", "sticky_state_comment"])
+@pytest.mark.parametrize("failure_mode", ["success", "truncated", "exception", "budget_skipped"])
+def test_history_source_axis_covers_every_source_and_failure_mode(source, failure_mode):
+    module = _module()
+    assert set(["artifact_snapshot", "sticky_state_comment"]) == set(module.HISTORY_SOURCES)
+    previous = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="old", preflight={}, audit=_audit("old", ["a"]),
+        prior_entries=[], dispositions={},
+    )
+    status_for_mode = {
+        "success": "success",
+        "truncated": "incomplete",
+        "exception": "failure",
+        "budget_skipped": "failure",
+    }
+    history_sources = {name: "success" for name in module.HISTORY_SOURCES}
+    history_sources[source] = status_for_mode[failure_mode]
+
+    entry = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+        head_sha="new", preflight={}, audit=_audit("new", ["a", "b"]),
+        prior_entries=[previous], dispositions={}, history_sources=history_sources,
+    )
+
+    expected_complete = failure_mode == "success"
+    assert entry["history_status"] == ("complete" if expected_complete else "incomplete")
+    assert entry["comparison"]["kind"] == ("new_head" if expected_complete else "history_incomplete")
+    assert entry["comparison"]["authoritative"] is expected_complete
+    if not expected_complete:
+        assert not {
+            "persistent_finding_ids", "resolved_finding_ids", "new_finding_ids",
+            "missing_finding_ids", "appeared_finding_ids",
+        }.intersection(entry["comparison"])
 
 
 @pytest.mark.parametrize(
@@ -977,6 +1031,149 @@ def test_history_fetch_retry_exhaustion_stays_below_step_budget(monkeypatch):
     assert [timeout for _, timeout in calls] == [10, 10, 10, 10]
 
 
+@pytest.mark.parametrize(
+    "call_point,budget",
+    [
+        ("artifact_list", 20),
+        ("artifact_archive", 21),
+        ("comments", 100),
+        ("post_head", 120),
+        ("post_write", 120),
+    ],
+)
+def test_each_network_call_skips_when_remaining_budget_is_insufficient(
+    tmp_path, monkeypatch, call_point, budget,
+):
+    module = _module()
+    monkeypatch.setattr(module, "NETWORK_BUDGET_SECONDS", budget)
+    clock = [0.0]
+    calls: list[tuple[str, float]] = []
+    attempts_by_url: dict[str, int] = {}
+
+    previous = {**_named_entry(9, "old"), "pr_number": 7}
+    post_statuses = []
+    original_post = module.post_state_comment
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    def fake_urlopen(request, timeout):
+        url = request.full_url
+        calls.append((url, timeout))
+        attempts_by_url[url] = attempts_by_url.get(url, 0) + 1
+        attempt = attempts_by_url[url]
+        attempt_limit = 2 if timeout == 10 else 3
+        clock[0] += timeout
+        if attempt < attempt_limit:
+            raise _connection_urlerror()
+        if "/actions/artifacts" in url:
+            artifacts = []
+            if call_point == "artifact_archive":
+                artifacts = [{
+                    "id": 1,
+                    "expired": False,
+                    "archive_download_url": "https://example.test/archive/1",
+                }]
+            return _ApiResponse(json.dumps({"artifacts": artifacts}).encode())
+        if "/issues/7/comments" in url and request.get_method() == "GET":
+            return _ApiResponse(b"[]")
+        if "/pulls/7" in url:
+            return _ApiResponse(b'{"head":{"sha":"head"}}')
+        return _ApiResponse(b"{}")
+
+    def post_wrapper(*args, **kwargs):
+        result = original_post(*args, **kwargs)
+        post_statuses.append(result)
+        return result
+
+    if call_point == "post_write":
+        prior_fetch = lambda *a, **k: ([previous], "success")
+        comments_fetch = lambda *a, **k: ([], "success")
+    else:
+        prior_fetch = False
+        comments_fetch = False if call_point in {"comments", "post_head"} else None
+
+    _run_ledger_main(
+        module,
+        tmp_path,
+        monkeypatch,
+        preflight=_preflight(),
+        prior_entries_fetch=prior_fetch,
+        fetch_comments_impl=comments_fetch,
+        post_state_comment_impl=post_wrapper if call_point in {"post_head", "post_write"} else None,
+        monotonic_impl=lambda: clock[0],
+        sleep_impl=fake_sleep,
+        urlopen_impl=fake_urlopen,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    current = next(row for row in rows if row["run_id"] == 10)
+    assert current["run_id"] == 10
+    target = {
+        "artifact_list": "/actions/artifacts",
+        "artifact_archive": "example.test/archive",
+        "comments": "/issues/7/comments",
+        "post_head": "/pulls/7",
+        "post_write": "/issues/7/comments",
+    }[call_point]
+    assert not any(target in url for url, _ in calls)
+    if call_point in {"artifact_list", "artifact_archive", "comments"}:
+        assert current["history_status"] == "incomplete"
+    else:
+        assert post_statuses == ["failure"]
+
+
+def test_total_network_budget_is_bounded_and_current_row_is_written(tmp_path, monkeypatch):
+    module = _module()
+    clock = [0.0]
+    calls: list[tuple[str, float]] = []
+    attempts_by_url: dict[str, int] = {}
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    def fake_urlopen(request, timeout):
+        url = request.full_url
+        calls.append((url, timeout))
+        attempts_by_url[url] = attempts_by_url.get(url, 0) + 1
+        attempt = attempts_by_url[url]
+        attempt_limit = 2 if timeout == module.HISTORY_REQUEST_TIMEOUT_SECONDS else 3
+        clock[0] += timeout
+        if attempt < attempt_limit:
+            raise _connection_urlerror()
+        if "/actions/artifacts" in url:
+            return _ApiResponse(b'{"artifacts":[]}')
+        if "/issues/7/comments" in url:
+            return _ApiResponse(b"[]")
+        return _ApiResponse(b"{}")
+
+    _run_ledger_main(
+        module,
+        tmp_path,
+        monkeypatch,
+        preflight=_preflight(),
+        prior_entries_fetch=False,
+        fetch_comments_impl=False,
+        post_state_comment_impl=False,
+        monotonic_impl=lambda: clock[0],
+        sleep_impl=fake_sleep,
+        urlopen_impl=fake_urlopen,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert any(row["run_id"] == 10 for row in rows)
+    assert [timeout for _, timeout in calls] == [10, 10, 30, 30, 30]
+    assert clock[0] == (
+        module.HISTORY_REQUEST_WORST_CASE_SECONDS + module.API_REQUEST_WORST_CASE_SECONDS
+    )
+    assert clock[0] <= module.NETWORK_BUDGET_SECONDS < 144
+    max_allowed_windows = max(
+        4 * module.HISTORY_REQUEST_WORST_CASE_SECONDS,
+        module.HISTORY_REQUEST_WORST_CASE_SECONDS + module.API_REQUEST_WORST_CASE_SECONDS,
+    )
+    assert max_allowed_windows < 144
+
+
 def test_v2_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
     module = _module()
     historical, current = _pr_ledger_entries(module, 2)
@@ -1002,7 +1199,7 @@ def test_v2_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch
     monkeypatch.setattr(module, "_api_request", fake_api_request)
     prior, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
     assert _entry_keys(prior) == _entry_keys([historical])
-    assert history_status == "complete"
+    assert history_status == "success"
     module.post_state_comment(
         "token", "zlxlabs/app", 7, current["head_sha"],
         module.dedupe_entries([*prior, current]), current, [],
