@@ -22,9 +22,25 @@ def test_sync_workflow_is_main_push_and_has_contents_write():
     raw, trigger = _load()
     assert trigger["push"] == {"branches": ["main"]}
     assert "workflow_dispatch" in trigger
+    assert trigger["workflow_dispatch"]["inputs"]["canary_run_id"]["required"] is True
     assert trigger["schedule"] == [{"cron": "17 * * * *"}]
     assert raw["permissions"] == {"contents": "write"}
     assert raw["jobs"]["sync"]["if"] == "github.ref == 'refs/heads/main'"
+
+
+def test_permission_probe_is_dispatch_only_and_suppresses_responses():
+    raw, _ = _load()
+    steps = raw["jobs"]["sync"]["steps"]
+    probe = next(step for step in steps if step.get("name") == "Probe canary Actions API permissions")
+    assert probe["if"] == "github.event_name == 'workflow_dispatch'"
+    assert "V2_TAG_SYNC_ENABLED" not in probe["run"]
+    assert "github.token" in probe["env"]["GITHUB_TOKEN"]
+    assert probe["run"].count("--output /dev/null") == 1
+    assert probe["run"].count("--write-out '%{http_code}'") == 1
+    assert probe["run"].count("probe_canary_endpoint") == 4
+    assert "actions/runs?per_page=1" in probe["run"]
+    assert "/actions/runs/${CANARY_RUN_ID}" in probe["run"]
+    assert "/actions/runs/${CANARY_RUN_ID}/jobs?per_page=1" in probe["run"]
 
 
 def test_sync_workflow_has_migration_switch_and_contract_before_push():
@@ -68,6 +84,7 @@ def test_evidence_selection_is_before_contract_and_move():
     assert contract["if"] == "steps.monotonicity.outputs.move == 'true'"
     assert move["if"] == "steps.monotonicity.outputs.move == 'true'"
     assert "TARGET_SHA" in move["env"]
+    assert steps.index(move) == len(steps) - 1
 
 
 def test_disabled_switch_skips_entire_evidence_step():

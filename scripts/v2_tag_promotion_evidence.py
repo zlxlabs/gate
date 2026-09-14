@@ -12,11 +12,13 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 
 API_BASE = "https://api.github.com"
 CANARY_REPOSITORY = "zlxlabs/ci-infra-canary"
+CANARY_GATE_WORKFLOW_ID = "gate.yml"
 GATE_WORKFLOW_REFERENCE = "zlxlabs/gate/.github/workflows/gate-v2.yml"
 # Read from .github/workflows/gate-v2.yml:471: the reusable workflow job id is
 # `primary` and it has no separate `name:`.  Actions may prefix it with the
@@ -25,6 +27,8 @@ PRIMARY_JOB_ID = "primary"
 RUNS_PAGE_SIZE = 100
 JOBS_PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 60
+SCHEDULE_INTERVAL_HOURS = 1
+NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS = 4 * SCHEDULE_INTERVAL_HOURS
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -102,7 +106,8 @@ def _run_id(run: object, endpoint: str) -> str:
 
 def _load_runs(api_reader: ApiReader) -> list[object]:
     endpoint = (
-        f"repos/{CANARY_REPOSITORY}/actions/runs?per_page={RUNS_PAGE_SIZE}"
+        f"repos/{CANARY_REPOSITORY}/actions/workflows/"
+        f"{CANARY_GATE_WORKFLOW_ID}/runs?per_page={RUNS_PAGE_SIZE}"
     )
     payload = _mapping(api_reader(endpoint), endpoint)
     runs = payload.get("workflow_runs")
@@ -155,7 +160,10 @@ def _candidate_result(
 ) -> CandidateResult:
     reasons: list[str] = []
     for run in runs:
-        list_endpoint = f"repos/{CANARY_REPOSITORY}/actions/runs?per_page={RUNS_PAGE_SIZE}"
+        list_endpoint = (
+            f"repos/{CANARY_REPOSITORY}/actions/workflows/"
+            f"{CANARY_GATE_WORKFLOW_ID}/runs?per_page={RUNS_PAGE_SIZE}"
+        )
         run_id = _run_id(run, list_endpoint)
         listed_conclusion = _mapping(run, list_endpoint).get("conclusion")
         if listed_conclusion is not None and listed_conclusion != "success":
@@ -178,10 +186,11 @@ def _candidate_result(
         if not gate_shas:
             reasons.append(f"run {run_id}: gate-v2 reference is absent")
             continue
-        if candidate_sha not in gate_shas:
+        if any(gate_sha != candidate_sha for gate_sha in gate_shas):
             reasons.append(
-                f"run {run_id}: gate-v2 referenced sha(s)={','.join(gate_shas)}, "
-                f"expected {candidate_sha}"
+                f"run {run_id}: gate-v2 references inconsistent "
+                f"sha(s)={','.join(gate_shas)}, expected every reference to be "
+                f"{candidate_sha}"
             )
             continue
         jobs = _jobs_for_run(run_id, api_reader)
@@ -195,19 +204,17 @@ def _candidate_result(
                 f"run {run_id}: primary job {PRIMARY_JOB_ID!r} is absent"
             )
             continue
-        primary_conclusion = primary_jobs[0].get("conclusion")
-        if primary_conclusion == "success":
+        primary_conclusions = [job.get("conclusion") for job in primary_jobs]
+        if all(conclusion == "success" for conclusion in primary_conclusions):
             return CandidateResult(
                 candidate_sha, True, f"run {run_id}: gate-v2 and primary succeeded", run_id
             )
-        if primary_conclusion == "skipped":
-            reasons.append(
-                f"run {run_id}: primary job conclusion=skipped, execution required"
-            )
+        if len(primary_conclusions) == 1 and primary_conclusions[0] == "skipped":
+            reasons.append(f"run {run_id}: primary job conclusion=skipped, execution required")
         else:
             reasons.append(
-                f"run {run_id}: primary job conclusion={primary_conclusion!r}, "
-                "required success"
+                f"run {run_id}: primary job conclusions={primary_conclusions!r}, "
+                "all primary jobs required success"
             )
     if not reasons:
         reasons.append("no canary run was returned")
@@ -266,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", action="append")
     parser.add_argument("--check-ancestor", nargs=2, metavar=("CURRENT", "TARGET"))
+    parser.add_argument("--current-v2-commit-time")
     args = parser.parse_args(argv)
     if args.check_ancestor is not None:
         try:
@@ -287,6 +295,33 @@ def main(argv: list[str] | None = None) -> int:
         state = "eligible" if candidate.eligible else "ineligible"
         print(f"candidate={candidate.sha} {state}: {candidate.reason}", file=sys.stderr)
     if result.selected_sha is None:
+        if args.current_v2_commit_time is not None:
+            try:
+                current_v2_commit_time = datetime.fromisoformat(
+                    args.current_v2_commit_time.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                print(
+                    f"v2 promotion evidence query failed: invalid current v2 commit time: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            if current_v2_commit_time.tzinfo is None:
+                print(
+                    "v2 promotion evidence query failed: current v2 commit time must include a timezone",
+                    file=sys.stderr,
+                )
+                return 1
+            age = datetime.now(timezone.utc) - current_v2_commit_time
+            if age > timedelta(hours=NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS):
+                age_hours = age.total_seconds() / 3600
+                print(
+                    "::error::no eligible canary-verified main commit after "
+                    f"{age_hours:.1f}h; current v2 commit is older than the "
+                    f"{NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS}h threshold",
+                    file=sys.stderr,
+                )
+                return 1
         print("no eligible canary-verified main commit; v2 tag will not move", file=sys.stderr)
     else:
         print(f"selected canary-verified main commit: {result.selected_sha}", file=sys.stderr)

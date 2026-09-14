@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,9 @@ class FakeAPI:
 
     def __call__(self, endpoint):
         self.calls.append(endpoint)
-        if endpoint.endswith("actions/runs?per_page=100"):
+        if endpoint.endswith(
+            f"actions/workflows/{evidence.CANARY_GATE_WORKFLOW_ID}/runs?per_page=100"
+        ):
             return {"workflow_runs": self.runs}
         for run_id, detail in self.details.items():
             if endpoint == f"repos/{evidence.CANARY_REPOSITORY}/actions/runs/{run_id}":
@@ -90,6 +93,45 @@ def test_successful_run_with_skipped_primary_is_ineligible():
     assert "primary job conclusion=skipped" in result.checked[0].reason
 
 
+@pytest.mark.parametrize(
+    ("gate_shas", "expected_sha", "reason_fragment"),
+    [
+        ([], None, "gate-v2 reference is absent"),
+        ([SHA_A, SHA_B], None, "references inconsistent"),
+        ([SHA_A, SHA_A], SHA_A, None),
+    ],
+)
+def test_gate_references_must_all_match_candidate(gate_shas, expected_sha, reason_fragment):
+    api = FakeAPI(
+        [_run(1)],
+        {
+            "1": {
+                "conclusion": "success",
+                "referenced_workflows": [
+                    {"path": evidence.GATE_WORKFLOW_REFERENCE, "sha": sha}
+                    for sha in gate_shas
+                ],
+            }
+        },
+        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+    )
+    result = _select(api, [SHA_A])
+    assert result.selected_sha == expected_sha
+    assert reason_fragment is None or reason_fragment in result.checked[0].reason
+
+
+def test_all_primary_jobs_must_succeed():
+    api = FakeAPI(
+        [_run(1)],
+        {"1": _detail()},
+        {"1": [{"name": "gate / primary", "conclusion": "success"}, {"name": "gate / primary", "conclusion": "skipped"}]},
+    )
+    result = _select(api, [SHA_A])
+    assert result.selected_sha is None
+    assert "skipped" in result.checked[0].reason
+    assert "all primary jobs required success" in result.checked[0].reason
+
+
 def test_successful_run_with_wrong_gate_sha_is_ineligible():
     api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
     result = _select(api, [SHA_A])
@@ -128,7 +170,9 @@ def test_api_http_4xx_is_a_query_error(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setattr(evidence.urllib.request, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(error))
     with pytest.raises(evidence.EvidenceQueryError, match="HTTP 403"):
-        evidence._api_json("repos/zlxlabs/ci-infra-canary/actions/runs?per_page=100")
+        evidence._api_json(
+            "repos/zlxlabs/ci-infra-canary/actions/workflows/gate.yml/runs?per_page=100"
+        )
 
 
 def test_malformed_api_response_is_a_query_error():
@@ -183,3 +227,41 @@ def test_http_error_reader_is_fail_closed():
 
     with pytest.raises(evidence.EvidenceQueryError, match="HTTP 404"):
         _select(broken_api, [SHA_A])
+
+
+def test_filtered_workflow_404_is_fail_closed_without_fallback():
+    endpoints = []
+
+    def missing_workflow(endpoint):
+        endpoints.append(endpoint)
+        raise evidence.EvidenceQueryError("HTTP 404 for filtered workflow")
+
+    with pytest.raises(evidence.EvidenceQueryError, match="HTTP 404"):
+        _select(missing_workflow, [SHA_A])
+    assert endpoints == [
+        "repos/zlxlabs/ci-infra-canary/actions/workflows/gate.yml/runs?per_page=100"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("age_hours", "expected_exit", "expects_error"),
+    [
+        (evidence.NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS + 1, 1, True),
+        (evidence.NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS - 1, 0, False),
+    ],
+)
+def test_v2_without_eligible_candidate_alerts_only_when_stale(
+    age_hours, expected_exit, expects_error, monkeypatch, capsys
+):
+    api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
+    monkeypatch.setattr(evidence, "_api_json", api)
+    stale_time = (
+        datetime.now(timezone.utc)
+        - timedelta(hours=age_hours)
+    ).isoformat()
+    assert evidence.main(
+        ["--candidate", SHA_A, "--current-v2-commit-time", stale_time]
+    ) == expected_exit
+    output = capsys.readouterr().err
+    assert ("::error::" in output) is expects_error
+    assert expects_error or "no eligible canary-verified main commit" in output
