@@ -54,6 +54,14 @@ class CrossHostAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
 URL_OPENER = urllib.request.build_opener(CrossHostAuthStripRedirectHandler())
 API_REQUEST_ATTEMPTS = 3
 API_REQUEST_BACKOFF_SECONDS = (1, 2)
+HISTORY_REQUEST_TIMEOUT_SECONDS = 10
+HISTORY_REQUEST_ATTEMPTS = 2
+HISTORY_REQUEST_BACKOFF_SECONDS = (1,)
+HISTORY_REQUEST_WORST_CASE_SECONDS = (
+    HISTORY_REQUEST_TIMEOUT_SECONDS * HISTORY_REQUEST_ATTEMPTS
+    + sum(HISTORY_REQUEST_BACKOFF_SECONDS)
+)
+HISTORY_BUDGET_SECONDS = 90
 _RETRYABLE_CONNECTION_ERRORS = (
     urllib.error.URLError,
     ssl.SSLError,
@@ -608,7 +616,12 @@ def build_entry(
     fallback_status: str = "not_run",
     terminal_envelope: dict[str, Any] | None = None,
     input_short_circuited: bool = False,
+    history_status: str | None = None,
 ) -> dict[str, Any]:
+    if history_status is None:
+        history_status = "complete" if prior_entries else "none"
+    if history_status not in {"complete", "incomplete", "none"}:
+        raise ValueError("history_status must be one of complete, incomplete, none")
     relevant = [
         entry for entry in prior_entries
         if entry.get("repository") == repository and entry.get("pr_number") == pr_number
@@ -624,12 +637,20 @@ def build_entry(
         audit, fallback_status, preflight, input_short_circuited=input_short_circuited,
     )
     current_ids = set(review["finding_ids"])
-    comparison: dict[str, Any] = {"kind": "prior_conflict" if prior_conflict else "first_review"}
-    if previous:
+    comparison: dict[str, Any] = {
+        "kind": (
+            "history_incomplete"
+            if history_status == "incomplete"
+            else "prior_conflict" if prior_conflict else "first_review"
+        ),
+        "authoritative": False,
+    }
+    if history_status == "complete" and previous:
         previous_ids = set(previous.get("review", {}).get("finding_ids", []))
         same_head = previous.get("head_sha") == head_sha
         comparison = {
             "kind": "same_head_rerun" if same_head else "new_head",
+            "authoritative": True,
             "previous_head_sha": previous.get("head_sha"),
             "previous_run_id": previous.get("run_id"),
             "persistent_finding_ids": sorted(previous_ids & current_ids),
@@ -669,6 +690,7 @@ def build_entry(
         "run_attempt": run_attempt,
         "head_sha": head_sha,
         "review_round": len({(entry.get("run_id"), entry.get("run_attempt")) for entry in relevant}) + 1,
+        "history_status": history_status,
         "preflight": preflight or None,
         # D5(ci-cache-strategy.md 阶段 A):Install dependencies 步骤的度量信号 —
         # {ecosystem, status, duration_s, cache_hit}(见 gate.yml Install 步骤),
@@ -736,7 +758,16 @@ def dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ))
 
 
-def _api_request(token: str, url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
+def _api_request(
+    token: str,
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout: float = 30,
+    attempts: int = API_REQUEST_ATTEMPTS,
+    backoff_seconds: tuple[float, ...] = API_REQUEST_BACKOFF_SECONDS,
+) -> bytes:
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
         url,
@@ -750,29 +781,29 @@ def _api_request(token: str, url: str, *, method: str = "GET", payload: dict[str
             "Content-Type": "application/json",
         },
     )
-    last_attempt = API_REQUEST_ATTEMPTS - 1
-    for attempt in range(API_REQUEST_ATTEMPTS):
+    last_attempt = attempts - 1
+    for attempt in range(attempts):
         try:
-            with URL_OPENER.open(request, timeout=30) as response:
+            with URL_OPENER.open(request, timeout=timeout) as response:
                 return response.read()
         except urllib.error.HTTPError:
             raise
         except _RETRYABLE_CONNECTION_ERRORS as error:
             if attempt >= last_attempt:
                 raise
-            delay = API_REQUEST_BACKOFF_SECONDS[attempt]
+            delay = backoff_seconds[attempt]
             print(
                 "GitHub API request retry: "
                 f"path={urllib.parse.urlsplit(url).path} "
-                f"attempt={attempt + 2}/{API_REQUEST_ATTEMPTS} "
+                f"attempt={attempt + 2}/{attempts} "
                 f"error={type(error).__name__} delay={delay}s",
                 flush=True,
             )
             time.sleep(delay)
 
 
-def _api_json(token: str, url: str) -> Any:
-    return json.loads(_api_request(token, url))
+def _api_json(token: str, url: str, **request_options: Any) -> Any:
+    return json.loads(_api_request(token, url, **request_options))
 
 
 LEDGER_ARTIFACT_NAMES = ("codex-review-ledger-v2",)
@@ -784,24 +815,53 @@ def fetch_prior_entries(
     *,
     artifact_limit: int = 3,
     time_budget_seconds: float | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
     # Optional environment override: LEDGER_HISTORY_BUDGET_SECONDS (default 90).
-    budget = (
-        float(os.environ.get("LEDGER_HISTORY_BUDGET_SECONDS", "90"))
+    configured_budget = (
+        float(os.environ.get("LEDGER_HISTORY_BUDGET_SECONDS", str(HISTORY_BUDGET_SECONDS)))
         if time_budget_seconds is None else time_budget_seconds
     )
+    if not math.isfinite(configured_budget) or configured_budget < 0:
+        raise ValueError("LEDGER_HISTORY_BUDGET_SECONDS must be finite and non-negative")
+    budget = min(configured_budget, HISTORY_BUDGET_SECONDS)
     started_at = time.monotonic()
     entries: list[dict[str, Any]] = []
     downloaded = 0
     for artifact_name in LEDGER_ARTIFACT_NAMES:
+        if time.monotonic() - started_at + HISTORY_REQUEST_WORST_CASE_SECONDS > budget:
+            print(
+                "::warning::Stopped fetching prior ledger history before the next request: "
+                f"the {budget:g}-second time budget cannot cover its "
+                f"{HISTORY_REQUEST_WORST_CASE_SECONDS:g}-second worst-case request window"
+            )
+            return dedupe_entries(entries), "incomplete"
         query = urllib.parse.urlencode({"name": artifact_name, "per_page": artifact_limit})
-        payload = _api_json(token, f"https://api.github.com/repos/{repository}/actions/artifacts?{query}")
+        payload = _api_json(
+            token,
+            f"https://api.github.com/repos/{repository}/actions/artifacts?{query}",
+            timeout=HISTORY_REQUEST_TIMEOUT_SECONDS,
+            attempts=HISTORY_REQUEST_ATTEMPTS,
+            backoff_seconds=HISTORY_REQUEST_BACKOFF_SECONDS,
+        )
         if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
             raise ValueError("prior ledger artifact list has invalid JSON shape")
         for artifact in payload.get("artifacts", [])[:artifact_limit]:
             if artifact.get("expired"):
                 continue
-            archive = _api_request(token, artifact["archive_download_url"])
+            if time.monotonic() - started_at + HISTORY_REQUEST_WORST_CASE_SECONDS > budget:
+                print(
+                    "::warning::Stopped fetching prior ledger history before artifact "
+                    f"{artifact.get('id')}: the {budget:g}-second time budget cannot cover "
+                    f"its {HISTORY_REQUEST_WORST_CASE_SECONDS:g}-second worst-case request window"
+                )
+                return dedupe_entries(entries), "incomplete"
+            archive = _api_request(
+                token,
+                artifact["archive_download_url"],
+                timeout=HISTORY_REQUEST_TIMEOUT_SECONDS,
+                attempts=HISTORY_REQUEST_ATTEMPTS,
+                backoff_seconds=HISTORY_REQUEST_BACKOFF_SECONDS,
+            )
             downloaded += 1
             with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                 name = next((name for name in bundle.namelist() if name.endswith("ledger.jsonl")), None)
@@ -818,8 +878,9 @@ def fetch_prior_entries(
                     "::warning::Stopped fetching prior ledger history after "
                     f"{downloaded} artifact(s): the {budget:g}-second time budget was exceeded"
                 )
-                return dedupe_entries(entries)
-    return dedupe_entries(entries)
+                return dedupe_entries(entries), "incomplete"
+    deduped = dedupe_entries(entries)
+    return deduped, "complete" if deduped else "none"
 
 
 def fetch_comments(token: str, repository: str, pr_number: int) -> list[dict[str, Any]]:
@@ -955,17 +1016,22 @@ def main() -> int:
         fallback = "not_run"
 
     prior_entries: list[dict[str, Any]] = []
+    history_status = "incomplete"
     dispositions: dict[str, dict[str, Any]] = {}
     comments: list[dict[str, Any]] = []
     try:
-        prior_entries = fetch_prior_entries(token, args.repository)
+        prior_entries, history_status = fetch_prior_entries(token, args.repository)
     except Exception as error:
         print(f"::warning::could not load prior review ledger history; continuing without history: {error}")
     if token:
         try:
             comments = fetch_comments(token, args.repository, args.pr_number)
             dispositions = parse_dispositions(comments)
-            prior_entries = dedupe_entries([*prior_entries, *parse_state_entries(comments)])
+            state_entries = parse_state_entries(comments)
+            if state_entries:
+                prior_entries = dedupe_entries([*prior_entries, *state_entries])
+                if history_status == "none":
+                    history_status = "incomplete"
         except Exception as error:
             print(f"::warning::could not load finding dispositions or PR ledger state: {error}")
 
@@ -989,6 +1055,7 @@ def main() -> int:
         fallback_status=fallback,
         terminal_envelope=terminal,
         input_short_circuited=input_short_circuited,
+        history_status=history_status,
     )
     all_entries = dedupe_entries([*prior_entries, entry])
     write_ledger(args.output, all_entries, max_entries=args.max_entries)

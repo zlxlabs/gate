@@ -399,7 +399,11 @@ def _run_ledger_main(
         install_path.write_text(json.dumps(install), encoding="utf-8")
     output = work / "ledger.jsonl"
     monkeypatch.setenv("GH_TOKEN", "test-token")
-    monkeypatch.setattr(module, "fetch_prior_entries", prior_entries_fetch or (lambda *a, **k: []))
+    monkeypatch.setattr(
+        module,
+        "fetch_prior_entries",
+        prior_entries_fetch or (lambda *a, **k: ([], "none")),
+    )
     monkeypatch.setattr(module, "fetch_comments", lambda *a, **k: [])
     monkeypatch.setattr(module, "post_state_comment", lambda *a, **k: None)
     monkeypatch.setattr(sys, "argv", [
@@ -727,10 +731,10 @@ def test_v2_primary_audit_rejects_companion_fields_for_wrong_verdict(verdict, fi
 
 def test_fetch_prior_entries_fails_on_corrupt_artifact(monkeypatch):
     module = _module()
-    monkeypatch.setattr(module, "_api_json", lambda token, url: {
+    monkeypatch.setattr(module, "_api_json", lambda token, url, **kwargs: {
         "artifacts": [{"id": 1, "expired": False, "archive_download_url": "https://example.test/1"}]
     })
-    monkeypatch.setattr(module, "_api_request", lambda token, url: b"not a zip")
+    monkeypatch.setattr(module, "_api_request", lambda token, url, **kwargs: b"not a zip")
 
     with pytest.raises(zipfile.BadZipFile):
         module.fetch_prior_entries("token", "zlxlabs/app")
@@ -756,7 +760,9 @@ def test_fetch_prior_entries_queries_the_v2_ledger_epoch(monkeypatch):
 
     monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
 
-    assert module.fetch_prior_entries("token", "zlxlabs/app") == []
+    entries, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
+    assert entries == []
+    assert history_status == "none"
     assert len(requested) == 1
     assert "name=codex-review-ledger-v2" in requested[0]
     assert "per_page=3" in requested[0]
@@ -784,7 +790,13 @@ def test_main_downgrades_prior_history_http_error_to_empty_history(tmp_path, mon
     )
 
     assert rc == 0
-    assert len(output.read_text(encoding="utf-8").splitlines()) == 1
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["history_status"] == "incomplete"
+    assert rows[0]["comparison"] == {
+        "kind": "history_incomplete",
+        "authoritative": False,
+    }
     assert "::warning::could not load prior review ledger history" in capsys.readouterr().out
 
 
@@ -814,7 +826,7 @@ def _patch_named_artifact_api(module, monkeypatch, artifacts_by_name: dict[str, 
             rows.append({"id": artifact_id, "expired": False, "archive_download_url": url})
         listed[name] = rows
 
-    def fake_json(token, url):
+    def fake_json(token, url, **kwargs):
         name = (urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("name") or [""])[0]
         return {"artifacts": listed.get(name, [])}
 
@@ -844,7 +856,9 @@ _V2, _V1, _SHARED, _V2U, _V1U = (
 def test_fetch_prior_entries_reads_only_v2_artifact_name(artifacts_by_name, expected, monkeypatch):
     module = _module()
     _patch_named_artifact_api(module, monkeypatch, artifacts_by_name)
-    assert _entry_keys(module.fetch_prior_entries("token", "zlxlabs/app")) == _entry_keys(expected)
+    entries, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
+    assert _entry_keys(entries) == _entry_keys(expected)
+    assert history_status == ("complete" if expected else "none")
 
 
 def test_fetch_prior_entries_returns_downloaded_part_when_time_budget_is_reached(monkeypatch, capsys):
@@ -854,13 +868,113 @@ def test_fetch_prior_entries_returns_downloaded_part_when_time_budget_is_reached
         monkeypatch,
         {"codex-review-ledger-v2": [[_V2], [_V2U], [_SHARED]], "codex-review-ledger": []},
     )
-    clock = iter([100.0, 110.0, 200.0])
+    clock = iter([100.0, 100.0, 100.0, 110.0, 110.0, 200.0])
     monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
 
-    prior = module.fetch_prior_entries("token", "zlxlabs/app", time_budget_seconds=90)
+    prior, history_status = module.fetch_prior_entries("token", "zlxlabs/app", time_budget_seconds=90)
 
     assert _entry_keys(prior) == _entry_keys([_V2, _V2U])
+    assert history_status == "incomplete"
     assert "::warning::Stopped fetching prior ledger history after 2 artifact(s)" in capsys.readouterr().out
+
+
+def test_history_status_has_three_states_and_only_complete_history_can_compare():
+    module = _module()
+    previous = module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="old", preflight={}, audit=_audit("old", ["a"]),
+        prior_entries=[], dispositions={},
+    )
+
+    cases = [
+        ("complete", [previous], "new_head", True),
+        ("incomplete", [previous], "history_incomplete", False),
+        ("none", [], "first_review", False),
+    ]
+    for history_status, prior_entries, kind, authoritative in cases:
+        entry = module.build_entry(
+            repository="zlxlabs/app", pr_number=7, run_id=11, run_attempt=1,
+            head_sha="new", preflight={}, audit=_audit("new", ["a", "b"]),
+            prior_entries=prior_entries, dispositions={}, history_status=history_status,
+        )
+
+        assert entry["history_status"] == history_status
+        assert entry["comparison"]["kind"] == kind
+        assert entry["comparison"]["authoritative"] is authoritative
+        if not authoritative:
+            assert not {
+                "persistent_finding_ids", "resolved_finding_ids", "new_finding_ids",
+                "missing_finding_ids", "appeared_finding_ids",
+            }.intersection(entry["comparison"])
+
+
+@pytest.mark.parametrize(
+    "partial_entries",
+    [[], [_named_entry(9, "partial-history")]],
+    ids=["no_history_downloaded", "history_download_stopped_midway"],
+)
+def test_main_writes_current_row_when_history_is_incomplete(tmp_path, monkeypatch, partial_entries):
+    module = _module()
+
+    def fetch_partial(*args, **kwargs):
+        return partial_entries, "incomplete"
+
+    rc, output, _ = _run_ledger_main(
+        module,
+        tmp_path,
+        monkeypatch,
+        preflight=_preflight(),
+        prior_entries_fetch=fetch_partial,
+    )
+
+    assert rc == 0
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    current = next(row for row in rows if row["run_id"] == 10)
+    assert current["history_status"] == "incomplete"
+    assert current["comparison"] == {
+        "kind": "history_incomplete",
+        "authoritative": False,
+    }
+
+
+def test_history_fetch_retry_exhaustion_stays_below_step_budget(monkeypatch):
+    module = _module()
+    clock = [0.0]
+    calls: list[tuple[str, float]] = []
+    attempts_by_url: dict[str, int] = {}
+    archive_url = "https://example.test/archive/slow"
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    def fake_urlopen(request, timeout):
+        url = request.full_url
+        key = "artifact-list" if "/actions/artifacts" in url else url
+        attempts_by_url[key] = attempts_by_url.get(key, 0) + 1
+        calls.append((url, timeout))
+        clock[0] += timeout
+        if key == "artifact-list":
+            success_attempt = 2 if timeout == 10 else 3
+            if attempts_by_url[key] < success_attempt:
+                raise _connection_urlerror()
+            return _ApiResponse(json.dumps({
+                "artifacts": [{
+                    "id": 1,
+                    "expired": False,
+                    "archive_download_url": archive_url,
+                }],
+            }).encode())
+        raise _connection_urlerror()
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(module.URL_OPENER, "open", fake_urlopen)
+
+    with pytest.raises(urllib.error.URLError):
+        module.fetch_prior_entries("token", "zlxlabs/app")
+
+    assert clock[0] < 144
+    assert [timeout for _, timeout in calls] == [10, 10, 10, 10]
 
 
 def test_v2_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch, capsys):
@@ -869,7 +983,7 @@ def test_v2_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch
     zip_bytes = _ledger_zip_bytes([historical])
     recorded: list[tuple[str, str, dict | None]] = []
 
-    def fake_api_request(token, url, *, method="GET", payload=None):
+    def fake_api_request(token, url, *, method="GET", payload=None, **kwargs):
         recorded.append((method, url, payload))
         parsed = urllib.parse.urlparse(url)
         name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
@@ -886,8 +1000,9 @@ def test_v2_artifact_history_posts_state_comment_when_cursor_missing(monkeypatch
         raise AssertionError(f"unexpected request {method} {url}")
 
     monkeypatch.setattr(module, "_api_request", fake_api_request)
-    prior = module.fetch_prior_entries("token", "zlxlabs/app")
+    prior, history_status = module.fetch_prior_entries("token", "zlxlabs/app")
     assert _entry_keys(prior) == _entry_keys([historical])
+    assert history_status == "complete"
     module.post_state_comment(
         "token", "zlxlabs/app", 7, current["head_sha"],
         module.dedupe_entries([*prior, current]), current, [],
@@ -2008,7 +2123,7 @@ def _build_from_terminal(module, terminal, **overrides):
 
 _SAME_ATTEMPT_TERMINAL_ENTRY_KEYS = {
     "schema_version", "recorded_at", "repository", "pr_number", "run_id",
-    "run_attempt", "head_sha", "review_round", "preflight", "install",
+    "run_attempt", "head_sha", "review_round", "history_status", "preflight", "install",
     "primary_identity", "review", "comparison", "finding_dispositions",
     "convergence_projection", "false_positive_count",
     "disposition_receipt_consumption",
