@@ -67,3 +67,19 @@
 ## PR 正文必写说明
 
 第 7/8 条有意推翻既有“job 级 `continue-on-error` 集合恒等于 `{"ocr"}`”约定：ledger 只负责独立历史台账持久化，不参与 gate 放行（`ledger` 不在 gate 的 needs，`Aggregate required verdict` 也不读取 ledger），但其慢下载/上传失败会把整个 workflow run 染红，导致 PR 页面无法区分门禁失败与非放行台账故障；因此 ledger job 纳入 fail-open 集合，同时保留步骤级 3 分钟预算和 warning/产物观测信号。
+
+## 第二轮修复：terminal 上传失败仍染红 gate
+
+验收第一轮发现首传 terminal artifact 没有 `continue-on-error`，且 panel 发布只看首传 outcome，导致重试成功也无法救回 gate job 或发布面板。本轮只修改 `.github/workflows/gate-v2.yml` gate job 与其契约测试：
+
+- `.github/workflows/gate-v2.yml:1260-1280`：首传和重传均 fail-open；重传步骤 id 为 `retry-upload-gate-terminal`。
+- `.github/workflows/gate-v2.yml:1281-1282`：`Publish gate status panel` 改为首传或重传任一成功即发布。
+- `.github/workflows/gate-v2.yml:1328-1341`：复用现有诊断 warning 步骤；两次 terminal 上传均失败时额外留下 `::warning::`，并保留诊断上传失败 warning。
+- `tests/test_gate_v2_contract.py:907-925,1575-1608`：恒等断言首传 fail-open、重传 id、两次 outcome 的发布条件，以及 terminal 双失败 warning 的条件/env/文案。
+- 未修改 ledger job、`build_ledger.py` 或 `Aggregate required verdict`。
+
+本轮验证：
+
+- `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` → `994 passed in 86.38s (0:01:26)`。
+- `uv run --with pytest,PyYAML,diff-cover,coverage python -m pytest -q tests/test_gate_v2_contract.py tests/test_gate_v2_diagnostics_upload.py` → `136 passed in 29.16s`。
+- `python3 scripts/check_pinned_uses.py` → 退出码 0，9 个 live workflow/action metadata 文件检查通过。

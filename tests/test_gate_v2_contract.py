@@ -905,15 +905,21 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
     terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
-    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error", "retention-days": 30} and "continue-on-error" not in terminal_upload
+    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error", "retention-days": 30} and terminal_upload["continue-on-error"] is True
     terminal_retry = next(s for s in gate_steps if s.get("name") == "Retry upload gate terminal envelope")
     assert terminal_retry["if"] == "always() && steps.upload-gate-terminal.outcome == 'failure'"
+    assert terminal_retry["id"] == "retry-upload-gate-terminal"
     assert terminal_retry["continue-on-error"] is True
     assert terminal_retry["uses"] == terminal_upload["uses"]
     assert terminal_retry["with"] == {
         **terminal_upload["with"],
         "overwrite": True,
     }
+    publish = next(s for s in gate_steps if s.get("name") == "Publish gate status panel")
+    assert publish["if"] == (
+        "always() && (steps.upload-gate-terminal.outcome == 'success' || "
+        "steps.retry-upload-gate-terminal.outcome == 'success')"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1588,8 +1594,18 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
         s for s in gate_steps
         if s.get("name") == "Warn when gate status panel delivery diagnostic is unavailable"
     )
-    assert warning["if"] == "always() && steps.upload-gate-status-panel-diagnostic.outcome == 'failure'"
+    assert warning["if"] == (
+        "always() && (steps.upload-gate-status-panel-diagnostic.outcome == 'failure' || "
+        "(steps.upload-gate-terminal.outcome == 'failure' && "
+        "steps.retry-upload-gate-terminal.outcome == 'failure'))"
+    )
+    assert warning["env"] == {
+        "PANEL_DIAGNOSTIC_OUTCOME": "${{ steps.upload-gate-status-panel-diagnostic.outcome }}",
+        "TERMINAL_UPLOAD_OUTCOME": "${{ steps.upload-gate-terminal.outcome }}",
+        "TERMINAL_RETRY_OUTCOME": "${{ steps.retry-upload-gate-terminal.outcome }}",
+    }
     assert "::warning::" in warning["run"]
+    assert "Gate terminal envelope upload failed after retry" in warning["run"]
 
 
 def test_gate_job_timeout_matches_aggregate_publish_budget():

@@ -1260,6 +1260,7 @@ jobs:
       - name: Upload gate terminal envelope
         if: always()
         id: upload-gate-terminal
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1269,6 +1270,7 @@ jobs:
 
       - name: Retry upload gate terminal envelope
         if: always() && steps.upload-gate-terminal.outcome == 'failure'
+        id: retry-upload-gate-terminal
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -1279,7 +1281,7 @@ jobs:
           overwrite: true
 
       - name: Publish gate status panel
-        if: always() && steps.upload-gate-terminal.outcome == 'success'
+        if: always() && (steps.upload-gate-terminal.outcome == 'success' || steps.retry-upload-gate-terminal.outcome == 'success')
         env:
           GH_TOKEN: ${{ github.token }}
           QUALITY_RESULT: ${{ needs.quality.result }}
@@ -1326,9 +1328,19 @@ jobs:
           retention-days: 3
 
       - name: Warn when gate status panel delivery diagnostic is unavailable
-        if: always() && steps.upload-gate-status-panel-diagnostic.outcome == 'failure'
+        if: always() && (steps.upload-gate-status-panel-diagnostic.outcome == 'failure' || (steps.upload-gate-terminal.outcome == 'failure' && steps.retry-upload-gate-terminal.outcome == 'failure'))
+        env:
+          PANEL_DIAGNOSTIC_OUTCOME: ${{ steps.upload-gate-status-panel-diagnostic.outcome }}
+          TERMINAL_UPLOAD_OUTCOME: ${{ steps.upload-gate-terminal.outcome }}
+          TERMINAL_RETRY_OUTCOME: ${{ steps.retry-upload-gate-terminal.outcome }}
         shell: bash
-        run: echo "::warning::Gate status panel delivery diagnostic was not uploaded; the required verdict was already aggregated"
+        run: |
+          if [ "$PANEL_DIAGNOSTIC_OUTCOME" = "failure" ]; then
+            echo "::warning::Gate status panel delivery diagnostic was not uploaded; the required verdict was already aggregated"
+          fi
+          if [ "$TERMINAL_UPLOAD_OUTCOME" = "failure" ] && [ "$TERMINAL_RETRY_OUTCOME" = "failure" ]; then
+            echo "::warning::Gate terminal envelope upload failed after retry; ledger may lack terminal input"
+          fi
 
   # ── ledger (independent persistence health check) ───────────────────────
   ledger:
