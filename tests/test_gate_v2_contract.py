@@ -346,7 +346,7 @@ def test_classify_job_always_runs_and_exposes_review_expected():
     job = raw["jobs"][CLASSIFY_JOB_ID]
     assert job.get("if") == "always()"
     assert "needs" not in job
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == raw["jobs"]["gate"]["runs-on"]
     assert job["outputs"]["review_expected"] == "${{ steps.classify.outputs.review_expected }}"
     step = next(s for s in job["steps"] if s.get("id") == "classify")
     run = step["run"]
@@ -807,7 +807,7 @@ def test_gate_and_notify_runs_on_use_the_same_guarded_control_plane_route():
     )
     workflow_text = WORKFLOW.read_text()
     assert "gate-control" not in workflow_text
-    for job_name in ("gate", "notify"):
+    for job_name in ("gate", "notify", "classify_pr_paths"):
         runs_on = str(raw["jobs"][job_name]["runs-on"])
         assert runs_on == expected
         assert FORK_GUARD in runs_on

@@ -156,7 +156,11 @@ def test_shadow_classify_job_matches_required_gate_classifier():
     assert shadow_job.get("if") == "always()"
     assert required_job.get("if") == "always()"
     assert "needs" not in shadow_job
-    assert shadow_job["runs-on"] == required_job["runs-on"] == "ubuntu-latest"
+    assert shadow_job["runs-on"] == raw["jobs"]["resolve"]["runs-on"]
+    assert required_job["runs-on"] == required_raw["jobs"]["gate"]["runs-on"]
+    for runs_on in (shadow_job["runs-on"], required_job["runs-on"]):
+        assert FORK_GUARD in runs_on
+        assert "ubuntu-latest" in runs_on
     assert shadow_job["outputs"] == required_job["outputs"]
     shadow_classify = next(s for s in shadow_job["steps"] if s.get("id") == "classify")
     required_classify = next(s for s in required_job["steps"] if s.get("id") == "classify")
