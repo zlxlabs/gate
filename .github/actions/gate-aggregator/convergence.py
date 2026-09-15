@@ -202,18 +202,13 @@ class DispositionReceipt:
 
 @dataclass(frozen=True)
 class DispositionStatus:
-    """Read-only disposition diagnostic; it is not convergence state."""
+    """Receipt claim diagnostics; ``active`` means current-target match, never authorization."""
 
     receipt: DispositionReceipt
     valid: bool
     active: bool
-    consumable: bool
     reason: str
     reason_code: str = ""
-
-    @property
-    def accepted(self) -> bool:
-        return self.consumable
 
     @property
     def finding_id(self) -> str:
@@ -226,29 +221,14 @@ class DispositionStatus:
         return self.reason
 
 @dataclass(frozen=True)
-class DispositionConsumption:
-    """Pure result of applying protected dispositions to one primary audit."""
+class DispositionAudit:
+    """Read-only audit of receipt claims; it never changes primary findings."""
 
-    remaining_p1_ids: tuple[str, ...]
-    consumed_receipts: tuple[DispositionReceipt, ...]
+    primary_p1_ids: tuple[str, ...]
+    recorded_receipts: tuple[DispositionReceipt, ...]
     rejected_receipts: tuple[tuple[DispositionReceipt, str], ...]
-    fail_closed: bool
     statuses: tuple[DispositionStatus, ...] = ()
-    # The stable receipt target is not necessarily its human-facing finding
-    # id. Keep the id resolved during consumption for terminal/ledger output.
-    consumed_finding_ids: tuple[str, ...] = ()
-
-    @property
-    def p1_ids(self) -> tuple[str, ...]:
-        return self.remaining_p1_ids
-
-    @property
-    def consumed(self) -> tuple[DispositionReceipt, ...]:
-        return self.consumed_receipts
-
-    @property
-    def rejected(self) -> tuple[tuple[DispositionReceipt, str], ...]:
-        return self.rejected_receipts
+    recorded_finding_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -370,7 +350,6 @@ class RoundDecision:
     processing_key: ProcessingKey
     round_key: RoundKey
     event_id: str
-    disposition: DispositionConsumption | None = None
 
     @property
     def clean_streak(self) -> int:
@@ -602,7 +581,6 @@ def _disposition_status(
     *,
     valid: bool,
     active: bool,
-    consumable: bool,
     reason: str,
     message: str | None = None,
 ) -> DispositionStatus:
@@ -610,7 +588,6 @@ def _disposition_status(
         receipt=receipt,
         valid=valid,
         active=active,
-        consumable=consumable,
         reason=reason if message is None else message,
         reason_code=reason,
     )
@@ -627,7 +604,7 @@ def _ambiguous_finding_key_status(
     if len(matches) <= 1:
         return None
     return _disposition_status(
-        receipt, valid=False, active=False, consumable=False,
+        receipt, valid=False, active=False,
         reason="finding_key_ambiguous",
         message=(
             f"finding_key_ambiguous: finding key {finding_key!r} matches "
@@ -669,52 +646,52 @@ def validate_disposition_receipt(
 
     if not isinstance(receipt, DispositionReceipt):
         return _disposition_status(
-            DispositionReceipt(), valid=False, active=False, consumable=False,
+            DispositionReceipt(), valid=False, active=False,
             reason="malformed_receipt",
         )
     if _legacy_disposition_stub(receipt):
         return _disposition_status(
-            receipt, valid=False, active=False, consumable=False,
+            receipt, valid=False, active=False,
             reason="absent_legacy_stub",
         )
     if not isinstance(scope, Scope) or _scope_errors(scope):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_scope")
+        return _disposition_status(receipt, valid=False, active=False, reason="malformed_scope")
     if not isinstance(primary, CanonicalPrimary):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_primary")
+        return _disposition_status(receipt, valid=False, active=False, reason="malformed_primary")
     if receipt.schema_version != DISPOSITION_RECEIPT_SCHEMA_VERSION:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="schema_version_mismatch")
+        return _disposition_status(receipt, valid=False, active=False, reason="schema_version_mismatch")
     if receipt.disposition not in DISPOSITION_KINDS:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="unknown_disposition")
+        return _disposition_status(receipt, valid=False, active=False, reason="unknown_disposition")
     target_field = "finding_key" if receipt.finding_key else "finding_id"
     required_text = ("repository_id", "epoch", "head_sha", "audit_digest", target_field, "reason")
     if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+        return _disposition_status(receipt, valid=False, active=False, reason="malformed_receipt")
     if not isinstance(receipt.approver, str) or not receipt.approver.strip():
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+        return _disposition_status(receipt, valid=False, active=False, reason="malformed_receipt")
     if type(receipt.approver_id) is not int or receipt.approver_id <= 0:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+        return _disposition_status(receipt, valid=False, active=False, reason="malformed_receipt")
     if not _approved_at_has_time(receipt.approved_at):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_receipt")
+        return _disposition_status(receipt, valid=False, active=False, reason="malformed_receipt")
     if type(receipt.pr_number) is not int or receipt.pr_number <= 0:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="malformed_pr_number")
+        return _disposition_status(receipt, valid=False, active=False, reason="malformed_pr_number")
     if receipt.repository_id != str(scope.repository_id):
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="repository_mismatch")
+        return _disposition_status(receipt, valid=False, active=False, reason="repository_mismatch")
     if receipt.pr_number != scope.pr_number:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="pr_mismatch")
+        return _disposition_status(receipt, valid=False, active=False, reason="pr_mismatch")
     expected_epoch = derive_epoch(scope)
     if receipt.epoch != expected_epoch:
         return _disposition_status(
-            receipt, valid=False, active=False, consumable=False, reason="epoch_mismatch_stale",
+            receipt, valid=False, active=False, reason="epoch_mismatch_stale",
             message=_actionable_disposition_reason(
                 "epoch_mismatch_stale", receipt, scope=scope, primary=primary,
                 audit_digest=audit_digest,
             ),
         )
     if receipt.head_sha != scope.head_sha:
-        return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="head_sha_mismatch")
+        return _disposition_status(receipt, valid=False, active=False, reason="head_sha_mismatch")
     if not _receipt_audit_digest_matches(receipt.audit_digest, audit_digest, legacy_raw_audit_digest):
         return _disposition_status(
-            receipt, valid=False, active=False, consumable=False, reason="audit_digest_mismatch",
+            receipt, valid=False, active=False, reason="audit_digest_mismatch",
             message=_actionable_disposition_reason(
                 "audit_digest_mismatch", receipt, scope=scope, primary=primary,
                 audit_digest=audit_digest,
@@ -731,7 +708,7 @@ def validate_disposition_receipt(
             return ambiguous
         if len(matches) == 0:
             return _disposition_status(
-                receipt, valid=False, active=False, consumable=False,
+                receipt, valid=False, active=False,
                 reason="finding_not_current_p1",
                 message=_actionable_disposition_reason(
                     "finding_not_current_p1", receipt, scope=scope, primary=primary,
@@ -745,10 +722,10 @@ def validate_disposition_receipt(
         # branch after the v2 artifact TTL has elapsed and all v2 receipts have
         # been reissued with finding_key.
         if receipt.finding_id in {"*", "all"} or any(character in receipt.finding_id for character in "?[]"):
-            return _disposition_status(receipt, valid=False, active=False, consumable=False, reason="finding_target_not_exact")
+            return _disposition_status(receipt, valid=False, active=False, reason="finding_target_not_exact")
         if receipt.finding_id not in primary.p1_ids:
             return _disposition_status(
-                receipt, valid=False, active=False, consumable=False,
+                receipt, valid=False, active=False,
                 reason="finding_not_current_p1",
                 message=_actionable_disposition_reason(
                     "finding_not_current_p1", receipt, scope=scope, primary=primary,
@@ -781,10 +758,10 @@ def validate_disposition_receipt(
         finding_trigger_kind = finding[2] if isinstance(finding, tuple) and len(finding) >= 3 else None
     if finding is None or finding_severity not in P1_SEVERITIES or finding_trigger_kind != "inferred":
         return _disposition_status(
-            receipt, valid=False, active=False, consumable=False,
+            receipt, valid=False, active=False,
             reason="finding_trigger_not_inferred",
         )
-    return _disposition_status(receipt, valid=True, active=True, consumable=True, reason="active_false_positive")
+    return _disposition_status(receipt, valid=True, active=True, reason="active_false_positive")
 
 
 def disposition_status(
@@ -806,20 +783,7 @@ def disposition_status(
     )
 
 
-_DISPOSITION_FAIL_CLOSED_REASONS = frozenset(
-    {
-        "malformed_receipt", "schema_version_mismatch", "unknown_disposition",
-        "malformed_pr_number", "repository_mismatch",
-        "pr_mismatch", "epoch_mismatch_stale", "head_sha_mismatch",
-        "audit_digest_mismatch",
-        "finding_target_not_exact", "finding_not_current_p1", "finding_key_ambiguous",
-        "finding_trigger_not_inferred",
-        "malformed_primary",
-    }
-)
-
-
-def consume_dispositions(
+def record_dispositions(
     p1_ids: Sequence[str],
     receipts: Sequence[DispositionReceipt],
     *,
@@ -827,21 +791,16 @@ def consume_dispositions(
     primary: CanonicalPrimary,
     audit_digest: str,
     legacy_raw_audit_digest: str | None = None,
-) -> DispositionConsumption:
-    """Apply only active exact false-positive receipts to this P1 projection."""
+) -> DispositionAudit:
+    """Validate receipt claims for audit while retaining every primary P1."""
 
-    if not isinstance(p1_ids, Sequence) or isinstance(p1_ids, (str, bytes)):
-        return DispositionConsumption((), (), (), True, ())
-    remaining = list(p1_ids)
-    if any(not _nonempty_text(finding_id) for finding_id in remaining):
-        return DispositionConsumption(tuple(remaining), (), (), True, ())
+    primary_ids = tuple(p1_ids) if isinstance(p1_ids, Sequence) and not isinstance(p1_ids, (str, bytes)) else ()
     if not isinstance(receipts, Sequence) or isinstance(receipts, (str, bytes)):
-        return DispositionConsumption(tuple(remaining), (), (), True, ())
+        return DispositionAudit(primary_p1_ids=primary_ids, recorded_receipts=(), rejected_receipts=())
     statuses: list[DispositionStatus] = []
-    consumed: list[DispositionReceipt] = []
-    consumed_finding_ids: list[str] = []
+    recorded: list[DispositionReceipt] = []
+    recorded_finding_ids: list[str] = []
     rejected: list[tuple[DispositionReceipt, str]] = []
-    fail_closed = False
     seen_payloads: set[str] = set()
     for receipt in receipts:
         if not isinstance(receipt, DispositionReceipt):
@@ -851,14 +810,13 @@ def consume_dispositions(
             )
             statuses.append(status)
             rejected.append((status.receipt, status.reason_code))
-            fail_closed = True
             continue
         if _legacy_disposition_stub(receipt):
-            statuses.append(_disposition_status(receipt, valid=False, active=False, consumable=False, reason="absent_legacy_stub"))
+            statuses.append(_disposition_status(receipt, valid=False, active=False, reason="absent_legacy_stub"))
             continue
         payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         if payload_signature in seen_payloads:
-            statuses.append(_disposition_status(receipt, valid=True, active=True, consumable=False, reason="duplicate_receipt_noop"))
+            statuses.append(_disposition_status(receipt, valid=True, active=True, reason="duplicate_receipt_noop"))
             continue
         seen_payloads.add(payload_signature)
         status = validate_disposition_receipt(
@@ -866,29 +824,22 @@ def consume_dispositions(
             legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
         statuses.append(status)
-        if status.consumable:
+        if status.active and status.valid:
             target_id = receipt.finding_id
             if receipt.finding_key:
                 stable_matches = _stable_primary_matches(receipt.finding_key, primary)
                 if len(stable_matches) == 1:
                     target_id = stable_matches[0][0]
-            if target_id in remaining:
-                remaining.remove(target_id)
-                consumed.append(receipt)
-                consumed_finding_ids.append(target_id)
-            else:
-                rejected.append((receipt, "finding_already_consumed"))
+            recorded.append(receipt)
+            recorded_finding_ids.append(target_id)
         elif status.reason_code != "absent_legacy_stub":
             rejected.append((receipt, status.reason_code))
-            if status.reason_code in _DISPOSITION_FAIL_CLOSED_REASONS:
-                fail_closed = True
-    return DispositionConsumption(
-        remaining_p1_ids=tuple(remaining),
-        consumed_receipts=tuple(consumed),
+    return DispositionAudit(
+        primary_p1_ids=primary_ids,
+        recorded_receipts=tuple(recorded),
         rejected_receipts=tuple(rejected),
-        fail_closed=fail_closed,
         statuses=tuple(statuses),
-        consumed_finding_ids=tuple(consumed_finding_ids),
+        recorded_finding_ids=tuple(recorded_finding_ids),
     )
 
 
@@ -907,18 +858,18 @@ def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
     )
 
 
-def required_disposition_lines(consumption: DispositionConsumption) -> tuple[str, ...]:
-    """Human-visible required-gate lines for consumed false-positive receipts."""
+def recorded_disposition_lines(audit: DispositionAudit) -> tuple[str, ...]:
+    """Human-visible lines label receipts as submitter claims, never approvals."""
 
     lines: list[str] = []
-    for receipt in consumption.consumed_receipts:
+    for receipt in audit.recorded_receipts:
         collapsed = " ".join(receipt.reason.split())
         if len(collapsed) > DISPOSITION_REASON_DISPLAY_MAX:
             collapsed = collapsed[:DISPOSITION_REASON_DISPLAY_MAX]
         target = receipt.finding_key or receipt.finding_id
         lines.append(
-            f"finding {target} ({receipt.disposition}, approved by {receipt.approver}) "
-            f"resolved by receipt {disposition_receipt_artifact_name(receipt)}: {collapsed}"
+            f"finding {target} receipt claim ({receipt.disposition}) submitted by {receipt.approver} "
+            f"recorded as {disposition_receipt_artifact_name(receipt)}: {collapsed}"
         )
     return tuple(lines)
 
@@ -1387,7 +1338,6 @@ def _decision(
     reason: str,
     accepted: bool,
     no_op: bool,
-    disposition: DispositionConsumption | None = None,
 ) -> RoundDecision:
     return RoundDecision(
         state=state,
@@ -1398,7 +1348,6 @@ def _decision(
         processing_key=processing_key,
         round_key=round_key,
         event_id=event_id,
-        disposition=disposition,
     )
 
 
@@ -1408,14 +1357,14 @@ def evaluate_round(
     scope: Scope,
     primary: CanonicalPrimary,
     audit_digest: str,
-    waiver_receipts: Sequence[DispositionReceipt],
+    waiver_receipts: Sequence[DispositionReceipt] = (),
     processing_key: ProcessingKey,
-    legacy_raw_audit_digest: str | None = None,
 ) -> RoundDecision:
     """Consume exactly one canonical primary observation.
 
     A clean round is defined solely by an eligible canonical primary whose
-    current P1 projection is empty after protected disposition consumption.
+    own current P1 projection is empty. ``waiver_receipts`` remains accepted
+    for callers but is ignored; receipt claims are audited by the aggregator.
     """
 
     scope_errors = _scope_errors(scope) if isinstance(scope, Scope) else ["scope must be Scope"]
@@ -1500,9 +1449,6 @@ def evaluate_round(
             accepted=False,
             no_op=False,
         )
-    if not isinstance(waiver_receipts, Sequence) or any(not isinstance(receipt, DispositionReceipt) for receipt in waiver_receipts):
-        failed = _fail_closed_state(state, "waiver receipts have an invalid shape")
-        return _decision(failed, processing_key=processing_key, round_key=RoundKey(epoch, primary.run_id, audit_digest), event_id="", reason=failed.reason, accepted=False, no_op=False)
     # Epoch boundaries precede all idempotency checks. Old indexes cannot
     # consume a round in the new generation.
     if state.epoch != epoch:
@@ -1554,28 +1500,6 @@ def evaluate_round(
             no_op=True,
         )
 
-    disposition_result = consume_dispositions(
-        primary.p1_ids,
-        waiver_receipts,
-        scope=scope,
-        primary=primary,
-        audit_digest=audit_digest,
-        legacy_raw_audit_digest=legacy_raw_audit_digest,
-    )
-    if disposition_result.fail_closed:
-        reasons = ", ".join(reason for _, reason in disposition_result.rejected_receipts)
-        failed = _fail_closed_state(working, f"invalid disposition: {reasons or 'malformed_receipt'}")
-        return _decision(
-            failed,
-            processing_key=processing_key,
-            round_key=round_key,
-            event_id=event_id,
-            reason=failed.reason,
-            accepted=False,
-            no_op=False,
-            disposition=disposition_result,
-        )
-
     if working.terminal_decision == "fail_closed":
         return _decision(
             working,
@@ -1585,7 +1509,6 @@ def evaluate_round(
             reason="fail_closed state is sticky",
             accepted=False,
             no_op=True,
-            disposition=disposition_result,
         )
     if working.terminal_decision == "manual_required":
         return _decision(
@@ -1596,7 +1519,6 @@ def evaluate_round(
             reason="manual_required is terminal for this epoch",
             accepted=False,
             no_op=True,
-            disposition=disposition_result,
         )
     if working.terminal_decision == "converged":
         recorded = _record_event(
@@ -1605,7 +1527,7 @@ def evaluate_round(
             round_key=round_key,
             event_id=event_id,
             fingerprint=fingerprint,
-            verdict=primary.verdict, p1_ids=disposition_result.remaining_p1_ids, effect="terminal",
+            verdict=primary.verdict, p1_ids=primary.p1_ids, effect="terminal",
         )
         terminal = _state_with(recorded, terminal_decision="manual_required", reason="new round after convergence requires manual review")
         return _decision(
@@ -1616,7 +1538,6 @@ def evaluate_round(
             reason=terminal.reason,
             accepted=True,
             no_op=False,
-            disposition=disposition_result,
         )
 
     recorded = _record_event(
@@ -1625,7 +1546,7 @@ def evaluate_round(
         round_key=round_key,
         event_id=event_id,
         fingerprint=fingerprint,
-        verdict=primary.verdict, p1_ids=disposition_result.remaining_p1_ids,
+        verdict=primary.verdict, p1_ids=primary.p1_ids,
         effect="unavailable" if primary.verdict == "unavailable" else "eligible",
     )
     if primary.verdict == "unavailable":
@@ -1645,11 +1566,10 @@ def evaluate_round(
             reason=next_state.reason,
             accepted=True,
             no_op=False,
-            disposition=disposition_result,
         )
 
     eligible = recorded.eligible_rounds + 1
-    streak = recorded.clean_streak + 1 if not disposition_result.remaining_p1_ids else 0
+    streak = recorded.clean_streak + 1 if not primary.p1_ids else 0
     # The threshold is deliberately checked before the eligible cap.
     if streak >= policy.clean_rounds:
         terminal = "converged"
@@ -1676,7 +1596,6 @@ def evaluate_round(
         reason=reason,
         accepted=True,
         no_op=False,
-        disposition=disposition_result,
     )
 
 

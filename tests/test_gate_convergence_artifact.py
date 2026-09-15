@@ -325,7 +325,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     status = CONV.validate_disposition_receipt(
         parsed, scope=SCOPE, primary=primary, audit_digest=digest,
     )
-    assert (status.consumable, status.reason) == (True, "active_false_positive")
+    assert (status.active, status.reason) == (True, "active_false_positive")
     assert (parsed.approver, parsed.approver_id, parsed.approved_at) == (
         "octocat", 1, "2026-08-30T12:00:00Z",
     )
@@ -626,7 +626,7 @@ def _failing_runtime_audit(*, duration_ms, run_attempt, findings=None):
     }
 
 
-def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_path):
+def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path):
     first = _failing_runtime_audit(duration_ms=11, run_attempt=2)
     second = _failing_runtime_audit(
         duration_ms=99, run_attempt=4,
@@ -664,10 +664,11 @@ def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_pat
         receipt, scope=SCOPE, primary=primary, audit_digest=digest,
     )
     assert status.reason == "active_false_positive"
-    consumed = CONV.consume_dispositions(
+    recorded = CONV.record_dispositions(
         primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest=digest,
     )
-    assert consumed.remaining_p1_ids == ()
+    assert recorded.primary_p1_ids == primary.p1_ids
+    assert recorded.recorded_finding_ids == ("model-renamed",)
     other = _failing_runtime_audit(
         duration_ms=99, run_attempt=4,
         findings=[{
@@ -689,7 +690,7 @@ def test_disposition_receipt_consumes_same_findings_across_runtime_bytes(tmp_pat
     assert receipt.finding_key in mismatched.reason
 
 
-def test_legacy_raw_bytes_receipt_still_consumes_same_audit_file():
+def test_legacy_raw_bytes_receipt_is_recorded_without_changing_gate_result():
     audit = _failing_runtime_audit(duration_ms=11, run_attempt=2)
     raw = json.dumps(audit, indent=2).encode() + b"\n"
     legacy = hashlib.sha256(raw).hexdigest()
@@ -713,7 +714,9 @@ def test_legacy_raw_bytes_receipt_still_consumes_same_audit_file():
     without_legacy = AGG.evaluate(**kwargs)
     with_legacy = AGG.evaluate(**kwargs, legacy_raw_audit_digest=legacy)
     assert without_legacy.gate_result == "fail"
-    assert with_legacy.gate_result == "pass"
+    assert with_legacy.gate_result == "fail"
+    assert with_legacy.disposition_audit.recorded_receipts == (receipt,)
+    assert without_legacy.gate_result == with_legacy.gate_result
 
 
 def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():

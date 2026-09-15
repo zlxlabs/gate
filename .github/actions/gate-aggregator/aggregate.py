@@ -279,11 +279,9 @@ class Outcome:
     audit_artifact_name: Optional[str] = None
     convergence_envelope: Optional[dict[str, Any]] = None
     convergence_receipt: Optional[Any] = None
-    resolved_findings: list[str] = field(default_factory=list)
-    # Structured consume_dispositions result. Panel/G4 strings live in
-    # resolved_findings; this object is the only source for the terminal
-    # persistence block (ledger is the second consumer).
-    disposition_consumption: Optional[Any] = None
+    recorded_disposition_claims: list[str] = field(default_factory=list)
+    # Typed receipt audit is the only source for the terminal receipt record.
+    disposition_audit: Optional[Any] = None
 
 
 @dataclass
@@ -370,9 +368,10 @@ _ACTIVE_PUBLISH_BUDGET: contextvars.ContextVar[Optional[_PublishBudget]] = conte
 )
 
 
-def empty_disposition_receipt_consumption() -> dict[str, Any]:
-    """Default block for a run that never consumed a disposition receipt."""
+def empty_disposition_receipt_audit() -> dict[str, Any]:
+    """Default schema-2 block for a run without recorded receipt claims."""
     return {
+        "recorded": [],
         "resolved": [],
         "consumed_count": 0,
         "rejected_count": 0,
@@ -381,40 +380,41 @@ def empty_disposition_receipt_consumption() -> dict[str, Any]:
     }
 
 
-def project_disposition_receipt_consumption(consumption: Any) -> dict[str, Any]:
-    """Project consume_dispositions onto the terminal persistence block.
+def project_disposition_receipt_audit(audit: Any) -> dict[str, Any]:
+    """Project validated submitter claims into an audit-only schema-2 block.
 
-    Reads DispositionReceipt objects, never G4 display strings. Ledger
-    copies this block as the top-level disposition_receipt_consumption
-    field (the second consumer).
+    Receipt disposition is a claim, and actor identity is not human approval.
+    The legacy resolved fields remain empty for schema-2 readers.
     """
-    if consumption is None:
-        return empty_disposition_receipt_consumption()
-    consumed_finding_ids = consumption.consumed_finding_ids
-    if len(consumed_finding_ids) != len(consumption.consumed_receipts):
-        raise ValueError("disposition consumption has mismatched resolved finding ids")
-    resolved = []
-    for index, receipt in enumerate(consumption.consumed_receipts):
+    if audit is None:
+        return empty_disposition_receipt_audit()
+    recorded_finding_ids = audit.recorded_finding_ids
+    if len(recorded_finding_ids) != len(audit.recorded_receipts):
+        raise ValueError("disposition audit has mismatched recorded finding ids")
+    recorded = []
+    for index, receipt in enumerate(audit.recorded_receipts):
         item = {
-            "finding_id": consumed_finding_ids[index],
+            "finding_id": recorded_finding_ids[index],
             "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
-            "approver": receipt.approver,
-            "approver_id": receipt.approver_id,
-            "approved_at": receipt.approved_at,
+            "disposition_claim": receipt.disposition,
+            "triggering_actor": receipt.approver,
+            "triggering_actor_id": receipt.approver_id,
+            "recorded_at": receipt.approved_at,
             "reason": receipt.reason,
         }
         if receipt.finding_key:
             item["finding_key"] = receipt.finding_key
-        resolved.append(item)
+        recorded.append(item)
     rejected_reasons: dict[str, int] = {}
-    for _receipt, reason in consumption.rejected_receipts:
+    for _receipt, reason in audit.rejected_receipts:
         rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
     return {
-        "resolved": resolved,
-        "consumed_count": len(consumption.consumed_receipts),
-        "rejected_count": len(consumption.rejected_receipts),
+        "recorded": recorded,
+        "resolved": [],
+        "consumed_count": 0,
+        "rejected_count": len(audit.rejected_receipts),
         "rejected_reasons": dict(sorted(rejected_reasons.items())),
-        "fail_closed": bool(consumption.fail_closed),
+        "fail_closed": False,
     }
 
 
@@ -438,12 +438,12 @@ def build_terminal_envelope(
         "classification": outcome.classification,
         "reason_code": outcome.reason_code,
         "audit": {"available": outcome.audit_available, "source_attempt": outcome.audit_source_attempt if outcome.audit_available else None, "artifact_name": outcome.audit_artifact_name if outcome.audit_available else None},
-        "disposition_receipt_consumption": project_disposition_receipt_consumption(
-            outcome.disposition_consumption,
+        "disposition_receipt_consumption": project_disposition_receipt_audit(
+            outcome.disposition_audit,
         ),
     }
-    if outcome.resolved_findings:
-        envelope["resolved_findings"] = list(outcome.resolved_findings)
+    if outcome.recorded_disposition_claims:
+        envelope["recorded_disposition_claims"] = list(outcome.recorded_disposition_claims)
     return envelope
 
 
@@ -531,15 +531,6 @@ def build_convergence_envelope(
         "decision": decision.decision,
         "state": decision.state.as_dict(),
     }
-    consumption = getattr(decision, "disposition", None)
-    if consumption is not None and consumption.consumed_receipts:
-        envelope["resolved_findings"] = [
-            {
-                "finding_id": receipt.finding_id,
-                "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
-            }
-            for receipt in consumption.consumed_receipts
-        ]
     return envelope
 
 
@@ -836,7 +827,7 @@ def evaluate(
         processing_key = _CONVERGENCE.ProcessingKey(
             identity.repository_id, identity.pr, identity.run_id, identity.run_attempt,
         )
-        consumption = _CONVERGENCE.consume_dispositions(
+        disposition_audit = _CONVERGENCE.record_dispositions(
             p1_ids,
             waiver_receipts,
             scope=scope,
@@ -844,22 +835,16 @@ def evaluate(
             audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
-        # First-pass consumption is the judge's durable fact: rejected
-        # receipts never reach evaluate_round, so round_decision.disposition
-        # cannot be the persistence source.
-        outcome.disposition_consumption = consumption
-        # Historical / invalid receipts must not fail-close this round's
-        # convergence; only receipts that already consumed a current finding
-        # are forwarded to the evaluator.
+        # The receipt is a submitter claim, so it is recorded without changing
+        # the canonical P1 projection sent to convergence.
+        outcome.disposition_audit = disposition_audit
         state = convergence_state or _CONVERGENCE.initial_state(scope)
         round_decision = _CONVERGENCE.evaluate_round(
             state=state,
             scope=scope,
             primary=primary,
             audit_digest=audit_digest,
-            waiver_receipts=consumption.consumed_receipts,
             processing_key=processing_key,
-            legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
         outcome.convergence_envelope = build_convergence_envelope(
             scope=scope,
@@ -877,22 +862,9 @@ def evaluate(
                 source_attempt=audit_source,
                 artifact_name=artifact_name,
             )
-        resolved_lines = list(_CONVERGENCE.required_disposition_lines(consumption))
-        if resolved_lines:
-            outcome.resolved_findings = resolved_lines
-            if (
-                outcome.classification == "code_fail"
-                and outcome.reason_code == "primary_findings"
-                and not consumption.remaining_p1_ids
-            ):
-                outcome.ok = True
-                outcome.classification = "code_pass"
-                outcome.reason_code = "primary_pass"
-                outcome.gate_result = "pass"
-                outcome.problems = [
-                    problem for problem in outcome.problems
-                    if problem != "primary review verdict is 'fail'"
-                ]
+        recorded_claim_lines = list(_CONVERGENCE.recorded_disposition_lines(disposition_audit))
+        if recorded_claim_lines:
+            outcome.recorded_disposition_claims = recorded_claim_lines
     return outcome
 
 
@@ -977,9 +949,9 @@ def _action_sentence(
         run_url = f"https://github.com/{repository}/actions/runs/{identity.run_id}"
     gate_result = outcome.gate_result
     if gate_result == "pass":
-        if outcome.resolved_findings:
+        if outcome.recorded_disposition_claims:
             return (
-                "No action needed — blocking findings were resolved by disposition receipts; the gate is green."
+                "A disposition receipt claim was recorded; the gate conclusion is unchanged and green."
             )
         return "No action needed — quality passed and the primary reviewer approved this change; the gate is green."
     if gate_result == "skipped":
@@ -1064,9 +1036,9 @@ def render_summary(
         for note in outcome.notes:
             lines.append(f"- {note}")
         lines.append("")
-    if outcome.resolved_findings:
-        lines.append("Resolved:")
-        for line in outcome.resolved_findings:
+    if outcome.recorded_disposition_claims:
+        lines.append("Receipt claims recorded:")
+        for line in outcome.recorded_disposition_claims:
             lines.append(f"- {line}")
         lines.append("")
     if outcome.problems:
@@ -1209,9 +1181,17 @@ def render_status_panel(
     warning_line = _bounded_history_warning(history_warning=history_warning, history_reasons=history_reasons)
     if warning_line:
         lines.extend(["", warning_line])
+    recorded_claims = [
+        line for line in (current.get("recorded_disposition_claims") or [])
+        if isinstance(line, str) and line
+    ]
+    if recorded_claims:
+        lines.extend(["", "Receipt claims recorded:"])
+        for line in recorded_claims:
+            lines.append(f"- {line}")
     resolved = [
         line for line in (current.get("resolved_findings") or [])
-        if isinstance(line, str) and line
+        if isinstance(line, str) and line and "resolved by receipt" not in line
     ]
     if resolved:
         lines.extend(["", "Resolved:"])
@@ -1443,9 +1423,12 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "classification": record["classification"],
         "reason_code": record["reason_code"],
     }
+    recorded_claims = record.get("recorded_disposition_claims")
+    if isinstance(recorded_claims, list) and all(isinstance(item, str) for item in recorded_claims) and recorded_claims:
+        row["recorded_disposition_claims"] = list(recorded_claims)
     resolved = record.get("resolved_findings")
     if isinstance(resolved, list) and all(isinstance(item, str) for item in resolved) and resolved:
-        row["resolved_findings"] = list(resolved)
+        row["resolved_findings"] = [item for item in resolved if "resolved by receipt" not in item]
     return row
 
 
@@ -1602,7 +1585,8 @@ def _fetch_disposition_receipts(
                 ),
             )
             if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
-                break
+                print("::warning::Disposition receipt scan returned an invalid artifact list; claims were not recorded.")
+                return ()
             page_artifacts = payload["artifacts"]
             artifacts.extend(
                 artifact for artifact in page_artifacts
@@ -1614,18 +1598,26 @@ def _fetch_disposition_receipts(
             if len(page_artifacts) < 100:
                 break
             page += 1
-    except Exception:
+    except Exception as exc:
+        print(f"::warning::Disposition receipt scan failed; claims were not recorded ({type(exc).__name__}).")
         return ()
 
     receipts: list[Any] = []
+    artifact_warning_reported = False
     for artifact in artifacts:
         archive_url = artifact.get("archive_download_url")
         if not isinstance(archive_url, str) or not archive_url:
+            if not artifact_warning_reported:
+                print("::warning::Disposition receipt artifact has no archive URL; claims were not recorded.")
+                artifact_warning_reported = True
             continue
         try:
             payload = _read_disposition_zip(_download_terminal_zip(token=token, url=archive_url))
             receipt = _CONVERGENCE.parse_disposition_receipt(payload)
-        except Exception:
+        except Exception as exc:
+            if not artifact_warning_reported:
+                print(f"::warning::Disposition receipt artifact could not be recorded ({type(exc).__name__}).")
+                artifact_warning_reported = True
             continue
         if receipt.pr_number != pr_number or receipt.repository_id != str(repository_id):
             continue
@@ -1998,8 +1990,8 @@ def _panel_current_row(
         "classification": classification,
         "reason_code": reason_code,
     }
-    if outcome.resolved_findings:
-        row["resolved_findings"] = list(outcome.resolved_findings)
+    if outcome.recorded_disposition_claims:
+        row["recorded_disposition_claims"] = list(outcome.recorded_disposition_claims)
     return row
 
 
@@ -2178,8 +2170,8 @@ def _finish(
             handle.write(summary)
     for note in outcome.notes:
         print(f"::notice::{note}")
-    for resolved in outcome.resolved_findings:
-        print(f"::notice::{resolved}")
+    for recorded_claim in outcome.recorded_disposition_claims:
+        print(f"::notice::{recorded_claim}")
     for problem in outcome.problems:
         print(f"::error::{problem}")
     # Terminal-state annotation carrying the machine codes, so the checks list
