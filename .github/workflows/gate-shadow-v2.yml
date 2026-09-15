@@ -27,8 +27,8 @@
 #              changed path is in {retro/acceptance-log.jsonl} ∪ the caller
 #              review_exempt_paths input. Its control-plane route follows
 #              `resolve`: GitHub rounds each job up to a minute, making hosted
-#              minutes a scarce shared pool; agent-config used 668 hosted
-#              minutes from 2026-09-12 through 15. resolve's `if:` is
+#              minutes a scarce shared pool (evidence: zlxlabs/agent-config#2283).
+#              resolve's `if:` is
 #              byte-identical to gate-v2.yml's primary `if:` (includes the
 #              classify output).
 #   resolve  — resolves this repo's `review_policy.*.shadow` reviewer list (via

@@ -21,8 +21,8 @@
 #              draft/fork/hosted). Only `false` skips model jobs; listing
 #              failures stay non-false (fail closed). Its control-plane route
 #              follows `gate`: GitHub rounds each job up to a minute, making
-#              hosted minutes a scarce shared pool; agent-config used 668
-#              hosted minutes from 2026-09-12 through 15. Skip when
+#              hosted minutes a scarce shared pool (evidence: zlxlabs/
+#              agent-config#2283). Skip when
 #              every changed path is in {retro/acceptance-log.jsonl} ∪ the
 #              caller-declared review_exempt_paths input.
 #   quality  — lint / jscpd / dependency-cruiser / tests / PR-size preflight.
@@ -131,8 +131,7 @@ jobs:
     # inside the step also stay non-false. Never skip this job for draft /
     # fork / hosted — those guards stay on primary / resolve_advisory. Its
     # control-plane route follows `gate`; per-job minute rounding makes the
-    # hosted pool scarce (agent-config used 668 minutes from 2026-09-12
-    # through 15).
+    # hosted pool scarce (evidence: zlxlabs/agent-config#2283).
     if: always()
     runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 5
