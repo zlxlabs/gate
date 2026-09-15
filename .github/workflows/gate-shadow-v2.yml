@@ -25,8 +25,12 @@
 #   classify_pr_paths — same script and skip semantics as gate-v2.yml: list PR
 #              files, output review_expected, always run. Skip when every
 #              changed path is in {retro/acceptance-log.jsonl} ∪ the caller
-#              review_exempt_paths input. resolve's `if:` is byte-identical
-#              to gate-v2.yml's primary `if:` (includes the classify output).
+#              review_exempt_paths input. Its control-plane route follows
+#              `resolve`: GitHub rounds each job up to a minute, making hosted
+#              minutes a scarce shared pool (evidence: zlxlabs/agent-config#2283).
+#              resolve's `if:` is
+#              byte-identical to gate-v2.yml's primary `if:` (includes the
+#              classify output).
 #   resolve  — resolves this repo's `review_policy.*.shadow` reviewer list (via
 #              gate-hub's resolve_policy.py, the SAME resolver review-shadow itself uses
 #              internally — this job re-runs it standalone purely to get the list BEFORE
@@ -135,7 +139,7 @@ jobs:
   # ── classify_pr_paths (exempt-path PRs skip shadow resolve) ─────────────
   classify_pr_paths:
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 5
     outputs:
       review_expected: ${{ steps.classify.outputs.review_expected }}

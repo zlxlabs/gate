@@ -19,8 +19,10 @@
 #   classify_pr_paths — lists this PR's changed paths via the GitHub files
 #              API and outputs review_expected. Always runs (never skip on
 #              draft/fork/hosted). Only `false` skips model jobs; listing
-#              failures stay non-false (fail closed). ubuntu-latest so this
-#              cheap API job never waits on a self-hosted slot. Skip when
+#              failures stay non-false (fail closed). Its control-plane route
+#              follows `gate`: GitHub rounds each job up to a minute, making
+#              hosted minutes a scarce shared pool (evidence: zlxlabs/
+#              agent-config#2283). Skip when
 #              every changed path is in {retro/acceptance-log.jsonl} ∪ the
 #              caller-declared review_exempt_paths input.
 #   quality  — lint / jscpd / dependency-cruiser / tests / PR-size preflight.
@@ -127,9 +129,11 @@ jobs:
     # Must always run: a skipped classifier leaves outputs empty, and the
     # model-job `if:` treats empty as not-false (still review). Failures
     # inside the step also stay non-false. Never skip this job for draft /
-    # fork / hosted — those guards stay on primary / resolve_advisory.
+    # fork / hosted — those guards stay on primary / resolve_advisory. Its
+    # control-plane route follows `gate`; per-job minute rounding makes the
+    # hosted pool scarce (evidence: zlxlabs/agent-config#2283).
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 5
     outputs:
       review_expected: ${{ steps.classify.outputs.review_expected }}
