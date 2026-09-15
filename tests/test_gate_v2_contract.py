@@ -611,18 +611,13 @@ def test_job_id_resolution_separates_api_failure_from_empty_result(job_name):
 
 
 # ── concurrency contract ─────────────────────────────────────────────────────
-# Two job-level locks, no workflow-level group: quality/primary cancel stale
-# work per PR; gate/ledger keep cancel-in-progress: false so writers finish.
+# Full lock matrix: no workflow-level group; quality/primary cancel stale work
+# per PR; gate serializes its per-PR panel writer; ledger has no lock because
+# its files and artifact are run-local; every other job stays unlocked.
 
-_WRITER_CONCURRENCY = {
-    "gate": {
-        "group": "gate-required-v2-panel-${{ github.repository_id }}-${{ github.event.pull_request.number }}",
-        "cancel-in-progress": False,
-    },
-    "ledger": {
-        "group": "gate-required-v2-ledger-${{ github.repository_id }}",
-        "cancel-in-progress": False,
-    },
+_GATE_WRITER_CONCURRENCY = {
+    "group": "gate-required-v2-panel-${{ github.repository_id }}-${{ github.event.pull_request.number }}",
+    "cancel-in-progress": False,
 }
 
 
@@ -631,13 +626,12 @@ def test_required_v2_has_no_workflow_level_concurrency():
     assert "concurrency" not in raw
 
 
-def test_gate_and_ledger_writer_locks_remain_cancel_false():
+def test_gate_panel_writer_lock_remains_cancel_false():
     raw, _ = _load_workflow()
     # Byte-exact contract with base: the full mapping (complete group literal
     # + cancel-in-progress) must equal these constants, not just pass per-field
     # shape probes.
-    for job_name, expected in _WRITER_CONCURRENCY.items():
-        assert raw["jobs"][job_name].get("concurrency") == expected
+    assert raw["jobs"]["gate"].get("concurrency") == _GATE_WRITER_CONCURRENCY
 
 
 def _assert_expensive_job_cancel_lock(job_name: str, concurrency: dict) -> None:
@@ -678,7 +672,7 @@ def test_quality_runs_for_each_primary_result_without_dependency(primary_result)
 def test_non_writer_non_expensive_jobs_have_no_concurrency():
     raw, _ = _load_workflow()
     for job_name, job in raw["jobs"].items():
-        if job_name not in {"ledger", "gate", "quality", "primary"}:
+        if job_name not in {"gate", "quality", "primary"}:
             assert "concurrency" not in job
 
 
@@ -974,7 +968,6 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert ledger["needs"] == ["quality", "primary", "gate", "classify_pr_paths"]
     assert ledger["if"] == "always()"
     assert ledger["continue-on-error"] is True
-    assert ledger["timeout-minutes"] == 3
     assert not any(step.get("name") == "Build v2 review effectiveness ledger" for step in gate_steps)
     assert not any(step.get("name") == "Upload v2 review effectiveness ledger" for step in gate_steps)
     retry_upload = next(
@@ -1016,6 +1009,33 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
         "if-no-files-found": "error",
         "retention-days": 30,
     }
+
+
+def _assert_ledger_scheduling_contract(workflow: dict) -> None:
+    ledger = workflow["jobs"]["ledger"]
+    assert ledger["timeout-minutes"] == 10
+    assert "concurrency" not in ledger
+
+
+@pytest.mark.parametrize("regression", ["three_minute_limit", "repository_only_lock"])
+def test_ledger_scheduling_contract_rejects_known_regressions(regression):
+    raw, _ = _load_workflow()
+    ledger = raw["jobs"]["ledger"]
+    if regression == "three_minute_limit":
+        ledger["timeout-minutes"] = 3
+    else:
+        ledger["concurrency"] = {
+            "group": "gate-required-v2-ledger-${{ github.repository_id }}",
+            "cancel-in-progress": False,
+        }
+
+    with pytest.raises(AssertionError):
+        _assert_ledger_scheduling_contract(raw)
+
+
+def test_ledger_job_has_ten_minute_limit_and_no_shared_concurrency():
+    raw, _ = _load_workflow()
+    _assert_ledger_scheduling_contract(raw)
 
 
 def test_ledger_build_step_has_one_minute_timeout():
