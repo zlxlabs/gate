@@ -1,6 +1,6 @@
 # Canonical clean-streak convergence 设计
 
-> 状态：planning；本卡只新增本文档，不修改生产代码、测试或 `.github/`。
+> 状态：历史设计；2026-09-15 的 gate-hub#810 裁决及实现契约以 `docs/sessions/260915-disposition-record-only/design.md` 为准。
 >
 > 目标：把 gate#35 的三增量收敛为可直接拆实现卡的契约，并吸收 gate-hub#335 的 protected、digest-bound false-positive disposition 规格。
 >
@@ -17,12 +17,12 @@
 ```text
 canonical primary audit 已通过 schema / identity / scope 校验
 且 verdict ∈ {pass, fail}
-且当前 P1 finding 集合减去本轮有效 false-positive disposition 后为空
+且 canonical primary audit 的当前 P1 finding 集合为空
 ```
 
-`unavailable`、`not_expected`、reviewer 自报 `waived`、缺 artifact、digest 不匹配和无法验证的 waiver 都不是 clean。它们分别走不可用、预期跳过或 fail-closed/manual-required，不得借“没有看到 finding”放行。
+`unavailable`、`not_expected`、reviewer 自报 `waived` 和非空 P1 集合都不是 clean。Disposition receipt 只记录提交者的主张，不移除 P1、不制造 clean round，也不单独令门禁 fail；缺失、digest 不匹配、畸形或不可读取的 receipt 只影响诊断记录。canonical primary / audit 自身仍按既有规则 fail-closed。
 
-本设计刻意不做跨轮 finding 身份推断。`finding_id` 只用于当前 canonical audit 内精确匹配授权 disposition；不保存前轮 finding 集合、lineage、文本 fingerprint 或行号。这样同一条 finding 反复出现、换 reviewer、换行号或换文本，都不会被误当作 clean。
+本设计刻意不做跨轮 finding 身份推断。`finding_id` 只用于把 receipt claim 定位到当时的 canonical finding；不保存前轮 finding 集合、lineage、文本 fingerprint 或行号。这样同一条 finding 反复出现、换 reviewer、换行号或换文本，都不会被误当作 clean。
 
 ### 1.1 当前基线（必须保留的事实）
 
@@ -33,7 +33,7 @@ canonical primary audit 已通过 schema / identity / scope 校验
 | canonical audit artifact 按 `repository_id/head_sha/run_id/run_attempt` 命名，gate 会选择不晚于当前 attempt 的最高来源 attempt | `.github/workflows/gate-v2.yml:596-669` | 读取必须同时保留 `source_attempt`、artifact id、audit digest；不能只看文件名。 |
 | v2 `gate` 状态条持 PR 级 panel 锁、`ledger` 持 repository 级串行队列（均 cancel false 排队不取消）；`quality`/`primary` 各持 job 级 cancel true 的 PR 取消锁 | `docs/design/gate-convergence-criterion.md`；`tests/test_gate_v2_contract.py:test_gate_and_ledger_writer_locks_remain_cancel_false`、`test_quality_and_primary_have_independent_cancel_true_pr_locks` | 不能假定现有 ledger 锁保护 convergence；增量 3 必须显式验证 writer/receipt 语义。 |
 | review ledger 会读取历史 artifact，并用 sticky comment 保存 epoch 游标，但读取失败目前 warning 后继续 | `.github/actions/review-ledger/build_ledger.py:556-603,692-730` | ledger 只能做观测投影；correctness replay 不能依赖它的 fail-open 路径。 |
-| ledger 目前把 PR 评论中的 `Codex finding disposition` 解析进 `finding_dispositions` | `.github/actions/review-ledger/build_ledger.py:73-85,470-496` | 旧评论格式可以保留作审计输入，但不能直接解除 required 红；必须升级为受保护 receipt。 |
+| ledger 目前把 PR 评论中的 `Codex finding disposition` 解析进 `finding_dispositions` | `.github/actions/review-ledger/build_ledger.py:73-85,470-496` | 旧评论格式只作观察数据；receipt claim 也只作审计记录，二者都不能解除 required 红。 |
 | 终态 envelope 是跨 job artifact，已有 schema/可见性测试 | `.github/actions/gate-aggregator/aggregate.py:189-205`；`tests/test_gate_aggregator.py:test_terminal_envelope_bytes_unchanged_by_rendering_work` | 新 decision 可扩展 versioned envelope，但不能用评论替代它或静默改变旧字段。 |
 
 ### 1.2 固定术语和唯一 source of truth
@@ -89,9 +89,9 @@ def evaluate_round(
 | INV-A4 | scope 任一 guard 变化生成新 epoch，旧计数和 waiver 不继承 | `convergence.py:derive_epoch/replay_receipts` | `tests/test_gate_convergence.py::test_scope_digest_change_starts_zero_generation` |
 | INV-A5 | 相同 processing/round key 重放是 no-op，异文冲突 fail-closed | `convergence.py:dedupe_receipts` | `tests/test_gate_convergence.py::test_duplicate_round_is_idempotent_and_conflicting_payload_fails_closed` |
 | INV-B1 | source attempt、artifact id、audit digest、epoch 必须成组校验 | `aggregate.py` artifact resolver + `convergence.py:validate_receipt` | `tests/test_gate_convergence_artifact.py::test_producer_payload_preserves_all_attempt_guards` |
-| INV-C1 | disposition 只能由人工 `workflow_dispatch` 入口签发；不做签发人身份校验，且绑定当前 `head_sha + audit_digest + epoch + finding_id` | `convergence.py:validate_disposition_receipt` | `tests/test_gate_convergence.py::test_disposition_receipt_is_bound_to_the_current_round` |
-| INV-C2 | `DISPOSITION_KINDS` 只有 `false-positive`；非该值一律 fail-closed，合法值只移除当前同 digest 的 exact P1 | `convergence.py:consume_dispositions` | `tests/test_gate_convergence.py::test_rejected_disposition_cannot_advance_streak` |
-| INV-C3 | `head_sha + audit_digest + epoch + finding_id` 任一变化即失效；这是防止豁免跨轮造成 clean streak 虚假，不是攻击防护 | `convergence.py:validate_disposition_receipt` | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
+| INV-C1 | producer 的 `github.triggering_actor` / `actor_id` 只能标识 GitHub 账号；owner-only Environment 且 `prevent_self_review=false`、共享 owner 凭据不能证明是人工操作。Receipt 只记录 `false-positive` 主张，不授权放行 | `convergence.py:record_dispositions` | `tests/test_review_ledger.py::test_real_disposition_producer_receipt_is_record_only_through_ledger` |
+| INV-C2 | 收据技术校验只决定记录状态；任何值都不能移除当前 P1 或触发 fail-closed gate state | `convergence.py:record_dispositions/evaluate_round` | `tests/test_gate_convergence.py` disposition 状态矩阵 |
+| INV-C3 | `head_sha + audit_digest + epoch + finding_id` 仍绑定审计记录，保证记录对应具体 primary finding；不再授予 gate 权限 | `convergence.py:validate_disposition_receipt` | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
 | INV-D1 | 三个降层问题在 receipt 写入前回答；保护的是写入和 gate 行为两层 | `aggregate.py` + `gate-v2.yml` wiring | `tests/test_gate_convergence_artifact.py::test_terminal_publish_has_verified_receipt_before_exit` |
 | INV-E1 | convergence receipt 是 immutable replay source；ledger 只是观测；评论没有机器 state | `gate-v2.yml` artifact steps + `build_ledger.py` projection | `tests/test_gate_v2_contract.py::test_convergence_state_never_lives_in_pr_comment` |
 
@@ -99,7 +99,7 @@ def evaluate_round(
 
 ### 2.1 轴 A：streak 状态机
 
-状态简写：`C` = collecting（`eligible_rounds < max_rounds` 且 `clean_streak < N`），`U` = collecting 但有不可用预算，`T` = converged/terminal replay，`M` = `manual_required`，`F` = fail-closed/state lost。每个事件先通过 identity、scope、audit 和 disposition 校验，再按以下格子转移；receipt 的 `decision` 字段不参与转移。本表未完整限定路径的 `test_*` 均位于 `tests/test_gate_convergence.py`，artifact 路径另写完整文件名。
+状态简写：`C` = collecting（`eligible_rounds < max_rounds` 且 `clean_streak < N`），`U` = collecting 但有不可用预算，`T` = converged/terminal replay，`M` = `manual_required`，`F` = fail-closed/state lost。此表原本把 disposition 当作 gate 输入，属于 gate-hub#810 已推翻的假设。当前 primary 收敛只按 canonical primary P1 计算；receipt 状态仅影响审计记录，完整更新后的 receipt 轴见 `docs/sessions/260915-disposition-record-only/design.md`。本段状态机的非-disposition格子仍用于解释收敛状态。
 
 | 状态 \ 事件 | 新 major / blocker | 无新 finding | waiver 通过 | waiver 拒绝 | rerun | 新 commit 改 digest |
 |---|---|---|---|---|---|---|
@@ -126,17 +126,16 @@ def evaluate_round(
 
 这里的“唯一”不是依赖 PR 评论的 `If-Match`。artifact id 只是下载定位符；真正 correctness identity 是 epoch、run、attempt、audit digest 的组合。若两个 payload 声称同一组合却字节不同，reducer 必须停在 fail-closed。
 
-### 2.3 轴 C：绑定当前轮次的 false-positive disposition 生命周期
+### 2.3 轴 C：false-positive 主张的记录生命周期
 
-唯一准入约束是人工 `workflow_dispatch`。receipt 只有 9 个字段：`schema_version`、`disposition`、`repository_id`、`pr_number`、`epoch`、`head_sha`、`audit_digest`、`finding_id`、`reason`。不做签发人身份校验；本仓只有一个人类。撤销、expiry、nonce、evidence manifest、issuer/approval provenance、receipt digest 和完整 scope 绑定均已删除，重开条件是本仓出现第二个人类 write 用户。
+本轴记录数据的来源与有效性，不给 receipt 授权效力。`workflow_dispatch` 提交的账号身份不等于人工审批身份。
 
-| 阶段 | 必须发生的事 | 绑定/输出 | 失败与失效 | 检测点 |
+| 阶段 | 必须发生的事 | 记录语义 | 失败与失效 | 检测点 |
 |---|---|---|---|---|
-| 签发申请 | owner 通过人工 `workflow_dispatch` 指定 PR、`finding_id`、非空 `reason`；control job 读取当前 canonical audit | 组装只含上述 9 个字段的 `disposition_receipt`；`disposition` 只能是 `false-positive` | 缺 reason、unknown finding id 或 current audit 不可读：不产可消费 receipt；PR 评论不会改变 required decision | `tests/test_gate_v2_contract.py::test_disposition_workflow_is_protected_and_cannot_publish_gate_result` |
-| 绑定 | receipt 同时绑定 `repository_id/pr_number`、`epoch`、`head_sha`、完整 `audit_digest` 和 exact `finding_id` | canonical JSON 写入 immutable artifact；reason 是自由文本，可包含证据链接 | 不允许 wildcard/category-only；任一绑定值不匹配，明确 targeting 当前 PR 的 receipt fail-closed | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
-| 消费 | reducer 只从当前 epoch/current audit digest 的 receipt 集合取 exact finding id，并移除该当前 P1 的阻塞贡献 | 只消费当前合法 `false-positive`；原始 audit finding 仍保留供人审计 | 仅缺 receipt 则是 active P1 blocked；非 `false-positive` 一律 fail-closed；同一 receipt 不跨轮继承 | `tests/test_gate_convergence.py::test_only_false_positive_resolves_matching_current_finding` |
-| 非法 disposition | reducer 检查 `disposition in DISPOSITION_KINDS`，其中唯一合法值是 `false-positive` | 非法值不进入 waiver 消费路径 | `accepted`、`wont-fix`、`fixed` 或其他值都 fail-closed，不得当作没有 waiver 继续算 | `tests/test_gate_convergence.py::test_rejected_disposition_cannot_advance_streak` |
-| 失效 | 新 head、audit digest、epoch 或 exact finding id 生成新绑定关系 | 换任一值即忽略该 receipt；这条是防自欺，防止豁免跨轮制造虚假 clean streak | receipt 不能解除新一轮或其他 finding 的 P1；无需独立撤销通道 | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
+| 签发申请 | producer 读取当前 canonical audit，要求非空 reason 并确认目标是 inferred P1 | immutable artifact 保存既有 bytes；`disposition` 是提交者的 `false-positive` 主张 | 缺 reason、unknown finding id 或 audit 不可读时不能生成 artifact；Required Check 仍只按 primary / quality 结果判定 | `tests/test_gate_v2_contract.py::test_disposition_workflow_is_protected_and_cannot_publish_gate_result` |
+| 绑定 | receipt 校验 `repository_id/pr_number`、`epoch`、`head_sha`、完整 `audit_digest` 与 exact `finding_id` | binding 让审计记录可定位到当时的 primary finding，不授予放行权 | 不允许 wildcard/category-only；任一绑定不匹配只把该 receipt 记为 stale/invalid diagnostic | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
+| 记录 | 通过技术校验的 receipt 写入 terminal / ledger record | 输出 `recorded`, `claim`, `triggering_actor`；不输出 `resolved` 或人工 `approved` | 不论当前或旧绑定，receipt 均不得移除 P1 或改变 gate / streak | `tests/test_review_ledger.py::test_real_disposition_producer_receipt_is_record_only_through_ledger` |
+| 非法 / 重复 / stale | consumer 保留可诊断的校验状态 | 错误只影响 receipt 记录，不参与 primary 或 convergence 状态 | invalid / duplicate / stale / read error 都不能使原本 pass 变 fail，也不能使原本 fail 变 pass | `tests/test_gate_convergence.py` disposition 状态矩阵；`tests/test_gate_aggregator.py` receipt read-error test |
 
 ### 2.4 轴 D：降层三问（每条路径都要能回答）
 
@@ -144,7 +143,7 @@ def evaluate_round(
 |---|---|---|---|---|
 | primary audit producer | reviewer chain 执行和上传 audit 不可逆；producer 先写临时文件、fsync/close 后以唯一 artifact name 上传；上传失败不产生 eligible receipt | `repo/pr/epoch/run_id/run_attempt/audit_digest/source_attempt` 全量进入 payload 和 artifact name；同组合异文 F | 保护写入：只接受实际上传字节；保护行为：aggregator 不接受 quality/OCR/shadow 代替 canonical primary | `tests/test_gate_convergence_artifact.py::test_primary_producer_payload_is_the_bytes_aggregator_verifies` |
 | convergence receipt | replay 完成前不发布 `gate/gate` green；receipt artifact upload 是不可逆发布，必须在 exit/terminal envelope 前成功 | `event_id`、epoch、round key、artifact id、source attempt 可重算；parallel writer 不靠 CAS | 同时保护写入（receipt 不可变、冲突停机）和行为（`gate_result=pass` 只来自重放后的 N）；不能只测文件写成功 | `tests/test_gate_convergence_artifact.py::test_terminal_publish_has_verified_receipt_before_exit` |
-| disposition receipt | 人工 `workflow_dispatch` 读取 current canonical audit 后签发；原始 PR 评论不会自动变绿 | 9 个字段和 `head_sha + audit_digest + epoch + finding_id` 可重算；不依赖签发人身份 | 保护行为：只解除当前同 digest 的 exact finding；不保护“有人写了任意评论” | `tests/test_gate_convergence.py::test_disposition_receipt_is_bound_to_the_current_round` |
+| disposition receipt | workflow 读取 current canonical audit 后记录提交者主张；PR 评论不会作为 receipt 输入 | 9 个字段和 `head_sha + audit_digest + epoch + finding_id` 用于校验记录归属；账号字段不能证明人工身份 | 仅保护记录完整性；receipt 不解除 finding，也不改变 Required Check | `tests/test_review_ledger.py::test_real_disposition_producer_receipt_is_record_only_through_ledger` |
 | terminal / Required Check | 终态 envelope 和 check context 发布不可逆；发布前必须完成 replay、waiver validation、receipt upload；失败只可 red/manual | `gate/gate` job、run id/attempt、epoch 和 terminal envelope 同源；future artifact、旧 head、旧 source attempt 均拒绝 | 既保护写入也保护行为：`gate` job 必须真的退出对应 code 并发布名为 `gate/gate` 的 check；Step Summary 不能替代 check | `tests/test_gate_v2_contract.py::test_gate_consumes_convergence_before_publishing_required_result` |
 
 ### 2.5 轴 E：介质约束
@@ -153,7 +152,7 @@ def evaluate_round(
 |---|---|---|---|
 | `gate-convergence-receipt-v1-*` immutable artifact（每个 producer event 一个） | scope/epoch、run/attempt、audit digest、当轮 P1 evidence、disposition consumption、producer metadata、event id、可重算的 decision 诊断 | 可被 PATCH 的累计 counter、唯一“当前 state”文件、跨轮 finding lineage；artifact 中的 counter 只能是诊断字段 | 按 artifact 全集纯函数 replay；listing/download/字节/digest 错误 F/M；`tests/test_gate_convergence_artifact.py::test_replay_uses_receipt_bytes_not_reported_counters` |
 | canonical primary audit artifact | reviewer 原始 verdict、findings、scope、attempt chain、audit bytes | streak、waiver authorization、PR comment state | 只作为 canonical input；`aggregate.py` 先校验 identity/schema。audit **文件字节不稳定**（含 duration/tokens/timestamps）；disposition `audit_digest` 对 `canonical_audit_digest` 的字段子集取哈希，见 `tests/test_gate_convergence.py::test_canonical_audit_digest_ignores_runtime_noise` |
-| disposition receipt artifact | 9 个字段：`schema_version`、`disposition`、`repository_id`、`pr_number`、`epoch`、`head_sha`、`audit_digest`、`finding_id`、`reason` | 直接 gate pass、全局忽略规则、可变“active=true”旗标 | reducer 按当前 head/audit/epoch/finding 重算消费；`tests/test_gate_convergence_artifact.py::test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit` |
+| disposition receipt artifact | 既有字段与 producer bytes，包括提交者的 `false-positive` 主张 | 直接 gate pass、全局忽略规则、可变“active=true”旗标 | reducer 只校验并记录当前/失效状态，绝不移除 P1；`tests/test_gate_convergence_artifact.py::test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit` |
 | `codex-review-ledger-v2` JSONL | 每轮观测、review status、finding/disposition 诊断、convergence decision/receipt ids 的 additive projection | correctness state、唯一 writer cursor、缺历史时的默认 clean | ledger 可 fail-open 但 required evaluator 不可依赖；`tests/test_review_ledger.py::test_convergence_projection_is_observational_only` |
 | `gate-terminal-v1` / 新 versioned terminal envelope | 本 run 的最终 machine decision、epoch、streak snapshot、reason、receipt ids | 下一轮要修改的累计 state | envelope 是发布结果不是输入；`tests/test_gate_aggregator.py::test_terminal_envelope_bytes_unchanged_by_rendering_work` 与新增 convergence envelope golden test |
 | PR 评论 / Step Summary / annotation | 面向人的当前 run 摘要、被 disposition 的 exact finding、reason/evidence 直达链接、manual action | 任意 `gate-convergence-state` marker、counter、epoch cursor、waiver active flag、CAS token、唯一 replay 输入 | 普通用户评论和 bot 评论都不参与 replay；`tests/test_gate_v2_contract.py::test_convergence_state_never_lives_in_pr_comment` |
@@ -210,43 +209,15 @@ hosted、primary skipped 或 audit 不可用等没有 canonical primary 的轮�
 
 实现约 550 行，纯函数测试与 fixture 约 750 行，合计约 1,300 行，低于本增量 3,500 行上限；不新增 retry/fallback/防御性吞错。
 
-### 增量 2：绑定当前轮次的 false-positive disposition
+### 增量 2：绑定当前轮次的 false-positive disposition（原授权方案已撤销）
 
-**范围裁决（2026-08-20，owner）**
+2026-09-15，gate-hub#810 证明原来的身份前提不成立：disposition workflow 记录 `github.triggering_actor` / `github.actor_id`，但 owner-only Environment 没有禁止自批，共用 owner 凭据下无法据此区分人和执行器。用户裁决为“收据只记账，不再改变门禁结论”。
 
-本节原设计包含 protected issuer provenance、evidence manifest 密码学校验、nonce 一次性、
-append-only revocation、expiry 与完整 scope 绑定。经第一性原理复核：本仓是个人自用的多
-Agent 开发门禁，write 权限只有 owner 与其派出的 agent，**上述机制防的「有预谋的内部
-攻击者」在本项目中不存在**，属过度设计，已全部删除。判定依据与实测见
-`docs/sessions/gate35-inc2/reviews/inc2-r1-verdict.md`、`inc2-r2-verdict.md`。
+Receipt 仍绑定 `repository_id/pr_number`、`epoch`、`head_sha`、完整 `audit_digest` 和 exact `finding_id`；这些字段用于校验和解释所记录的主张，不提供放行权。`audit_digest` 继续按 `canonical_audit_digest` 计算，producer 对 canonical audit 中 inferred P1 的目标真实性检查照常执行。
 
-**目标**
+Input artifact 保留既有 JSON bytes 与字段，包括 `disposition=false-positive`、`approver`、`approver_id`、`approved_at`。其中 disposition 是提交者主张；身份/时间字段表示 producer 收到的 GitHub 账号与时间，不能呈现为已验证的人工审批。Terminal / ledger 只写 `recorded`、`claim` 和 `triggering_actor` 语义，不再写“approved”或“resolved”。
 
-让 owner 能对**当前这一轮 canonical audit 中的 exact finding** 声明 false-positive，
-使该 finding 不再阻塞 required gate，并留下三个月后仍读得懂的理由。
-
-**保留的绑定（与安全无关，与正确性有关）**
-
-豁免绑定 `head_sha + audit_digest + epoch + finding_id`。换 head、换 **canonical** audit 或换 epoch 即失效。
-`audit_digest` 是 scope 稳定字段 + 排序后的 finding `id/severity/file/line` + `verdict` 的 canonical JSON SHA-256（`convergence.canonical_audit_digest`），**不是** audit 文件原始字节：primary 每次 run 都会写入 duration/tokens/timestamps，按字节绑定会使任何 rerun 都 `audit_digest_mismatch`。消费端过渡期同时接受新 canonical digest 与旧 raw-bytes digest（expand-then-contract）；签发端只产新 digest。
-理由：门禁主审存在「挤牙膏」行为（每轮只报一条不代表只剩一条），一次豁免若能跨 finding 集永久生效，
-clean streak 就不再反映真实收敛。这条不是防攻击，是防自欺。
-
-**receipt 形状**
-
-`schema_version`、`disposition`（只允许 `false-positive`）、`repository_id`、`pr_number`、
-`epoch`、`head_sha`、`audit_digest`、`finding_id`、`reason`。
-
-**唯一的准入约束**
-
-签发入口是人工 `workflow_dispatch`。agent 在 CI 中够不到该入口——这已满足本仓唯一的威胁模型
-（agent 不应能给自己开绿灯）。不做签发人身份校验：本仓只有一个人类。
-
-**若将来变成多人协作**
-
-需要重新引入的是：issuer provenance（从 GitHub environment 的真实审批记录取 approver）与
-canonical audit 的 run provenance 校验（核验 run 的 workflow identity/ref/event/conclusion，
-而非只信 artifact 自报字段）。重开条件是**本仓出现第二个人类 write 用户**，不是「觉得更严谨」。
+当前没有人工放行路径。若未来确实需要人工放行，必须先提供执行器拿不到的独立审批身份，再由新设计决定如何消费；不能恢复 owner 共用凭据下的旧 shortcut。
 
 ### 增量 3b：workflow 读回、replay 接线与 canary 实证
 
@@ -285,7 +256,7 @@ canonical primary upload
 | clean streak | personal `N=1` 一次无 P1；internal `N=2` 连续两次同 epoch 无 P1 | personal 首轮 `gate/gate=success`；internal 首轮非 pass、第二个 distinct round 才 success；OCR/shadow 不改变结果 |
 | active finding | 同 epoch 连续提交含 major 的 audit，finding id 可相同或变化 | 每个 eligible round `streak=0`；达到 max 后 `manual_required`/red，不能因 finding “重复”而放行 |
 | valid false positive | 先让唯一 P1 使 gate red，再走 protected disposition，再运行真实 gate | 只有 exact digest/finding 的 `false-positive` 消除该项；receipt id/reason/evidence 可见；不产生空 commit/admin bypass |
-| invalid/stale disposition | 修改 head/diff、错误 audit digest、unknown id、过期、撤销、普通评论或 label | 旧 receipt 不消费；current-target malformed 走 fail-closed/manual；普通评论永不改变 Required Check |
+| invalid/stale disposition | 修改 head/diff、错误 audit digest、unknown id、过期、撤销、普通评论或 label | receipt 只留下诊断；无论是否 current-target 都不改变 P1、clean streak 或 Required Check；普通评论永不改变 Required Check |
 | unavailable/manual | 连续产生 `K=max_rounds` 个同 epoch reviewer/circuit unavailable receipt；穿插一次 eligible round 再重复 | unavailable 不增 eligible；连续 K 次进入 `manual_required`；eligible round 清空 unavailable streak；不返回 pass |
 | rerun / cross-attempt | 对同一 run 执行 `rerun --failed`，使 attempt 2 读取 attempt 1 audit；再产生不同 audit digest | 同 audit 不多一个 round；新 digest 只计一次；source attempt/selected artifact 都可在 payload 与 envelope 对上 |
 | force-push / parallel | 同时触发两个 attempt，再 push 新 head | receipt replay 与到达顺序无关；旧 epoch 全排除；新 epoch 从零开始；同 event 异文 fail-closed |
@@ -310,8 +281,8 @@ workflow/resolver/aggregator wiring 约 750 行，跨边界测试与 canary fixt
 三增量的落地顺序和停线条件：
 
 1. 增量 1 未通过轴 A 全格矩阵，禁止接 waiver 或 workflow。
-2. 增量 2 未通过当前 `head_sha + audit_digest + epoch + finding_id` 绑定与非 `false-positive` fail-closed 测试，禁止在 required gate 中消费任何评论 disposition；只能继续保持 active P1 red/manual。
+2. disposition 绑定校验或 receipt 记录测试未通过时，禁止将 receipt claim 写成 resolved/approved；Required Check 仍只看 canonical primary 与 quality。
 3. 增量 3 的静态 contract、payload boundary 和真实 canary 任一未通过，不能把 `gate/gate` 标为已收敛；先回滚到旧 fail-closed aggregator，保留 immutable receipts 供调查，不删除 evidence。
-4. canary 后发现旧 epoch receipt 被错误消费、parallel order 影响结果、或 disposition 能跨当前 head/audit/epoch/finding 解红，立即关闭 convergence consumer/feature pin；不得用空 commit、label、admin bypass 或手改评论补洞。
+4. canary 后发现 receipt 状态影响 primary P1、clean streak 或 Required Check，立即关闭 convergence consumer/feature pin；不得用空 commit、label、admin bypass 或手改评论补洞。
 
-本设计最终冻结的核心判据是：**只对当前 epoch 的 canonical primary 做本轮 P1 机械判定；只对人工 `workflow_dispatch` 产出的、绑定当前 `head_sha + audit_digest + epoch + exact finding_id` 的 `false-positive` 做当前轮授权；非 `false-positive` 一律 fail-closed；跨轮只重放 immutable artifact，不把 GitHub 评论当可变状态。**
+本设计的收敛判据仍是：**只对当前 epoch 的 canonical primary 做本轮 P1 机械判定；disposition receipt 仅为绑定到具体 finding 的审计主张，任何 receipt 均无当前轮授权；receipt 校验和读取失败不进入 Required Check 判定；跨轮只重放 convergence immutable artifact，不把 GitHub 评论当可变状态。**

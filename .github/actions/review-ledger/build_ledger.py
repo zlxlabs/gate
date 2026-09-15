@@ -361,9 +361,10 @@ def _primary_identity(
     return {field: audit[field] for field in PRIMARY_IDENTITY_FIELDS if field in audit}
 
 
-def empty_disposition_receipt_consumption() -> dict[str, Any]:
-    """Producer empty block. Copied onto the ledger only when a terminal is present."""
+def empty_disposition_receipt_audit() -> dict[str, Any]:
+    """Empty schema-2 receipt block for a run without recorded claims."""
     return {
+        "recorded": [],
         "resolved": [],
         "consumed_count": 0,
         "rejected_count": 0,
@@ -391,8 +392,8 @@ def load_gate_terminal_envelope(path: Path) -> dict[str, Any]:
     return payload
 
 
-def validate_disposition_receipt_consumption(block: Any) -> dict[str, Any]:
-    """Type-check the producer block. Does not re-run receipt auth/waiver rules."""
+def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
+    """Validate submitter claims and retain legacy schema-2 fields."""
     if not isinstance(block, dict):
         raise ValueError("disposition_receipt_consumption must be an object")
     for key in ("resolved", "consumed_count", "rejected_count", "rejected_reasons", "fail_closed"):
@@ -445,7 +446,29 @@ def validate_disposition_receipt_consumption(block: Any) -> dict[str, Any]:
     fail_closed = block["fail_closed"]
     if type(fail_closed) is not bool:
         raise ValueError("disposition_receipt_consumption.fail_closed must be a boolean")
+    recorded = block.get("recorded", [])
+    if not isinstance(recorded, list):
+        raise ValueError("disposition_receipt_consumption.recorded must be an array")
+    projected_claims: list[dict[str, Any]] = []
+    for item in recorded:
+        if not isinstance(item, dict):
+            raise ValueError("disposition_receipt_consumption.recorded item must be an object")
+        for key in ("finding_id", "receipt", "disposition_claim", "triggering_actor", "recorded_at", "reason"):
+            if not isinstance(item.get(key), str) or not item[key]:
+                raise ValueError(f"disposition_receipt_consumption.recorded item has invalid {key}")
+        if not _strict_int(item.get("triggering_actor_id")) or item["triggering_actor_id"] <= 0:
+            raise ValueError("disposition_receipt_consumption.recorded triggering_actor_id must be a positive integer")
+        projected_claim = {key: item[key] for key in (
+            "finding_id", "receipt", "disposition_claim", "triggering_actor",
+            "triggering_actor_id", "recorded_at", "reason",
+        )}
+        if "finding_key" in item:
+            if not isinstance(item["finding_key"], str) or not item["finding_key"]:
+                raise ValueError("disposition_receipt_consumption.recorded has invalid finding_key")
+            projected_claim["finding_key"] = item["finding_key"]
+        projected_claims.append(projected_claim)
     return {
+        "recorded": projected_claims,
         "resolved": projected,
         "consumed_count": consumed_count,
         "rejected_count": rejected_count,
@@ -479,7 +502,7 @@ def _disposition_receipt_consumption_from_terminal(
         raise ValueError(f"gate terminal identity mismatch: {sorted(mismatches)}")
     if "disposition_receipt_consumption" not in envelope:
         raise ValueError("gate terminal artifact is missing disposition_receipt_consumption")
-    return validate_disposition_receipt_consumption(envelope["disposition_receipt_consumption"])
+    return validate_disposition_receipt_audit(envelope["disposition_receipt_consumption"])
 
 
 def build_entry(
