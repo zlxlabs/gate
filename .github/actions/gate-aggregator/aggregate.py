@@ -1652,22 +1652,26 @@ def _silo_objects_under(prefix: str) -> list[tuple[str, bytes]]:
     """Return (key, body) pairs under a Silo prefix. Raises on listing/get failure."""
 
     store = _silo_store_mod()
+    has_boto3 = True
     try:
         import boto3  # noqa: F401
-        client = store.connect()
-        bucket = store.bucket_name()
-        keys = store.list_keys(client, bucket, prefix)
-        objects: list[tuple[str, bytes]] = []
-        for key in keys:
-            response = client.get_object(Bucket=bucket, Key=key)
-            objects.append(
-                (key, store._body_bytes(response.get("Body") if isinstance(response, dict) else response))
-            )
-        return objects
     except ImportError:
-        pass
-    except SystemExit as exc:
-        raise RuntimeError(f"silo scan failed with exit {exc.code}") from exc
+        has_boto3 = False
+
+    if has_boto3:
+        try:
+            client = store.connect()
+            bucket = store.bucket_name()
+            keys = store.list_keys(client, bucket, prefix)
+            objects: list[tuple[str, bytes]] = []
+            for key in keys:
+                response = client.get_object(Bucket=bucket, Key=key)
+                objects.append(
+                    (key, store._body_bytes(response.get("Body") if isinstance(response, dict) else response))
+                )
+            return objects
+        except SystemExit as exc:
+            raise RuntimeError(f"silo scan failed with exit {exc.code}") from exc
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="silo-scan-") as dest:
