@@ -20,3 +20,10 @@
 - 本段结论：`gate-v2-disposition.yml` 去掉 `upload-artifact`；receipt 走 `silo_store put-dir --tier d30`；primary-audit 先 `get --key d14/…/primary-review-audit.json`，退出码 2 才 `gh run download`。首个 S3 步前有与 B1 同款 MagicDNS（`100.100.100.100`）。`runs-on` 改为 `[self-hosted, linux, ci]`，因为 GitHub-hosted 到不了 tailnet Silo。
 - 关键决策与已否决方案：回退只绑 Silo 退出码 2（键不存在），其它 Silo 错误 fail-loud。未改 receipt 文件名。caller 模板不在本卡允许范围，沿用 `secrets: inherit`。
 - 下一步唯一动作：文档与契约测试对齐后跑全量 pytest 与 `check_pinned_uses.py`。
+
+## 2026-09-16 文档与收口
+
+- 当前阶段：implementing / 文档收口
+- 本段结论：`docs/gate-v2-status-panel.md` 与 `docs/design/clean-streak-convergence.md` 改为描述 GitHub ∪ Silo 双读、Silo 优先下载与 receipt 上传。全量验证与 `check_pinned_uses.py` 在本段之后跑。
+- 关键决策与已否决方案：无
+- 下一步唯一动作：全量验证；红验一条双读断言。
