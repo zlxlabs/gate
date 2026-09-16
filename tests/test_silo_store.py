@@ -12,10 +12,17 @@ import pytest
 from scripts import silo_store as store
 
 
+class FakeClientError(Exception):
+    def __init__(self, code: str, message: str = "Client error", key: str = ""):
+        super().__init__(f"{code}: {message}")
+        self.response = {"Error": {"Code": code, "Message": message, "Key": key}}
+
+
 class FakeS3:
-    def __init__(self, objects=None, *, list_error=None):
+    def __init__(self, objects=None, *, list_error=None, get_error=None):
         self.objects = dict(objects or {})
         self.list_error = list_error
+        self.get_error = get_error
         self.puts: list[str] = []
 
     def put_object(self, *, Bucket, Key, Body):
@@ -28,8 +35,12 @@ class FakeS3:
         return {}
 
     def get_object(self, *, Bucket, Key):
+        if self.get_error is not None:
+            if callable(self.get_error):
+                raise self.get_error(Key)
+            raise self.get_error
         if Key not in self.objects:
-            raise KeyError(f"NoSuchKey: {Key}")
+            raise FakeClientError("NoSuchKey", f"Key {Key} not found", key=Key)
         return {"Body": io.BytesIO(self.objects[Key])}
 
     def list_objects_v2(self, *, Bucket, Prefix="", ContinuationToken=None):
@@ -280,3 +291,71 @@ def test_magicdns_prints_ip_or_tailnet_error(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "tailnet 不可达" in err
     assert "100.100.100.100" in err
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_rc"),
+    [
+        ("NoSuchKey", store.EXIT_NOT_FOUND),
+        ("404", store.EXIT_NOT_FOUND),
+        ("NoSuchBucket", store.EXIT_NOT_FOUND),
+        ("AccessDenied", store.EXIT_ERROR),
+        ("InternalError", store.EXIT_ERROR),
+    ],
+)
+def test_get_client_error_mapping_contract(monkeypatch, capsys, tmp_path, code, expected_rc):
+    fake = FakeS3(get_error=FakeClientError(code, f"Mocked {code}"))
+    _use(monkeypatch, fake)
+    target_key = "d14/42/primary-audit-v2-42-sha-1-1/primary-review-audit.json"
+    with pytest.raises(SystemExit) as caught:
+        store.main(["get", "--key", target_key, "--dest", str(tmp_path / "out.json")])
+    assert caught.value.code == expected_rc
+    err = capsys.readouterr().err
+    if expected_rc == store.EXIT_NOT_FOUND:
+        assert f"Silo object not found: {target_key}" in err
+    else:
+        assert f"({code}): {target_key}" in err
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_rc"),
+    [
+        ("NoSuchKey", store.EXIT_NOT_FOUND),
+        ("404", store.EXIT_NOT_FOUND),
+        ("NoSuchBucket", store.EXIT_NOT_FOUND),
+        ("AccessDenied", store.EXIT_ERROR),
+    ],
+)
+def test_list_download_client_error_mapping_contract(monkeypatch, capsys, tmp_path, code, expected_rc):
+    target_key = "d30/1327629472/gate-disposition-receipt-v2-xyz/gate-disposition-receipt-v2-xyz"
+    objects = {target_key: b"{}"}
+    fake = FakeS3(objects, get_error=FakeClientError(code, f"Mocked {code}"))
+    _use(monkeypatch, fake)
+
+    # list without --dest does not download and succeeds with exit 0
+    assert store.main(["list", "--prefix", "d30/1327629472/gate-disposition-receipt-v2-"]) == 0
+    assert target_key in capsys.readouterr().out
+
+    # list with --dest triggers download and maps ClientError
+    dest = tmp_path / "dest"
+    with pytest.raises(SystemExit) as caught:
+        store.main(["list", "--prefix", "d30/1327629472/gate-disposition-receipt-v2-", "--dest", str(dest)])
+    assert caught.value.code == expected_rc
+    err = capsys.readouterr().err
+    if expected_rc == store.EXIT_NOT_FOUND:
+        assert f"Silo object not found: {target_key}" in err
+    else:
+        assert f"({code}): {target_key}" in err
+
+
+def test_get_non_structured_client_error_fails_loud(monkeypatch, capsys, tmp_path):
+    class FakeLegacyClientError(Exception):
+        pass  # Class name or str contains ClientError/NoSuchKey, but no structured .response dict
+
+    fake = FakeS3(get_error=FakeLegacyClientError("ClientError: NoSuchKey happened"))
+    _use(monkeypatch, fake)
+    target_key = "d14/42/name/file.json"
+    with pytest.raises(SystemExit) as caught:
+        store.main(["get", "--key", target_key, "--dest", str(tmp_path / "out.json")])
+    assert caught.value.code == store.EXIT_ERROR
+    assert caught.value.code != store.EXIT_NOT_FOUND

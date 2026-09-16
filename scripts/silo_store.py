@@ -310,10 +310,16 @@ def cmd_get(args: argparse.Namespace) -> int:
             try:
                 response = client.get_object(Bucket=bucket, Key=key)
             except Exception as err:  # noqa: BLE001
-                name = type(err).__name__
-                if name in {"NoSuchKey", "ClientError"} or "NoSuchKey" in str(err):
-                    fail(f"Silo object not found: {key}", EXIT_NOT_FOUND)
-                fail(f"Silo get failed: {name}: {err}")
+                resp = getattr(err, "response", None)
+                if isinstance(resp, dict):
+                    error_dict = resp.get("Error")
+                    code = error_dict.get("Code") if isinstance(error_dict, dict) else None
+                    if code in {"NoSuchKey", "404", "NoSuchBucket"}:
+                        fail(f"Silo object not found: {key}", EXIT_NOT_FOUND)
+                    if code:
+                        fail(f"Silo get failed ({code}): {key}")
+                    fail(f"Silo get failed: {key}")
+                fail(f"Silo get failed: {err}")
             body = _body_bytes(response.get("Body") if isinstance(response, dict) else response)
             if args.key and (dest.exists() and dest.is_dir() or str(args.dest).endswith("/")):
                 target = dest / Path(key).name
@@ -400,10 +406,16 @@ def cmd_list(args: argparse.Namespace) -> int:
             try:
                 response = client.get_object(Bucket=bucket, Key=key)
             except Exception as err:  # noqa: BLE001
-                name = type(err).__name__
-                if name in {"NoSuchKey", "ClientError"} or "NoSuchKey" in str(err):
-                    fail(f"Silo object not found: {key}", EXIT_NOT_FOUND)
-                fail(f"Silo list download failed: {name}: {err}")
+                resp = getattr(err, "response", None)
+                if isinstance(resp, dict):
+                    error_dict = resp.get("Error")
+                    code = error_dict.get("Code") if isinstance(error_dict, dict) else None
+                    if code in {"NoSuchKey", "404", "NoSuchBucket"}:
+                        fail(f"Silo object not found: {key}", EXIT_NOT_FOUND)
+                    if code:
+                        fail(f"Silo list download failed ({code}): {key}")
+                    fail(f"Silo list download failed: {key}")
+                fail(f"Silo list download failed: {err}")
             body = _body_bytes(response.get("Body") if isinstance(response, dict) else response)
             target = dest / artifact_name / relative
             target.parent.mkdir(parents=True, exist_ok=True)
