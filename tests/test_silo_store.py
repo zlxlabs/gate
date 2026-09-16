@@ -115,6 +115,49 @@ def test_put_dir_empty_skip_prints_notice(tmp_path, monkeypatch, capsys):
     assert "::notice::silo put-dir skipped" in capsys.readouterr().out
 
 
+def test_put_single_file_missing_fails(tmp_path, monkeypatch, capsys):
+    _use(monkeypatch, FakeS3())
+    missing = tmp_path / "absent.json"
+    with pytest.raises(SystemExit) as caught:
+        store.main(["put", "--tier", "d1", "--repo-id", "7", "--name", "single-test", "--file", str(missing)])
+    assert caught.value.code == store.EXIT_ERROR
+    assert f"put source is not a file: {missing}" in capsys.readouterr().err
+
+
+def test_put_multi_file_partial_missing_uploads_existing_and_logs_skip(tmp_path, monkeypatch, capsys):
+    fake = FakeS3()
+    _use(monkeypatch, fake)
+    existing = tmp_path / "pr-size-preflight.json"
+    existing.write_bytes(b'{"size": 42}')
+    missing = tmp_path / "install-result.json"
+    rc = store.main([
+        "put", "--tier", "d1", "--repo-id", "7", "--name", "ledger-input",
+        "--file", str(existing), "--file", str(missing),
+    ])
+    assert rc == 0
+    assert fake.puts == ["d1/7/ledger-input/pr-size-preflight.json"]
+    err = capsys.readouterr().err
+    assert f"put skipping missing source file: {missing}" in err
+
+
+def test_put_multi_file_all_missing_fails(tmp_path, monkeypatch, capsys):
+    fake = FakeS3()
+    _use(monkeypatch, fake)
+    missing1 = tmp_path / "preflight.json"
+    missing2 = tmp_path / "install.json"
+    with pytest.raises(SystemExit) as caught:
+        store.main([
+            "put", "--tier", "d1", "--repo-id", "7", "--name", "ledger-input",
+            "--file", str(missing1), "--file", str(missing2),
+        ])
+    assert caught.value.code == store.EXIT_ERROR
+    assert fake.puts == []
+    err = capsys.readouterr().err
+    assert f"put skipping missing source file: {missing1}" in err
+    assert f"put skipping missing source file: {missing2}" in err
+    assert "all sources missing" in err
+
+
 def test_resolve_prints_selected_prefix_and_exit_codes(monkeypatch, capsys, tmp_path):
     objects = {
         "d14/5/primary-audit-v2-5-sha-11-1/primary-review-audit.json": b"a",

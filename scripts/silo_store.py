@@ -233,15 +233,25 @@ def cmd_magicdns(args: argparse.Namespace) -> int:
 
 
 def cmd_put(args: argparse.Namespace) -> int:
-    files: list[tuple[Path, str]] = []
-    for raw in args.file or []:
-        path = Path(raw)
+    raw_files = list(args.file or [])
+    if not raw_files:
+        fail("put requires at least one --file")
+    if len(raw_files) == 1:
+        path = Path(raw_files[0])
         if not path.is_file():
             fail(f"put source is not a file: {path}")
-        object_name = args.object_name if args.object_name and len(args.file) == 1 else path.name
-        files.append((path, object_name))
-    if not files:
-        fail("put requires at least one --file")
+        object_name = args.object_name if args.object_name else path.name
+        files = [(path, object_name)]
+    else:
+        files: list[tuple[Path, str]] = []
+        for raw in raw_files:
+            path = Path(raw)
+            if not path.is_file():
+                print(f"put skipping missing source file: {path}", file=sys.stderr)
+                continue
+            files.append((path, path.name))
+        if not files:
+            fail("put requires at least one existing --file: all sources missing")
     client = connect()
     bucket = bucket_name()
     try:
