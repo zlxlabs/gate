@@ -27,13 +27,23 @@ concurrency:
   group: gate-disposition-${{ github.repository_id }}-${{ inputs.pr_number }}
   cancel-in-progress: false
 
+env:
+  SILO_ENDPOINT: https://zlx-vm-work-i5-infra.taile9071.ts.net:9000
+  SILO_BUCKET: ci-artifacts
+
 jobs:
   control:
     # Keep the environment so any future protection can be configured in GitHub.
     environment:
       name: gate-disposition
-    runs-on: ubuntu-latest
+    # Silo is on tailnet; GitHub-hosted cannot reach 100.x. Use the ci pool
+    # (same labels as quality), not ubuntu-latest.
+    runs-on: [self-hosted, linux, ci]
     timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
+      SILO_STORE: scripts/silo_store.py
     steps:
       - name: Checkout disposition producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -43,8 +53,26 @@ jobs:
           sparse-checkout: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
+            scripts/silo_store.py
           sparse-checkout-cone-mode: false
           fetch-depth: 1
+
+      - name: Resolve Silo hostname via MagicDNS
+        run: |
+          set -euo pipefail
+          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          }
+          SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
+          if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          fi
+          if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
+          elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
+          else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
+          fi
 
       - name: Resolve current PR head and canonical primary audit
         env:
@@ -66,7 +94,20 @@ jobs:
           audit_dir="$RUNNER_TEMP/current-primary-audit"
           mkdir -p "$audit_dir"
           audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
-          gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name" --dir "$audit_dir"
+          silo_key="d14/${GITHUB_REPOSITORY_ID}/${audit_name}/primary-review-audit.json"
+          dest="$audit_dir/primary-review-audit.json"
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          set +e
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" get --key "$silo_key" --dest "$dest"
+          silo_rc=$?
+          set -e
+          if [ "$silo_rc" -eq 2 ]; then
+            gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name" --dir "$audit_dir"
+          elif [ "$silo_rc" -ne 0 ]; then
+            echo "::error::Silo get failed for canonical primary audit (exit=${silo_rc})" >&2
+            exit "$silo_rc"
+          fi
           audit_path="$(find "$audit_dir" -type f -name '*.json' -print -quit)"
           test -n "$audit_path"
           audit_digest="$(sha256sum "$audit_path" | cut -d' ' -f1)"
@@ -169,9 +210,15 @@ jobs:
 
       - name: Upload immutable disposition artifact
         if: always() && steps.disposition.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ${{ steps.disposition.outputs.artifact_name }}
-          path: ${{ runner.temp }}/gate-disposition-artifact/*
-          if-no-files-found: error
-          retention-days: 30
+        env:
+          ARTIFACT_NAME: ${{ steps.disposition.outputs.artifact_name }}
+          OUTPUT_DIR: ${{ runner.temp }}/gate-disposition-artifact
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put-dir \
+            --tier d30 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$OUTPUT_DIR"
