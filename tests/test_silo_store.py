@@ -182,6 +182,55 @@ def test_resolve_prints_selected_prefix_and_exit_codes(monkeypatch, capsys, tmp_
     assert empty.value.code == store.EXIT_NOT_FOUND
 
 
+# Copied from B1 canary run 35082772768 on silo/ci-artifacts (mcli ls --recursive).
+CANARY_TERMINAL_KEY = (
+    "d30/1327629472/gate-terminal-v1-1327629472-"
+    "2cdbc1bd4719665b7ba7548ba04edea73ec65ffc-35082772768-1/gate-terminal.json"
+)
+CANARY_AUDIT_KEY = (
+    "d14/1327629472/primary-audit-v2-1327629472-"
+    "2cdbc1bd4719665b7ba7548ba04edea73ec65ffc-35082772768-1/primary-review-audit.json"
+)
+CANARY_RECEIPT_NAME = (
+    "gate-disposition-receipt-v2-"
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0123456789ab-finding1"
+)
+CANARY_RECEIPT_KEY = f"d30/1327629472/{CANARY_RECEIPT_NAME}/{CANARY_RECEIPT_NAME}"
+
+
+def test_list_prints_keys_under_name_prefix_and_optional_dest(tmp_path, monkeypatch, capsys):
+    objects = {
+        CANARY_TERMINAL_KEY: b'{"kind":"gate_terminal"}',
+        CANARY_AUDIT_KEY: b'{"kind":"primary_review"}',
+        "d30/1327629472/codex-review-ledger-v2-1327629472-dead-1/ledger.jsonl": b"{}",
+        CANARY_RECEIPT_KEY: b'{"kind":"gate-disposition-receipt-v2"}',
+    }
+    _use(monkeypatch, FakeS3(objects))
+    assert store.main([
+        "list", "--tier", "d30", "--repo-id", "1327629472",
+        "--name-prefix", "gate-terminal-v1-1327629472-",
+    ]) == 0
+    assert capsys.readouterr().out.splitlines() == [CANARY_TERMINAL_KEY]
+
+    dest = tmp_path / "out"
+    assert store.main([
+        "list", "--prefix", "d30/1327629472/gate-disposition-receipt-v2-", "--dest", str(dest),
+    ]) == 0
+    listed = capsys.readouterr().out.splitlines()
+    assert listed == [CANARY_RECEIPT_KEY]
+    saved = dest / CANARY_RECEIPT_NAME / CANARY_RECEIPT_NAME
+    assert saved.read_bytes() == b'{"kind":"gate-disposition-receipt-v2"}'
+
+    _use(monkeypatch, FakeS3(objects))
+    assert store.main(["list", "--prefix", "d30/1327629472/missing-prefix-"]) == 0
+    assert capsys.readouterr().out == ""
+
+    _use(monkeypatch, FakeS3(list_error=RuntimeError("connection refused")))
+    with pytest.raises(SystemExit) as failed:
+        store.main(["list", "--prefix", "d30/1327629472/"])
+    assert failed.value.code == store.EXIT_ERROR
+
+
 def test_missing_access_key_stderr(monkeypatch, capsys):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")

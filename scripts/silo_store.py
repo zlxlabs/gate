@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Put, get, and resolve CI artifacts on Silo.
+"""Put, get, list, and resolve CI artifacts on Silo.
 
 Key layout: d<tier>/<repo_id>/<artifact_name>/<relative path>
 tier ∈ {d1, d3, d14, d30}. Env: AWS_ACCESS_KEY_ID (SILO_ACCESS_KEY),
@@ -367,6 +367,54 @@ def artifact_names_from_keys(keys: Iterable[str], tier: str, repo_id: str) -> li
     return names
 
 
+def _layout_suffix(key: str) -> tuple[str, str]:
+    """Return (artifact_name, relative_path) for a canonical four-segment key."""
+
+    parts = key.split("/", 3)
+    if len(parts) != 4 or not all(parts):
+        fail(f"object key {key!r} is not tier/repo_id/artifact_name/path")
+    return parts[2], parts[3]
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    prefix = (args.prefix or "").strip()
+    if prefix:
+        listing_prefix = prefix
+    else:
+        if not args.tier or not args.repo_id:
+            fail("list requires --prefix or both --tier and --repo-id")
+        listing_prefix = f"{args.tier}/{args.repo_id}/"
+        name_prefix = (args.name_prefix or "").strip()
+        if name_prefix:
+            listing_prefix = f"{args.tier}/{args.repo_id}/{name_prefix}"
+    client = connect()
+    bucket = bucket_name()
+    keys = list_keys(client, bucket, listing_prefix)
+    dest = Path(args.dest) if args.dest else None
+    try:
+        for key in keys:
+            print(key)
+            if dest is None:
+                continue
+            artifact_name, relative = _layout_suffix(key)
+            try:
+                response = client.get_object(Bucket=bucket, Key=key)
+            except Exception as err:  # noqa: BLE001
+                name = type(err).__name__
+                if name in {"NoSuchKey", "ClientError"} or "NoSuchKey" in str(err):
+                    fail(f"Silo object not found: {key}", EXIT_NOT_FOUND)
+                fail(f"Silo list download failed: {name}: {err}")
+            body = _body_bytes(response.get("Body") if isinstance(response, dict) else response)
+            target = dest / artifact_name / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+    except SystemExit:
+        raise
+    except Exception as err:  # noqa: BLE001
+        fail(f"Silo list failed: {type(err).__name__}: {err}")
+    return EXIT_OK
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     if args.attempt < 1:
         fail("attempt must be >= 1")
@@ -424,6 +472,17 @@ def build_parser() -> argparse.ArgumentParser:
     key_group.add_argument("--key", default="")
     key_group.add_argument("--prefix", default="")
     get.set_defaults(func=cmd_get)
+
+    listing = sub.add_parser(
+        "list",
+        help="print object keys under a prefix; optionally download each key",
+    )
+    listing.add_argument("--prefix", default="", help="raw S3 prefix; overrides --tier/--repo-id/--name-prefix")
+    listing.add_argument("--tier", default=None, choices=sorted(TIERS))
+    listing.add_argument("--repo-id", default="")
+    listing.add_argument("--name-prefix", default="", help="artifact_name prefix after tier/repo_id/")
+    listing.add_argument("--dest", default="", help="if set, download each key to dest/artifact_name/relative")
+    listing.set_defaults(func=cmd_list)
 
     resolve = sub.add_parser(
         "resolve",
