@@ -1179,6 +1179,7 @@ def _run_ledger_resolver(
     for key in (
         "REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID",
         "QUALITY_LEDGER_INPUT_UPLOAD", "QUALITY_RESULT", "PRIMARY_RESULT",
+        "PRIMARY_RESULT_RAW",
     ):
         env.pop(key, None)
     # The workflow always sets these via needs.*.result; default to the
@@ -1551,6 +1552,49 @@ def test_ledger_resolver_allows_missing_audit_for_observed_abandoned_primary(tmp
     assert "audit_artifact_id=\n" in output
     assert "input_artifact_id=101" in output
     assert "terminal_artifact_id=201" in output
+
+
+@pytest.mark.parametrize("primary_result", ["success", "failure"])
+def test_ledger_resolver_still_requires_audit_for_reviewed_success_or_failure(tmp_path, primary_result):
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=[
+            {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+            {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        ],
+        current=1,
+        review_expected="true",
+        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": primary_result},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching canonical primary audit artifact found" in combined
+
+
+def test_ledger_resolver_cancelled_primary_still_requires_terminal(tmp_path):
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=[{"name": "review-ledger-input-v2-1", "expired": False, "id": 101}],
+        current=1,
+        review_expected="true",
+        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "cancelled"},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+
+
+def test_ledger_resolver_quality_success_still_requires_input_on_cancelled_primary(tmp_path):
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=[{"name": "gate-terminal-v1-1", "expired": False, "id": 201}],
+        current=1,
+        review_expected="true",
+        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "cancelled"},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required ledger input artifact found" in combined
 
 
 def test_ledger_persistence_steps_are_fail_closed():
