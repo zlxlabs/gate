@@ -128,6 +128,25 @@ bump 了 `gate-shadow-v2.yml` 的一个修复，`gate-v2.yml` 暂不动）——
 (`9b673035aad284eb4dedaf2fd7554a9581c7decd`，即本次 Stage 2 canary 切换时的
 `zlxlabs/gate` `main`)。
 
+### Silo 产物存储（gate-v2.yml）
+
+`gate-v2.yml` 的八类 run 内产物（review-ledger-input / primary-audit / diagnostics /
+advisory-event / convergence-receipt / gate-terminal / status-panel-delivery /
+codex-review-ledger）改走 Silo bucket `ci-artifacts`，不再上传 GitHub Actions
+artifact。Caller 必须透传两个 org 级 secret（`workflow_call.secrets` 声明为
+`required: false`，与 `FEISHU_CI_WEBHOOK` 同模式）：
+
+- `SILO_ACCESS_KEY`
+- `SILO_SECRET_KEY`
+
+下游 caller 不传时，S3 步骤明确报错（文案含「SILO_ACCESS_KEY 未传入」），禁止静默跳过。
+fleet 正常拓扑是全 self-hosted；`runner: hosted` 或控制面落到 GitHub-hosted 时，
+MagicDNS `100.100.100.100` 解析 Silo 主机名失败即红（tailnet 不可达），没有 GitHub
+artifact 兜底。
+
+推广期 `.github/v2-tag-sync.hold` 存在，`v2` 移动 tag 不会前移。移除 hold、逐仓更新
+caller 透传这两个 secret，是后续推广卡的责任，不是本文件的自动行为。
+
 ### org runner group 白名单运维要点（bump SHA 时最容易漏的一步）
 
 上面「公开仓安全模型」小节讲的 `restricted_to_workflows` 白名单，在 v2 caller 存在后
