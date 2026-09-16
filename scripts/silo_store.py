@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
-"""Put, get, and resolve CI artifacts on Silo (S3-compatible object storage).
+"""Put, get, and resolve CI artifacts on Silo.
 
-Key layout (locked for cards B2/C):
-
-    d<tier>/<repo_id>/<artifact_name>/<relative path>
-
-``tier`` is one of ``d1``, ``d3``, ``d14``, ``d30``. ``artifact_name`` is the
-producer's GitHub-era name (including repo_id/sha/run_id/attempt suffixes).
-Directory producers store one object per file; the last key segment is the
-path relative to the uploaded directory.
-
-Environment:
-
-    AWS_ACCESS_KEY_ID       from secrets.SILO_ACCESS_KEY
-    AWS_SECRET_ACCESS_KEY   from secrets.SILO_SECRET_KEY
-    SILO_ENDPOINT           https://host:9000
-    SILO_BUCKET             default ci-artifacts
-
-Exit codes: 0 success; 2 resolve/get found no matching object; 1 any other
-failure (missing credentials, listing/transport error, invalid args). A miss
-must not reuse the query-failure code.
+Key layout: d<tier>/<repo_id>/<artifact_name>/<relative path>
+tier ∈ {d1, d3, d14, d30}. Env: AWS_ACCESS_KEY_ID (SILO_ACCESS_KEY),
+AWS_SECRET_ACCESS_KEY, SILO_ENDPOINT, SILO_BUCKET (default ci-artifacts).
+Exit: 0 ok; 2 miss; 1 any other failure (distinct from miss).
 """
 
 from __future__ import annotations
@@ -30,6 +15,7 @@ import re
 import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 TIERS = frozenset({"d1", "d3", "d14", "d30"})
@@ -165,6 +151,85 @@ def iter_dir_files(directory: Path) -> Iterator[tuple[Path, str]]:
             continue
         relative = path.relative_to(directory).as_posix()
         yield path, relative
+
+
+def resolve_magicdns(endpoint: str, nameserver: str = "100.100.100.100", timeout: float = 15) -> tuple[str, str]:
+    """Query MagicDNS for the A record of SILO_ENDPOINT's hostname.
+
+    Returns ``(ip, host)``. Query failure is fail-loud: hosted runners without
+    tailnet 100.100.100.100 must turn red, not skip S3.
+    """
+
+    import socket
+    import struct
+
+    host = urlparse(endpoint).hostname
+    if not host:
+        fail("SILO_ENDPOINT must contain a hostname")
+    labels = host.rstrip(".").split(".")
+    if any(not label or len(label) > 63 for label in labels):
+        fail("SILO_ENDPOINT hostname contains an invalid label")
+    question_name = b"".join(bytes((len(label),)) + label.encode("idna") for label in labels) + b"\0"
+    query_id = b"\x01\x02"
+    packet = query_id + struct.pack("!HHHHH", 0x0100, 1, 0, 0, 0) + question_name + struct.pack("!HH", 1, 1)
+
+    def skip_name(data: bytes, offset: int) -> int:
+        while True:
+            if offset >= len(data):
+                fail("MagicDNS returned a truncated name")
+            length = data[offset]
+            if length == 0:
+                return offset + 1
+            if length & 0xC0 == 0xC0:
+                if offset + 1 >= len(data):
+                    fail("MagicDNS returned a truncated pointer")
+                return offset + 2
+            if length & 0xC0:
+                fail("MagicDNS returned an invalid name")
+            offset += length + 1
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as dns:
+            dns.settimeout(timeout)
+            dns.sendto(packet, (nameserver, 53))
+            response, _ = dns.recvfrom(4096)
+    except OSError as err:
+        fail(
+            f"Silo MagicDNS lookup failed; tailnet 不可达 "
+            f"(hosted runner 或容器无 {nameserver})。SILO_ENDPOINT={endpoint} ({err})"
+        )
+
+    if len(response) < 12 or response[:2] != query_id:
+        fail("MagicDNS returned an invalid response")
+    _, flags, question_count, answer_count, _, _ = struct.unpack("!HHHHHH", response[:12])
+    if flags & 0x000F:
+        fail(f"MagicDNS returned DNS error {flags & 0x000F}")
+    offset = 12
+    for _ in range(question_count):
+        offset = skip_name(response, offset)
+        if offset + 4 > len(response):
+            fail("MagicDNS returned a truncated question")
+        offset += 4
+    for _ in range(answer_count):
+        offset = skip_name(response, offset)
+        if offset + 10 > len(response):
+            fail("MagicDNS returned a truncated answer")
+        record_type, record_class, _, record_length = struct.unpack("!HHIH", response[offset : offset + 10])
+        offset += 10
+        if offset + record_length > len(response):
+            fail("MagicDNS returned a truncated record")
+        record = response[offset : offset + record_length]
+        offset += record_length
+        if record_type == 1 and record_class == 1 and record_length == 4:
+            return socket.inet_ntoa(record), host
+    fail(f"MagicDNS returned no A record for {host}")
+    raise AssertionError("unreachable")
+
+
+def cmd_magicdns(args: argparse.Namespace) -> int:
+    ip, host = resolve_magicdns(args.endpoint, args.nameserver)
+    print(f"{ip} {host}")
+    return EXIT_OK
 
 
 def cmd_put(args: argparse.Namespace) -> int:
@@ -316,6 +381,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    magicdns = sub.add_parser("magicdns", help="resolve SILO_ENDPOINT via MagicDNS (100.100.100.100)")
+    magicdns.add_argument("--endpoint", required=True)
+    magicdns.add_argument("--nameserver", default="100.100.100.100")
+    magicdns.set_defaults(func=cmd_magicdns)
 
     put = sub.add_parser("put", help="upload one or more files as objects")
     put.add_argument("--tier", required=True, choices=sorted(TIERS))
