@@ -1244,7 +1244,7 @@ jobs:
           path: _gate-aggregator-src
 
       - name: Resolve Silo hostname via MagicDNS
-        if: always()
+        if: ${{ needs.primary.result != 'skipped' }}
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
