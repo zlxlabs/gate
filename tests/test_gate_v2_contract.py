@@ -356,6 +356,46 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
         assert "id -u" in dns["run"]
         assert "100.100.100.100" in dns["run"]
 
+    # F1 lock: MagicDNS step conditions. Gate job must not run MagicDNS when primary is skipped.
+    gate_dns = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert gate_dns["if"] == "${{ needs.primary.result != 'skipped' }}"
+    # When primary is skipped (e.g. fork PR), gate DNS must not run:
+    assert ("skipped" != "skipped") is False
+    assert ("success" != "skipped") is True
+    assert ("failure" != "skipped") is True
+
+    quality_dns = next(s for s in raw["jobs"]["quality"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert quality_dns["if"] == "always()"
+    primary_dns = next(s for s in raw["jobs"]["primary"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert primary_dns["if"] == "always()"
+    ledger_dns = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert ledger_dns["if"] == "always()"
+    ocr_dns = next(s for s in raw["jobs"]["ocr"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert ocr_dns["if"] == "always() && matrix.reviewer != '__none__'"
+
+
+def test_silo_store_env_aligns_with_job_checkout_path():
+    raw, _ = _load_workflow()
+    for job_name in ("quality", "primary", "ocr", "gate", "ledger"):
+        job = raw["jobs"][job_name]
+        silo_store_env = job.get("env", {}).get("SILO_STORE", "")
+        assert silo_store_env.endswith("/scripts/silo_store.py"), (
+            f"{job_name}: SILO_STORE must point to scripts/silo_store.py"
+        )
+        checkout_dir = silo_store_env.split("/")[0]
+        checkout_step = next(
+            (
+                s
+                for s in job["steps"]
+                if s.get("uses", "").startswith("actions/checkout@")
+                and s.get("with", {}).get("path") == checkout_dir
+            ),
+            None,
+        )
+        assert checkout_step is not None, f"{job_name}: no checkout step for {checkout_dir}"
+        assert checkout_step["with"]["repository"] == "${{ job.workflow_repository }}"
+        assert checkout_step["with"]["ref"] == "${{ job.workflow_sha }}"
+
 
 def test_secrets_explicit_and_feishu_optional():
     code = "\n".join(ln for ln in WORKFLOW.read_text().splitlines() if not ln.lstrip().startswith("#"))
