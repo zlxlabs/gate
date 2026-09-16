@@ -222,8 +222,18 @@ def test_missing_remote_tag_is_failure(capsys):
     assert "refs/tags/v2 was not returned" in capsys.readouterr().out
 
 
-def test_enabled_clean_commit_advances(capsys):
-    assert main(["--enabled", "true", "--commit-message", "fix implementation"]) == 0
+def test_enabled_clean_commit_advances(capsys, tmp_path):
+    missing = tmp_path / "absent-v2-tag-sync.hold"
+    assert main(
+        [
+            "--enabled",
+            "true",
+            "--commit-message",
+            "fix implementation",
+            "--hold-file",
+            str(missing),
+        ]
+    ) == 0
     assert "v2 tag sync enabled and no breaker signal found" in capsys.readouterr().out
 
 

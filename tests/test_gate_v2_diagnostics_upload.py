@@ -10,8 +10,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
-UPLOAD_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
-DIAGNOSTICS_PATH = "${{ runner.temp }}/primary-review-diagnostics/"
+DIAGNOSTICS_DIR = "${{ runner.temp }}/primary-review-diagnostics"
 
 
 def _primary_steps():
@@ -38,9 +37,12 @@ def test_primary_writes_restricted_manifest_before_diagnostics_upload():
     assert "::warning::" in run
     assert not any(token in run for token in ("cat ", "read_bytes", "read_text(", "response_body"))
     assert upload["if"] == "always()"
-    assert upload["uses"] == UPLOAD_ACTION
-    assert upload["with"]["path"] == DIAGNOSTICS_PATH
-    assert upload["with"]["if-no-files-found"] == "ignore"
+    assert "uses" not in upload
+    assert "continue-on-error" not in upload
+    assert upload["env"]["DIAGNOSTICS_DIR"] == DIAGNOSTICS_DIR
+    assert "--tier d3" in upload["run"]
+    assert "--empty skip" in upload["run"]
+    assert "$SILO_STORE" in upload["run"]
 
 
 def _manifest_program():

@@ -108,12 +108,23 @@ on:
         # cannot read secrets — see the notify job); private repos may rely on
         # the same-name repo VARIABLE fallback instead (see notify job below).
         required: false
+      SILO_ACCESS_KEY:
+        # Optional at the workflow_call schema so existing callers keep
+        # starting; S3 steps fail loud with "SILO_ACCESS_KEY 未传入" when
+        # the caller omits it. Fleet callers are updated one repo at a time.
+        required: false
+      SILO_SECRET_KEY:
+        required: false
+
+env:
+  SILO_ENDPOINT: https://zlx-vm-work-i5-infra.taile9071.ts.net:9000
+  SILO_BUCKET: ci-artifacts
 
 # Union of everything any job below needs; each caller must grant this whole
 # set (reusable-workflow permission escalation otherwise fails at startup).
 # actions: read   — Jobs API (resolve this run's numeric job id for the
-#                    primary/OCR jobs' REVIEW_JOB_ID) + actions/download-artifact
-#                    in the gate job.
+#                    primary/OCR jobs' REVIEW_JOB_ID) + ledger terminal
+#                    attribution against this run's attempts.
 # pull-requests: write — the quality job's PR-size preflight action, diff-coverage
 #                    advisory, the OCR advisory job, and the gate job's Stage 4 PR-comment
 #                    receipt (fail-open email-visible mirror of the Step
@@ -198,6 +209,10 @@ jobs:
     # quality 走无凭据 ci 池（spec：gate-hub docs/designs/runner-ci-pool-split.md）。
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
+      SILO_STORE: _gate-silo-src/scripts/silo_store.py
     outputs:
       ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
     # Per-PR cancel of stale quality only. Group is independent of `primary`
@@ -410,34 +425,73 @@ jobs:
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         run: uv cache prune --ci || true
 
+      - name: Checkout silo store at this workflow's own commit
+        if: always()
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-silo-src
+          sparse-checkout: |
+            scripts/silo_store.py
+
+      - name: Resolve Silo hostname via MagicDNS
+        if: always()
+        run: |
+          set -euo pipefail
+          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          }
+          SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
+          if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          fi
+          if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
+          elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
+          else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
+          fi
+
       - name: Upload v2 review ledger inputs
         id: ledger-input-upload
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pr-size-preflight.json
-            ${{ runner.temp }}/install-result.json
-          if-no-files-found: error
-          retention-days: 1
+        env:
+          ARTIFACT_NAME: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PREFLIGHT: ${{ runner.temp }}/pr-size-preflight.json
+          INSTALL: ${{ runner.temp }}/install-result.json
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put \
+            --tier d1 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$PREFLIGHT" \
+            --file "$INSTALL"
 
       - name: Retry upload v2 review ledger inputs
         id: ledger-input-upload-retry
         if: always() && steps.ledger-input-upload.outcome == 'failure'
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pr-size-preflight.json
-            ${{ runner.temp }}/install-result.json
-          if-no-files-found: error
-          retention-days: 1
-          overwrite: true
+        env:
+          ARTIFACT_NAME: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PREFLIGHT: ${{ runner.temp }}/pr-size-preflight.json
+          INSTALL: ${{ runner.temp }}/install-result.json
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put \
+            --tier d1 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$PREFLIGHT" \
+            --file "$INSTALL"
 
       - name: Record ledger input upload outcome
         id: ledger-input-upload-outcome
@@ -492,6 +546,10 @@ jobs:
     runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
+      SILO_STORE: _gate-silo-src/scripts/silo_store.py
     # Per-PR cancel of stale primary only. Own group (not shared with
     # quality) so one run's lint and review never queue or kill each other.
     concurrency:
@@ -672,35 +730,72 @@ jobs:
             echo "::warning::primary review diagnostics manifest generation failed; diagnostics upload may have no files"
           fi
 
+      - name: Checkout silo store at this workflow's own commit
+        if: always()
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-silo-src
+          sparse-checkout: |
+            scripts/silo_store.py
+
+      - name: Resolve Silo hostname via MagicDNS
+        if: always()
+        run: |
+          set -euo pipefail
+          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          }
+          SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
+          if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          fi
+          if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
+          elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
+          else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
+          fi
+
       - name: Upload canonical primary audit
         # Fail-closed by design: if the audit can't be uploaded, the aggregator
         # must never see a "success" primary job without a matching artifact
         # to validate — so this step deliberately has NO `continue-on-error`.
-        # P1 fix (2026-07-26, canary probe #2): an earlier draft of this step relied on
-        # actions/upload-artifact v4's DEFAULT `if-no-files-found` behavior, which is
-        # `warn` — NOT `ignore`, but also NOT `error`: canary observed primary fail to
-        # write an audit at all, yet this step still concluded `success` (a warning
-        # annotation, not a job failure). `if-no-files-found: error` below is the actual
-        # fail-closed setting; "no if-no-files-found: ignore" alone was never sufficient.
+        # Missing source file makes silo_store.py put exit 1 (fail-closed),
+        # matching the previous if-no-files-found: error semantics.
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/primary-review-audit.json
-          if-no-files-found: error
-          retention-days: 14
+        env:
+          ARTIFACT_NAME: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put \
+            --tier d14 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$AUDIT_PATH"
 
       - name: Upload primary review diagnostics
         # The finalizer creates manifest.json for an absent/empty producer
-        # directory; `ignore` keeps this best-effort path from changing the
+        # directory; --empty skip keeps this best-effort path from changing the
         # primary result if the finalizer itself was killed or failed.
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/primary-review-diagnostics/
-          if-no-files-found: ignore
-          retention-days: 3
+        env:
+          ARTIFACT_NAME: primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put-dir \
+            --tier d3 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$DIAGNOSTICS_DIR" \
+            --empty skip
 
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
   resolve_advisory:
@@ -778,6 +873,10 @@ jobs:
     # review-shadow's own default internal budget is 780s; this leaves headroom
     # for checkout, Jobs API lookup, event upload, and PR comment persistence.
     timeout-minutes: 15
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
+      SILO_STORE: _gate-silo-src/scripts/silo_store.py
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: matrix.reviewer != '__none__'
@@ -1059,14 +1158,48 @@ jobs:
           fi
           echo "OCR advisory sticky $operation succeeded for reviewer $REVIEWER"
 
+      - name: Checkout silo store at this workflow's own commit
+        if: always() && matrix.reviewer != '__none__'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _gate-silo-src
+          sparse-checkout: |
+            scripts/silo_store.py
+
+      - name: Resolve Silo hostname via MagicDNS
+        if: always() && matrix.reviewer != '__none__'
+        run: |
+          set -euo pipefail
+          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          }
+          SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
+          if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          fi
+          if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
+          elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
+          else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
+          fi
+
       - name: Upload advisory review event
         if: always() && matrix.reviewer != '__none__'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/shadow-events/advisory
-          if-no-files-found: error
-          retention-days: 3
+        env:
+          ARTIFACT_NAME: advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
+          ADVISORY_DIR: ${{ runner.temp }}/shadow-events/advisory
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put-dir \
+            --tier d3 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$ADVISORY_DIR"
 
   # ── gate (final aggregator — required check) ────────────────────────────
   gate:
@@ -1088,6 +1221,10 @@ jobs:
     # 8 minutes: aggregation is seconds, publish is capped at <=2 minutes,
     # and the remaining time covers artifact download/upload and runner jitter.
     timeout-minutes: 8
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
+      SILO_STORE: _gate-aggregator-src/scripts/silo_store.py
     steps:
       # `uses:` cannot itself take an expression, so the only way to pin the
       # aggregator script to the EXACT commit this reusable workflow file is
@@ -1106,97 +1243,80 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: _gate-aggregator-src
 
+      - name: Resolve Silo hostname via MagicDNS
+        if: always()
+        run: |
+          set -euo pipefail
+          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          }
+          SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
+          if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          fi
+          if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
+          elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
+          else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
+          fi
+
       - name: Resolve canonical primary audit artifact
         id: resolve-audit-artifact
         if: ${{ needs.primary.result != 'skipped' }}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
+          REPO_ID: ${{ github.repository_id }}
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
         run: |
           set -euo pipefail
-          # Empty outputs keep the best-effort path fail-closed when the REST lookup fails or finds no candidate.
-          echo "artifact_id=" >> "$GITHUB_OUTPUT"
-          echo "source_attempt=" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=" >> "$GITHUB_OUTPUT"
-          artifact_listing="$(mktemp)"
-          trap 'rm -f "$artifact_listing"' EXIT
-          artifacts_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
-          max_attempts=3
-          retry_delay_seconds=1
-          rc=0
-          for attempt in 1 2 3; do
-            rc=0
-            timeout --foreground 15s gh api "$artifacts_api" --paginate --slurp > "$artifact_listing" 2>/dev/null || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              break
-            fi
-            if [ "$attempt" -lt "$max_attempts" ]; then
-              echo "::warning::GitHub API request retry: path=${artifacts_api} attempt=$((attempt + 1))/${max_attempts} error=exit_${rc}"
-              sleep "$retry_delay_seconds"
-            fi
-          done
+          # Empty outputs keep the best-effort path fail-closed when resolve misses.
+          {
+            echo "artifact_id="
+            echo "source_attempt="
+            echo "artifact_name="
+          } >> "$GITHUB_OUTPUT"
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          set +e
+          selected="$(uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" resolve \
+            --tier d14 \
+            --repo-id "$REPO_ID" \
+            --name-prefix "$AUDIT_PREFIX" \
+            --attempt "$CURRENT_ATTEMPT")"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "No matching canonical primary audit artifact found" >&2
+            exit 0
+          fi
           if [ "$rc" -ne 0 ]; then
             exit "$rc"
           fi
-          selected="$(python3 - "$artifact_listing" "$AUDIT_PREFIX" "$CURRENT_ATTEMPT" <<'PY'
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          listing_path, prefix, current_attempt_text = sys.argv[1:]
-          current_attempt = int(current_attempt_text)
-          payload = json.loads(Path(listing_path).read_text(encoding="utf-8"))
-          pages = payload if isinstance(payload, list) else [payload]
-          candidates = []
-          for page in pages:
-              if isinstance(page, dict):
-                  artifacts = page.get("artifacts", [])
-              elif isinstance(page, list):
-                  artifacts = page
-              else:
-                  artifacts = []
-              for artifact in artifacts:
-                  if not isinstance(artifact, dict) or artifact.get("expired") is True:
-                      continue
-                  name = artifact.get("name")
-                  if not isinstance(name, str) or not name.startswith(prefix):
-                      continue
-                  suffix = name[len(prefix):]
-                  if not re.fullmatch(r"[0-9]+", suffix):
-                      continue
-                  attempt = int(suffix)
-                  if attempt <= current_attempt:
-                      artifact_id = artifact.get("id")
-                      if isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
-                          candidates.append((attempt, artifact_id, name))
-          if not candidates:
-              print("No matching canonical primary audit artifact found", file=sys.stderr)
-              raise SystemExit(0)
-          attempt, artifact_id, name = max(candidates, key=lambda candidate: candidate[0])
-          print(f"{artifact_id}\t{attempt}\t{name}")
-          PY
-          )"
           if [ -z "$selected" ]; then
             exit 0
           fi
           IFS=$'\t' read -r artifact_id source_attempt artifact_name <<< "$selected"
-          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
-          echo "source_attempt=$source_attempt" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact_id=$artifact_id"
+            echo "source_attempt=$source_attempt"
+            echo "artifact_name=$artifact_name"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download canonical primary audit (best effort — may not exist)
         if: ${{ needs.primary.result != 'skipped' && steps.resolve-audit-artifact.outputs.artifact_id != '' }}
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ steps.resolve-audit-artifact.outputs.artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/primary-audit
+        env:
+          ARTIFACT_PREFIX: ${{ steps.resolve-audit-artifact.outputs.artifact_id }}
+          DEST: ${{ runner.temp }}/primary-audit
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" get \
+            --prefix "$ARTIFACT_PREFIX" \
+            --dest "$DEST"
 
       - name: Aggregate required verdict
         id: aggregate-required-verdict
@@ -1256,35 +1376,52 @@ jobs:
 
       - name: Upload convergence receipt
         if: always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/convergence-receipt
-          if-no-files-found: error
-          retention-days: 3
+        env:
+          ARTIFACT_NAME: gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          RECEIPT_DIR: ${{ runner.temp }}/convergence-receipt
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put-dir \
+            --tier d3 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$RECEIPT_DIR"
 
       - name: Upload gate terminal envelope
         if: always()
         id: upload-gate-terminal
         continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gate-terminal.json
-          if-no-files-found: error
-          retention-days: 30
+        env:
+          ARTIFACT_NAME: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put \
+            --tier d30 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$TERMINAL_PATH"
 
       - name: Retry upload gate terminal envelope
         if: always() && steps.upload-gate-terminal.outcome == 'failure'
         id: retry-upload-gate-terminal
         continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gate-terminal.json
-          if-no-files-found: error
-          retention-days: 30
-          overwrite: true
+        env:
+          ARTIFACT_NAME: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put \
+            --tier d30 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$TERMINAL_PATH"
 
       - name: Publish gate status panel
         if: always() && (steps.upload-gate-terminal.outcome == 'success' || steps.retry-upload-gate-terminal.outcome == 'success')
@@ -1327,12 +1464,18 @@ jobs:
         if: always()
         id: upload-gate-status-panel-diagnostic
         continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gate-status-panel-delivery.json
-          if-no-files-found: error
-          retention-days: 3
+        env:
+          ARTIFACT_NAME: gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PANEL_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put \
+            --tier d3 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$PANEL_PATH"
 
       - name: Warn when gate status panel delivery diagnostic is unavailable
         if: always() && (steps.upload-gate-status-panel-diagnostic.outcome == 'failure' || (steps.upload-gate-terminal.outcome == 'failure' && steps.retry-upload-gate-terminal.outcome == 'failure'))
@@ -1356,6 +1499,10 @@ jobs:
     continue-on-error: true
     runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
+      SILO_STORE: _gate-aggregator-src/scripts/silo_store.py
     steps:
       - name: Checkout ledger action at this workflow's own commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -1364,6 +1511,24 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: _gate-aggregator-src
 
+      - name: Resolve Silo hostname via MagicDNS
+        if: always()
+        run: |
+          set -euo pipefail
+          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          }
+          SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
+          if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
+            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            exit 1
+          fi
+          if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
+          elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
+          else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
+          fi
+
       - name: Resolve v2 ledger artifacts
         id: resolve-ledger-artifacts
         if: always()
@@ -1371,6 +1536,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          REPO_ID: ${{ github.repository_id }}
           INPUT_PREFIX: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           TERMINAL_PREFIX: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
@@ -1382,39 +1548,46 @@ jobs:
           PRIMARY_RESULT: ${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}
         run: |
           set -euo pipefail
-          listing="$(mktemp)"
-          trap 'rm -f "$listing"' EXIT
-          artifacts_api="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
-          max_attempts=3
-          retry_delay_seconds=1
-          rc=0
-          for attempt in 1 2 3; do
-            rc=0
-            timeout --foreground 15s gh api "$artifacts_api" --paginate --slurp > "$listing" 2>/dev/null || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              break
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          silo_resolve() {
+            local tier="$1" prefix="$2"
+            uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" resolve \
+              --tier "$tier" --repo-id "$REPO_ID" --name-prefix "$prefix" --attempt "$CURRENT_ATTEMPT"
+          }
+          resolve_or_empty() {
+            local tier="$1" prefix="$2"
+            local out rc
+            set +e
+            out="$(silo_resolve "$tier" "$prefix")"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 1 ]; then
+              exit 1
             fi
-            if [ "$attempt" -lt "$max_attempts" ]; then
-              echo "::warning::GitHub API request retry: path=${artifacts_api} attempt=$((attempt + 1))/${max_attempts} error=exit_${rc}"
-              sleep "$retry_delay_seconds"
+            if [ "$rc" -eq 2 ]; then
+              out=""
+            elif [ "$rc" -ne 0 ]; then
+              exit "$rc"
             fi
-          done
-          if [ "$rc" -ne 0 ]; then
-            exit "$rc"
-          fi
-          python3 - "$listing" "$INPUT_PREFIX" "$AUDIT_PREFIX" "$TERMINAL_PREFIX" "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
+            printf '%s' "$out"
+          }
+          INPUT_RESOLVE="$(resolve_or_empty d1 "$INPUT_PREFIX")"
+          AUDIT_RESOLVE="$(resolve_or_empty d14 "$AUDIT_PREFIX")"
+          TERMINAL_RESOLVE="$(resolve_or_empty d30 "$TERMINAL_PREFIX")"
+          export INPUT_RESOLVE AUDIT_RESOLVE TERMINAL_RESOLVE
+          python3 - "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
-          import re
           import subprocess
           import sys
           from datetime import datetime
           from pathlib import Path
 
           argv = sys.argv[1:]
-          listing_path, input_prefix, audit_prefix, terminal_prefix, current_text, expected_text, output_path = argv[:7]
-          jobs_listing_path = argv[7] if len(argv) > 7 else ""
-          attempt_listing_path = argv[8] if len(argv) > 8 else ""
+          current_text, expected_text, output_path = argv[:3]
+          jobs_listing_path = argv[3] if len(argv) > 3 else ""
+          attempt_listing_path = argv[4] if len(argv) > 4 else ""
           current = int(current_text)
           if expected_text not in {"true", "false"}:
               raise SystemExit("REVIEW_EXPECTED must be true or false")
@@ -1430,51 +1603,43 @@ jobs:
           # input artifact legitimately does not exist for this combination.
           quality_short_circuited = quality_result == "skipped" and primary_result == "failure"
           quality_upload = (os.environ.get("QUALITY_LEDGER_INPUT_UPLOAD") or "").strip() or "unknown"
-          payload = json.loads(Path(listing_path).read_text(encoding="utf-8"))
-          pages = payload if isinstance(payload, list) else [payload]
-          artifacts = []
-          for page in pages:
-              if not isinstance(page, dict) or not isinstance(page.get("artifacts"), list):
-                  raise SystemExit("current run artifact listing has invalid JSON shape")
-              artifacts.extend(page["artifacts"])
 
-          def select_artifact(prefix, missing_message, required):
-              candidates = []
-              for artifact in artifacts:
-                  if not isinstance(artifact, dict) or artifact.get("expired") is True:
-                      continue
-                  name = artifact.get("name", "")
-                  if not isinstance(name, str) or not name.startswith(prefix):
-                      continue
-                  suffix = name[len(prefix):]
-                  if not re.fullmatch(r"[0-9]+", suffix):
-                      continue
-                  attempt = int(suffix)
-                  # input/audit/terminal may reuse an earlier attempt of this run.
-                  # never select an attempt newer than the current run attempt.
-                  artifact_id = artifact.get("id")
-                  if attempt <= current and isinstance(artifact_id, int) and not isinstance(artifact_id, bool):
-                      candidates.append((attempt, artifact_id, name))
-              if not candidates:
+          def parse_resolve(raw, missing_message, required):
+              text = (raw or "").strip()
+              if not text:
                   if required:
                       raise SystemExit(missing_message)
                   return None
-              return max(candidates, key=lambda item: (item[0], item[1]))
+              parts = text.split("\t")
+              if len(parts) != 3:
+                  raise SystemExit("Silo resolve output has invalid shape")
+              prefix, attempt_text, _name = parts
+              if not attempt_text.isdigit():
+                  raise SystemExit("Silo resolve attempt is not an integer")
+              attempt = int(attempt_text)
+              # resolve already selected attempt <= current; still refuse a future one.
+              if attempt > current:
+                  if required:
+                      raise SystemExit(missing_message)
+                  return None
+              return attempt, prefix, _name
 
-          input_artifact = select_artifact(
-              input_prefix,
+          input_artifact = parse_resolve(
+              os.environ.get("INPUT_RESOLVE"),
               f"No matching required ledger input artifact found (quality upload outcome: {quality_upload})",
               not quality_short_circuited,
           )
           if quality_short_circuited and input_artifact is None:
               print("::notice::ledger input skipped: quality was short-circuited by primary failure (gate#105 A); preflight/install fields will be null")
-          audit_artifact = select_artifact(
-              audit_prefix,
+          audit_artifact = parse_resolve(
+              os.environ.get("AUDIT_RESOLVE"),
               "No matching canonical primary audit artifact found",
               expected_text == "true" and primary_result != "cancelled",
           )
-          terminal_artifact = select_artifact(
-              terminal_prefix, "No matching required gate terminal artifact found", True,
+          terminal_artifact = parse_resolve(
+              os.environ.get("TERMINAL_RESOLVE"),
+              "No matching required gate terminal artifact found",
+              True,
           )
 
           def is_gate_aggregator_job(name):
@@ -1593,26 +1758,41 @@ jobs:
         # missing files to null preflight/install fields and the row is
         # still written.
         if: steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/review-ledger-input
+        env:
+          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}
+          DEST: ${{ runner.temp }}/review-ledger-input
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" get \
+            --prefix "$ARTIFACT_PREFIX" \
+            --dest "$DEST"
 
       - name: Download canonical primary audit for ledger
         if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/primary-audit
+        env:
+          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
+          DEST: ${{ runner.temp }}/primary-audit
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" get \
+            --prefix "$ARTIFACT_PREFIX" \
+            --dest "$DEST"
 
       - name: Download gate terminal envelope for ledger
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/gate-terminal
+        env:
+          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
+          DEST: ${{ runner.temp }}/gate-terminal
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" get \
+            --prefix "$ARTIFACT_PREFIX" \
+            --dest "$DEST"
 
       - name: Build v2 review effectiveness ledger
         timeout-minutes: 1
@@ -1631,12 +1811,18 @@ jobs:
           input-short-circuited: ${{ steps.resolve-ledger-artifacts.outputs.input_short_circuited }}
 
       - name: Upload v2 review effectiveness ledger
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: codex-review-ledger-v2
-          path: ${{ runner.temp }}/review-ledger/ledger.jsonl
-          if-no-files-found: error
-          retention-days: 30
+        env:
+          ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
+          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put \
+            --tier d30 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$LEDGER_PATH"
 
   # ── notify (registry-routed, required-gate-failure only) ────────────────
   # Same fail-only semantics as legacy gate.yml's notify job (see that file
