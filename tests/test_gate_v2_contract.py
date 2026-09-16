@@ -441,8 +441,9 @@ def test_observed_abandoned_primary_is_normalized_and_raw_value_is_preserved():
     assert fixture["observed_env"]["PRIMARY_RESULT"] == "abandoned"
     raw, _ = _load_workflow()
     aggregate = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
+    publish = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Publish gate status panel")
     resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
-    for step in (aggregate, resolver):
+    for step in (aggregate, publish, resolver):
         assert step["env"]["PRIMARY_RESULT"] == PRIMARY_RESULT_EXPR
         assert step["env"]["PRIMARY_RESULT_RAW"] == PRIMARY_RESULT_RAW_EXPR
 
