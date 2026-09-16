@@ -3054,3 +3054,312 @@ def test_disposition_receipt_read_error_is_visible_and_does_not_change_gate(monk
     assert "Disposition receipt scan failed" in warning
     assert "RuntimeError" in warning
     assert "private response body" not in warning
+
+
+# ── dual-read GitHub ∪ Silo (cross-run history + disposition receipts) ────
+# Key morphology copied from B1 canary run 35082772768:
+#   mcli ls --recursive silo/ci-artifacts/d30/  and  .../d14/
+_CANARY_REPO_ID = 1327629472
+_CANARY_SHA = "2cdbc1bd4719665b7ba7548ba04edea73ec65ffc"
+_CANARY_RUN_ID = 35082772768
+_CANARY_ATTEMPT = 1
+_CANARY_TERMINAL_NAME = (
+    f"gate-terminal-v1-{_CANARY_REPO_ID}-{_CANARY_SHA}-{_CANARY_RUN_ID}-{_CANARY_ATTEMPT}"
+)
+_CANARY_TERMINAL_KEY = f"d30/{_CANARY_REPO_ID}/{_CANARY_TERMINAL_NAME}/gate-terminal.json"
+_CANARY_AUDIT_KEY = (
+    f"d14/{_CANARY_REPO_ID}/primary-audit-v2-{_CANARY_REPO_ID}-"
+    f"{_CANARY_SHA}-{_CANARY_RUN_ID}-{_CANARY_ATTEMPT}/primary-review-audit.json"
+)
+
+
+def test_dual_read_fixtures_copy_b1_canary_key_layout():
+    assert _CANARY_TERMINAL_KEY == (
+        "d30/1327629472/gate-terminal-v1-1327629472-"
+        "2cdbc1bd4719665b7ba7548ba04edea73ec65ffc-35082772768-1/gate-terminal.json"
+    )
+    assert _CANARY_AUDIT_KEY == (
+        "d14/1327629472/primary-audit-v2-1327629472-"
+        "2cdbc1bd4719665b7ba7548ba04edea73ec65ffc-35082772768-1/primary-review-audit.json"
+    )
+
+
+def _canary_terminal_bytes(gate_result="pass", *, run_id=_CANARY_RUN_ID, run_attempt=_CANARY_ATTEMPT, head_sha=_CANARY_SHA):
+    record = {
+        "schema_version": 1,
+        "kind": "gate_terminal",
+        "repository": "zlxlabs/gate",
+        "repository_id": _CANARY_REPO_ID,
+        "pr_number": 42,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+        "gate_result": gate_result,
+        "classification": "code_pass" if gate_result == "pass" else "code_fail",
+        "reason_code": "primary_pass" if gate_result == "pass" else "primary_findings",
+    }
+    return json.dumps(record).encode()
+
+
+def _canary_terminal_zip(gate_result="pass", **kwargs):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as bundle:
+        bundle.writestr("gate-terminal.json", _canary_terminal_bytes(gate_result, **kwargs))
+    return buf.getvalue()
+
+
+def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_objects, github_error=None, silo_error=None):
+    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
+
+    def fake_github_json(**kwargs):
+        if github_error is not None:
+            raise github_error
+        return {"artifacts": github_artifacts}
+
+    def fake_download(**kwargs):
+        return github_blobs[kwargs["url"]]
+
+    def fake_silo(prefix):
+        if silo_error is not None:
+            raise silo_error
+        return [(key, body) for key, body in silo_objects if key.startswith(prefix)]
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    monkeypatch.setattr(AGG, "_download_terminal_zip", fake_download)
+    monkeypatch.setattr(AGG, "_silo_objects_under", fake_silo)
+
+
+def _canary_receipt(reason="locked upstream behavior", finding_id="p1"):
+    scope = _scope_for(_failing_scoped_audit())
+    return _false_positive_receipt(
+        scope, repository_id=str(_CANARY_REPO_ID), reason=reason, finding_id=finding_id,
+    )
+
+
+def _receipt_payload(receipt):
+    return {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
+
+
+def _receipt_key(receipt):
+    name = CONV.disposition_receipt_artifact_name(receipt)
+    return f"d30/{_CANARY_REPO_ID}/{name}/{name}"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["github_only", "silo_only", "both_same", "both_empty", "github_fail", "silo_fail"],
+)
+def test_terminal_history_dual_read_table(monkeypatch, capsys, case):
+    github_zip = _canary_terminal_zip("fail")
+    silo_bytes = _canary_terminal_bytes("pass")
+    github_art = [{
+        "name": _CANARY_TERMINAL_NAME, "expired": False,
+        "archive_download_url": "https://api.github.com/artifacts/canary/zip",
+    }]
+    kwargs = dict(github_artifacts=[], github_blobs={}, silo_objects=[])
+    if case == "github_only":
+        kwargs = dict(github_artifacts=github_art, github_blobs={"https://api.github.com/artifacts/canary/zip": github_zip}, silo_objects=[])
+    elif case == "silo_only":
+        kwargs = dict(github_artifacts=[], github_blobs={}, silo_objects=[(_CANARY_TERMINAL_KEY, silo_bytes)])
+    elif case == "both_same":
+        kwargs = dict(
+            github_artifacts=github_art,
+            github_blobs={"https://api.github.com/artifacts/canary/zip": github_zip},
+            silo_objects=[(_CANARY_TERMINAL_KEY, silo_bytes)],
+        )
+    elif case == "github_fail":
+        kwargs = dict(
+            github_artifacts=[], github_blobs={}, silo_objects=[(_CANARY_TERMINAL_KEY, silo_bytes)],
+            github_error=RuntimeError("github listing down"),
+        )
+    elif case == "silo_fail":
+        kwargs = dict(
+            github_artifacts=github_art,
+            github_blobs={"https://api.github.com/artifacts/canary/zip": github_zip},
+            silo_objects=[],
+            silo_error=RuntimeError("silo listing down"),
+        )
+    _install_dual_read(monkeypatch, **kwargs)
+    result = AGG._fetch_terminal_history(
+        token="tok", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    warning = capsys.readouterr().out
+    rows_by_id = {(row["run_id"], row["run_attempt"]): row["gate_result"] for row in result.rows}
+    if case == "github_only":
+        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "fail"}
+        assert "Silo terminal history unavailable" not in warning
+    elif case == "silo_only":
+        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "pass"}
+        assert not any(reason.startswith("no terminal artifact matched gate-terminal-v1-") for reason in result.incomplete_reasons)
+        assert "Silo terminal history unavailable" not in warning
+    elif case == "both_same":
+        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "pass"}
+        assert "Silo terminal history unavailable" not in warning
+    elif case == "both_empty":
+        assert result.rows == []
+        assert any("no terminal artifact matched" in reason for reason in result.incomplete_reasons)
+        assert "Silo terminal history unavailable" not in warning
+    elif case == "github_fail":
+        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "pass"}
+        assert any("GitHub terminal history unavailable: RuntimeError" in reason for reason in result.incomplete_reasons)
+    elif case == "silo_fail":
+        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "fail"}
+        assert "Silo terminal history unavailable: RuntimeError" in warning
+        assert any("Silo terminal history unavailable: RuntimeError" in reason for reason in result.incomplete_reasons)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["github_only", "silo_only", "both_same", "both_empty", "github_fail", "silo_fail"],
+)
+def test_disposition_receipts_dual_read_table(monkeypatch, capsys, case):
+    github_receipt = _canary_receipt(reason="from-github")
+    silo_receipt = _canary_receipt(reason="from-silo")
+    other = _canary_receipt(reason="from-silo-only", finding_id="p2")
+    github_zip = _zip_receipt_bytes(_receipt_payload(github_receipt))
+    github_art = [{
+        "name": CONV.disposition_receipt_artifact_name(github_receipt),
+        "expired": False,
+        "archive_download_url": "https://api.github.com/artifacts/receipt/zip",
+    }]
+    kwargs = dict(github_artifacts=[], github_blobs={}, silo_objects=[])
+    if case == "github_only":
+        kwargs = dict(
+            github_artifacts=github_art,
+            github_blobs={"https://api.github.com/artifacts/receipt/zip": github_zip},
+            silo_objects=[],
+        )
+    elif case == "silo_only":
+        kwargs = dict(
+            github_artifacts=[], github_blobs={},
+            silo_objects=[(_receipt_key(silo_receipt), json.dumps(_receipt_payload(silo_receipt)).encode())],
+        )
+    elif case == "both_same":
+        kwargs = dict(
+            github_artifacts=github_art,
+            github_blobs={"https://api.github.com/artifacts/receipt/zip": github_zip},
+            silo_objects=[(_receipt_key(silo_receipt), json.dumps(_receipt_payload(silo_receipt)).encode())],
+        )
+    elif case == "github_fail":
+        kwargs = dict(
+            github_artifacts=[], github_blobs={},
+            silo_objects=[(_receipt_key(other), json.dumps(_receipt_payload(other)).encode())],
+            github_error=RuntimeError("private response body must not be logged"),
+        )
+    elif case == "silo_fail":
+        kwargs = dict(
+            github_artifacts=github_art,
+            github_blobs={"https://api.github.com/artifacts/receipt/zip": github_zip},
+            silo_objects=[],
+            silo_error=RuntimeError("silo listing down"),
+        )
+    _install_dual_read(monkeypatch, **kwargs)
+    receipts = AGG._fetch_disposition_receipts(
+        token="tok", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    warning = capsys.readouterr().out
+    reasons = [receipt.reason for receipt in receipts]
+    names = [CONV.disposition_receipt_artifact_name(receipt) for receipt in receipts]
+    if case == "github_only":
+        assert reasons == ["from-github"]
+        assert "Silo disposition receipt scan failed" not in warning
+    elif case == "silo_only":
+        assert reasons == ["from-silo"]
+        assert "Silo disposition receipt scan failed" not in warning
+    elif case == "both_same":
+        assert reasons == ["from-silo"]
+        assert names == [CONV.disposition_receipt_artifact_name(silo_receipt)]
+    elif case == "both_empty":
+        assert receipts == ()
+        assert "scan failed" not in warning
+    elif case == "github_fail":
+        assert reasons == ["from-silo-only"]
+        assert "Disposition receipt scan failed" in warning
+        assert "RuntimeError" in warning
+        assert "private response body" not in warning
+    elif case == "silo_fail":
+        assert reasons == ["from-github"]
+        assert "Silo disposition receipt scan failed" in warning
+        assert "RuntimeError" in warning
+
+
+def test_silo_objects_under_cli_path_contract(monkeypatch):
+    import subprocess
+
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    prefix = f"d30/{_CANARY_REPO_ID}/"
+    canonical_key = f"d30/{_CANARY_REPO_ID}/artifact-abc/receipt.json"
+    payload = b'{"receipt": true}'
+    recorded_calls = []
+
+    dest_existed = []
+
+    def fake_cli(argv):
+        recorded_calls.append(list(argv))
+        assert "--dest" in argv
+        dest_idx = argv.index("--dest")
+        dest_dir = Path(argv[dest_idx + 1])
+        dest_existed.append(dest_dir.is_dir())
+        parts = canonical_key.split("/", 3)
+        file_path = dest_dir / parts[2] / parts[3]
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(payload)
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=f"{canonical_key}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_cli)
+    objects = AGG._silo_objects_under(prefix)
+
+    # 断言走 CLI 路径及 argv 形态
+    assert len(recorded_calls) == 1
+    argv = recorded_calls[0]
+    assert argv[0:3] == ["list", "--prefix", prefix]
+    assert argv[3] == "--dest"
+    assert dest_existed == [True]
+
+    # 断言 stdout 键解析与 (key, body) 返回
+    assert objects == [(canonical_key, payload)]
+
+    # 断言四段键校验
+    def bad_key_cli(argv):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="invalid-two-segment/key\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(AGG, "_silo_cli", bad_key_cli)
+    with pytest.raises(ValueError) as exc:
+        AGG._silo_objects_under(prefix)
+    assert "silo key is not tier/repo_id/artifact_name/path" in str(exc.value)
+
+
+def test_silo_objects_under_narrows_import_error(monkeypatch):
+    import types
+
+    monkeypatch.setitem(sys.modules, "boto3", types.ModuleType("boto3"))
+    fake_store = AGG._silo_store_mod()
+
+    class BrokenClient:
+        pass
+
+    monkeypatch.setattr(fake_store, "connect", lambda: BrokenClient())
+    monkeypatch.setattr(fake_store, "bucket_name", lambda: "ci-artifacts")
+
+    def raise_import_error(*args, **kwargs):
+        raise ImportError("dependency missing during listing")
+
+    monkeypatch.setattr(fake_store, "list_keys", raise_import_error)
+
+    cli_called = []
+    monkeypatch.setattr(AGG, "_silo_cli", lambda argv: cli_called.append(argv))
+
+    with pytest.raises(ImportError) as exc:
+        AGG._silo_objects_under("d30/1/")
+    assert "dependency missing during listing" in str(exc.value)
+    assert not cli_called, "CLI fallback must not be triggered when store operations raise ImportError"

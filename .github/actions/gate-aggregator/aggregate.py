@@ -101,6 +101,7 @@ import os
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -169,6 +170,8 @@ MAX_REPO_WIDE_HISTORY_PAGES = 5
 MAX_TARGETED_HISTORY_RUNS = 50
 MAX_HISTORY_WARNING_CHARS = 500
 DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v2-"
+SILO_TERMINAL_TIER = "d30"
+SILO_DISPOSITION_TIER = "d30"
 PUBLISH_OPERATION_ORDER = (
     "IDENTITY",
     "COMMENT_LOOKUP",
@@ -1472,7 +1475,7 @@ def _consume_terminal_artifact(
     return True
 
 
-def _fetch_terminal_history(
+def _fetch_github_terminal_history(
     *, token: str, repository: str, repository_id: int, pr_number: int,
     target_run_ids: Optional[list[int]] = None,
 ) -> HistoryLoad:
@@ -1568,10 +1571,10 @@ def _read_disposition_zip(raw: bytes) -> dict[str, Any]:
     return payload
 
 
-def _fetch_disposition_receipts(
+def _fetch_github_disposition_receipts(
     *, token: str, repository: str, repository_id: int, pr_number: int,
 ) -> tuple[Any, ...]:
-    """Bounded same-repo artifact scan; errors fail-open to an empty tuple."""
+    """Bounded same-repo GitHub artifact scan; errors fail-open to an empty tuple."""
 
     artifacts: list[dict[str, Any]] = []
     page = 1
@@ -1623,6 +1626,249 @@ def _fetch_disposition_receipts(
             continue
         receipts.append(receipt)
     return tuple(receipts)
+
+
+def _silo_configured() -> bool:
+    return bool((os.environ.get("SILO_ENDPOINT") or "").strip())
+
+
+def _silo_store_mod():
+    from scripts import silo_store as store
+
+    return store
+
+
+def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
+    store_path = os.environ.get("SILO_STORE") or str(GATE_ROOT / "scripts" / "silo_store.py")
+    return subprocess.run(
+        ["uv", "run", "--python", "3.12", "--with", "boto3", "--", "python3", store_path, *argv],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _silo_objects_under(prefix: str) -> list[tuple[str, bytes]]:
+    """Return (key, body) pairs under a Silo prefix. Raises on listing/get failure."""
+
+    store = _silo_store_mod()
+    has_boto3 = True
+    try:
+        import boto3  # noqa: F401
+    except ImportError:
+        has_boto3 = False
+
+    if has_boto3:
+        try:
+            client = store.connect()
+            bucket = store.bucket_name()
+            keys = store.list_keys(client, bucket, prefix)
+            objects: list[tuple[str, bytes]] = []
+            for key in keys:
+                response = client.get_object(Bucket=bucket, Key=key)
+                objects.append(
+                    (key, store._body_bytes(response.get("Body") if isinstance(response, dict) else response))
+                )
+            return objects
+        except SystemExit as exc:
+            raise RuntimeError(f"silo scan failed with exit {exc.code}") from exc
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="silo-scan-") as dest:
+        proc = _silo_cli(["list", "--prefix", prefix, "--dest", dest])
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "silo list failed").strip())
+        keys = [line for line in proc.stdout.splitlines() if line.strip()]
+        objects = []
+        for key in keys:
+            parts = key.split("/", 3)
+            if len(parts) != 4:
+                raise ValueError(f"silo key is not tier/repo_id/artifact_name/path: {key}")
+            path = Path(dest) / parts[2] / parts[3]
+            objects.append((key, path.read_bytes()))
+        return objects
+
+
+def _terminal_artifact_run_id(name: str, repository_id: int) -> Optional[int]:
+    prefix = f"gate-terminal-v1-{repository_id}-"
+    if not name.startswith(prefix):
+        return None
+    parts = name[len(prefix) :].rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    sha, run_id_s, attempt_s = parts
+    if len(sha) != 40 or not run_id_s.isdigit() or not attempt_s.isdigit():
+        return None
+    return int(run_id_s)
+
+
+def _silo_artifact_name(key: str) -> str:
+    parts = key.split("/")
+    if len(parts) >= 3 and parts[2]:
+        return parts[2]
+    return key
+
+
+def _consume_silo_terminal_json(
+    result: HistoryLoad, *, name: str, raw: bytes, repository: str,
+    repository_id: int, pr_number: int,
+) -> None:
+    try:
+        record = json.loads(raw)
+        result.rows.append(
+            _terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number)
+        )
+    except ValueError as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        result.skipped_records.append({"name": name, "reason": reason})
+        if "identity does not match" not in str(exc):
+            result.incomplete_reasons.append(f"silo object {name}: {reason}")
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        result.skipped_records.append({"name": name, "reason": reason})
+        result.incomplete_reasons.append(f"silo object {name}: {reason}")
+
+
+def _fetch_silo_terminal_history(
+    *, repository: str, repository_id: int, pr_number: int,
+    target_run_ids: Optional[list[int]] = None,
+) -> HistoryLoad:
+    prefix = f"{SILO_TERMINAL_TIER}/{repository_id}/gate-terminal-v1-{repository_id}-"
+    result = HistoryLoad()
+    objects = _silo_objects_under(prefix)
+    allowed: Optional[set[int]] = None
+    if target_run_ids is not None:
+        unique_run_ids = list(dict.fromkeys(target_run_ids))
+        if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
+            unique_run_ids = unique_run_ids[:MAX_TARGETED_HISTORY_RUNS]
+        allowed = set(unique_run_ids)
+    for key, raw in objects:
+        name = _silo_artifact_name(key)
+        if allowed is not None:
+            run_id = _terminal_artifact_run_id(name, repository_id)
+            if run_id is not None and run_id not in allowed:
+                continue
+        _consume_silo_terminal_json(
+            result, name=name, raw=raw, repository=repository,
+            repository_id=repository_id, pr_number=pr_number,
+        )
+    return result
+
+
+def _merge_history_loads(github: HistoryLoad, silo: HistoryLoad) -> HistoryLoad:
+    by_identity: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in github.rows:
+        by_identity[(row["run_id"], row["run_attempt"])] = row
+    for row in silo.rows:
+        by_identity[(row["run_id"], row["run_attempt"])] = row
+    return HistoryLoad(
+        rows=list(by_identity.values()),
+        skipped_records=[*github.skipped_records, *silo.skipped_records],
+        incomplete_reasons=[*github.incomplete_reasons, *silo.incomplete_reasons],
+    )
+
+
+def _fetch_terminal_history(
+    *, token: str, repository: str, repository_id: int, pr_number: int,
+    target_run_ids: Optional[list[int]] = None,
+) -> HistoryLoad:
+    github = HistoryLoad()
+    try:
+        github = _fetch_github_terminal_history(
+            token=token, repository=repository, repository_id=repository_id,
+            pr_number=pr_number, target_run_ids=target_run_ids,
+        )
+    except _PublishBudgetExhausted:
+        raise
+    except Exception as exc:
+        github = HistoryLoad(
+            incomplete_reasons=[f"GitHub terminal history unavailable: {type(exc).__name__}"],
+        )
+    silo = HistoryLoad()
+    if _silo_configured():
+        try:
+            silo = _fetch_silo_terminal_history(
+                repository=repository, repository_id=repository_id,
+                pr_number=pr_number, target_run_ids=target_run_ids,
+            )
+        except _PublishBudgetExhausted:
+            raise
+        except Exception as exc:
+            print(f"::warning::Silo terminal history unavailable: {type(exc).__name__}")
+            silo = HistoryLoad(
+                incomplete_reasons=[f"Silo terminal history unavailable: {type(exc).__name__}"],
+            )
+    merged = _merge_history_loads(github, silo)
+    present_runs = {row["run_id"] for row in merged.rows}
+    filtered: list[str] = []
+    for reason in merged.incomplete_reasons:
+        if reason.startswith("no terminal artifact matched run "):
+            run_token = reason.rsplit(" ", 1)[-1]
+            if run_token.isdigit() and int(run_token) in present_runs:
+                continue
+        if reason.startswith("no terminal artifact matched gate-terminal-v1-") and merged.rows:
+            continue
+        filtered.append(reason)
+    merged.incomplete_reasons = filtered
+    return merged
+
+
+def _fetch_silo_disposition_receipts(*, repository_id: int, pr_number: int) -> tuple[Any, ...]:
+    prefix = f"{SILO_DISPOSITION_TIER}/{repository_id}/{DISPOSITION_ARTIFACT_PREFIX}"
+    try:
+        objects = _silo_objects_under(prefix)
+    except Exception as exc:
+        print(
+            f"::warning::Silo disposition receipt scan failed; "
+            f"claims from Silo were not recorded ({type(exc).__name__})."
+        )
+        return ()
+    receipts: list[Any] = []
+    artifact_warning_reported = False
+    for key, raw in objects:
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("disposition receipt payload must be a JSON object")
+            receipt = _CONVERGENCE.parse_disposition_receipt(payload)
+        except Exception as exc:
+            if not artifact_warning_reported:
+                print(
+                    f"::warning::Silo disposition receipt object could not be recorded ({type(exc).__name__})."
+                )
+                artifact_warning_reported = True
+            continue
+        if receipt.pr_number != pr_number or receipt.repository_id != str(repository_id):
+            continue
+        receipts.append(receipt)
+    return tuple(receipts)
+
+
+def _receipt_merge_key(receipt: Any) -> str:
+    return _CONVERGENCE.disposition_receipt_artifact_name(receipt)
+
+
+def _merge_disposition_receipts(github: tuple[Any, ...], silo: tuple[Any, ...]) -> tuple[Any, ...]:
+    by_name: dict[str, Any] = {}
+    for receipt in github:
+        by_name[_receipt_merge_key(receipt)] = receipt
+    for receipt in silo:
+        by_name[_receipt_merge_key(receipt)] = receipt
+    return tuple(by_name.values())
+
+
+def _fetch_disposition_receipts(
+    *, token: str, repository: str, repository_id: int, pr_number: int,
+) -> tuple[Any, ...]:
+    """Dual-read GitHub ∪ Silo; errors fail-open per source and merge the rest."""
+
+    github = _fetch_github_disposition_receipts(
+        token=token, repository=repository, repository_id=repository_id, pr_number=pr_number,
+    )
+    silo: tuple[Any, ...] = ()
+    if _silo_configured():
+        silo = _fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number)
+    return _merge_disposition_receipts(github, silo)
 
 
 def _merge_panel_rows(current: dict[str, Any], history: list[dict[str, Any]]) -> list[dict[str, Any]]:

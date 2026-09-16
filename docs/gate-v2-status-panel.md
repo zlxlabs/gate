@@ -30,17 +30,26 @@ POST self-healing still enforce the one-comment invariant.
 The body is a pure projection and is never used as the history database. The
 marker is `gate-v2-status-panel:v1`; it is not an ownership credential.
 
-History authority is the repository's `gate-terminal-v1-*` Actions artifacts.
+History authority is the union of the repository's `gate-terminal-v1-*`
+GitHub Actions artifacts and the same names under Silo bucket `ci-artifacts`
+(`d30/<repo_id>/gate-terminal-v1-<repo_id>-…/gate-terminal.json`). The two
+listings are merged by `run_id + run_attempt`; when both sides have the same
+run, Silo wins. GitHub-only rows cover the migration window (retention ≤ 30
+days). A Silo listing failure is a documented degradation: the panel may miss
+new runs, and the job log emits `::warning::Silo terminal history unavailable`
+rather than swallowing the error.
 When an existing own panel has parseable history rows, the aggregator validates
 those rows through the per-run Actions endpoint
-`actions/runs/{run_id}/artifacts`; it does not scan the repository-wide artifact
+`actions/runs/{run_id}/artifacts` plus a Silo prefix listing filtered to those
+run ids; it does not scan the repository-wide GitHub artifact
 list. Targeted validation is capped at 50 cached run ids. Each malformed,
 mismatched, or expired record is skipped independently and counted in the
 receipt/Step Summary. This includes prior head SHAs, so a new push adds a row.
 The cached rows are unioned with artifact rows by `run_id + run_attempt`; this
 is a cache/retention fallback, not a replacement for the artifact authority.
 If the panel is missing or its marker has no parseable history rows, the next
-run rebuilds from the repository-wide artifact list, bounded to five pages.
+run rebuilds from the repository-wide GitHub artifact list, bounded to five pages,
+unioned with the Silo prefix listing.
 Exceeding either bound marks history as incomplete with a `bounded_scan` reason.
 If either source is incomplete, the public panel states `历史可能不完整（原因）`
 and the receipt carries the per-record diagnostic. The panel groups repeated

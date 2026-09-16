@@ -175,12 +175,18 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert "gate/gate" not in text
     assert "check-runs" not in text
     upload = next(step for step in control["steps"] if step.get("name") == "Upload immutable disposition artifact")
-    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
-    assert upload["with"]["if-no-files-found"] == "error"
+    assert "uses" not in upload
+    assert "--tier d30" in upload["run"]
+    assert "put-dir" in upload["run"]
     resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
     assert resolve["env"]["GH_REPO"] == "${{ github.repository }}"
     assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
+    assert 'silo_key="d14/${GITHUB_REPOSITORY_ID}/${audit_name}/primary-review-audit.json"' in resolve["run"]
+    assert "silo_store.py\" get" in resolve["run"] or "$SILO_STORE\" get" in resolve["run"] or "$SILO_STORE get" in resolve["run"]
+    assert resolve["run"].index("$SILO_STORE") < resolve["run"].index("gh run download")
+    assert 'if [ "$silo_rc" -eq 2 ]; then' in resolve["run"]
     assert 'gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
+    assert "upload-artifact" not in text
     issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
     assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
     assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.triggering_actor }}"
@@ -191,6 +197,41 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert "inputs.approver" not in text
     assert "${{ github.triggering_actor }}" in text
     assert "${{ github.actor_id }}" in text
+
+
+def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_artifact():
+    raw, _ = _load_disposition_workflow()
+    text = DISPOSITION_WORKFLOW.read_text(encoding="utf-8")
+    assert "upload-artifact" not in text
+    assert text.count("100.100.100.100") >= 1
+    assert raw.get("env", {}).get("SILO_ENDPOINT") == "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000"
+    assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
+    control = raw["jobs"]["control"]
+    assert control["env"]["SILO_STORE"].endswith("scripts/silo_store.py")
+    assert control["runs-on"] == ["self-hosted", "linux", "ci"]
+    names = [step.get("name") for step in control["steps"]]
+    dns_index = names.index("Resolve Silo hostname via MagicDNS")
+    first_s3 = next(
+        index
+        for index, step in enumerate(control["steps"])
+        if "$SILO_STORE" in str(step.get("run", ""))
+        and any(token in str(step.get("run", "")) for token in (" put ", " put-dir ", " get "))
+    )
+    assert dns_index < first_s3
+    dns = control["steps"][dns_index]
+    assert "id -u" in dns["run"]
+    assert "100.100.100.100" in dns["run"]
+    download_run = next(
+        step["run"] for step in control["steps"]
+        if step.get("name") == "Resolve current PR head and canonical primary audit"
+    )
+    fallback_at = download_run.index("gh run download")
+    silo_get_at = download_run.index("get --key")
+    assert silo_get_at < fallback_at
+    after_fallback_branch = download_run[download_run.index('if [ "$silo_rc" -eq 2 ]; then'):]
+    assert "gh run download" in after_fallback_branch
+    before_fallback = download_run[:download_run.index('if [ "$silo_rc" -eq 2 ]; then')]
+    assert "gh run download" not in before_fallback
 
 
 def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
@@ -270,6 +311,7 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
     assert listed == {
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
+        "scripts/silo_store.py",
     }
     assert checkout["with"].get("sparse-checkout-cone-mode") is False
 
