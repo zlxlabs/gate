@@ -436,7 +436,7 @@ jobs:
             scripts/silo_store.py
 
       - name: Resolve Silo hostname via MagicDNS
-        if: always()
+        if: always() && env.AWS_ACCESS_KEY_ID != ''
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {

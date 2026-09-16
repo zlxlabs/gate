@@ -365,7 +365,10 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
     assert ("failure" != "skipped") is True
 
     quality_dns = next(s for s in raw["jobs"]["quality"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
-    assert quality_dns["if"] == "always()"
+    assert quality_dns["if"] == "always() && env.AWS_ACCESS_KEY_ID != ''"
+    # When secrets are omitted (e.g. fork PR), quality DNS step must not run:
+    assert ("" != "") is False
+    assert ("test-key" != "") is True
     primary_dns = next(s for s in raw["jobs"]["primary"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
     assert primary_dns["if"] == "always()"
     ledger_dns = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")

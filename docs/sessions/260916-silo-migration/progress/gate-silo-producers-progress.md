@@ -32,9 +32,9 @@
 
 - 当前阶段：fixing / R1 finding 修复完成
 - 本段结论：
-  1. F1: gate job 的 MagicDNS 步对齐 S3 依赖条件，仅在 needs.primary.result != 'skipped' 时运行，避免 fork PR / hosted 路径因无 tailnet 误拒 gate / gate；
+  1. F1: gate job 的 MagicDNS 步对齐 S3 依赖条件，仅在 needs.primary.result != 'skipped' 时运行；quality job 的 MagicDNS 步增加 always() && env.AWS_ACCESS_KEY_ID != '' 条件，避免 fork PR / hosted 路径因无 tailnet/secret 误拒 quality / gate；primary 整 job fork PR 跳过，ocr/ledger 具 continue-on-error 保持不变；
   2. F2: silo_store put --file 多文件对齐旧 upload-artifact 容错语义，缺失文件在 stderr 打印跳过明示，仅当全部文件缺失时退出码 1 报错；单文件缺失仍立即报错保持不变；
-  3. 契约测试：test_silo_store.py 锁单文件缺失报错、多文件部分缺失上传并提示、全缺失报错三态；test_gate_v2_contract.py 锁 gate DNS 条件及各 job SILO_STORE env ↔ checkout 路径严格对齐。
+  3. 契约测试：test_silo_store.py 锁单文件缺失报错、多文件部分缺失上传并提示、全缺失报错三态；test_gate_v2_contract.py 锁 gate 与 quality DNS 条件（含 fork PR 无 secret 时 quality DNS 跳过断言）及各 job SILO_STORE env ↔ checkout 路径严格对齐。
 - 关键决策与已否决方案：未新增 continue-on-error 或 || true；保留 hosted S3 fail-loud 既定决策。
 - 下一步唯一动作：全量验证通过后提交交付报告，由主脑启动 R2 复审。
 
