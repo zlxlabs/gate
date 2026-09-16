@@ -30,6 +30,7 @@ CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-v2.yml"
 DISPOSITION_CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-disposition.yml"
 DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
@@ -43,6 +44,8 @@ REVIEW_EXPECTED_IF = (
     "inputs.runner == 'self' && "
     "needs.classify_pr_paths.outputs.review_expected != 'false' }}"
 )
+PRIMARY_RESULT_EXPR = "${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}"
+PRIMARY_RESULT_RAW_EXPR = "${{ needs.primary.result }}"
 ARTIFACT_NAME_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -420,7 +423,6 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
         aggregate["env"]["REVIEW_EXPECTED"],
         publish["env"]["REVIEW_EXPECTED"],
         resolver["env"]["REVIEW_EXPECTED"],
-        download_audit["if"],
         build["with"]["codex-expected"],
     ]
     for copy in copies:
@@ -428,6 +430,22 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
     assert workflow_text.count(CLASSIFY_GUARD) == 7
     assert "outputs.review_expected == 'true'" not in workflow_text
+    assert download_audit["if"] == (
+        REVIEW_EXPECTED_IF[:-3] + " && "
+        "steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}"
+    )
+
+
+def test_observed_abandoned_primary_is_normalized_and_raw_value_is_preserved():
+    fixture = json.loads(ABANDONED_FIXTURE.read_text(encoding="utf-8"))
+    assert fixture["observed_env"]["PRIMARY_RESULT"] == "abandoned"
+    raw, _ = _load_workflow()
+    aggregate = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
+    publish = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Publish gate status panel")
+    resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
+    for step in (aggregate, publish, resolver):
+        assert step["env"]["PRIMARY_RESULT"] == PRIMARY_RESULT_EXPR
+        assert step["env"]["PRIMARY_RESULT_RAW"] == PRIMARY_RESULT_RAW_EXPR
 
 
 def test_classify_listing_failure_does_not_output_false(tmp_path):
@@ -1162,6 +1180,7 @@ def _run_ledger_resolver(
     for key in (
         "REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID",
         "QUALITY_LEDGER_INPUT_UPLOAD", "QUALITY_RESULT", "PRIMARY_RESULT",
+        "PRIMARY_RESULT_RAW",
     ):
         env.pop(key, None)
     # The workflow always sets these via needs.*.result; default to the
@@ -1425,7 +1444,8 @@ def test_ledger_resolver_step_env_and_download_guard_literals():
     ledger_steps = raw["jobs"]["ledger"]["steps"]
     resolve = next(s for s in ledger_steps if s.get("name") == "Resolve v2 ledger artifacts")
     assert resolve["env"]["QUALITY_RESULT"] == "${{ needs.quality.result }}"
-    assert resolve["env"]["PRIMARY_RESULT"] == "${{ needs.primary.result }}"
+    assert resolve["env"]["PRIMARY_RESULT"] == PRIMARY_RESULT_EXPR
+    assert resolve["env"]["PRIMARY_RESULT_RAW"] == PRIMARY_RESULT_RAW_EXPR
     download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
     assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
 
@@ -1509,6 +1529,73 @@ def test_ledger_resolver_result_domain_accepts_legal_values(
     assert "must be one of" not in combined
     assert "input_artifact_id=101" in output
     assert "terminal_artifact_id=201" in output
+
+
+def test_ledger_resolver_allows_missing_audit_for_observed_abandoned_primary(tmp_path):
+    fixture = json.loads(ABANDONED_FIXTURE.read_text(encoding="utf-8"))
+    observed = fixture["observed_env"]
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=artifacts,
+        current=fixture["identity"]["run_attempt"],
+        review_expected=observed["REVIEW_EXPECTED"],
+        extra_env={
+            "QUALITY_RESULT": observed["QUALITY_RESULT"],
+            "PRIMARY_RESULT": "cancelled",
+            "PRIMARY_RESULT_RAW": observed["PRIMARY_RESULT"],
+        },
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "audit_artifact_id=\n" in output
+    assert "input_artifact_id=101" in output
+    assert "terminal_artifact_id=201" in output
+
+
+@pytest.mark.parametrize("primary_result", ["success", "failure"])
+def test_ledger_resolver_still_requires_audit_for_reviewed_success_or_failure(tmp_path, primary_result):
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=[
+            {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+            {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+        ],
+        current=1,
+        review_expected="true",
+        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": primary_result},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching canonical primary audit artifact found" in combined
+
+
+def test_ledger_resolver_cancelled_primary_still_requires_terminal(tmp_path):
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=[{"name": "review-ledger-input-v2-1", "expired": False, "id": 101}],
+        current=1,
+        review_expected="true",
+        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "cancelled"},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required gate terminal artifact found" in combined
+
+
+def test_ledger_resolver_quality_success_still_requires_input_on_cancelled_primary(tmp_path):
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=[{"name": "gate-terminal-v1-1", "expired": False, "id": 201}],
+        current=1,
+        review_expected="true",
+        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "cancelled"},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "No matching required ledger input artifact found" in combined
 
 
 def test_ledger_persistence_steps_are_fail_closed():

@@ -1202,7 +1202,8 @@ jobs:
         id: aggregate-required-verdict
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
-          PRIMARY_RESULT: ${{ needs.primary.result }}
+          PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
+          PRIMARY_RESULT: ${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}
           # Forwarded so the aggregator can strictly validate it itself
           # (self|hosted only) — a typo here must fail closed, not silently
           # fall through whichever branch it happens to resemble.
@@ -1290,7 +1291,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           QUALITY_RESULT: ${{ needs.quality.result }}
-          PRIMARY_RESULT: ${{ needs.primary.result }}
+          PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
+          PRIMARY_RESULT: ${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}
           RUNNER_MODE: ${{ inputs.runner }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
@@ -1376,7 +1378,8 @@ jobs:
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
           QUALITY_LEDGER_INPUT_UPLOAD: ${{ needs.quality.outputs.ledger_input_upload }}
           QUALITY_RESULT: ${{ needs.quality.result }}
-          PRIMARY_RESULT: ${{ needs.primary.result }}
+          PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
+          PRIMARY_RESULT: ${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}
         run: |
           set -euo pipefail
           listing="$(mktemp)"
@@ -1465,7 +1468,11 @@ jobs:
           )
           if quality_short_circuited and input_artifact is None:
               print("::notice::ledger input skipped: quality was short-circuited by primary failure (gate#105 A); preflight/install fields will be null")
-          audit_artifact = select_artifact(audit_prefix, "No matching canonical primary audit artifact found", expected_text == "true")
+          audit_artifact = select_artifact(
+              audit_prefix,
+              "No matching canonical primary audit artifact found",
+              expected_text == "true" and primary_result != "cancelled",
+          )
           terminal_artifact = select_artifact(
               terminal_prefix, "No matching required gate terminal artifact found", True,
           )
@@ -1593,7 +1600,7 @@ jobs:
           path: ${{ runner.temp }}/review-ledger-input
 
       - name: Download canonical primary audit for ledger
-        if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
+        if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}

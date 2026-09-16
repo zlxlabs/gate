@@ -29,6 +29,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+ABANDONED_FIXTURE = ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
 
 
 def _module():
@@ -491,18 +492,19 @@ def test_read_audit_file_non_dict_json_roundtrips_as_is(tmp_path):
 # ── CLI end-to-end (exit codes + step summary) ───────────────────────────
 
 def _cli_args(audit_dir, summary_path, **overrides):
+    identity = overrides.pop("identity", IDENTITY)
     values = dict(
         quality_result="success",
         primary_result="success",
         runner="self",
         is_draft="false",
         review_expected="true",
-        repository_id=str(IDENTITY.repository_id),
-        head_sha=IDENTITY.head_sha,
-        run_id=str(IDENTITY.run_id),
-        run_attempt=str(IDENTITY.run_attempt),
-        pr_number=str(IDENTITY.pr), repository="zlxlabs/gate",
-        audit_source_attempt=str(IDENTITY.run_attempt), audit_artifact_name="primary-audit-v2-1", terminal_path=str(Path(summary_path).with_name("gate-terminal.json")),
+        repository_id=str(identity.repository_id),
+        head_sha=identity.head_sha,
+        run_id=str(identity.run_id),
+        run_attempt=str(identity.run_attempt),
+        pr_number=str(identity.pr), repository="zlxlabs/gate",
+        audit_source_attempt=str(identity.run_attempt), audit_artifact_name="primary-audit-v2-1", terminal_path=str(Path(summary_path).with_name("gate-terminal.json")),
     )
     values.update(overrides)
     args = [
@@ -537,6 +539,61 @@ def test_main_exit_code_zero_on_pass(tmp_path):
     rc = AGG.main(_cli_args(audit_dir, summary_path))
     assert rc == 0
     assert "pass" in summary_path.read_text() and json.loads(summary_path.with_name("gate-terminal.json").read_text())["kind"] == "gate_terminal"
+
+
+def test_observed_abandoned_fixture_produces_fail_terminal_and_unreviewed_ledger_row(tmp_path, monkeypatch):
+    fixture = json.loads(ABANDONED_FIXTURE.read_text(encoding="utf-8"))
+    observed = fixture["observed_env"]
+    source = fixture["identity"]
+    identity = AGG.Identity(
+        repository_id=source["repository_id"], head_sha=source["head_sha"],
+        run_id=source["run_id"], run_attempt=source["run_attempt"], pr=source["pr_number"],
+    )
+    summary_path = tmp_path / "summary.md"
+    rc = AGG.main(_cli_args(
+        tmp_path / "missing-audit",
+        summary_path,
+        identity=identity,
+        repository=source["repository"],
+        quality_result=observed["QUALITY_RESULT"],
+        primary_result="cancelled",
+        review_expected=observed["REVIEW_EXPECTED"],
+    ))
+    assert observed["PRIMARY_RESULT"] == "abandoned"
+    assert rc == 1
+    terminal_path = summary_path.with_name("gate-terminal.json")
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert terminal["primary_result"] == "cancelled"
+    assert terminal["gate_result"] == "unavailable"  # existing cancelled fail-closed terminal state
+    assert terminal["reason_code"] == "primary_cancelled"
+
+    ledger_spec = importlib.util.spec_from_file_location(
+        "review_ledger_for_abandoned", ROOT / ".github" / "actions" / "review-ledger" / "build_ledger.py",
+    )
+    ledger = importlib.util.module_from_spec(ledger_spec)
+    assert ledger_spec.loader
+    ledger_spec.loader.exec_module(ledger)
+    preflight = tmp_path / "pr-size-preflight.json"
+    install = tmp_path / "install-result.json"
+    output = tmp_path / "ledger.jsonl"
+    preflight.write_text(json.dumps({"reviewable": True}), encoding="utf-8")
+    install.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "build_ledger.py", "--audit-path", str(tmp_path / "missing-audit.json"),
+        "--preflight-path", str(preflight), "--install-path", str(install),
+        "--terminal-path", str(terminal_path), "--output", str(output),
+        "--repository", source["repository"], "--pr-number", str(source["pr_number"]),
+        "--run-id", str(source["run_id"]), "--run-attempt", str(source["run_attempt"]),
+        "--head-sha", source["head_sha"], "--expected-repository-id", str(source["repository_id"]),
+        "--expected-base-sha", "redacted-base", "--expected-caller-sha", "redacted-caller",
+        "--expected-reusable-workflow-sha", "redacted-workflow", "--codex-expected", "true",
+    ])
+    assert ledger.main() == 0
+    row = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert row["schema_version"] == 2
+    assert row["review"]["status"] == "not_run"
+    assert row["review"]["verdict"] is None
+    assert row["review"]["result"] is None
 
 
 def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):

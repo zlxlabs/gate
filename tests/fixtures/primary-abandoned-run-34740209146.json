@@ -1,0 +1,45 @@
+{
+  "source": {
+    "run_url": "https://github.com/zlxlabs/agent-config/actions/runs/34740209146",
+    "attempt_jobs_url": "https://github.com/zlxlabs/agent-config/actions/runs/34740209146/attempts/1/jobs",
+    "primary_job_url": "https://github.com/zlxlabs/agent-config/actions/runs/34740209146/job/103678552561",
+    "ledger_job_url": "https://github.com/zlxlabs/agent-config/actions/runs/34740209146/job/103681220092"
+  },
+  "identity": {
+    "repository": "zlxlabs/agent-config",
+    "repository_id": 1309811311,
+    "head_sha": "fd659ece36ec6c0c827de0ea84b3c93af5ed42c6",
+    "run_id": 34740209146,
+    "run_attempt": 1,
+    "pr_number": 2156
+  },
+  "observed_env": {
+    "PRIMARY_RESULT": "abandoned",
+    "QUALITY_RESULT": "success",
+    "REVIEW_EXPECTED": "true"
+  },
+  "jobs": {
+    "primary": {
+      "id": 103678552561,
+      "status": "completed",
+      "conclusion": "cancelled",
+      "started_at": "2026-09-13T05:24:21Z",
+      "completed_at": "2026-09-13T05:43:43Z",
+      "steps": []
+    },
+    "quality": {
+      "id": 103678532493,
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-09-13T05:40:59Z",
+      "completed_at": "2026-09-13T05:42:17Z"
+    },
+    "ledger": {
+      "id": 103681220092,
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-09-13T05:51:03Z",
+      "completed_at": "2026-09-13T05:51:17Z"
+    }
+  }
+}
