@@ -3340,6 +3340,9 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
 
 
 def test_silo_objects_under_narrows_import_error(monkeypatch):
+    import types
+
+    monkeypatch.setitem(sys.modules, "boto3", types.ModuleType("boto3"))
     fake_store = AGG._silo_store_mod()
 
     class BrokenClient:
