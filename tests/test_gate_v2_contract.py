@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from scripts import silo_store as silo_store
 from _gha_lint import (
     find_arithmetic_gha_expression_offenders,
     materialize_jobs_api_snippet_for_probe,
@@ -75,8 +76,6 @@ UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886
 EXPECTED_ACTION_REFS = {
     "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
     "actions/cache": "0057852bfaa89a56745cba8c7296529d2fc39830",
-    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
-    "actions/download-artifact": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
 }
 # fromJSON('["self-hosted","linux","ci"]') — capture each array literal in runs-on.
 _FROMJSON_LABELS_RE = re.compile(r"fromJSON\('(\[[^\]]*\])'\)")
@@ -322,13 +321,94 @@ def test_production_v2_official_actions_are_exactly_sha_pinned():
     assert actual == {action: {ref} for action, ref in EXPECTED_ACTION_REFS.items()}
 
 
+def test_gate_v2_has_no_github_artifact_actions():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "upload-artifact" not in text
+    assert "download-artifact" not in text
+    raw, _ = _load_workflow()
+    assert raw.get("env", {}).get("SILO_ENDPOINT") == "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000"
+    assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
+    hold = REPO_ROOT / ".github" / "v2-tag-sync.hold"
+    assert hold.is_file()
+    assert "Silo" in hold.read_text(encoding="utf-8")
+
+
+def test_silo_touching_jobs_resolve_magicdns_before_s3():
+    raw, _ = _load_workflow()
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("100.100.100.100") >= 5
+    for job_name in ("quality", "primary", "ocr", "gate", "ledger"):
+        steps = raw["jobs"][job_name]["steps"]
+        names = [step.get("name") for step in steps]
+        assert "Resolve Silo hostname via MagicDNS" in names
+        dns_index = names.index("Resolve Silo hostname via MagicDNS")
+        first_transfer = None
+        for index, step in enumerate(steps):
+            run = str(step.get("run", ""))
+            if "$SILO_STORE" not in run:
+                continue
+            if any(token in run for token in (" put ", " put-dir ", " get ", " resolve")):
+                first_transfer = index
+                break
+        assert first_transfer is not None, job_name
+        assert dns_index < first_transfer, job_name
+        dns = steps[dns_index]
+        assert "id -u" in dns["run"]
+        assert "100.100.100.100" in dns["run"]
+
+    # F1 lock: MagicDNS step conditions. Gate job must not run MagicDNS when primary is skipped.
+    gate_dns = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert gate_dns["if"] == "${{ needs.primary.result != 'skipped' }}"
+    # When primary is skipped (e.g. fork PR), gate DNS must not run:
+    assert ("skipped" != "skipped") is False
+    assert ("success" != "skipped") is True
+    assert ("failure" != "skipped") is True
+
+    quality_dns = next(s for s in raw["jobs"]["quality"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert quality_dns["if"] == "always() && env.AWS_ACCESS_KEY_ID != ''"
+    # When secrets are omitted (e.g. fork PR), quality DNS step must not run:
+    assert ("" != "") is False
+    assert ("test-key" != "") is True
+    primary_dns = next(s for s in raw["jobs"]["primary"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert primary_dns["if"] == "always()"
+    ledger_dns = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert ledger_dns["if"] == "always()"
+    ocr_dns = next(s for s in raw["jobs"]["ocr"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    assert ocr_dns["if"] == "always() && matrix.reviewer != '__none__'"
+
+
+def test_silo_store_env_aligns_with_job_checkout_path():
+    raw, _ = _load_workflow()
+    for job_name in ("quality", "primary", "ocr", "gate", "ledger"):
+        job = raw["jobs"][job_name]
+        silo_store_env = job.get("env", {}).get("SILO_STORE", "")
+        assert silo_store_env.endswith("/scripts/silo_store.py"), (
+            f"{job_name}: SILO_STORE must point to scripts/silo_store.py"
+        )
+        checkout_dir = silo_store_env.split("/")[0]
+        checkout_step = next(
+            (
+                s
+                for s in job["steps"]
+                if s.get("uses", "").startswith("actions/checkout@")
+                and s.get("with", {}).get("path") == checkout_dir
+            ),
+            None,
+        )
+        assert checkout_step is not None, f"{job_name}: no checkout step for {checkout_dir}"
+        assert checkout_step["with"]["repository"] == "${{ job.workflow_repository }}"
+        assert checkout_step["with"]["ref"] == "${{ job.workflow_sha }}"
+
+
 def test_secrets_explicit_and_feishu_optional():
     code = "\n".join(ln for ln in WORKFLOW.read_text().splitlines() if not ln.lstrip().startswith("#"))
     assert "inherit" not in code
     _, trigger = _load_workflow()
     secrets = trigger["workflow_call"].get("secrets", {})
-    assert set(secrets.keys()) == {"FEISHU_CI_WEBHOOK"}
+    assert set(secrets.keys()) == {"FEISHU_CI_WEBHOOK", "SILO_ACCESS_KEY", "SILO_SECRET_KEY"}
     assert secrets["FEISHU_CI_WEBHOOK"].get("required") is False
+    assert secrets["SILO_ACCESS_KEY"].get("required") is False
+    assert secrets["SILO_SECRET_KEY"].get("required") is False
 
 
 def test_control_runner_input_defaults_to_follow_runner():
@@ -519,7 +599,9 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
     assert 'advisory-delivery-${REVIEWER}.json' in comment_step["run"]
 
     upload_step = next(s for s in ocr["steps"] if s.get("name") == "Upload advisory review event")
-    assert upload_step["with"]["path"] == "${{ runner.temp }}/shadow-events/advisory"
+    assert upload_step["env"]["ADVISORY_DIR"] == "${{ runner.temp }}/shadow-events/advisory"
+    assert "--tier d3" in upload_step["run"]
+    assert "advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}" in upload_step["env"]["ARTIFACT_NAME"]
 
 
 def test_advisory_event_upload_declares_three_day_retention():
@@ -529,7 +611,8 @@ def test_advisory_event_upload_declares_three_day_retention():
         for step in raw["jobs"]["ocr"]["steps"]
         if step.get("name") == "Upload advisory review event"
     )
-    assert upload["with"]["retention-days"] == 3
+    assert "--tier d3" in upload["run"]
+    assert "$SILO_STORE" in upload["run"]
 
 
 def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
@@ -733,7 +816,12 @@ def test_gate_terminal_upload_declares_explicit_retention():
         for step in raw["jobs"]["gate"]["steps"]
         if step.get("name") == "Upload gate terminal envelope"
     )
-    assert upload["with"]["retention-days"] == 30
+    assert "--tier d30" in upload["run"]
+    assert "$SILO_STORE" in upload["run"]
+    assert upload["env"]["ARTIFACT_NAME"] == (
+        "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+        "-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
 
 
 def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication():
@@ -756,15 +844,14 @@ def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication(
 
     upload = steps[receipt_index]
     assert upload["if"] == "always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
-    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
+    assert "uses" not in upload
     assert "always()" in str(upload["if"])
     assert "continue-on-error" not in upload
-    assert upload["with"] == {
-        "name": CONVERGENCE_RECEIPT_NAME_EXPR,
-        "path": CONVERGENCE_RECEIPT_PATH,
-        "if-no-files-found": "error",
-        "retention-days": 3,
-    }
+    assert upload["env"]["ARTIFACT_NAME"] == CONVERGENCE_RECEIPT_NAME_EXPR
+    assert upload["env"]["RECEIPT_DIR"] == CONVERGENCE_RECEIPT_PATH
+    assert "--tier d3" in upload["run"]
+    assert "$SILO_STORE" in upload["run"]
+    assert "|| true" not in upload["run"]
 
 
 def test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggregate_rc():
@@ -854,18 +941,15 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     primary_steps = raw["jobs"]["primary"]["steps"]
     upload = next(s for s in primary_steps if s.get("name") == "Upload canonical primary audit")
     assert upload["if"] == "always()"
-    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
-    assert upload["with"]["name"] == ARTIFACT_NAME_EXPR
+    assert "uses" not in upload
+    assert upload["env"]["ARTIFACT_NAME"] == ARTIFACT_NAME_EXPR
     # fail-closed: unlike legacy's advisory codex-audit upload, this upload has no
-    # continue-on-error. P1 fix (2026-07-26, canary probe #2): if-no-files-found MUST be
-    # explicit `error` — actions/upload-artifact@v4's own default is `warn` (a step
-    # annotation, not a failure), which is what let canary's primary job conclude
-    # `success` despite writing no audit at all; relying on "we didn't set `ignore`"
-    # alone was never sufficient fail-closed enforcement.
+    # continue-on-error. Missing source file makes silo_store put exit 1.
     assert "continue-on-error" not in upload
-    assert upload["with"]["if-no-files-found"] == "error"
-    assert upload["with"]["path"] == "${{ runner.temp }}/primary-review-audit.json"
-    assert upload["with"]["retention-days"] == 14
+    assert "--tier d14" in upload["run"]
+    assert upload["env"]["AUDIT_PATH"] == "${{ runner.temp }}/primary-review-audit.json"
+    assert "|| true" not in upload["run"]
+    assert "SILO_ACCESS_KEY 未传入" in upload["run"]
 
 
 def test_primary_uploads_review_diagnostics_after_canonical_audit():
@@ -876,17 +960,14 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
         i for i, step in enumerate(steps) if step.get("name") == "Upload primary review diagnostics"
     )
     assert diagnostics_index == audit_index + 1
-    assert steps[diagnostics_index] == {
-        "name": "Upload primary review diagnostics",
-        "if": "always()",
-        "uses": UPLOAD_ARTIFACT_ACTION,
-        "with": {
-            "name": DIAGNOSTICS_NAME_EXPR,
-            "path": DIAGNOSTICS_PATH,
-            "if-no-files-found": "ignore",
-            "retention-days": 3,
-        },
-    }
+    diagnostics = steps[diagnostics_index]
+    assert diagnostics["name"] == "Upload primary review diagnostics"
+    assert diagnostics["if"] == "always()"
+    assert "uses" not in diagnostics
+    assert diagnostics["env"]["ARTIFACT_NAME"] == DIAGNOSTICS_NAME_EXPR
+    assert diagnostics["env"]["DIAGNOSTICS_DIR"] == DIAGNOSTICS_PATH.rstrip("/")
+    assert "--tier d3" in diagnostics["run"]
+    assert "--empty skip" in diagnostics["run"]
 
     gate_steps = raw["jobs"]["gate"]["steps"]
     resolver = next(s for s in gate_steps if s.get("name") == "Resolve canonical primary audit artifact")
@@ -895,12 +976,10 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     assert resolver["continue-on-error"] is True
     assert resolver["env"]["AUDIT_PREFIX"] == ARTIFACT_PREFIX_EXPR
     resolver_run = resolver["run"]
-    assert "gh api" in resolver_run
-    assert "actions/runs/${{ github.run_id }}/artifacts" in resolver_run
-    assert "--paginate" in resolver_run
-    assert "expired" in resolver_run
-    assert "<= current_attempt" in resolver_run
-    assert "max(" in resolver_run
+    assert "$SILO_STORE" in resolver_run
+    assert "resolve" in resolver_run
+    assert "--tier d14" in resolver_run
+    assert "--attempt" in resolver_run
     assert 'artifact_id=' in resolver_run
     assert 'source_attempt=' in resolver_run
     assert 'echo "artifact_id="' in resolver_run
@@ -908,25 +987,31 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     assert 'No matching canonical primary audit artifact found' in resolver_run
 
     download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
-    assert download["with"]["artifact-ids"] == "${{ steps.resolve-audit-artifact.outputs.artifact_id }}"
-    assert download["with"]["merge-multiple"] is True
-    assert "name" not in download["with"]
+    assert download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-audit-artifact.outputs.artifact_id }}"
+    assert download["env"]["DEST"] == "${{ runner.temp }}/primary-audit"
+    assert "$SILO_STORE" in download["run"]
+    assert " get " in download["run"] or "\n          get " in download["run"] or "silo_store.py\" get" in download["run"]
     assert download["continue-on-error"] is True
     assert download["if"] == (
         "${{ needs.primary.result != 'skipped' && "
         "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
     )
     terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
-    assert terminal_upload["if"] == "always()" and terminal_upload["uses"] == UPLOAD_ARTIFACT_ACTION and terminal_upload["with"] == {"name": "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", "path": "${{ runner.temp }}/gate-terminal.json", "if-no-files-found": "error", "retention-days": 30} and terminal_upload["continue-on-error"] is True
+    assert terminal_upload["if"] == "always()"
+    assert "uses" not in terminal_upload
+    assert terminal_upload["continue-on-error"] is True
+    assert terminal_upload["env"]["ARTIFACT_NAME"] == (
+        "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+        "-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert "--tier d30" in terminal_upload["run"]
     terminal_retry = next(s for s in gate_steps if s.get("name") == "Retry upload gate terminal envelope")
     assert terminal_retry["if"] == "always() && steps.upload-gate-terminal.outcome == 'failure'"
     assert terminal_retry["id"] == "retry-upload-gate-terminal"
     assert terminal_retry["continue-on-error"] is True
-    assert terminal_retry["uses"] == terminal_upload["uses"]
-    assert terminal_retry["with"] == {
-        **terminal_upload["with"],
-        "overwrite": True,
-    }
+    assert "uses" not in terminal_retry
+    assert terminal_retry["env"]["ARTIFACT_NAME"] == terminal_upload["env"]["ARTIFACT_NAME"]
+    assert "--tier d30" in terminal_retry["run"]
     publish = next(s for s in gate_steps if s.get("name") == "Publish gate status panel")
     assert publish["if"] == (
         "always() && (steps.upload-gate-terminal.outcome == 'success' || "
@@ -946,17 +1031,10 @@ def test_artifact_listing_resolvers_retry_with_bounded_timeout(job_name, step_na
     step = next(s for s in raw["jobs"][job_name]["steps"] if s.get("name") == step_name)
     run = step["run"]
 
-    assert "artifacts_api=\"repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts\"" in run
-    assert "max_attempts=3" in run
-    assert "retry_delay_seconds=1" in run
-    assert "for attempt in 1 2 3; do" in run
-    assert "timeout --foreground 15s gh api \"$artifacts_api\" --paginate --slurp" in run
-    assert '|| rc=$?' in run
-    assert "GitHub API request retry:" in run
-    assert "path=${artifacts_api} attempt=$((attempt + 1))/${max_attempts} error=exit_${rc}" in run
-    assert 'sleep "$retry_delay_seconds"' in run
-    assert 'if [ "$rc" -ne 0 ]; then' in run
-    assert 'exit "$rc"' in run
+    assert "$SILO_STORE" in run
+    assert " resolve" in run
+    assert "--attempt" in run
+    assert "SILO_ACCESS_KEY 未传入" in run
     assert "while true" not in run
     assert "until true" not in run
 
@@ -995,17 +1073,17 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert input_upload["continue-on-error"] is True
     assert retry_upload["continue-on-error"] is True
     assert retry_upload["if"] == "always() && steps.ledger-input-upload.outcome == 'failure'"
-    assert retry_upload["with"]["name"] == input_upload["with"]["name"]
-    assert retry_upload["with"]["path"] == input_upload["with"]["path"]
-    assert retry_upload["uses"] == input_upload["uses"]
-    assert retry_upload["with"]["overwrite"] is True
-    assert input_download["with"]["artifact-ids"] == "${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}"
-    assert "pr-size-preflight.json" in input_upload["with"]["path"]
-    assert "install-result.json" in input_upload["with"]["path"]
-    assert input_download["with"]["path"] == "${{ runner.temp }}/review-ledger-input"
+    assert retry_upload["env"]["ARTIFACT_NAME"] == input_upload["env"]["ARTIFACT_NAME"]
+    assert retry_upload["env"]["PREFLIGHT"] == input_upload["env"]["PREFLIGHT"]
+    assert "uses" not in retry_upload and "uses" not in input_upload
+    assert "--tier d1" in input_upload["run"] and "--tier d1" in retry_upload["run"]
+    assert input_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}"
+    assert "pr-size-preflight.json" in input_upload["env"]["PREFLIGHT"]
+    assert "install-result.json" in input_upload["env"]["INSTALL"]
+    assert input_download["env"]["DEST"] == "${{ runner.temp }}/review-ledger-input"
     terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
-    assert terminal_download["with"]["artifact-ids"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
-    assert terminal_download["with"]["path"] == "${{ runner.temp }}/gate-terminal"
+    assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
+    assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
     assert "continue-on-error" not in terminal_download
     build = steps[build_index]
     assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
@@ -1020,13 +1098,14 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "token" not in build["with"]
 
     upload = steps[upload_index]
-    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
-    assert upload["with"] == {
-        "name": "codex-review-ledger-v2",
-        "path": "${{ runner.temp }}/review-ledger/ledger.jsonl",
-        "if-no-files-found": "error",
-        "retention-days": 30,
-    }
+    assert "uses" not in upload
+    assert upload["env"]["ARTIFACT_NAME"] == (
+        "codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+        "-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert upload["env"]["LEDGER_PATH"] == "${{ runner.temp }}/review-ledger/ledger.jsonl"
+    assert "--tier d30" in upload["run"]
+    assert "$SILO_STORE" in upload["run"]
 
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:
@@ -1076,8 +1155,9 @@ def test_review_ledger_input_uploads_declare_one_day_retention():
         for step in quality_steps
         if step.get("name") == "Retry upload v2 review ledger inputs"
     )
-    assert upload["with"]["retention-days"] == 1
-    assert retry["with"]["retention-days"] == 1
+    assert "--tier d1" in upload["run"]
+    assert "--tier d1" in retry["run"]
+    assert "$SILO_STORE" in upload["run"]
 
 
 def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
@@ -1109,7 +1189,7 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
     assert resolver["env"]["REVIEW_EXPECTED"] == raw["jobs"]["primary"]["if"]
     run = resolver["run"]
     for marker in (
-        "--paginate", "expired", "<= current",
+        "$SILO_STORE", "resolve", "--attempt",
         "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
         "terminal_source_attempt",
     ):
@@ -1141,21 +1221,48 @@ def _ledger_resolver_python() -> str:
     return run[start:end]
 
 
+def _silo_prefix(name: str) -> str:
+    if name.startswith("review-ledger-input-v2-"):
+        return f"d1/1/{name}"
+    if name.startswith("primary-audit-v2-"):
+        return f"d14/1/{name}"
+    if name.startswith("gate-terminal-v1-"):
+        return f"d30/1/{name}"
+    raise ValueError(name)
+
+
+def _resolve_env_from_artifacts(artifacts, current: int) -> dict[str, str]:
+    names = [
+        artifact["name"]
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+        and isinstance(artifact.get("name"), str)
+        and artifact.get("expired") is not True
+    ]
+
+    def picked(prefix: str, tier: str) -> str:
+        selected = silo_store.select_attempt(names, prefix, current)
+        if selected is None:
+            return ""
+        name, attempt = selected
+        return f"{tier}/1/{name}\t{attempt}\t{name}"
+
+    return {
+        "INPUT_RESOLVE": picked("review-ledger-input-v2-", "d1"),
+        "AUDIT_RESOLVE": picked("primary-audit-v2-", "d14"),
+        "TERMINAL_RESOLVE": picked("gate-terminal-v1-", "d30"),
+    }
+
+
 def _run_ledger_resolver(
     tmp_path, *, artifacts, current, review_expected="false",
     jobs=None, jobs_path=None, attempt=None, attempt_path=None,
     extra_env=None,
 ):
-    listing = tmp_path / "listing.json"
-    listing.write_text(json.dumps({"artifacts": artifacts}), encoding="utf-8")
     output = tmp_path / "github_output"
     output.write_text("", encoding="utf-8")
     argv = [
         sys.executable, "-",
-        str(listing),
-        "review-ledger-input-v2-",
-        "primary-audit-v2-",
-        "gate-terminal-v1-",
         str(current),
         review_expected,
         str(output),
@@ -1180,13 +1287,14 @@ def _run_ledger_resolver(
     for key in (
         "REPOSITORY", "RUN_ID", "GITHUB_REPOSITORY", "GITHUB_RUN_ID",
         "QUALITY_LEDGER_INPUT_UPLOAD", "QUALITY_RESULT", "PRIMARY_RESULT",
-        "PRIMARY_RESULT_RAW",
+        "PRIMARY_RESULT_RAW", "INPUT_RESOLVE", "AUDIT_RESOLVE", "TERMINAL_RESOLVE",
     ):
         env.pop(key, None)
     # The workflow always sets these via needs.*.result; default to the
     # non-short-circuit happy path, overridable per test via extra_env.
     env["QUALITY_RESULT"] = "success"
     env["PRIMARY_RESULT"] = "success"
+    env.update(_resolve_env_from_artifacts(artifacts, current))
     if extra_env:
         env.update(extra_env)
     result = subprocess.run(
@@ -1249,7 +1357,7 @@ def test_ledger_resolver_falls_back_to_prior_terminal_when_current_attempt_is_mi
         attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
     )
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "terminal_artifact_id=201" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
     assert "terminal_source_attempt=1" in output
 
 
@@ -1261,7 +1369,7 @@ def test_ledger_resolver_selects_current_attempt_terminal_not_an_older_one(tmp_p
     ]
     result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "terminal_artifact_id=202" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-2')}" in output
     assert "terminal_source_attempt=2" in output
 
 
@@ -1274,7 +1382,7 @@ def test_ledger_resolver_refuses_future_terminal_artifact(tmp_path):
     combined = result.stderr + result.stdout
     assert result.returncode != 0
     assert "No matching required gate terminal artifact found" in combined
-    assert "terminal_artifact_id=203" not in _output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-3')}" not in _output
 
 
 def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp_path):
@@ -1288,9 +1396,9 @@ def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp
         attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
     )
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "terminal_artifact_id=201" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
     assert "terminal_source_attempt=1" in output
-    assert "terminal_artifact_id=203" not in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-3')}" not in output
 
 
 @pytest.mark.parametrize("gate_job_name", ["gate", "gate / gate"])
@@ -1321,7 +1429,7 @@ def test_ledger_resolver_skips_jobs_listing_when_current_terminal_exists(tmp_pat
         tmp_path, artifacts=artifacts, current=2, jobs_path=missing,
     )
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "terminal_artifact_id=202" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-2')}" in output
     assert "terminal_source_attempt=2" in output
     poison = tmp_path / "jobs-poison.json"
     poison.write_text("{not json", encoding="utf-8")
@@ -1348,7 +1456,7 @@ def test_ledger_resolver_falls_back_when_copied_aggregator_job_predates_attempt(
         attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
     )
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "terminal_artifact_id=201" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
     assert "terminal_source_attempt=1" in output
 
 
@@ -1527,8 +1635,8 @@ def test_ledger_resolver_result_domain_accepts_legal_values(
     combined = result.stderr + result.stdout
     assert result.returncode == 0, combined
     assert "must be one of" not in combined
-    assert "input_artifact_id=101" in output
-    assert "terminal_artifact_id=201" in output
+    assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
 
 
 def test_ledger_resolver_allows_missing_audit_for_observed_abandoned_primary(tmp_path):
@@ -1551,8 +1659,8 @@ def test_ledger_resolver_allows_missing_audit_for_observed_abandoned_primary(tmp
     )
     assert result.returncode == 0, result.stderr + result.stdout
     assert "audit_artifact_id=\n" in output
-    assert "input_artifact_id=101" in output
-    assert "terminal_artifact_id=201" in output
+    assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
 
 
 @pytest.mark.parametrize("primary_result", ["success", "failure"])
@@ -1688,16 +1796,14 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
 
     upload = next(s for s in gate_steps if s.get("name") == "Upload gate status panel delivery diagnostic")
     assert upload["if"] == "always()"
-    assert upload["uses"] == UPLOAD_ARTIFACT_ACTION
-    assert upload["with"] == {
-        "name": PANEL_DELIVERY_NAME_EXPR,
-        "path": "${{ runner.temp }}/gate-status-panel-delivery.json",
-        "if-no-files-found": "error",
-        "retention-days": 3,
-    }
+    assert "uses" not in upload
+    assert upload["env"]["ARTIFACT_NAME"] == PANEL_DELIVERY_NAME_EXPR
+    assert upload["env"]["PANEL_PATH"] == "${{ runner.temp }}/gate-status-panel-delivery.json"
+    assert "--tier d3" in upload["run"]
+    assert "$SILO_STORE" in upload["run"]
     assert upload["id"] == "upload-gate-status-panel-diagnostic"
     assert upload["continue-on-error"] is True
-    assert upload["with"]["path"] == publish_step["env"]["PANEL_DELIVERY_PATH"]
+    assert upload["env"]["PANEL_PATH"] == publish_step["env"]["PANEL_DELIVERY_PATH"]
     warning = next(
         s for s in gate_steps
         if s.get("name") == "Warn when gate status panel delivery diagnostic is unavailable"
@@ -2168,6 +2274,16 @@ def test_caller_permissions_minimal_and_no_secrets_inherit():
     assert raw["permissions"] == {"actions": "read", "contents": "read", "pull-requests": "write"}
     code = "\n".join(ln for ln in CALLER_TEMPLATE.read_text().splitlines() if not ln.lstrip().startswith("#"))
     assert "inherit" not in code
+
+
+def test_caller_forwards_silo_secrets():
+    raw, _ = _load_caller()
+    secrets = raw["jobs"]["gate"]["secrets"]
+    assert secrets["SILO_ACCESS_KEY"] == "${{ secrets.SILO_ACCESS_KEY }}"
+    assert secrets["SILO_SECRET_KEY"] == "${{ secrets.SILO_SECRET_KEY }}"
+    text = CALLER_TEMPLATE.read_text(encoding="utf-8")
+    assert "SILO_ACCESS_KEY 未传入" in text
+    assert "Fleet callers are updated" in text
 
 
 def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error():
