@@ -870,9 +870,13 @@ jobs:
         reviewer: ${{ fromJSON(needs.resolve_advisory.outputs.advisory_reviewers || '["__none__"]') }}
     # Same self-hosted/fork guard as `primary` and `resolve_advisory`.
     runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
-    # review-shadow's own default internal budget is 780s; this leaves headroom
-    # for checkout, Jobs API lookup, event upload, and PR comment persistence.
-    timeout-minutes: 15
+    # review-shadow's internal budget is set explicitly on the review step
+    # (REVIEW_GATE_TIMEOUT_S=1080, i.e. (20-2)*60 — the same "2 minutes reserved for
+    # setup/upload" shape gate-shadow-v2.yml derives from shadow_timeout_minutes). OCR
+    # 1.12.x reviews each selected file with an agentic tool loop measured at ~4 min per
+    # file (gate-hub#859); the previous 780s default left the scan chain 300s, which could
+    # not finish a single such file.
+    timeout-minutes: 20
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
@@ -959,6 +963,8 @@ jobs:
           REVIEW_REUSABLE_WORKFLOW_SHA: ${{ job.workflow_sha }}
           REVIEW_SHADOW_ROLE: advisory
           REVIEW_SHADOW_EVENT_DIR: ${{ runner.temp }}/shadow-events
+          # Must stay (timeout-minutes - 2) * 60; the job-level comment explains the number.
+          REVIEW_GATE_TIMEOUT_S: 1080
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEWER: ${{ matrix.reviewer }}
