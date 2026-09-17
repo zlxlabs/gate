@@ -2407,3 +2407,17 @@ def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
     assert "pull-requests: write" not in text
     assert "secrets." not in non_comment_text
     assert "environment:" not in text
+
+
+def test_ocr_job_timeout_and_internal_budget_follow_shadow_reserve_shape():
+    """gate-hub#859: OCR reviews ~4 min per selected file; the job must hand review-shadow
+    an explicit internal budget that leaves 2 minutes of job time for setup/upload, the
+    same reserve shape gate-shadow-v2.yml derives from shadow_timeout_minutes."""
+    raw, _ = _load_workflow()
+    ocr = raw["jobs"]["ocr"]
+    assert ocr["timeout-minutes"] == 20
+
+    review_step = next(s for s in ocr["steps"] if s.get("name") == "Run OCR advisory review")
+    internal_budget_s = review_step["env"]["REVIEW_GATE_TIMEOUT_S"]
+    assert internal_budget_s == 1080
+    assert internal_budget_s == (ocr["timeout-minutes"] - 2) * 60
