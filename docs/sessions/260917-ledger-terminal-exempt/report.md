@@ -115,6 +115,39 @@ FAILED tests/test_gate_v2_contract.py::test_silo_touching_jobs_resolve_magicdns_
 
 豁免路径下 `Resolve v2 ledger artifacts` 退出 0 且写出一行「本轮未评审/豁免，无终态产物」；正常路径缺终态、以及聚合器本 attempt 跑过却没产终态，仍 fail-closed。
 
+## P2-1：MagicDNS `if` 对齐 `runs-on` 的 `control_runner`
+
+审查 P2：`gate` 作业 MagicDNS 的 `if` 漏了 `inputs.control_runner != 'github-hosted'`，与同 job `runs-on` 三元式的 self-hosted 条件不对齐。`runner=self` + `control_runner=github-hosted` 时 job 跑在 `ubuntu-latest`，改动前 MagicDNS 因 `primary` skipped 被跳过（required 绿），改动后会硬失败（required 红）。
+
+修法：只给 gate MagicDNS 补这一项，ledger MagicDNS 仍是存量 `if: always()`。新 `if`：
+
+```
+${{ always() && inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && github.event.pull_request.head.repo.full_name == github.repository }}
+```
+
+新对齐断言原文（从 `runs-on` 抽出 `&& fromJSON` 前的 self-hosted 条件，再对 `RUNNER_GUARD` / `CONTROL_RUNNER_GUARD` 做子串包含）：
+
+```
+    gate_runs_on = str(raw["jobs"]["gate"]["runs-on"])
+    self_hosted_cond = gate_runs_on.split("&& fromJSON", 1)[0]
+    for token in (RUNNER_GUARD, CONTROL_RUNNER_GUARD):
+        assert token in self_hosted_cond, token
+        assert token in gate_dns["if"], token
+```
+
+红验：把 gate MagicDNS `if` 改回不带 `control_runner` 的版本。对齐断言转红（断言失败，不是导入错误）：
+
+```
+        for token in (RUNNER_GUARD, CONTROL_RUNNER_GUARD):
+            assert token in self_hosted_cond, token
+>           assert token in gate_dns["if"], token
+E           AssertionError: inputs.control_runner != 'github-hosted'
+E           assert "inputs.control_runner != 'github-hosted'" in "${{ always() && inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}"
+FAILED tests/test_gate_v2_contract.py::test_silo_touching_jobs_resolve_magicdns_before_s3
+```
+
+修复 commit：`425c8e89adc30facebe2b669dad897b66971a9c0`。红验后已还原，未改历史。
+
 ## 回执
 
 - 主脑第 3 步已用 key-proxy run 35188009171 的真实 warning 原文证实 [output: 2026-09-17T06:04:37.2067358Z ##[warning]Gate terminal envelope upload failed after retry; ledger may lack terminal input]
@@ -128,4 +161,10 @@ FAILED tests/test_gate_v2_contract.py::test_silo_touching_jobs_resolve_magicdns_
 - 红验 ① 断言失败原文见上节 [file: tests/test_gate_v2_contract.py:1488]
 - 红验 ② 断言失败原文见上节 [file: tests/test_gate_v2_contract.py:406]
 - 实现 commit [commit: 2d92910464510d96ef55bba1f0881103a850e44c]
+- P2-1：gate MagicDNS `if` 补上 `inputs.control_runner != 'github-hosted'`，与同 job `runs-on` 对齐 [file: .github/workflows/gate-v2.yml:1257]
+- P2-1：从 `runs-on` 抽出 self-hosted 条件，对 `CONTROL_RUNNER_GUARD` 做子串包含锁死 [file: tests/test_gate_v2_contract.py:409]
+- P2-1 红验：去掉 `control_runner` 后对齐断言失败原文见上节 [file: tests/test_gate_v2_contract.py:411]
+- P2-1 修复 commit [commit: 425c8e89adc30facebe2b669dad897b66971a9c0]
+- P2 复跑仓级 Verify-Command 末行 [output: 1030 passed in 78.37s (0:01:18)]
+- P2 复跑 check_pinned_uses.py [output: OK: checked 9 live workflow/action metadata file(s); all internal uses are workspace-relative]
 - 合并须 merge commit，禁 squash / rebase（workflow SHA 被下游 pin）
