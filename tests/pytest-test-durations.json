@@ -1,3 +1,4 @@
 {
-  "tests/test_classify_pr_reviewable_paths.py": 1.20
+  "tests/test_classify_pr_reviewable_paths.py": 1.20,
+  "tests/test_gate_bounded_retry.py": 1.50
 }

@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from scripts import silo_store as silo_store
+from scripts import gate_bounded_retry as retry
 from _gha_lint import (
     find_arithmetic_gha_expression_offenders,
     materialize_jobs_api_snippet_for_probe,
@@ -74,6 +75,9 @@ CONVERGENCE_RECEIPT_PATH = "${{ runner.temp }}/convergence-receipt"
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+BOUNDED_RETRY_HELPER = REPO_ROOT / "scripts" / "gate_bounded_retry.py"
+CHECKOUT_HELPER_RUN = 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout'
+MAGICDNS_HELPER_RUN = 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns'
 UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 EXPECTED_ACTION_REFS = {
     "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
@@ -99,6 +103,39 @@ def _load_disposition_workflow():
     raw = yaml.safe_load(DISPOSITION_WORKFLOW.read_text())
     trigger = raw.get("on", raw.get(True))
     return raw, trigger
+
+
+def _sparse_env_paths(step: dict) -> list[str]:
+    raw = (step.get("env") or {}).get("GATE_CHECKOUT_SPARSE", "")
+    if not isinstance(raw, str):
+        return []
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def assert_workflow_sha_checkout(step: dict, *, path: str | None = None, sparse: list[str] | str | None = None) -> None:
+    """Lock reusable-workflow identity + helper invocation without weakening fields."""
+
+    uses = str(step.get("uses", ""))
+    assert not uses.startswith("actions/checkout"), step.get("name")
+    env = step["env"]
+    assert env["GATE_CHECKOUT_REPOSITORY"] == "${{ job.workflow_repository }}"
+    assert env["GATE_CHECKOUT_REF"] == "${{ job.workflow_sha }}"
+    if path:
+        assert env["GATE_CHECKOUT_PATH"] == path
+    elif path == "":
+        assert "GATE_CHECKOUT_PATH" not in env
+    assert env["GATE_GITHUB_TOKEN"] == "${{ github.token }}"
+    if sparse is not None:
+        expected = sparse.splitlines() if isinstance(sparse, str) else list(sparse)
+        expected = [line.strip() for line in expected if line.strip()]
+        assert _sparse_env_paths(step) == expected
+    run = step["run"]
+    assert CHECKOUT_HELPER_RUN in run
+    assert "os.environ['GATE_GITHUB_TOKEN']" in run
+    assert "-H \"@${RUNNER_TEMP}/gate-api.hdr\"" in run
+    assert "${{" not in run
+    assert "x-access-token" not in run
+    assert "github.token" not in run
 
 
 def _disposition_scope_python() -> str:
@@ -223,6 +260,7 @@ def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_arti
     dns = control["steps"][dns_index]
     assert "id -u" in dns["run"]
     assert "100.100.100.100" in dns["run"]
+    assert MAGICDNS_HELPER_RUN in dns["run"]
     download_run = next(
         step["run"] for step in control["steps"]
         if step.get("name") == "Resolve current PR head and canonical primary audit"
@@ -308,14 +346,15 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
         for step in raw["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
     )
-    sparse = checkout["with"]["sparse-checkout"]
-    listed = {line.strip() for line in sparse.splitlines() if line.strip()}
+    listed = set(_sparse_env_paths(checkout))
     assert listed == {
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
         "scripts/silo_store.py",
     }
-    assert checkout["with"].get("sparse-checkout-cone-mode") is False
+    helper = BOUNDED_RETRY_HELPER.read_text(encoding="utf-8")
+    assert '["sparse-checkout", "init", "--no-cone"]' in helper
+    assert '"--no-cone"' in helper
 
 
 def test_disposition_checkout_uses_reusable_workflow_identity():
@@ -325,8 +364,11 @@ def test_disposition_checkout_uses_reusable_workflow_identity():
         for step in raw["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
     )
-    assert checkout["with"]["repository"] == "${{ job.workflow_repository }}"
-    assert checkout["with"]["ref"] == "${{ job.workflow_sha }}"
+    assert_workflow_sha_checkout(checkout, path="", sparse=[
+        ".github/actions/gate-disposition/issue_receipt.py",
+        ".github/actions/gate-aggregator/convergence.py",
+        "scripts/silo_store.py",
+    ])
     assert not any(step.get("name") == "Require 40-hex gate_ref" for step in raw["jobs"]["control"]["steps"])
     assert "inputs." + "gate_ref" not in DISPOSITION_WORKFLOW.read_text()
 
@@ -399,6 +441,8 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
         dns = steps[dns_index]
         assert "id -u" in dns["run"]
         assert "100.100.100.100" in dns["run"]
+        assert MAGICDNS_HELPER_RUN in dns["run"]
+        assert "--silo-store \"$SILO_STORE\"" in dns["run"]
 
     # gate#185: Upload terminal is if: always() and needs /etc/hosts. Skipping
     # MagicDNS whenever primary is skipped made exempt PRs fail ledger.
@@ -443,14 +487,12 @@ def test_silo_store_env_aligns_with_job_checkout_path():
             (
                 s
                 for s in job["steps"]
-                if s.get("uses", "").startswith("actions/checkout@")
-                and s.get("with", {}).get("path") == checkout_dir
+                if (s.get("env") or {}).get("GATE_CHECKOUT_PATH") == checkout_dir
             ),
             None,
         )
         assert checkout_step is not None, f"{job_name}: no checkout step for {checkout_dir}"
-        assert checkout_step["with"]["repository"] == "${{ job.workflow_repository }}"
-        assert checkout_step["with"]["ref"] == "${{ job.workflow_sha }}"
+        assert_workflow_sha_checkout(checkout_step, path=checkout_dir)
 
 
 def test_secrets_explicit_and_feishu_optional():
@@ -526,12 +568,40 @@ def test_classify_job_checks_out_this_workflow_commit():
         s for s in raw["jobs"][CLASSIFY_JOB_ID]["steps"]
         if s.get("name") == "Checkout classify script at this workflow's own commit"
     )
-    assert checkout["uses"] == CHECKOUT_ACTION
-    assert checkout["with"] == {
-        "repository": "${{ job.workflow_repository }}",
-        "ref": "${{ job.workflow_sha }}",
-        "path": "_gate-classify-src",
-    }
+    assert_workflow_sha_checkout(checkout, path="_gate-classify-src", sparse=[])
+
+
+def test_workflow_sha_checkouts_use_centralized_bounded_retry():
+    raw, _ = _load_workflow()
+    env = raw["env"]
+    assert env["GATE_NET_RETRY_ATTEMPTS"] == str(retry.DEFAULT_RETRY_ATTEMPTS)
+    assert env["GATE_NET_RETRY_BACKOFF_SECS"] == " ".join(str(item) for item in retry.DEFAULT_RETRY_BACKOFF_SECS)
+    assert env["GATE_NET_ATTEMPT_TIMEOUT_SECS"] == str(retry.DEFAULT_ATTEMPT_TIMEOUT_SECS)
+    assert env["GATE_HTTP_LOW_SPEED_LIMIT"] == str(retry.DEFAULT_LOW_SPEED_LIMIT)
+    assert env["GATE_HTTP_LOW_SPEED_TIME"] == str(retry.DEFAULT_LOW_SPEED_TIME)
+    assert retry.worst_case_secs() <= 180
+    disposition, _ = _load_disposition_workflow()
+    for key in (
+        "GATE_NET_RETRY_ATTEMPTS", "GATE_NET_RETRY_BACKOFF_SECS",
+        "GATE_NET_ATTEMPT_TIMEOUT_SECS", "GATE_HTTP_LOW_SPEED_LIMIT", "GATE_HTTP_LOW_SPEED_TIME",
+    ):
+        assert disposition["env"][key] == env[key]
+    sites = []
+    for job_name, job in raw["jobs"].items():
+        for step in job.get("steps", []):
+            step_env = step.get("env") or {}
+            uses = str(step.get("uses", ""))
+            if step_env.get("GATE_CHECKOUT_REF") == "${{ job.workflow_sha }}":
+                sites.append((job_name, step.get("name")))
+                assert_workflow_sha_checkout(step)
+            if uses.startswith("actions/checkout"):
+                assert (step.get("with") or {}).get("ref") != "${{ job.workflow_sha }}"
+    assert len(sites) == 9
+    producer = next(
+        step for step in disposition["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+    assert_workflow_sha_checkout(producer, path="")
 
 
 def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_if():
@@ -981,8 +1051,7 @@ def test_gate_job_never_invokes_aggregator_via_a_moving_uses_ref():
     raw, _ = _load_workflow()
     steps = raw["jobs"]["gate"]["steps"]
     checkout = next(s for s in steps if s.get("name") == "Checkout gate-aggregator at this workflow's own commit")
-    assert checkout["with"]["repository"] == "${{ job.workflow_repository }}"
-    assert checkout["with"]["ref"] == "${{ job.workflow_sha }}"
+    assert_workflow_sha_checkout(checkout, path="_gate-aggregator-src", sparse=[])
     assert not any(str(s.get("uses", "")).startswith("zlxlabs/gate/.github/actions/gate-aggregator") for s in steps)
     aggregate_step = next(s for s in steps if s.get("name") == "Aggregate required verdict")
     assert "aggregate.py" in aggregate_step["run"]
@@ -2113,13 +2182,11 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
         step for step in steps
         if step.get("name") == "Checkout gate actions at this workflow's own commit"
     )
-    assert checkout["uses"] == CHECKOUT_ACTION
-    assert checkout["with"] == {
-        "repository": "${{ job.workflow_repository }}",
-        "ref": "${{ job.workflow_sha }}",
-        "path": "_gate-action-src",
-        "sparse-checkout": ".github/actions\nscripts/scrub_outbound.py\n",
-    }
+    assert_workflow_sha_checkout(
+        checkout,
+        path="_gate-action-src",
+        sparse=[".github/actions", "scripts/scrub_outbound.py"],
+    )
     names = [step.get("name") for step in steps]
     assert names.index(checkout["name"]) < names.index("PR size preflight")
 
@@ -2201,9 +2268,7 @@ def test_quality_action_sparse_checkout_excludes_tests_tree():
         step for step in raw["jobs"]["quality"]["steps"]
         if step.get("name") == "Checkout gate actions at this workflow's own commit"
     )
-    sparse_paths = checkout["with"]["sparse-checkout"]
-    if isinstance(sparse_paths, str):
-        sparse_paths = sparse_paths.splitlines()
+    sparse_paths = _sparse_env_paths(checkout)
     assert ".github/actions" in sparse_paths
     assert "scripts/scrub_outbound.py" in sparse_paths
     assert not any(path == "scripts" or path.startswith("scripts/") and path != "scripts/scrub_outbound.py" for path in sparse_paths)
@@ -2228,12 +2293,22 @@ def test_every_scrub_import_has_checkout_coverage_for_action_and_module():
 
             checkouts = [
                 candidate for candidate in job["steps"]
-                if candidate.get("uses", "").startswith(CHECKOUT_ACTION)
-                and candidate.get("with", {}).get("path") == action_root
+                if (
+                    (
+                        candidate.get("uses", "").startswith(CHECKOUT_ACTION)
+                        and candidate.get("with", {}).get("path") == action_root
+                    )
+                    or (
+                        (candidate.get("env") or {}).get("GATE_CHECKOUT_PATH") == action_root
+                        and CHECKOUT_HELPER_RUN in str(candidate.get("run", ""))
+                    )
+                )
             ]
             assert checkouts, f"{job_name}: expected at least one checkout for {action_root}"
             for checkout in checkouts:
-                sparse = checkout["with"].get("sparse-checkout")
+                sparse = checkout.get("with", {}).get("sparse-checkout")
+                if sparse is None:
+                    sparse = (checkout.get("env") or {}).get("GATE_CHECKOUT_SPARSE")
                 sparse_paths = None if sparse is None else (
                     sparse.splitlines() if isinstance(sparse, str) else sparse
                 )
@@ -2416,13 +2491,11 @@ def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error()
     assert checkout["if"] == "always()"
     assert checkout["continue-on-error"] is True
     assert checkout["timeout-minutes"] == 5
-    assert checkout["uses"] == CHECKOUT_ACTION
-    assert checkout["with"] == {
-        "repository": "${{ job.workflow_repository }}",
-        "ref": "${{ job.workflow_sha }}",
-        "path": "_gate-action-src",
-        "sparse-checkout": ".github/actions\nscripts/scrub_outbound.py\n",
-    }
+    assert_workflow_sha_checkout(
+        checkout,
+        path="_gate-action-src",
+        sparse=[".github/actions", "scripts/scrub_outbound.py"],
+    )
 
     advisory = steps[advisory_index]
     assert advisory["if"] == "always()"
