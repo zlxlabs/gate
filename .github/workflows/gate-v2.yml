@@ -119,6 +119,12 @@ on:
 env:
   SILO_ENDPOINT: https://zlx-vm-work-i5-infra.taile9071.ts.net:9000
   SILO_BUCKET: ci-artifacts
+  # gate#190: 25s * 3 attempts + 5s + 15s backoff = 95s worst case.
+  GATE_NET_RETRY_ATTEMPTS: "3"
+  GATE_NET_RETRY_BACKOFF_SECS: "5 15"
+  GATE_NET_ATTEMPT_TIMEOUT_SECS: "25"
+  GATE_HTTP_LOW_SPEED_LIMIT: "1000"
+  GATE_HTTP_LOW_SPEED_TIME: "20"
 
 # Union of everything any job below needs; each caller must grant this whole
 # set (reusable-workflow permission escalation otherwise fails at startup).
@@ -151,11 +157,16 @@ jobs:
       review_expected: ${{ steps.classify.outputs.review_expected }}
     steps:
       - name: Checkout classify script at this workflow's own commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-classify-src
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-classify-src
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Classify whether model review is expected
         id: classify
@@ -261,14 +272,19 @@ jobs:
       # source at the exact commit selected by the caller, then invoke the action
       # through a workspace-relative path so it follows the caller's workflow pin.
       - name: Checkout gate actions at this workflow's own commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-action-src
-          sparse-checkout: |
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-action-src
+          GATE_CHECKOUT_SPARSE: |
             .github/actions
             scripts/scrub_outbound.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: PR size preflight
         uses: ./_gate-action-src/.github/actions/pr-size-preflight
@@ -402,14 +418,19 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-action-src
-          sparse-checkout: |
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-action-src
+          GATE_CHECKOUT_SPARSE: |
             .github/actions
             scripts/scrub_outbound.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Diff coverage advisory
         if: always()
@@ -427,19 +448,24 @@ jobs:
 
       - name: Checkout silo store at this workflow's own commit
         if: always()
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-silo-src
-          sparse-checkout: |
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-silo-src
+          GATE_CHECKOUT_SPARSE: |
             scripts/silo_store.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Resolve Silo hostname via MagicDNS
         if: always() && env.AWS_ACCESS_KEY_ID != ''
         run: |
           set -euo pipefail
-          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+          SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
             echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
             exit 1
           }
@@ -732,19 +758,24 @@ jobs:
 
       - name: Checkout silo store at this workflow's own commit
         if: always()
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-silo-src
-          sparse-checkout: |
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-silo-src
+          GATE_CHECKOUT_SPARSE: |
             scripts/silo_store.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Resolve Silo hostname via MagicDNS
         if: always()
         run: |
           set -euo pipefail
-          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+          SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
             echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
             exit 1
           }
@@ -972,12 +1003,17 @@ jobs:
 
       - name: Checkout outbound scrub at this workflow's own commit
         if: always() && matrix.reviewer != '__none__'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-scrub-src
-          sparse-checkout: scripts/scrub_outbound.py
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-scrub-src
+          GATE_CHECKOUT_SPARSE: scripts/scrub_outbound.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Post advisory PR comment
         if: always() && matrix.reviewer != '__none__'
@@ -1166,19 +1202,24 @@ jobs:
 
       - name: Checkout silo store at this workflow's own commit
         if: always() && matrix.reviewer != '__none__'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-silo-src
-          sparse-checkout: |
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-silo-src
+          GATE_CHECKOUT_SPARSE: |
             scripts/silo_store.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Resolve Silo hostname via MagicDNS
         if: always() && matrix.reviewer != '__none__'
         run: |
           set -euo pipefail
-          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+          SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
             echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
             exit 1
           }
@@ -1243,11 +1284,16 @@ jobs:
       # this "reusable workflow checks out its own source" case (Contexts
       # reference, "Example usage of job context workflow identity").
       - name: Checkout gate-aggregator at this workflow's own commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-aggregator-src
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-aggregator-src
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       # Upload gate terminal envelope is if: always() and needs /etc/hosts.
       # Primary skipped (exempt / draft / hosted / fork) used to skip MagicDNS,
@@ -1257,7 +1303,7 @@ jobs:
         if: ${{ always() && inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -euo pipefail
-          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+          SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
             echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
             exit 1
           }
@@ -1515,17 +1561,22 @@ jobs:
       SILO_STORE: _gate-aggregator-src/scripts/silo_store.py
     steps:
       - name: Checkout ledger action at this workflow's own commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _gate-aggregator-src
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-aggregator-src
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Resolve Silo hostname via MagicDNS
         if: always()
         run: |
           set -euo pipefail
-          SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+          SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
             echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
             exit 1
           }

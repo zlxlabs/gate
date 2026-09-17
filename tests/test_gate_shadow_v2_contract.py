@@ -180,10 +180,18 @@ def test_shadow_classify_job_matches_required_gate_classifier():
         s for s in required_job["steps"]
         if s.get("name") == "Checkout classify script at this workflow's own commit"
     )
-    assert shadow_checkout["uses"] == required_checkout["uses"] == CHECKOUT_ACTION
-    assert shadow_checkout["with"] == required_checkout["with"]
+    # Shadow stays on pinned actions/checkout (out of this card's files). Required
+    # gate switched to bounded-retry helper; both still pin the same reusable
+    # workflow identity and destination path.
+    assert shadow_checkout["uses"] == CHECKOUT_ACTION
     assert shadow_checkout["with"]["repository"] == "${{ job.workflow_repository }}"
     assert shadow_checkout["with"]["ref"] == "${{ job.workflow_sha }}"
+    assert shadow_checkout["with"]["path"] == "_gate-classify-src"
+    required_env = required_checkout["env"]
+    assert required_env["GATE_CHECKOUT_REPOSITORY"] == "${{ job.workflow_repository }}"
+    assert required_env["GATE_CHECKOUT_REF"] == "${{ job.workflow_sha }}"
+    assert required_env["GATE_CHECKOUT_PATH"] == "_gate-classify-src"
+    assert 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout' in required_checkout["run"]
 
 
 def test_workflow_call_inputs_include_review_exempt_paths():
