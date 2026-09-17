@@ -1254,7 +1254,7 @@ jobs:
       # so silo_store.py put failed and ledger saw no terminal (gate#185).
       # Self-hosted same-repo still has tailnet; hosted/fork stay off.
       - name: Resolve Silo hostname via MagicDNS
-        if: ${{ always() && inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}
+        if: ${{ always() && inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {

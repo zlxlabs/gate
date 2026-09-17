@@ -37,6 +37,7 @@ ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
 RUNNER_GUARD = "inputs.runner == 'self'"
+CONTROL_RUNNER_GUARD = "inputs.control_runner != 'github-hosted'"
 CLASSIFY_GUARD = "needs.classify_pr_paths.outputs.review_expected != 'false'"
 CLASSIFY_JOB_ID = "classify_pr_paths"
 CLASSIFY_SCRIPT = "_gate-classify-src/scripts/classify_pr_reviewable_paths.py"
@@ -403,11 +404,16 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
     # MagicDNS whenever primary is skipped made exempt PRs fail ledger.
     # Self-hosted same-repo still has tailnet; hosted/fork stay off.
     gate_dns = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
+    gate_runs_on = str(raw["jobs"]["gate"]["runs-on"])
+    self_hosted_cond = gate_runs_on.split("&& fromJSON", 1)[0]
+    for token in (RUNNER_GUARD, CONTROL_RUNNER_GUARD):
+        assert token in self_hosted_cond, token
+        assert token in gate_dns["if"], token
     assert gate_dns["if"] == (
         "${{ always() && inputs.runner == 'self' && "
+        "inputs.control_runner != 'github-hosted' && "
         "github.event.pull_request.head.repo.full_name == github.repository }}"
     )
-    assert RUNNER_GUARD in gate_dns["if"]
     assert FORK_GUARD in gate_dns["if"]
     assert "needs.primary.result != 'skipped'" not in str(gate_dns.get("if", ""))
 
