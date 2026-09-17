@@ -144,8 +144,8 @@ fleet 正常拓扑是全 self-hosted；`runner: hosted` 或控制面落到 GitHu
 MagicDNS `100.100.100.100` 解析 Silo 主机名失败即红（tailnet 不可达），没有 GitHub
 artifact 兜底。
 
-推广期 `.github/v2-tag-sync.hold` 存在，`v2` 移动 tag 不会前移。移除 hold、逐仓更新
-caller 透传这两个 secret，是后续推广卡的责任，不是本文件的自动行为。
+Silo 推广已完成，`.github/v2-tag-sync.hold` 熔断文件已移除，`v2` 移动 tag 随主干前移。
+下游 caller 仍必须透传 `SILO_ACCESS_KEY` 与 `SILO_SECRET_KEY`（不传则 S3 步骤红）。
 
 ### org runner group 白名单运维要点（bump SHA 时最容易漏的一步）
 

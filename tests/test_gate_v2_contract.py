@@ -371,8 +371,8 @@ def test_gate_v2_has_no_github_artifact_actions():
     assert raw.get("env", {}).get("SILO_ENDPOINT") == "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000"
     assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
     hold = REPO_ROOT / ".github" / "v2-tag-sync.hold"
-    assert hold.is_file()
-    assert "Silo" in hold.read_text(encoding="utf-8")
+    # 冻结已解除；hold 文件回归会静默冻住 v2 tag（gate-hub#860）
+    assert not hold.exists()
 
 
 def test_silo_touching_jobs_resolve_magicdns_before_s3():

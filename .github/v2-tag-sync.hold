@@ -1,1 +1,0 @@
-Silo migration hold: do not advance the v2 moving tag until fleet callers forward SILO_ACCESS_KEY/SILO_SECRET_KEY and canary has produced Silo keys with zero GitHub artifacts. Remove this file in the fleet-promotion card.
