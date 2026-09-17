@@ -1249,8 +1249,12 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: _gate-aggregator-src
 
+      # Upload gate terminal envelope is if: always() and needs /etc/hosts.
+      # Primary skipped (exempt / draft / hosted / fork) used to skip MagicDNS,
+      # so silo_store.py put failed and ledger saw no terminal (gate#185).
+      # Self-hosted same-repo still has tailnet; hosted/fork stay off.
       - name: Resolve Silo hostname via MagicDNS
-        if: ${{ needs.primary.result != 'skipped' }}
+        if: ${{ always() && inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "$SILO_STORE" magicdns --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
@@ -1642,11 +1646,17 @@ jobs:
               "No matching canonical primary audit artifact found",
               expected_text == "true" and primary_result != "cancelled",
           )
+          # Review-not-expected (exempt / classify false / draft / hosted / fork)
+          # must still write a ledger row. required stays True when review is
+          # expected — missing terminal on that path remains fail-closed.
+          terminal_required = expected_text == "true"
           terminal_artifact = parse_resolve(
               os.environ.get("TERMINAL_RESOLVE"),
               "No matching required gate terminal artifact found",
-              True,
+              terminal_required,
           )
+          if not terminal_required and terminal_artifact is None:
+              print("::notice::本轮未评审/豁免，无终态产物")
 
           def is_gate_aggregator_job(name):
               return name == "gate" or (isinstance(name, str) and name.endswith(" / gate"))
@@ -1726,7 +1736,7 @@ jobs:
                   raise SystemExit(RUN_STARTED_AT_ERROR)
               return parsed
 
-          if terminal_artifact[0] != current:
+          if terminal_artifact is not None and terminal_artifact[0] != current:
               payload = load_current_attempt_jobs()
               attempt_started = parse_run_started_at(load_current_attempt_meta())
               aggregator_ran = False
@@ -1754,8 +1764,8 @@ jobs:
               output.write(f"input_short_circuited={'true' if quality_short_circuited and input_artifact is None else 'false'}\n")
               output.write(f"audit_artifact_id={audit_artifact[1] if audit_artifact else ''}\n")
               output.write(f"audit_source_attempt={audit_artifact[0] if audit_artifact else ''}\n")
-              output.write(f"terminal_artifact_id={terminal_artifact[1]}\n")
-              output.write(f"terminal_source_attempt={terminal_artifact[0]}\n")
+              output.write(f"terminal_artifact_id={terminal_artifact[1] if terminal_artifact else ''}\n")
+              output.write(f"terminal_source_attempt={terminal_artifact[0] if terminal_artifact else ''}\n")
           PY
 
       - name: Download v2 review ledger inputs
@@ -1789,6 +1799,7 @@ jobs:
             --dest "$DEST"
 
       - name: Download gate terminal envelope for ledger
+        if: steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''
         env:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
           DEST: ${{ runner.temp }}/gate-terminal
@@ -1807,7 +1818,7 @@ jobs:
           audit-path: ${{ runner.temp }}/primary-audit/primary-review-audit.json
           preflight-path: ${{ runner.temp }}/review-ledger-input/pr-size-preflight.json
           install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
-          terminal-path: ${{ runner.temp }}/gate-terminal/gate-terminal.json
+          terminal-path: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != '' && format('{0}/gate-terminal/gate-terminal.json', runner.temp) || '' }}
           codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' }}
           codex-waived: false
           expected-repository-id: ${{ github.repository_id }}

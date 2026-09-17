@@ -7,6 +7,7 @@ ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
 .github/workflows/gate.yml and its own tests/test_gate_contract.py are
 kept behaviorally aligned with this file.
 """
+import ast
 import json
 import os
 import re
@@ -398,13 +399,17 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
         assert "id -u" in dns["run"]
         assert "100.100.100.100" in dns["run"]
 
-    # F1 lock: MagicDNS step conditions. Gate job must not run MagicDNS when primary is skipped.
+    # gate#185: Upload terminal is if: always() and needs /etc/hosts. Skipping
+    # MagicDNS whenever primary is skipped made exempt PRs fail ledger.
+    # Self-hosted same-repo still has tailnet; hosted/fork stay off.
     gate_dns = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
-    assert gate_dns["if"] == "${{ needs.primary.result != 'skipped' }}"
-    # When primary is skipped (e.g. fork PR), gate DNS must not run:
-    assert ("skipped" != "skipped") is False
-    assert ("success" != "skipped") is True
-    assert ("failure" != "skipped") is True
+    assert gate_dns["if"] == (
+        "${{ always() && inputs.runner == 'self' && "
+        "github.event.pull_request.head.repo.full_name == github.repository }}"
+    )
+    assert RUNNER_GUARD in gate_dns["if"]
+    assert FORK_GUARD in gate_dns["if"]
+    assert "needs.primary.result != 'skipped'" not in str(gate_dns.get("if", ""))
 
     quality_dns = next(s for s in raw["jobs"]["quality"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
     assert quality_dns["if"] == "always() && env.AWS_ACCESS_KEY_ID != ''"
@@ -1126,6 +1131,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
     assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
     assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
+    assert terminal_download["if"] == "steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
     assert "continue-on-error" not in terminal_download
     build = steps[build_index]
     assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
@@ -1136,7 +1142,10 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert build["with"]["expected-base-sha"] == "${{ github.event.pull_request.base.sha }}"
     assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
     assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
-    assert build["with"]["terminal-path"] == "${{ runner.temp }}/gate-terminal/gate-terminal.json"
+    assert build["with"]["terminal-path"] == (
+        "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != '' && "
+        "format('{0}/gate-terminal/gate-terminal.json', runner.temp) || '' }}"
+    )
     assert "token" not in build["with"]
 
     upload = steps[upload_index]
@@ -1380,8 +1389,11 @@ def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(
     artifacts = [
         {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
         {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "primary-audit-v2-2", "expired": False, "id": 302},
     ]
-    result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, review_expected="true",
+    )
     combined = result.stderr + result.stdout
     assert result.returncode != 0
     assert "No matching required gate terminal artifact found" in combined
@@ -1418,9 +1430,12 @@ def test_ledger_resolver_selects_current_attempt_terminal_not_an_older_one(tmp_p
 def test_ledger_resolver_refuses_future_terminal_artifact(tmp_path):
     artifacts = [
         {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "primary-audit-v2-2", "expired": False, "id": 302},
         {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
     ]
-    result, _output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
+    result, _output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=2, review_expected="true",
+    )
     combined = result.stderr + result.stdout
     assert result.returncode != 0
     assert "No matching required gate terminal artifact found" in combined
@@ -1458,6 +1473,56 @@ def test_ledger_resolver_hard_fails_when_aggregator_ran_without_terminal(tmp_pat
     assert result.returncode != 0
     assert "Aggregator ran on this attempt but did not produce a terminal artifact" in combined
     assert "No matching required gate terminal artifact found" not in combined
+
+
+def test_ledger_resolver_records_not_applicable_when_review_not_expected_without_terminal(tmp_path):
+    """gate#185: attempt 1 也没有终态时，豁免路径记「不适用」而不是硬失败。"""
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path, artifacts=artifacts, current=1, review_expected="false",
+        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "skipped"},
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode == 0, combined
+    assert "本轮未评审/豁免，无终态产物" in result.stdout
+    assert "terminal_artifact_id=\n" in output
+    assert "terminal_source_attempt=\n" in output
+    assert "No matching required gate terminal artifact found" not in combined
+
+
+def test_ledger_resolver_python_keeps_terminal_required_tied_to_review_expected():
+    """YAML 抽出的 resolver AST：终态 parse_resolve 不得再写死 Constant True。"""
+    tree = ast.parse(_ledger_resolver_python())
+    required_name = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "terminal_required"
+            for target in node.targets
+        ):
+            compare = node.value
+            assert isinstance(compare, ast.Compare)
+            assert isinstance(compare.left, ast.Name) and compare.left.id == "expected_text"
+            assert isinstance(compare.comparators[0], ast.Constant)
+            assert compare.comparators[0].value == "true"
+            required_name = "terminal_required"
+            break
+    assert required_name == "terminal_required"
+    terminal_calls = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "parse_resolve"
+            and len(node.args) >= 3
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "No matching required gate terminal artifact found"
+        ):
+            terminal_calls.append(node)
+    assert len(terminal_calls) == 1
+    third = terminal_calls[0].args[2]
+    assert isinstance(third, ast.Name) and third.id == "terminal_required"
 
 
 def test_ledger_resolver_skips_jobs_listing_when_current_terminal_exists(tmp_path):
@@ -1598,6 +1663,8 @@ def test_ledger_resolver_step_env_and_download_guard_literals():
     assert resolve["env"]["PRIMARY_RESULT_RAW"] == PRIMARY_RESULT_RAW_EXPR
     download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
     assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
+    terminal_download = next(s for s in ledger_steps if s.get("name") == "Download gate terminal envelope for ledger")
+    assert terminal_download["if"] == "steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
 
 
 def test_ledger_build_step_forwards_input_short_circuited():
