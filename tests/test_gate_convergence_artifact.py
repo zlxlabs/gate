@@ -51,6 +51,12 @@ def _scope(**changes):
 SCOPE = _scope()
 
 
+def _producer_env(**extra):
+    env = {"PATH": os.environ["PATH"], "GITHUB_TRIGGERING_ACTOR": "octocat"}
+    env.update(extra)
+    return env
+
+
 def _receipt(scope=SCOPE, *, run_id=1, run_attempt=1, digest="a", verdict="pass", p1_ids=(), artifact=None, source_attempt=None, reported=None):
     digest = digest * 64 if len(digest) == 1 else digest
     epoch = CONV.derive_epoch(scope)
@@ -289,7 +295,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
         "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
     ]
-    producer_env = {"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-77", "GITHUB_ACTOR": "maintainer"}
+    producer_env = _producer_env(GITHUB_RUN_ID="control-77", GITHUB_ACTOR="maintainer")
     first = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
     assert first.args == argv
     result = json.loads(first.stdout)
@@ -307,6 +313,12 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     assert payload["approver"] == "octocat"
     assert payload["approver_id"] == 1
     assert payload["approved_at"] == "2026-08-30T12:00:00Z"
+    assert payload["triggering_actor"] == "octocat"
+    assert payload["triggering_actor_source"] == "env"
+    assert payload["schema_version"] == 2
+    assert b'"triggering_actor":"octocat"' in payload_bytes
+    assert b'"triggering_actor_source":"env"' in payload_bytes
+    assert b'"schema_version":2' in payload_bytes
     receipt = CONV.DispositionReceipt(**{
         field: payload[field]
         for field in CONV.DispositionReceipt.__dataclass_fields__
@@ -329,6 +341,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     assert (parsed.approver, parsed.approver_id, parsed.approved_at) == (
         "octocat", 1, "2026-08-30T12:00:00Z",
     )
+    assert (parsed.triggering_actor, parsed.triggering_actor_source) == ("octocat", "env")
 
 
 def test_disposition_producer_rejects_non_p1_finding(tmp_path):
@@ -345,7 +358,7 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
         "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict()),
     ]
-    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    failed = subprocess.run(argv, capture_output=True, text=True, env=_producer_env())
     assert failed.returncode == 1
     assert "finding_id must identify a P1 finding" in failed.stderr
 
@@ -380,7 +393,7 @@ def test_disposition_producer_rejects_stable_key_collision(tmp_path):
         "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
     ]
-    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    failed = subprocess.run(argv, capture_output=True, text=True, env=_producer_env())
     assert failed.returncode == 1
     assert "2" in failed.stderr
     assert "cannot determine" in failed.stderr
@@ -420,13 +433,14 @@ def test_disposition_producer_rejects_id_and_different_key_collision(tmp_path):
         "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
     ]
-    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    failed = subprocess.run(argv, capture_output=True, text=True, env=_producer_env())
     assert failed.returncode == 1
     assert "matches both a finding id and a different stable key" in failed.stderr
     assert "cannot determine" in failed.stderr
 
 
-def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
+def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_TRIGGERING_ACTOR", raising=False)
     audit = {
         "kind": "primary_review", "schema_version": 1,
         "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
@@ -458,6 +472,7 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
         approver="octocat",
         approver_id="7",
         approved_at="2026-08-30T12:00:00Z",
+        triggering_actor="octocat",
         scope_json=json.dumps(SCOPE.as_dict(), sort_keys=True),
         input_stdin=False,
     )
@@ -478,6 +493,83 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path):
     assert (receipt.approver, receipt.approver_id, receipt.approved_at) == (
         "octocat", 7, "2026-08-30T12:00:00Z",
     )
+    assert (receipt.triggering_actor, receipt.triggering_actor_source) == ("octocat", "cli")
+
+
+def _assert_receipt_actor_bytes(path, *, actor, source):
+    payload_bytes = path.read_bytes()
+    payload = json.loads(payload_bytes)
+    assert payload["triggering_actor"] == actor
+    assert payload["triggering_actor_source"] == source
+    assert payload["schema_version"] == 2
+    assert f'"triggering_actor":"{actor}"'.encode("utf-8") in payload_bytes
+    assert f'"triggering_actor_source":"{source}"'.encode("utf-8") in payload_bytes
+    assert b'"schema_version":2' in payload_bytes
+    parsed = CONV.parse_disposition_receipt(payload)
+    assert parsed.triggering_actor == actor
+    assert parsed.triggering_actor_source == source
+    assert parsed.schema_version == 2
+    return payload
+
+
+def test_issue_receipt_env_overrides_cli(tmp_path):
+    argv, env = _p1_issue_argv(tmp_path)
+    env["GITHUB_TRIGGERING_ACTOR"] = "  env-owner  "
+    argv.extend(["--triggering-actor", "cli-actor"])
+    result = subprocess.run(argv, capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    artifact = Path(json.loads(result.stdout)["path"])
+    _assert_receipt_actor_bytes(artifact, actor="env-owner", source="env")
+
+
+def test_issue_receipt_blank_env_falls_through_to_cli(tmp_path):
+    argv, env = _p1_issue_argv(tmp_path)
+    env["GITHUB_TRIGGERING_ACTOR"] = "   "
+    argv.extend(["--triggering-actor", "  cli-actor  ", "--input-stdin"])
+    result = subprocess.run(
+        argv, capture_output=True, text=True, env=env,
+        input=json.dumps({"triggering_actor": "envelope-actor"}),
+    )
+    assert result.returncode == 0, result.stderr
+    artifact = Path(json.loads(result.stdout)["path"])
+    _assert_receipt_actor_bytes(artifact, actor="cli-actor", source="cli")
+
+
+def test_issue_receipt_envelope_when_env_and_cli_blank(tmp_path):
+    argv, env = _p1_issue_argv(tmp_path)
+    env.pop("GITHUB_TRIGGERING_ACTOR", None)
+    argv.append("--input-stdin")
+    result = subprocess.run(
+        argv, capture_output=True, text=True, env=env,
+        input=json.dumps({"triggering_actor": "  envelope-actor  "}),
+    )
+    assert result.returncode == 0, result.stderr
+    artifact = Path(json.loads(result.stdout)["path"])
+    _assert_receipt_actor_bytes(artifact, actor="envelope-actor", source="envelope")
+
+
+def test_issue_receipt_all_blank_sources_fail_closed(tmp_path):
+    argv, env = _p1_issue_argv(tmp_path)
+    env["GITHUB_TRIGGERING_ACTOR"] = "   "
+    argv.extend(["--triggering-actor", "   ", "--input-stdin"])
+    result = subprocess.run(
+        argv, capture_output=True, text=True, env=env,
+        input=json.dumps({"triggering_actor": "   "}),
+    )
+    assert result.returncode != 0
+    assert "triggering_actor is required" in result.stderr
+    out_dir = tmp_path / "artifacts"
+    assert not out_dir.exists() or list(out_dir.iterdir()) == []
+
+
+def test_issue_receipt_missing_all_sources_fail_closed(tmp_path):
+    argv, env = _p1_issue_argv(tmp_path)
+    env.pop("GITHUB_TRIGGERING_ACTOR", None)
+    result = subprocess.run(argv, capture_output=True, text=True, env=env)
+    assert result.returncode != 0
+    assert "triggering_actor is required" in result.stderr
+    out_dir = tmp_path / "artifacts"
+    assert not out_dir.exists() or list(out_dir.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -518,7 +610,7 @@ def test_disposition_producer_rejects_malformed_auth_fields(tmp_path, override, 
         del argv[index:index + 2]
     else:
         argv[index + 1] = value
-    failed = subprocess.run(argv, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    failed = subprocess.run(argv, capture_output=True, text=True, env=_producer_env())
     assert failed.returncode == 1
     assert needle in failed.stderr
 
@@ -553,7 +645,7 @@ def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="lock
         "--approver-id", "1",
         "--approved-at", approved_at,
     ]
-    return argv, {"PATH": os.environ["PATH"]}
+    return argv, _producer_env()
 
 
 def test_disposition_producer_same_params_new_approved_at_is_noop(tmp_path):
@@ -650,7 +742,7 @@ def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path
         "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
     ]
-    produced = subprocess.run(argv, check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    produced = subprocess.run(argv, check=True, capture_output=True, text=True, env=_producer_env())
     payload = json.loads(Path(json.loads(produced.stdout)["path"]).read_bytes())
     receipt = CONV.parse_disposition_receipt(payload)
     digest = CONV.canonical_audit_digest(second)

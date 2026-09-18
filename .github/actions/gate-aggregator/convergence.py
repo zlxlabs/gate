@@ -181,6 +181,8 @@ class DispositionReceipt:
     approver: str = ""
     approver_id: int = 0
     approved_at: str = ""
+    triggering_actor: str = ""
+    triggering_actor_source: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -197,6 +199,8 @@ class DispositionReceipt:
             "approver": self.approver,
             "approver_id": self.approver_id,
             "approved_at": self.approved_at,
+            "triggering_actor": self.triggering_actor,
+            "triggering_actor_source": self.triggering_actor_source,
         }
 
 
@@ -658,7 +662,7 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, reason="malformed_scope")
     if not isinstance(primary, CanonicalPrimary):
         return _disposition_status(receipt, valid=False, active=False, reason="malformed_primary")
-    if receipt.schema_version != DISPOSITION_RECEIPT_SCHEMA_VERSION:
+    if receipt.schema_version not in (1, DISPOSITION_RECEIPT_SCHEMA_VERSION):
         return _disposition_status(receipt, valid=False, active=False, reason="schema_version_mismatch")
     if receipt.disposition not in DISPOSITION_KINDS:
         return _disposition_status(receipt, valid=False, active=False, reason="unknown_disposition")
@@ -897,6 +901,10 @@ def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
             approver=payload["approver"] if "approver" in payload else "",
             approver_id=payload["approver_id"] if "approver_id" in payload else 0,
             approved_at=payload["approved_at"] if "approved_at" in payload else "",
+            triggering_actor=str(payload["triggering_actor"]) if "triggering_actor" in payload else "",
+            triggering_actor_source=(
+                str(payload["triggering_actor_source"]) if "triggering_actor_source" in payload else ""
+            ),
         )
     except (KeyError, TypeError) as exc:
         raise ReceiptValidationError("malformed disposition receipt") from exc

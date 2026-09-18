@@ -236,6 +236,10 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert "inputs.approver" not in text
     assert "${{ github.triggering_actor }}" in text
     assert "${{ github.actor_id }}" in text
+    assert "GITHUB_TRIGGERING_ACTOR" not in issue.get("env", {})
+    assert "--triggering-actor" not in issue["run"]
+    assert "env -i" not in issue["run"]
+    assert "python3 .github/actions/gate-disposition/issue_receipt.py issue" in issue["run"]
 
 
 def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_artifact():

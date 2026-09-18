@@ -272,7 +272,7 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
         ({"approved_at": "2026-08-30"}, "malformed_receipt"),
         ({"approved_at": "2026-08-30Tnot-a-time"}, "malformed_receipt"),
         ({"approver": 12}, "malformed_receipt"),
-        ({"schema_version": 1}, "schema_version_mismatch"),
+        ({"schema_version": 3}, "schema_version_mismatch"),
     ],
     ids=[
         "approver-empty",
@@ -286,7 +286,7 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
         "approved-at-bare-date",
         "approved-at-invalid-time",
         "approver-non-string",
-        "schema-version-v1",
+        "schema-version-v3",
     ],
 )
 def test_disposition_v2_auth_fields_are_rejected_as_claims_only(changes, reason):
@@ -305,10 +305,10 @@ def test_disposition_v2_auth_fields_are_rejected_as_claims_only(changes, reason)
     assert audit.rejected_receipts == ((receipt, reason),)
 
 
-def test_parse_v1_payload_without_auth_fields_is_schema_version_mismatch():
+def test_parse_v1_kind_is_rejected_and_schema_v1_current_kind_is_accepted():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     receipt = _disposition(primary=primary)
-    payload = {
+    v1_kind_payload = {
         "schema_version": 1,
         "disposition": receipt.disposition,
         "repository_id": receipt.repository_id,
@@ -321,13 +321,63 @@ def test_parse_v1_payload_without_auth_fields_is_schema_version_mismatch():
         "kind": "gate-disposition-receipt-v1",
     }
     with pytest.raises(CONV.ReceiptValidationError, match="unexpected disposition receipt kind"):
-        CONV.parse_disposition_receipt(payload)
-    parsed = CONV.parse_disposition_receipt({**payload, "kind": CONV.DISPOSITION_RECEIPT_KIND})
-    status = CONV.validate_disposition_receipt(
-        parsed, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        CONV.parse_disposition_receipt(v1_kind_payload)
+    v1_payload = {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND, "schema_version": 1}
+    parsed_v1 = CONV.parse_disposition_receipt(v1_payload)
+    assert parsed_v1.schema_version == 1
+    v1_status = CONV.validate_disposition_receipt(
+        parsed_v1, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
-    assert status.reason == "schema_version_mismatch"
-    assert status.active is False
+    assert (v1_status.valid, v1_status.active, v1_status.reason) == (True, True, "active_false_positive")
+    bare = CONV.parse_disposition_receipt({**v1_kind_payload, "kind": CONV.DISPOSITION_RECEIPT_KIND})
+    assert bare.schema_version == 1
+    assert CONV.validate_disposition_receipt(
+        bare, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    ).reason == "malformed_receipt"
+
+
+def test_validate_disposition_receipt_accepts_v1_and_v2_rejects_unknown():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    v2 = _disposition(primary=primary)
+    v1 = replace(v2, schema_version=1)
+    unknown = replace(v2, schema_version=3)
+    for receipt in (v1, v2):
+        status = CONV.validate_disposition_receipt(
+            receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        )
+        assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+    rejected = CONV.validate_disposition_receipt(
+        unknown, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert rejected.reason == "schema_version_mismatch"
+    assert rejected.active is False
+
+
+def test_parse_disposition_receipt_preserves_triggering_actor_fields():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    payload = {
+        **receipt.as_dict(),
+        "kind": CONV.DISPOSITION_RECEIPT_KIND,
+        "triggering_actor": "env-owner",
+        "triggering_actor_source": "env",
+    }
+    parsed = CONV.parse_disposition_receipt(payload)
+    assert parsed.triggering_actor == "env-owner"
+    assert parsed.triggering_actor_source == "env"
+    assert parsed.schema_version == CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION
+    old_v2 = receipt.as_dict()
+    old_v2.pop("triggering_actor", None)
+    old_v2.pop("triggering_actor_source", None)
+    parsed_old = CONV.parse_disposition_receipt({**old_v2, "kind": CONV.DISPOSITION_RECEIPT_KIND})
+    assert parsed_old.triggering_actor == ""
+    assert parsed_old.triggering_actor_source == ""
+    old_status = CONV.validate_disposition_receipt(
+        parsed_old, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (old_status.valid, old_status.active, old_status.reason) == (
+        True, True, "active_false_positive",
+    )
 
 
 def test_parse_v2_missing_or_empty_auth_fields_are_malformed():
