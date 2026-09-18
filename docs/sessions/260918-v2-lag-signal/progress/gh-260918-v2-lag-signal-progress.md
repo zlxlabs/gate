@@ -21,4 +21,18 @@
 - 关键决策与已否决方案：红验只改 `tests/v2_lag_observe.py` 后还原，不留兼容分支。
 - 下一步唯一动作：push card 分支并开 PR；合并须 merge commit。
 
+## 进度 4
+
+- 当前阶段：repairing / age_h 误报
+- 本段结论：`age_h` 与 `behind_main` 仅在存在更新 canary-verified 候选（`target_sha` 非空且不等于当前 v2）时上报；无候选时四元组仍写 summary，reasons 为空。`newer_target_without_move` / `stuck_verified_cycles` 不变。
+- 关键决策与已否决方案：不把「v2 单纯变老」当故障——夜间/周末 main 无合并是常态。不改设计文档、不改 workflow summary 格式。
+- 下一步唯一动作：红验两条新测试后推同一分支。
+
+## 进度 5
+
+- 当前阶段：repairing / age_h 红验收口
+- 本段结论：无候选超阈仍 reasons 为空；有候选超阈含 age_h。两条红验均红后已还原。
+- 关键决策与已否决方案：红验只改 `has_newer_candidate` 守卫后还原。
+- 下一步唯一动作：全量验证后推 `card/gate-20260918-01`。
+
 

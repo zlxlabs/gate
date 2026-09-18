@@ -58,10 +58,11 @@ def evaluate_v2_lag(
         missed = previous_missed + 1
     else:
         missed = previous_missed
+    has_newer_candidate = bool(target_sha) and target_sha != v2_sha
     reasons: list[str] = []
-    if age_h >= lag_hours:
+    if has_newer_candidate and age_h >= lag_hours:
         reasons.append("age_h")
-    if lag_main_commits is not None and behind_main >= lag_main_commits:
+    if has_newer_candidate and lag_main_commits is not None and behind_main >= lag_main_commits:
         reasons.append("behind_main")
     if move == "false" and target_sha and target_sha != v2_sha:
         reasons.append("newer_target_without_move")

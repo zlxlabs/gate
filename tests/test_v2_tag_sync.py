@@ -314,8 +314,8 @@ def test_lag_summary_quadruplet_present_for_both_move_values():
 @pytest.mark.parametrize(
     "overrides, reason",
     [
-        ({"age_h": 0, "lag_hours": 0}, "age_h"),
-        ({"lag_main_commits": 0}, "behind_main"),
+        ({"age_h": 0, "lag_hours": 0, "move": "true", "target_sha": "b" * 40, "v2_sha": "a" * 40}, "age_h"),
+        ({"lag_main_commits": 0, "move": "true", "target_sha": "b" * 40, "v2_sha": "a" * 40}, "behind_main"),
         ({"move": "false", "target_sha": "b" * 40, "v2_sha": "a" * 40}, "newer_target_without_move"),
         ({"move": "true", "target_sha": "b" * 40, "v2_sha": "a" * 40, "stuck_threshold": 0}, "stuck_verified_cycles"),
     ],
@@ -326,6 +326,23 @@ def test_threshold_env_zero_reports_default_does_not(overrides, reason):
     assert "- v2_sha:" in summary
     _, quiet, _ = evaluate_v2_lag(**_quad_kwargs())
     assert quiet == []
+
+
+def test_age_h_over_threshold_without_candidate_does_not_report():
+    for target in ("", "a" * 40):
+        summary, reasons, _ = evaluate_v2_lag(
+            **_quad_kwargs(age_h=9, lag_main_commits=0, target_sha=target)
+        )
+        assert reasons == []
+        assert "- age_h: 9" in summary
+
+
+def test_age_h_over_threshold_with_newer_candidate_reports():
+    summary, reasons, _ = evaluate_v2_lag(
+        **_quad_kwargs(age_h=9, move="true", target_sha="b" * 40, v2_sha="a" * 40)
+    )
+    assert "age_h" in reasons
+    assert "- age_h: 9" in summary
 
 
 def test_stuck_verified_cycles_count_reset_and_threshold():
