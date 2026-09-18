@@ -17,3 +17,11 @@
 - 本段结论：`issue_receipt.py` 写入 `triggering_actor` + `triggering_actor_source`；`DispositionReceipt`/`parse`/`as_dict` 同步两字段；`validate_disposition_receipt` 接受 schema 1 与 2、拒绝 3。受影响四份测试文件 483 项 + aggregator 268 项通过。
 - 关键决策与已否决方案：未改 workflow；`GITHUB_TRIGGERING_ACTOR` 靠 Actions 默认注入继承。契约测试锁死 step env 不含该键、argv 不含 `--triggering-actor`、没有 `env -i`。
 - 下一步唯一动作：红验优先级/schema 双版本，再跑全量验证命令。
+
+## 2026-09-18 红验与全量验证
+
+- 当前阶段：repairing 收口。
+- 本段结论：三条红验均变红后已还原。全量 `1042 passed`；`scripts/check_pinned_uses.py` 退出 0。
+- 关键决策与已否决方案：红验 1 把 `triggering_actor` 写成 `forged-actor`，产物字节断言失败；红验 2 把 env/cli 对调，env 覆盖测试读到 `cli-actor`；红验 3 把校验改回只接受当前版本，v1 fixture 报 `schema_version_mismatch`。
+- 下一步唯一动作：push 分支并开 PR（merge commit，主脑合并）。
+
