@@ -18,8 +18,12 @@ gate-hub 的 `AGENTS.md`「附属仓库」节。
 - **risk-tier 不继承。** 本仓是 `personal`，不因为是 gate-hub 的附属仓就按 `internal` 审。
 - **合并方式是发布动作的一部分。** 调用方钉 `@v2`；本仓 workflow 历史仍不可 rebase。
   squash / rebase 会重写 SHA、当场打断下游 pin。改 workflow 的 PR 必须用
-  merge commit 合并；合并后的「runner-group 白名单 + caller pin bump」是独立的推广步骤，
-  不能停在中间态。
+  merge commit 合并。合并后无需任何人工推广动作：调用方跟踪的是移动标签 `@v2`，
+  由 `.github/workflows/v2-tag-sync.yml`（push main / 每小时 cron）在 canary 绿后自动
+  把 v2 抬到最新的、canary 实测绿过的 main 提交。**没有 caller pin bump 这一步**——
+  旧批量换钉工具已退役（gate-hub `scripts/bump_caller_pins.py` 头注释、`registry.yaml`）。
+  runner-group 白名单（org runner group 按文件名 admit `gate-v2.yml` / `gate-shadow-v2.yml`）
+  只在**新仓接入（onboarding）**时涉及；workflow 版本合并不改变仓的 runner-group 成员关系。
 
 ## 发布完成与关单
 
