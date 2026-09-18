@@ -16,10 +16,14 @@ gate-hub 的 `AGENTS.md`「附属仓库」节。
 本仓自己的两条不能忘：
 
 - **risk-tier 不继承。** 本仓是 `personal`，不因为是 gate-hub 的附属仓就按 `internal` 审。
-- **合并方式是发布动作的一部分。** 本仓的 workflow 被全舰队下游仓以 `@<40hex>` immutable
-  SHA 精确 pin，squash / rebase 会重写 SHA、当场打断下游 pin。改 workflow 的 PR 必须用
+- **合并方式是发布动作的一部分。** 调用方钉 `@v2`；本仓 workflow 历史仍不可 rebase。
+  squash / rebase 会重写 SHA、当场打断下游 pin。改 workflow 的 PR 必须用
   merge commit 合并；合并后的「runner-group 白名单 + caller pin bump」是独立的推广步骤，
   不能停在中间态。
+
+## 发布完成与关单
+
+修本仓 issue，关闭前确认远端 `refs/tags/v2` 已包含修复 SHA（`git ls-remote --tags origin v2`，再 `git merge-base --is-ancestor <fix-sha> <v2-commit>`）。未满足不得 CLOSED，改标 `status:waiting`（或仓库惯用的「待发布」），v2 抬升后再关。禁止用本地 tag 副本判断发布。
 
 ## 威胁模型
 
