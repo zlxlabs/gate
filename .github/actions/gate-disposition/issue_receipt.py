@@ -84,6 +84,19 @@ def _required(args: argparse.Namespace, envelope: dict[str, Any], name: str, env
     return value
 
 
+def _resolve_triggering_actor(args: argparse.Namespace, envelope: dict[str, Any]) -> tuple[str, str]:
+    env_actor = _value(argparse.Namespace(), {}, "triggering_actor", "GITHUB_TRIGGERING_ACTOR")
+    if env_actor is not None and str(env_actor).strip():
+        return str(env_actor).strip(), "env"
+    cli_actor = _value(args, {}, "triggering_actor")
+    if cli_actor is not None and str(cli_actor).strip():
+        return str(cli_actor).strip(), "cli"
+    envelope_actor = _value(argparse.Namespace(), envelope, "triggering_actor")
+    if envelope_actor is not None and str(envelope_actor).strip():
+        return str(envelope_actor).strip(), "envelope"
+    raise ValueError("triggering_actor is required")
+
+
 def _safe_component(name: str, field: str) -> str:
     if not isinstance(name, str) or not SAFE_COMPONENT.fullmatch(name):
         raise ValueError(f"{field} must be a safe artifact-name component")
@@ -189,6 +202,7 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         raise ValueError("approver must be non-empty")
     if not head_sha:
         raise ValueError("head_sha must be non-empty")
+    triggering_actor, triggering_actor_source = _resolve_triggering_actor(args, envelope)
     scope = _read_scope(
         args, envelope, repository_id=repository_id, pr_number=pr_number,
         head_sha=head_sha,
@@ -223,6 +237,8 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         "approver": approver,
         "approver_id": approver_id,
         "approved_at": approved_at,
+        "triggering_actor": triggering_actor,
+        "triggering_actor_source": triggering_actor_source,
     }
     return fields
 
@@ -286,7 +302,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_argument("--audit-path")
     for name in (
         "repository-id", "pr-number", "head-sha", "finding-id", "scope-json",
-        "approver", "approver-id", "approved-at",
+        "approver", "approver-id", "approved-at", "triggering-actor",
     ):
         sub.add_argument(f"--{name}", dest=name.replace("-", "_"))
     return parser

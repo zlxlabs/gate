@@ -1084,7 +1084,7 @@ def test_real_disposition_producer_receipt_is_record_only_through_ledger(tmp_pat
         check=True,
         capture_output=True,
         text=True,
-        env={"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-999"},
+        env={"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-999", "GITHUB_TRIGGERING_ACTOR": "octocat"},
     )
     producer_result = json.loads(produced.stdout)
     receipt_bytes = Path(producer_result["path"]).read_bytes()
