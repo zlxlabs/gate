@@ -240,3 +240,16 @@ def test_enabled_clean_commit_advances(capsys, tmp_path):
 def test_disabled_migration_switch_blocks_advancement(capsys):
     assert main(["--enabled", "", "--commit-message", "fix implementation"]) == 1
     assert "v2 tag sync disabled; set V2_TAG_SYNC_ENABLED=true after migration" in capsys.readouterr().out
+
+
+def test_agents_md_requires_remote_v2_before_closing_issues():
+    text = (REPO_ROOT / "AGENTS.md").read_text()
+    assert "## 发布完成与关单" in text
+    assert "git ls-remote --tags origin v2" in text
+    assert "git merge-base --is-ancestor <fix-sha> <v2-commit>" in text
+    assert "status:waiting" in text
+    assert "禁止用本地 tag 副本判断发布" in text
+    merge_section = text.split("## 发布完成与关单", 1)[0]
+    assert "调用方钉 `@v2`" in merge_section
+    assert "本仓 workflow 历史仍不可 rebase" in merge_section
+    assert "@<40hex>" not in merge_section
