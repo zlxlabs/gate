@@ -20,3 +20,10 @@
 - 本段结论：5 个契约测试全部读真实 `gate-v2.yml`：业务步 `id:` 齐备、记录步 `if: always()` 且逐 id 引用 `steps.<id>.outcome`、三值输出 `GITHUB_OUTPUT`、`quality.outputs` 与 gate job 两处调用点 env/argv 接线、证据路径无日志关键字匹配。
 - 关键决策与已否决方案：无（纯接线断言；publish-only 调用点同样传参——它虽不重算 verdict，接线一致才能保证未来改动不分叉）。
 - 下一步唯一动作：补判定表矩阵测试（三行逐格断言 classification/reason/gate_result 且 ok 为 False）。
+
+## 里程碑 4 — 判定矩阵：三行逐格 + 面板 + 非法输入 + CLI 到达性
+
+- 当前阶段：repairing（实现与测试齐备，待红验与全量验收）
+- 本段结论：判定表三行逐行有测试（`failed→fail`；`passed/not_started/空→unavailable`；`preflight failed→fail`），每格 `ok is False`；`quality_infra` 面板渲染「修基础设施」且不含「要修代码」；未知证据值 fail-closed；`cancelled` 腿不受证据影响；CLI  flags→判据到达性有端到端测试。
+- 关键决策与已否决方案：止血 8 测试中 7 个保持原期望（其中 draft/hosted 两例补 `caller_checks="failed"` 显式表达「真红」），仅 `test_issue199_quality_failure_with_passing_primary_stays_fail_known_residual` 按其自带注释「根治卡再翻」翻转为 `unavailable`（更名明示）；矩阵 `kwargs0` 与可见轴旧断言同理补证据。
+- 下一步唯一动作：红验（改坏记录步/判据确认新断言变红）+ 全量 Verify-Command + 写报告。
