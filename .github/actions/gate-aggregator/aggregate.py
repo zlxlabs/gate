@@ -141,8 +141,15 @@ _IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
 # fall through to.
 PRIMARY_RESULT_DOMAIN = ("success", "failure", "cancelled", "skipped")
 QUALITY_RESULT_DOMAIN = PRIMARY_RESULT_DOMAIN
+# gate#199 根治：quality job 末尾记录步上报的业务检查证据三值域。空字符串
+# 不是第四个值——它是“证据缺席”（job 在记录步之前死掉、或调用方工作流尚未
+# 升级），与 not_started/passed 同归 unavailable，绝不能默认 fail。
+CALLER_CHECKS_DOMAIN = ("not_started", "passed", "failed")
+# PR size preflight 步骤的 steps.<id>.outcome。"failure" 是正当红（PR 太大
+# 要拆）；其余（含缺席空值）都不干扰 caller_checks 判据。
+PREFLIGHT_RESULT_DOMAIN = ("", "success", "failure", "skipped", "cancelled")
 TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
-TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip", "review_expected_stale", "pr_state_unverifiable")
+TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip", "review_expected_stale", "pr_state_unverifiable")
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
 PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
@@ -647,6 +654,8 @@ def evaluate(
     convergence_state: Optional[Any] = None,
     waiver_receipts: Sequence[Any] = (),
     pr_draft_now: Optional[bool] = None,
+    caller_checks: str = "",
+    preflight_result: str = "",
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -672,6 +681,12 @@ def evaluate(
         invalid_inputs.append(f"primary job result {primary_result!r} is not a recognized value (expected one of {PRIMARY_RESULT_DOMAIN!r}) — fail-closed")
     if type(is_draft) is not bool or type(review_expected) is not bool:
         invalid_inputs.append("draft/review_expected must be genuine booleans — fail-closed")
+    caller_checks = (caller_checks or "").strip()
+    if caller_checks not in ("",) + CALLER_CHECKS_DOMAIN:
+        invalid_inputs.append(f"caller_checks input {caller_checks!r} is not a recognized value (expected one of {CALLER_CHECKS_DOMAIN!r} or empty when the evidence step never ran) — fail-closed")
+    preflight_result = (preflight_result or "").strip()
+    if preflight_result not in PREFLIGHT_RESULT_DOMAIN:
+        invalid_inputs.append(f"preflight_result input {preflight_result!r} is not a recognized value — fail-closed")
     if invalid_inputs:
         return Outcome(ok=False, problems=invalid_inputs)
 
@@ -803,7 +818,27 @@ def evaluate(
     if primary_classification in ("integration_error", "review_unavailable"):
         classification, reason_code = primary_classification, primary_reason
     elif quality_reason is not None:
-        classification, reason_code = "ci_failure", quality_reason
+        if quality_reason == "quality_failure":
+            # gate#199 根治：quality=failure 是 job 级标量，混同了门禁控制面
+            # 步骤失败与业务检查真失败。只有记录步证据 caller_checks=failed
+            # 才能定罪为代码问题；其余一律基础设施不可用（fail-closed 到
+            # unavailable，绝不默认 fail）。PR size preflight 单算一相：
+            # preflight 红是正当红（PR 太大要拆），仍走 fail。
+            if preflight_result == "failure":
+                problems.append("PR size preflight failed (PR exceeds the single-review budget) — split the PR and retry")
+                classification, reason_code = "ci_failure", "quality_failure"
+            elif caller_checks == "failed":
+                problems.append("quality business checks reported failure (caller_checks=failed) — a code problem")
+                classification, reason_code = "ci_failure", "quality_failure"
+            else:
+                evidence = caller_checks if caller_checks else "missing (the evidence record step never ran)"
+                problems.append(
+                    f"quality job failed but the business checks show no failure (caller_checks={evidence}) — "
+                    "treated as an infrastructure problem, not a code problem"
+                )
+                classification, reason_code = "review_unavailable", "quality_infra"
+        else:
+            classification, reason_code = "ci_failure", quality_reason
     else:
         classification, reason_code = primary_classification, primary_reason
     gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[classification]
@@ -940,6 +975,11 @@ REASON_CODE_EXPLANATIONS = {
     "unexpected_primary_skip": (
         "The primary review should have run but was skipped — this is NOT the normal draft/fork "
         "skip. Check the primary job configuration."
+    ),
+    "quality_infra": (
+        "The quality job failed but its business checks show no failure (or the evidence was "
+        "never recorded) — this is an infrastructure problem, not a code problem. Check the "
+        "quality job's control-plane steps (checkout, cache, MagicDNS, ledger upload)."
     ),
 }
 
@@ -2452,6 +2492,8 @@ def _finish(
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quality-result", required=True, help="needs.quality.result")
+    parser.add_argument("--caller-checks", default="", help="needs.quality.outputs.caller_checks (not_started|passed|failed; empty when the evidence step never ran)")
+    parser.add_argument("--preflight-result", default="", help="PR size preflight step outcome (failure means the PR exceeds the single-review budget)")
     parser.add_argument("--primary-result", required=True, help="needs.primary.result")
     parser.add_argument("--runner", required=True, help="inputs.runner ('self'/'hosted') — validated strictly")
     parser.add_argument("--is-draft", required=True, help="github.event.pull_request.draft ('true'/'false')")
@@ -2581,6 +2623,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     outcome = evaluate(
         quality_result=args.quality_result,
+        caller_checks=args.caller_checks,
+        preflight_result=args.preflight_result,
         primary_result=args.primary_result,
         runner=args.runner,
         is_draft=is_draft,
