@@ -3363,3 +3363,74 @@ def test_silo_objects_under_narrows_import_error(monkeypatch):
         AGG._silo_objects_under("d30/1/")
     assert "dependency missing during listing" in str(exc.value)
     assert not cli_called, "CLI fallback must not be triggered when store operations raise ImportError"
+
+
+# ── gate#199 止血：主审未产出结论时 quality 不得定罪 ──────────────────────
+
+def test_issue199_quality_failure_with_cancelled_primary_is_unavailable():
+    outcome = AGG.evaluate(**_base_kwargs(quality_result="failure", primary_result="cancelled", audit=None, audit_error=None))
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("review_unavailable", "primary_cancelled", "unavailable")
+    terminal = AGG.build_terminal_envelope(repository="zlxlabs/gate", identity=IDENTITY, quality_result="failure", primary_result="cancelled", review_expected=True, is_draft=False, runner="self", outcome=outcome)
+    assert terminal["quality_result"] == "failure"
+    assert any("quality" in p for p in outcome.problems)
+    assert any("cancelled" in p for p in outcome.problems)
+
+
+def test_issue199_quality_cancelled_with_cancelled_primary_is_unavailable():
+    outcome = AGG.evaluate(**_base_kwargs(quality_result="cancelled", primary_result="cancelled", audit=None, audit_error=None))
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("review_unavailable", "primary_cancelled", "unavailable")
+
+
+def test_issue199_quality_skipped_with_cancelled_primary_is_unavailable():
+    outcome = AGG.evaluate(**_base_kwargs(quality_result="skipped", primary_result="cancelled", audit=None, audit_error=None))
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("review_unavailable", "primary_cancelled", "unavailable")
+
+
+def test_issue199_draft_skipped_primary_with_quality_failure_stays_code_problem():
+    outcome = AGG.evaluate(
+        **_base_kwargs(quality_result="failure", primary_result="skipped", is_draft=True, pr_draft_now=True, review_expected=False, audit=None, audit_error=None)
+    )
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
+
+
+def test_issue199_hosted_skipped_primary_with_quality_failure_stays_code_problem():
+    outcome = AGG.evaluate(
+        **_base_kwargs(quality_result="failure", primary_result="skipped", is_draft=False, review_expected=False, audit=None, audit_error=None)
+    )
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
+
+
+def test_issue199_quality_failure_with_passing_primary_stays_fail_known_residual():
+    # 已知残留：primary=success + quality=infra 失败仍误判，本卡不断言翻转，
+    # 只锁现状（根治卡再翻）。
+    outcome = AGG.evaluate(**_base_kwargs(quality_result="failure"))
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
+
+
+def test_issue199_quality_failure_with_failing_primary_stays_fail():
+    outcome = AGG.evaluate(
+        **_base_kwargs(quality_result="failure", primary_result="failure", audit=_valid_primary_record(verdict="fail"))
+    )
+    assert outcome.ok is False
+    assert outcome.gate_result == "fail"
+
+
+def test_issue199_unavailable_panel_renders_infra_action():
+    body = AGG.render_status_panel([{
+        "schema_version": AGG.PANEL_HISTORY_ROW_SCHEMA_VERSION,
+        "repository": "zlxlabs/gate",
+        "run_id": 1,
+        "run_attempt": 1,
+        "head_sha": "a" * 40,
+        "gate_result": "unavailable",
+        "classification": "review_unavailable",
+        "reason_code": "primary_cancelled",
+    }])
+    assert "修基础设施" in body
+    assert "要修代码" not in body
