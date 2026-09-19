@@ -226,6 +226,8 @@ jobs:
       SILO_STORE: _gate-silo-src/scripts/silo_store.py
     outputs:
       ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
+      caller_checks: ${{ steps.caller-checks-outcome.outputs.caller_checks }}
+      preflight_result: ${{ steps.caller-checks-outcome.outputs.preflight_result }}
     # Per-PR cancel of stale quality only. Group is independent of `primary`
     # (same-run jobs must not share a group) and of the gate/ledger writer
     # locks (those stay cancel-in-progress: false). Workflow identity prefix
@@ -287,6 +289,7 @@ jobs:
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: PR size preflight
+        id: pr-size-preflight
         uses: ./_gate-action-src/.github/actions/pr-size-preflight
         with:
           base-sha: ${{ github.event.pull_request.base.sha }}
@@ -311,6 +314,7 @@ jobs:
           fi
 
       - name: Run scripts/gate-quality
+        id: run-quality
         if: ${{ steps.quality-entry.outputs.mode == 'entry' }}
         working-directory: ${{ github.workspace }}
         env:
@@ -318,17 +322,20 @@ jobs:
         run: ./scripts/gate-quality
 
       - name: Lint / format
+        id: lint-format
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
           if [ -f Makefile ] && grep -qE '^lint:' Makefile; then make lint
           else echo "no 'lint' make target — skipping"; fi
 
       - name: Duplicate check (jscpd, advisory)
+        id: duplicate-check
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         continue-on-error: true
         run: npx --yes jscpd --threshold "${JSCPD_THRESHOLD:-5}" --reporters console .
 
       - name: Dependency direction (dependency-cruiser)
+        id: dependency-direction
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
           if [ -f .dependency-cruiser.js ] || [ -f .dependency-cruiser.json ]; then
@@ -403,6 +410,7 @@ jobs:
           [ "$status" != "failed" ]
 
       - name: Tests
+        id: run-tests
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
           if   [ -f Makefile ] && grep -qE '^test:' Makefile; then make test
@@ -532,6 +540,39 @@ jobs:
           else
             echo "ledger_input_upload=failure" >> "$GITHUB_OUTPUT"
             echo "::error::review ledger input upload failed after one retry (network); gate / ledger will report the input missing"
+          fi
+
+      # gate#199 根治：业务检查证据记录步。只读各业务步骤的原生 outcome，
+      # 不解析日志文本。PR size preflight 单算一相（仍走 fail）；Diff
+      # coverage advisory 是 advisory 性质（continue-on-error），不计入业务相。
+      - name: Record caller checks outcome
+        id: caller-checks-outcome
+        if: always()
+        env:
+          PREFLIGHT_OUTCOME: ${{ steps.pr-size-preflight.outcome }}
+          RUN_QUALITY_OUTCOME: ${{ steps.run-quality.outcome }}
+          LINT_FORMAT_OUTCOME: ${{ steps.lint-format.outcome }}
+          DUPLICATE_CHECK_OUTCOME: ${{ steps.duplicate-check.outcome }}
+          DEPENDENCY_DIRECTION_OUTCOME: ${{ steps.dependency-direction.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          RUN_TESTS_OUTCOME: ${{ steps.run-tests.outcome }}
+        run: |
+          set -euo pipefail
+          echo "preflight_result=${PREFLIGHT_OUTCOME:-}" >> "$GITHUB_OUTPUT"
+          failed=0
+          passed=0
+          for outcome in "$RUN_QUALITY_OUTCOME" "$LINT_FORMAT_OUTCOME" "$DUPLICATE_CHECK_OUTCOME" "$DEPENDENCY_DIRECTION_OUTCOME" "$INSTALL_OUTCOME" "$RUN_TESTS_OUTCOME"; do
+            case "$outcome" in
+              failure) failed=1 ;;
+              success) passed=1 ;;
+            esac
+          done
+          if [ "$failed" -eq 1 ]; then
+            echo "caller_checks=failed" >> "$GITHUB_OUTPUT"
+          elif [ "$passed" -eq 1 ]; then
+            echo "caller_checks=passed" >> "$GITHUB_OUTPUT"
+          else
+            echo "caller_checks=not_started" >> "$GITHUB_OUTPUT"
           fi
 
   # ── primary ──────────────────────────────────────────────────────────────
@@ -1378,6 +1419,8 @@ jobs:
         id: aggregate-required-verdict
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
+          QUALITY_CALLER_CHECKS: ${{ needs.quality.outputs.caller_checks }}
+          QUALITY_PREFLIGHT_RESULT: ${{ needs.quality.outputs.preflight_result }}
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}
           # Forwarded so the aggregator can strictly validate it itself
@@ -1405,6 +1448,8 @@ jobs:
           set +e
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
+            --caller-checks "$QUALITY_CALLER_CHECKS" \
+            --preflight-result "$QUALITY_PREFLIGHT_RESULT" \
             --primary-result "$PRIMARY_RESULT" \
             --runner "$RUNNER_MODE" \
             --is-draft "$IS_DRAFT" \
@@ -1484,6 +1529,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           QUALITY_RESULT: ${{ needs.quality.result }}
+          QUALITY_CALLER_CHECKS: ${{ needs.quality.outputs.caller_checks }}
+          QUALITY_PREFLIGHT_RESULT: ${{ needs.quality.outputs.preflight_result }}
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}
           RUNNER_MODE: ${{ inputs.runner }}
@@ -1501,6 +1548,8 @@ jobs:
         run: |
           python3 _gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py \
             --quality-result "$QUALITY_RESULT" \
+            --caller-checks "$QUALITY_CALLER_CHECKS" \
+            --preflight-result "$QUALITY_PREFLIGHT_RESULT" \
             --primary-result "$PRIMARY_RESULT" \
             --runner "$RUNNER_MODE" \
             --is-draft "$IS_DRAFT" \
