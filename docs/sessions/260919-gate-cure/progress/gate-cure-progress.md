@@ -13,3 +13,10 @@
 - 本段结论：6 个业务步补齐 `id:`（`run-quality`/`lint-format`/`duplicate-check`/`dependency-direction`/`run-tests`，`install` 已有），`pr-size-preflight` 单列 `id:`；新增 `Record caller checks outcome`（`if: always()`，只读原生 `outcome`，`failed>passed>not_started` 三值输出 + `preflight_result` 透传）；`quality.outputs` 与 gate job 两处调用点（aggregate + publish-only）同步接线完毕。
 - 关键决策与已否决方案：`Diff coverage advisory` 不计入（advisory + `continue-on-error`，计入会把建议失败算成代码红）；`skipped`/空 outcome 中性跳过（entry/legacy 双模下对方阵营步骤恒为 skipped，不影响三值）；载体用 env（复用 `QUALITY_RESULT` 先例模式，不自创花样）。
 - 下一步唯一动作：写跨发布边界契约测试（读真实 YAML 断言接线不断链）。
+
+## 里程碑 3 — 契约测试：真实 YAML 接线不断链
+
+- 当前阶段：repairing（接线有契约锁死，判定矩阵待补）
+- 本段结论：5 个契约测试全部读真实 `gate-v2.yml`：业务步 `id:` 齐备、记录步 `if: always()` 且逐 id 引用 `steps.<id>.outcome`、三值输出 `GITHUB_OUTPUT`、`quality.outputs` 与 gate job 两处调用点 env/argv 接线、证据路径无日志关键字匹配。
+- 关键决策与已否决方案：无（纯接线断言；publish-only 调用点同样传参——它虽不重算 verdict，接线一致才能保证未来改动不分叉）。
+- 下一步唯一动作：补判定表矩阵测试（三行逐格断言 classification/reason/gate_result 且 ok 为 False）。

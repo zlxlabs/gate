@@ -2571,3 +2571,88 @@ def test_ocr_job_timeout_and_internal_budget_follow_shadow_reserve_shape():
     internal_budget_s = review_step["env"]["REVIEW_GATE_TIMEOUT_S"]
     assert internal_budget_s == 1080
     assert internal_budget_s == (ocr["timeout-minutes"] - 2) * 60
+
+
+# ── gate#199 根治：quality 自带 caller_checks 证据链 ─────────────────────
+#
+# 跨发布边界接线（producer → consumer）必须读仓库内真实的 gate-v2.yml 断言，
+# 自造 fixture 只做单元测试，不证明接线落地。
+
+# 业务检查相：name → 记录步引用的 id。PR size preflight 单算一相；
+# Diff coverage advisory 是 advisory 性质（continue-on-error），不计入。
+CALLER_CHECKS_BUSINESS_STEPS = {
+    "Run scripts/gate-quality": "run-quality",
+    "Lint / format": "lint-format",
+    "Duplicate check (jscpd, advisory)": "duplicate-check",
+    "Dependency direction (dependency-cruiser)": "dependency-direction",
+    "Install dependencies": "install",
+    "Tests": "run-tests",
+}
+CALLER_CHECKS_PREFLIGHT_STEP = ("PR size preflight", "pr-size-preflight")
+
+
+def _quality_steps(raw):
+    return raw["jobs"]["quality"]["steps"]
+
+
+def test_business_steps_carry_ids_for_caller_checks_evidence():
+    raw, _ = _load_workflow()
+    by_name = {s.get("name"): s for s in _quality_steps(raw)}
+    for name, step_id in list(CALLER_CHECKS_BUSINESS_STEPS.items()) + [CALLER_CHECKS_PREFLIGHT_STEP]:
+        assert by_name[name].get("id") == step_id, f"{name} must carry id: {step_id}"
+
+
+def test_caller_checks_record_step_covers_every_business_step():
+    raw, _ = _load_workflow()
+    record = next(s for s in _quality_steps(raw) if s.get("id") == "caller-checks-outcome")
+    assert record["if"] == "always()"
+    env_text = " ".join(str(v) for v in record["env"].values())
+    for _name, step_id in list(CALLER_CHECKS_BUSINESS_STEPS.items()) + [CALLER_CHECKS_PREFLIGHT_STEP]:
+        assert f"steps.{step_id}.outcome" in env_text, f"record step must read steps.{step_id}.outcome"
+    run = record["run"]
+    for value in ("caller_checks=failed", "caller_checks=passed", "caller_checks=not_started"):
+        assert value in run
+    assert "preflight_result=" in run
+    assert "GITHUB_OUTPUT" in run
+
+
+def test_quality_exposes_caller_checks_evidence_outputs():
+    raw, _ = _load_workflow()
+    quality = raw["jobs"]["quality"]
+    assert quality["outputs"]["caller_checks"] == (
+        "${{ steps.caller-checks-outcome.outputs.caller_checks }}"
+    )
+    assert quality["outputs"]["preflight_result"] == (
+        "${{ steps.caller-checks-outcome.outputs.preflight_result }}"
+    )
+
+
+def test_gate_forwards_caller_checks_at_both_call_sites():
+    raw, _ = _load_workflow()
+    gate_steps = raw["jobs"]["gate"]["steps"]
+    consumers = [
+        s for s in gate_steps
+        if "aggregate.py" in str(s.get("run", "")) and "QUALITY_RESULT" in str(s.get("env", ""))
+    ]
+    assert len(consumers) == 2, "aggregate + publish-only call sites must both forward the evidence"
+    for step in consumers:
+        assert step["env"]["QUALITY_CALLER_CHECKS"] == "${{ needs.quality.outputs.caller_checks }}"
+        assert step["env"]["QUALITY_PREFLIGHT_RESULT"] == "${{ needs.quality.outputs.preflight_result }}"
+        assert '--caller-checks "$QUALITY_CALLER_CHECKS"' in step["run"]
+        assert '--preflight-result "$QUALITY_PREFLIGHT_RESULT"' in step["run"]
+
+
+def test_caller_checks_evidence_path_uses_no_log_keyword_matching():
+    raw, _ = _load_workflow()
+    record = next(s for s in _quality_steps(raw) if s.get("id") == "caller-checks-outcome")
+    for keyword in ("curl", "timeout", "handshake", "github.com"):
+        assert keyword not in record["run"], f"evidence must read steps outcome, not match {keyword!r}"
+    evidence_lines = [
+        line for line in AGGREGATOR_SCRIPT.read_text().splitlines()
+        if "caller_checks" in line or "preflight" in line or "quality_infra" in line
+    ]
+    assert evidence_lines, "aggregator must carry the evidence through named variables"
+    for keyword in ("curl", "timeout", "handshake", "github.com"):
+        assert not any(keyword in line for line in evidence_lines), (
+            f"aggregator evidence判据 must not match {keyword!r}"
+        )
