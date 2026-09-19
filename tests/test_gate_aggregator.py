@@ -527,6 +527,10 @@ def _cli_args(audit_dir, summary_path, **overrides):
         args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
     if values.get("panel_delivery_path") is not None:
         args.extend(["--panel-delivery-path", values["panel_delivery_path"]])
+    if values.get("caller_checks") is not None:
+        args.extend(["--caller-checks", values["caller_checks"]])
+    if values.get("preflight_result") is not None:
+        args.extend(["--preflight-result", values["preflight_result"]])
     if values.get("convergence_receipt_path") is not None:
         args.extend(["--convergence-receipt-path", values["convergence_receipt_path"]])
     return args
@@ -837,7 +841,7 @@ def _assert_terminal_classification(outcome, expected):
         assert (outcome.audit_available, outcome.audit_source_attempt, outcome.audit_artifact_name) == (False, None, None)
 
 @pytest.mark.parametrize("kwargs,expected", [
-    ({"quality_result": "failure"}, ("ci_failure", "quality_failure", "fail")), ({"quality_result": "cancelled"}, ("ci_failure", "quality_cancelled", "fail")),
+    ({"quality_result": "failure", "caller_checks": "failed"}, ("ci_failure", "quality_failure", "fail")), ({"quality_result": "cancelled"}, ("ci_failure", "quality_cancelled", "fail")),
     ({"quality_result": "skipped"}, ("ci_failure", "quality_skipped", "fail")), ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": True}, ("expected_skip", "review_not_expected", "skipped")),
     ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": False}, ("review_unavailable", "review_expected_stale", "unavailable")),
     ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": None}, ("review_unavailable", "pr_state_unverifiable", "unavailable")),
@@ -902,7 +906,7 @@ def _stale_draft_kwargs(pr_draft_now):
 def test_terminal_reason_domain_lock():
     assert AGG.TERMINAL_REASON_DOMAIN == (
         "primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled",
-        "quality_failure", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid",
+        "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid",
         "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip",
         "review_expected_stale", "pr_state_unverifiable",
     )
@@ -1165,7 +1169,7 @@ def _visible_scenario(tmp_path, overrides, audit_record="__default__"):
             "review_unavailable", "primary_unavailable", "unavailable", 1, "::error::",
         ),
         (
-            {"quality_result": "failure"}, "__default__",
+            {"quality_result": "failure", "caller_checks": "failed"}, "__default__",
             "ci_failure", "quality_failure", "fail", 1, "::error::",
         ),
         ({}, None, "integration_error", "audit_missing", "unavailable", 1, "::error::"),
@@ -3391,7 +3395,7 @@ def test_issue199_quality_skipped_with_cancelled_primary_is_unavailable():
 
 def test_issue199_draft_skipped_primary_with_quality_failure_stays_code_problem():
     outcome = AGG.evaluate(
-        **_base_kwargs(quality_result="failure", primary_result="skipped", is_draft=True, pr_draft_now=True, review_expected=False, audit=None, audit_error=None)
+        **_base_kwargs(quality_result="failure", caller_checks="failed", primary_result="skipped", is_draft=True, pr_draft_now=True, review_expected=False, audit=None, audit_error=None)
     )
     assert outcome.ok is False
     assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
@@ -3399,23 +3403,24 @@ def test_issue199_draft_skipped_primary_with_quality_failure_stays_code_problem(
 
 def test_issue199_hosted_skipped_primary_with_quality_failure_stays_code_problem():
     outcome = AGG.evaluate(
-        **_base_kwargs(quality_result="failure", primary_result="skipped", is_draft=False, review_expected=False, audit=None, audit_error=None)
+        **_base_kwargs(quality_result="failure", caller_checks="failed", primary_result="skipped", is_draft=False, review_expected=False, audit=None, audit_error=None)
     )
     assert outcome.ok is False
     assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
 
 
-def test_issue199_quality_failure_with_passing_primary_stays_fail_known_residual():
-    # 已知残留：primary=success + quality=infra 失败仍误判，本卡不断言翻转，
-    # 只锁现状（根治卡再翻）。
+def test_issue199_quality_failure_with_passing_primary_is_unavailable_without_failed_evidence():
+    # 根治翻转（#199）：primary=success + quality=failure 时，没有
+    # caller_checks=failed 证据就不能定罪为代码问题，一律基础设施不可用。
+    # ok 仍为 False（合并照样被挡），只是桶从「要修代码」换到「修基础设施」。
     outcome = AGG.evaluate(**_base_kwargs(quality_result="failure"))
     assert outcome.ok is False
-    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("review_unavailable", "quality_infra", "unavailable")
 
 
 def test_issue199_quality_failure_with_failing_primary_stays_fail():
     outcome = AGG.evaluate(
-        **_base_kwargs(quality_result="failure", primary_result="failure", audit=_valid_primary_record(verdict="fail"))
+        **_base_kwargs(quality_result="failure", caller_checks="failed", primary_result="failure", audit=_valid_primary_record(verdict="fail"))
     )
     assert outcome.ok is False
     assert outcome.gate_result == "fail"
@@ -3434,3 +3439,76 @@ def test_issue199_unavailable_panel_renders_infra_action():
     }])
     assert "修基础设施" in body
     assert "要修代码" not in body
+
+
+# ── gate#199 根治判定表（quality=failure 前提）─────────────────────────
+
+@pytest.mark.parametrize("caller_checks,expected", [
+    ("failed", ("ci_failure", "quality_failure", "fail")),
+    ("passed", ("review_unavailable", "quality_infra", "unavailable")),
+    ("not_started", ("review_unavailable", "quality_infra", "unavailable")),
+    ("", ("review_unavailable", "quality_infra", "unavailable")),  # 证据缺席：旧调用方/记录步前死亡
+])
+def test_caller_checks_evidence_matrix(caller_checks, expected):
+    outcome = AGG.evaluate(**_base_kwargs(quality_result="failure", caller_checks=caller_checks))
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == expected
+
+
+def test_preflight_failure_is_legitimate_fail_despite_passing_checks():
+    outcome = AGG.evaluate(
+        **_base_kwargs(quality_result="failure", caller_checks="passed", preflight_result="failure")
+    )
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
+
+
+def test_preflight_failure_outranks_missing_evidence():
+    outcome = AGG.evaluate(
+        **_base_kwargs(quality_result="failure", caller_checks="", preflight_result="failure")
+    )
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")
+
+
+def test_unknown_caller_checks_value_fails_closed():
+    outcome = AGG.evaluate(**_base_kwargs(quality_result="failure", caller_checks="banana"))
+    assert outcome.ok is False
+    assert outcome.classification is None
+    assert any("caller_checks" in p for p in outcome.problems)
+
+
+def test_quality_cancelled_ignores_caller_checks_evidence():
+    # 只有 failure 腿读证据；cancelled/skipped 保持原语义。
+    outcome = AGG.evaluate(**_base_kwargs(quality_result="cancelled", caller_checks="passed"))
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_cancelled", "fail")
+
+
+def test_quality_infra_panel_renders_infra_action():
+    body = AGG.render_status_panel([{
+        "schema_version": AGG.PANEL_HISTORY_ROW_SCHEMA_VERSION,
+        "repository": "zlxlabs/gate",
+        "run_id": 1,
+        "run_attempt": 1,
+        "head_sha": "a" * 40,
+        "gate_result": "unavailable",
+        "classification": "review_unavailable",
+        "reason_code": "quality_infra",
+    }])
+    assert "修基础设施" in body
+    assert "要修代码" not in body
+
+
+def test_cli_evidence_reaches_the_verdict(tmp_path, monkeypatch):
+    # E2E-Assertion 的消费侧一半：--caller-checks/--preflight-result 经 CLI
+    # 到达判据（生产侧一半由契约测试锁 YAML→env→argv 接线）。
+    monkeypatch.setattr(AGG, "_fetch_pr_draft", lambda **kw: True)
+    _, summary_path, args = _visible_scenario(
+        tmp_path, {"quality_result": "failure", "caller_checks": "", "preflight_result": ""}, "__default__",
+    )
+    rc = AGG.main(args)
+    assert rc == 1
+    summary = summary_path.read_text()
+    assert "quality_infra" in summary
+    assert "review_unavailable" in summary
