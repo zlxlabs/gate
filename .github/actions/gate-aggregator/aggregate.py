@@ -791,7 +791,16 @@ def evaluate(
                     audit_source = artifact_name = None
                     primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
 
-    if primary_classification == "integration_error":
+    # gate#199: a primary that was expected but produced no conclusion
+    # (cancelled job, missing/invalid audit) means there is no reviewer
+    # verdict to trust — the gate cannot attribute the run to a code
+    # problem, so the primary leg outranks the quality leg. An expected
+    # skip (draft/fork/hosted) is a verdict in itself and stays below
+    # quality: a genuinely red quality run on a draft is still a code
+    # problem. code_pass/code_fail keep the old quality-first order (the
+    # primary=success + quality=infra-failure residual is left for the
+    # follow-up card, not flipped here).
+    if primary_classification in ("integration_error", "review_unavailable"):
         classification, reason_code = primary_classification, primary_reason
     elif quality_reason is not None:
         classification, reason_code = "ci_failure", quality_reason
