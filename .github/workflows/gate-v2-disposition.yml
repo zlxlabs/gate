@@ -71,12 +71,12 @@ jobs:
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
-            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            echo "::error::Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
             exit 1
           }
           SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
           if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
-            echo "::error::Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+            echo "::error::Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
             exit 1
           fi
           if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"

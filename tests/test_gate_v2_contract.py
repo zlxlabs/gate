@@ -278,6 +278,27 @@ def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_arti
     assert "gh run download" not in before_fallback
 
 
+def test_magicdns_failure_messages_point_to_underlying_retry_reason():
+    for workflow_name, loader in (
+        ("gate-v2.yml", _load_workflow),
+        ("gate-v2-disposition.yml", _load_disposition_workflow),
+    ):
+        raw, _ = loader()
+        for job_name, job in raw["jobs"].items():
+            for step in job.get("steps", []):
+                run = str(step.get("run", ""))
+                if MAGICDNS_HELPER_RUN not in run:
+                    continue
+                messages = re.findall(r'echo "::error::([^"\n]+)" >&2', run)
+                assert len(messages) == 2, (workflow_name, job_name, step.get("name"))
+                for message in messages:
+                    assert "Silo MagicDNS lookup failed" in message
+                    assert "MagicDNS attempt N/M failed:" in message
+                    assert "SILO_ENDPOINT=" in message
+                    assert "tailnet" not in message
+                    assert "100.100.100.100" not in message
+
+
 def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
     text = DISPOSITION_WORKFLOW.read_text()
     producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()

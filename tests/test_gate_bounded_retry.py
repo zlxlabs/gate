@@ -38,12 +38,12 @@ def test_worst_case_and_first_failure_absorbed_then_exhausted_stays_red(monkeypa
     assert hits["n"] == 2
 
     def boom():
-        raise RuntimeError("persistent MagicDNS lookup failed; tailnet 不可达")
+        raise RuntimeError("persistent MagicDNS lookup failed: injected resolver error")
 
     try:
         retry.run_with_retries(boom, label="probe")
     except RuntimeError as exc:
-        assert "tailnet 不可达" in str(exc)
+        assert "injected resolver error" in str(exc)
     else:
         raise AssertionError("expected failure")
 
@@ -112,7 +112,7 @@ def test_magicdns_cli_absorbs_then_fail_loud(tmp_path):
         f"p=Path({str(tmp_path / 'n')!r})\n"
         "n=int(p.read_text()) if p.exists() else 0\nn+=1\np.write_text(str(n))\n"
         "if n==1:\n"
-        "    sys.stderr.write('Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=https://silo.example\\n')\n"
+        "    sys.stderr.write('MagicDNS lookup failed: injected resolver error\\n')\n"
         "    raise SystemExit(1)\nprint('100.64.0.8 silo.example')\n",
         encoding="utf-8",
     )
@@ -122,11 +122,12 @@ def test_magicdns_cli_absorbs_then_fail_loud(tmp_path):
     assert ok.stdout.strip() == "100.64.0.8 silo.example"
     store.write_text(
         "#!/usr/bin/env python3\nimport sys\n"
-        "sys.stderr.write('Silo MagicDNS lookup failed; tailnet 不可达 (hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT=https://silo.example\\n')\n"
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
     bad = _run(["magicdns", "--silo-store", str(store), "--endpoint", "https://silo.example"], env, tmp_path)
     assert bad.returncode != 0
-    assert "Silo MagicDNS lookup failed; tailnet 不可达" in bad.stderr
-    assert bad.stderr.count("attempt ") == 3
+    assert "Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed:" in bad.stderr
+    assert "SILO_ENDPOINT=https://silo.example" in bad.stderr
+    assert "tailnet" not in bad.stderr
+    assert all(f"MagicDNS attempt {attempt}/3 failed:" in bad.stderr for attempt in range(1, 4))
