@@ -58,7 +58,7 @@ def _main_sha(output: str) -> str | None:
 def _commit_timestamp(sha: str) -> tuple[int | None, int]:
     try:
         result = subprocess.run(
-            ["git", "show", "-s", "--format=%ct", sha],
+            ["git", "log", "-1", "--format=%ct", sha],
             check=False,
             capture_output=True,
             text=True,
@@ -71,6 +71,22 @@ def _commit_timestamp(sha: str) -> tuple[int | None, int]:
         return int(result.stdout.strip()), 0
     except ValueError:
         return None, 0
+
+
+def _oldest_unreleased_sha(v2_sha: str, main_sha: str) -> tuple[str | None, int]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", f"{v2_sha}..{main_sha}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None, 127
+    if result.returncode != 0:
+        return None, result.returncode
+    lines = result.stdout.splitlines()
+    return (lines[-1] if lines else ""), 0
 
 
 def _query_failed(exit_code: int) -> int:
@@ -102,14 +118,21 @@ def main(argv: list[str] | None = None) -> int:
     if v2_sha is None or main_sha is None:
         return _query_failed(0)
 
-    commit_timestamp, timestamp_status = _commit_timestamp(v2_sha)
+    oldest_unreleased_sha, rev_list_status = _oldest_unreleased_sha(v2_sha, main_sha)
+    if oldest_unreleased_sha is None:
+        return _query_failed(rev_list_status)
+    if not oldest_unreleased_sha:
+        return 0
+
+    commit_timestamp, timestamp_status = _commit_timestamp(oldest_unreleased_sha)
     if commit_timestamp is None:
         return _query_failed(timestamp_status)
     lag_seconds = max(0, int(time.time()) - commit_timestamp)
-    if v2_sha != main_sha and lag_seconds > args.threshold_hours * 3600:
+    if lag_seconds > args.threshold_hours * 3600:
         print(
             f"v2 behind main: v2_sha={v2_sha} main_sha={main_sha} "
-            f"lag_hours={lag_seconds / 3600:.2f}"
+            f"main_lead_hours={lag_seconds / 3600:.2f} "
+            "(oldest unreleased commit age)"
         )
         return 1
     return 0
