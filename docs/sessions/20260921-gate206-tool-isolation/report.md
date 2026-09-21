@@ -341,3 +341,14 @@ store="$SILO_STORE"
 - graphify 全语义路径因 122 个文档且无语言模型 key 失败；随后按指引运行 `graphify . --code-only --no-viz` 成功生成 1382 nodes / 3257 edges / 62 communities，并已删除此次生成的 `graphify-out/` 临时产物。
 - `repo-settings-doctor.sh --hookspath` rc=0，无输出；`worktree_reconcile.py --dry-run --repo <当前 worktree>` rc=2，原文为 `worktree-reconcile: --repo 不是主仓（.git 非目录或非主 checkout）`，因此无法从 worktree 侧给出主仓回收清单。
 - 临时验证目录已销毁；最终 checkout 保持在 `card/gate-20260921-01`。
+
+## 推送状态
+
+本地已按授权执行 `git push -u origin card/gate-20260921-01`，但远端 SSH 连接超时，原始错误为：
+
+```text
+ssh: connect to host ssh.github.com port 443: Connection timed out
+fatal: Could not read from remote repository.
+```
+
+随后只读执行 `timeout 15s git ls-remote origin refs/heads/card/gate-20260921-01`：rc=0，但 stdout 为空；按照副作用纪律不做无条件重试，当前不能声称远端已收到提交。远端网络恢复后应先再次读取目标状态，再单次推送并用 `git ls-remote` 核对 SHA。
