@@ -131,6 +131,24 @@ OK: checked 9 live workflow/action metadata file(s); all internal uses are works
 
 差异检查：'git diff --check' 通过。
 
+## 推送状态
+
+按授权先用 HTTPS 推送，失败后先查远端；远端查询同样失败，没有把本地
+remote-tracking ref 当成成功证据：
+
+~~~text
+git push https://github.com/zlxlabs/gate.git HEAD:refs/heads/card/gate-20260921-03
+Connection closed by 140.82.121.35 port 443
+fatal: Could not read from remote repository.
+
+git ls-remote https://github.com/zlxlabs/gate.git refs/heads/card/gate-20260921-03
+Connection closed by 140.82.121.35 port 443
+fatal: Could not read from remote repository.
+~~~
+
+随后只做了一次有界的 HTTPS HTTP/1.1 备选，结果相同；再次 ls-remote 仍是上述连接错误。
+没有重试 SSH。当前只能确认本地分支提交完整，远端分支 SHA 因 GitHub HTTPS 连接阻塞而无法核实。
+
 ## 提交证据
 
 主改动提交：
