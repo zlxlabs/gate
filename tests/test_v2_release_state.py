@@ -42,15 +42,10 @@ def _runner(
 
 
 def _invoke(monkeypatch, v2_output: str, main_output: str, *extra: str, range_output="", timestamps=None, rev_list_status=0):
-    monkeypatch.setattr(
-        v2_release_state.subprocess,
-        "run",
-        _runner(v2_output, main_output, range_output=range_output, timestamps=timestamps, rev_list_status=rev_list_status),
-    )
+    fake = _runner(v2_output, main_output, range_output=range_output, timestamps=timestamps, rev_list_status=rev_list_status)
+    monkeypatch.setattr(v2_release_state.subprocess, "run", fake)
     monkeypatch.setattr(v2_release_state.time, "time", lambda: NOW)
-    return v2_release_state.main(
-        ["--remote", "https://remote.test/repo", "--threshold-hours", str(v2_release_state.DEFAULT_THRESHOLD_HOURS), *extra]
-    )
+    return v2_release_state.main(["--remote", "https://remote.test/repo", "--threshold-hours", str(v2_release_state.DEFAULT_THRESHOLD_HOURS), *extra])
 
 
 def test_v2_equals_main_is_silent(monkeypatch, capsys):
@@ -59,12 +54,7 @@ def test_v2_equals_main_is_silent(monkeypatch, capsys):
 
 
 def test_behind_but_within_threshold_is_silent(monkeypatch, capsys):
-    assert _invoke(
-        monkeypatch,
-        f"{V2_SHA}\t{v2_release_state.TAG_REF}\n",
-        f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n",
-        range_output=f"{MAIN_SHA}\n",
-    ) == 0
+    assert _invoke(monkeypatch, f"{V2_SHA}\t{v2_release_state.TAG_REF}\n", f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n", range_output=f"{MAIN_SHA}\n") == 0
     assert capsys.readouterr() == ("", "")
 
 
@@ -77,24 +67,12 @@ def test_behind_over_threshold_alerts(monkeypatch, capsys):
 
 
 def test_old_v2_age_does_not_alert_for_new_main_lead(monkeypatch, capsys):
-    assert _invoke(
-        monkeypatch,
-        f"{V2_SHA}\t{v2_release_state.TAG_REF}\n",
-        f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n",
-        range_output=f"{UNRELEASED_SHA}\n",
-        timestamps={V2_SHA: NOW - 100 * 3600, UNRELEASED_SHA: NOW - 3600},
-    ) == 0
+    assert _invoke(monkeypatch, f"{V2_SHA}\t{v2_release_state.TAG_REF}\n", f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n", range_output=f"{UNRELEASED_SHA}\n", timestamps={V2_SHA: NOW - 100 * 3600, UNRELEASED_SHA: NOW - 3600}) == 0
     assert capsys.readouterr() == ("", "")
 
 
 def test_rev_list_failure_is_inconclusive(monkeypatch, capsys):
-    assert _invoke(
-        monkeypatch,
-        f"{V2_SHA}\t{v2_release_state.TAG_REF}\n",
-        f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n",
-        range_output="",
-        rev_list_status=1,
-    ) == 2
+    assert _invoke(monkeypatch, f"{V2_SHA}\t{v2_release_state.TAG_REF}\n", f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n", rev_list_status=1) == 2
     assert v2_release_state.QUERY_FAILED in capsys.readouterr().err
 
 
