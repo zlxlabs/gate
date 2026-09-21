@@ -102,6 +102,7 @@ def test_evidence_selection_is_before_contract_and_move():
     assert "git rev-parse" not in lag["run"]
     assert "v2-stuck-verified" not in lag["run"]
     assert "state-path" not in lag["run"]
+    assert not lag["run"].rstrip().endswith("\\")
 
 
 def test_disabled_switch_skips_entire_evidence_step():

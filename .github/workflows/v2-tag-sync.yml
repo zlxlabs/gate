@@ -143,4 +143,4 @@ jobs:
           main_ls="$(git ls-remote origin refs/heads/main)"
           python3 tests/v2_lag_observe.py \
             --v2-ls-remote "${v2_ls}" \
-            --main-ls-remote "${main_ls}" \
+            --main-ls-remote "${main_ls}"
