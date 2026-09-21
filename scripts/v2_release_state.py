@@ -132,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"v2 behind main: v2_sha={v2_sha} main_sha={main_sha} "
             f"main_lead_hours={lag_seconds / 3600:.2f} "
-            "(oldest unreleased commit age)"
+            "(oldest unreleased commit age; not v2 commit age)"
         )
         return 1
     return 0
