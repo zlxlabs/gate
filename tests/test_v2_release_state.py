@@ -97,5 +97,7 @@ def test_annotated_tag_resolves_to_commit(tmp_path, monkeypatch):
     monkeypatch.setattr(v2_release_state.subprocess, "run", _runner(remote_output, f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n", calls=calls))
     monkeypatch.setattr(v2_release_state.time, "time", lambda: NOW)
     assert v2_release_state.main(["--remote", "https://remote.test/repo", "--threshold-hours", "0"]) == 1
+    assert ["git", "ls-remote", "https://remote.test/repo", v2_release_state.TAG_REF, f"{v2_release_state.TAG_REF}^{{}}"] in calls
+    assert ["git", "ls-remote", "https://remote.test/repo", v2_release_state.MAIN_REF] in calls
     show = next(command for command in calls if command[1:3] == ["show", "-s"])
     assert show[-1] == commit_sha
