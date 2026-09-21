@@ -1,5 +1,5 @@
 {
   "tests/test_classify_pr_reviewable_paths.py": 1.20,
   "tests/test_gate_bounded_retry.py": 1.50,
-  "tests/test_v2_release_state.py": 0.35
+  "tests/test_v2_release_state.py": 1.45
 }
