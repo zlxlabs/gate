@@ -141,3 +141,21 @@ def test_silo_wrapper_emits_isolated_cwd_and_argv(tmp_path):
 def test_silo_wrapper_transparent_exit_code(tmp_path):
     result, *_ = _run_with_uv_stub(tmp_path, exit_code=2)
     assert result.returncode == 2
+
+
+def test_silo_wrapper_fails_loud_when_store_env_is_missing(tmp_path):
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    env = os.environ.copy()
+    env["RUNNER_TEMP"] = str(runner_temp)
+    env.pop("SILO_STORE", None)
+    result = subprocess.run(
+        [str(SILO_EXEC), "get"],
+        cwd=runner_temp,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "SILO_STORE 未传入" in result.stderr
