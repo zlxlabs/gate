@@ -278,7 +278,7 @@ class _FakeDNS:
         return header + self.packet[12:] + answer, ("100.100.100.100", 53)
 
 
-def test_magicdns_prints_ip_or_tailnet_error(monkeypatch, capsys):
+def test_magicdns_prints_ip_or_lookup_error(monkeypatch, capsys):
     dns = _FakeDNS()
     monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: dns)
     assert store.main(["magicdns", "--endpoint", "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000", "--nameserver", "100.100.100.100"]) == 0
@@ -289,7 +289,8 @@ def test_magicdns_prints_ip_or_tailnet_error(monkeypatch, capsys):
         store.main(["magicdns", "--endpoint", "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000", "--nameserver", "100.100.100.100"])
     assert caught.value.code == store.EXIT_ERROR
     err = capsys.readouterr().err
-    assert "tailnet 不可达" in err
+    assert "Silo MagicDNS lookup failed" in err
+    assert "SILO_ENDPOINT=https://zlx-vm-work-i5-infra.taile9071.ts.net:9000" in err
     assert "100.100.100.100" in err
 
 

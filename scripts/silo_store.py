@@ -195,8 +195,8 @@ def resolve_magicdns(endpoint: str, nameserver: str = "100.100.100.100", timeout
             response, _ = dns.recvfrom(4096)
     except OSError as err:
         fail(
-            f"Silo MagicDNS lookup failed; tailnet 不可达 "
-            f"(hosted runner 或容器无 {nameserver})。SILO_ENDPOINT={endpoint} ({err})"
+            f"Silo MagicDNS lookup failed; SILO_ENDPOINT={endpoint}; "
+            f"nameserver={nameserver} ({err})"
         )
 
     if len(response) < 12 or response[:2] != query_id:

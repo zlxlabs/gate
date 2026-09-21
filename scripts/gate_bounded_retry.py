@@ -32,8 +32,8 @@ DEFAULT_ATTEMPT_TIMEOUT_SECS = 25
 DEFAULT_LOW_SPEED_LIMIT = 1000
 DEFAULT_LOW_SPEED_TIME = 20
 MAGICDNS_ERROR = (
-    "Silo MagicDNS lookup failed; tailnet 不可达 "
-    "(hosted runner 或容器无 100.100.100.100)。SILO_ENDPOINT="
+    "Silo MagicDNS lookup failed; see the preceding "
+    "MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT="
 )
 T = TypeVar("T")
 
