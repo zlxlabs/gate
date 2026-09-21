@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  repository_dispatch:
+    types: [canary-verified]
   # Best-effort polling only: GitHub may drop an entire run of scheduled
   # events, so correctness must not depend on this clock. v2 may lag main;
   # it only points at the newest main commit the canary actually ran green.

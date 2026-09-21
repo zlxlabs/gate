@@ -38,6 +38,17 @@ def test_sync_workflow_is_main_push_and_has_contents_write():
     }
 
 
+def test_canary_verified_dispatch_enters_main_sync_without_payload_consumption():
+    raw, trigger = _load()
+    assert trigger["repository_dispatch"] == {"types": ["canary-verified"]}
+    assert raw["jobs"]["sync"]["if"] == "github.ref == 'refs/heads/main'"
+    text = WORKFLOW.read_text()
+    assert "client_payload" not in text
+    guard = next(step for step in raw["jobs"]["sync"]["steps"] if step.get("id") == "guard")
+    assert "github.event.before || ''" in guard["env"]["EVENT_BEFORE"]
+    assert 'git log -1 --format=%B "${GITHUB_SHA}"' in guard["run"]
+
+
 def test_sync_workflow_has_migration_switch_and_contract_before_push():
     raw, _ = _load()
     text = WORKFLOW.read_text()
