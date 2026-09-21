@@ -7,7 +7,9 @@ import argparse
 import subprocess
 import sys
 import time
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.v2_tag_guard import _remote_tag_sha
 
 
