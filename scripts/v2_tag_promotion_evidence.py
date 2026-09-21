@@ -27,8 +27,7 @@ PRIMARY_JOB_ID = "primary"
 RUNS_PAGE_SIZE = 100
 JOBS_PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 60
-SCHEDULE_INTERVAL_HOURS = 1
-NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS = 4 * SCHEDULE_INTERVAL_HOURS
+NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS = 4
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -243,11 +242,33 @@ def _candidate_result(
     return CandidateResult(candidate_sha, False, summary)
 
 
+def workflows_match_main_tip(candidate_sha: str, main_tip: str) -> bool:
+    """Return whether candidate and main tip have identical workflow trees."""
+
+    candidate_sha = _validate_sha(candidate_sha, "candidate")
+    main_tip = _validate_sha(main_tip, "main tip")
+    completed = subprocess.run(
+        ["git", "diff", "--quiet", candidate_sha, main_tip, "--", ".github/workflows"],
+        check=False,
+    )
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    raise EvidenceQueryError(
+        "workflow compatibility check failed: "
+        f"git diff exited {completed.returncode} for {candidate_sha} vs {main_tip}"
+    )
+
+
 def select_latest_verified_commit(
-    candidate_shas: list[str], api_reader: ApiReader | None = None
+    candidate_shas: list[str],
+    main_tip: str,
+    api_reader: ApiReader | None = None,
 ) -> PromotionResult:
     if not candidate_shas:
         raise EvidenceQueryError("candidate set is empty")
+    main_tip = _validate_sha(main_tip, "main tip")
     ordered: list[str] = []
     seen: set[str] = set()
     for candidate in candidate_shas:
@@ -255,6 +276,26 @@ def select_latest_verified_commit(
         if candidate not in seen:
             ordered.append(candidate)
             seen.add(candidate)
+    workflow_status: list[tuple[str, bool]] = []
+    for candidate in ordered:
+        if workflows_match_main_tip(candidate, main_tip):
+            workflow_status.append((candidate, True))
+        else:
+            workflow_status.append((candidate, False))
+    if not any(compatible for _, compatible in workflow_status):
+        return PromotionResult(
+            None,
+            tuple(
+                CandidateResult(
+                    candidate,
+                    False,
+                    "candidate .github/workflows differs from main tip; "
+                    "promotion requires matching workflow files",
+                )
+                for candidate, _ in workflow_status
+            ),
+        )
+
     api_reader = api_reader or _api_json
     response_cache: dict[str, object] = {}
 
@@ -265,7 +306,17 @@ def select_latest_verified_commit(
 
     runs = _load_runs(read_once)
     checked: list[CandidateResult] = []
-    for candidate in ordered:
+    for candidate, compatible in workflow_status:
+        if not compatible:
+            checked.append(
+                CandidateResult(
+                    candidate,
+                    False,
+                    "candidate .github/workflows differs from main tip; "
+                    "promotion requires matching workflow files",
+                )
+            )
+            continue
         result = _candidate_result(candidate, runs, read_once)
         checked.append(result)
         if result.eligible:
@@ -290,6 +341,7 @@ def is_descendant_or_equal(current_sha: str, target_sha: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", action="append")
+    parser.add_argument("--main-tip")
     parser.add_argument("--check-ancestor", nargs=2, metavar=("CURRENT", "TARGET"))
     parser.add_argument("--current-v2-commit-time")
     args = parser.parse_args(argv)
@@ -305,7 +357,9 @@ def main(argv: list[str] | None = None) -> int:
         print("v2 promotion ancestry verified", file=sys.stderr)
         return 0
     try:
-        result = select_latest_verified_commit(args.candidate or [])
+        if not args.main_tip:
+            raise EvidenceQueryError("--main-tip is required for candidate selection")
+        result = select_latest_verified_commit(args.candidate or [], args.main_tip)
     except EvidenceQueryError as exc:
         print(f"v2 promotion evidence query failed: {exc}", file=sys.stderr)
         return 1

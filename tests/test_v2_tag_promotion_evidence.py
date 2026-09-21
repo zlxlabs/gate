@@ -5,6 +5,7 @@ import subprocess
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -60,7 +61,8 @@ def _detail(*, conclusion="success", gate_sha=SHA_A, refs=True):
 
 
 def _select(api, candidates):
-    return evidence.select_latest_verified_commit(candidates, api)
+    with patch.object(evidence, "workflows_match_main_tip", return_value=True):
+        return evidence.select_latest_verified_commit(candidates, SHA_C, api)
 
 
 def test_latest_candidate_with_successful_gate_and_primary_is_selected():
@@ -245,7 +247,8 @@ def test_cli_query_error_returns_nonzero(monkeypatch, capsys):
         raise evidence.EvidenceQueryError(f"HTTP 500 for {endpoint}")
 
     monkeypatch.setattr(evidence, "_api_json", broken_api)
-    assert evidence.main(["--candidate", SHA_A]) == 1
+    monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
+    assert evidence.main(["--candidate", SHA_A, "--main-tip", SHA_C]) == 1
     assert "evidence query failed" in capsys.readouterr().err
 
 
@@ -274,6 +277,71 @@ def test_no_candidate_is_normal_no_move_and_preserves_each_reason():
     assert all(not row.eligible for row in result.checked)
 
 
+def test_workflow_mismatch_is_ineligible_before_canary_evidence(monkeypatch):
+    monkeypatch.setattr(
+        evidence,
+        "workflows_match_main_tip",
+        lambda candidate, main_tip: candidate != SHA_A,
+    )
+    api = FakeAPI(
+        [_run(1)],
+        {"1": _detail(gate_sha=SHA_B)},
+        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+    )
+    result = evidence.select_latest_verified_commit([SHA_A, SHA_B], SHA_C, api)
+    assert result.selected_sha == SHA_B
+    assert result.checked[0].sha == SHA_A
+    assert result.checked[0].eligible is False
+    assert "workflows differs from main tip" in result.checked[0].reason
+
+
+def test_workflow_filter_preserves_candidate_report_order(monkeypatch):
+    monkeypatch.setattr(
+        evidence,
+        "workflows_match_main_tip",
+        lambda candidate, main_tip: candidate == SHA_A,
+    )
+    api = FakeAPI(
+        [_run(1)],
+        {"1": _detail(gate_sha=SHA_B)},
+        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+    )
+    result = evidence.select_latest_verified_commit([SHA_A, SHA_B], SHA_C, api)
+    assert [row.sha for row in result.checked] == [SHA_A, SHA_B]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [(0, True), (1, False)],
+)
+def test_workflow_diff_exit_zero_or_one_is_the_eligibility_answer(
+    monkeypatch, returncode, expected
+):
+    calls = []
+
+    def fake_run(argv, check):
+        calls.append((argv, check))
+        return subprocess.CompletedProcess(argv, returncode)
+
+    monkeypatch.setattr(evidence.subprocess, "run", fake_run)
+    assert evidence.workflows_match_main_tip(SHA_A, SHA_B) is expected
+    assert calls == [
+        (
+            ["git", "diff", "--quiet", SHA_A, SHA_B, "--", ".github/workflows"],
+            False,
+        )
+    ]
+
+
+def test_workflow_diff_query_failure_is_fail_loud(monkeypatch):
+    def broken_run(argv, check):
+        return subprocess.CompletedProcess(argv, 2)
+
+    monkeypatch.setattr(evidence.subprocess, "run", broken_run)
+    with pytest.raises(evidence.EvidenceQueryError, match="workflow compatibility check failed"):
+        evidence.workflows_match_main_tip(SHA_A, SHA_B)
+
+
 def test_ancestor_check_rejects_non_descendant(monkeypatch):
     calls = []
 
@@ -295,6 +363,12 @@ def test_ancestor_check_accepts_equal_without_git_call(monkeypatch):
         lambda *args, **kwargs: pytest.fail("equal target must not invoke git"),
     )
     assert evidence.is_descendant_or_equal(SHA_A, SHA_A)
+
+
+def test_cli_ancestor_check_does_not_require_main_tip(monkeypatch, capsys):
+    monkeypatch.setattr(evidence, "is_descendant_or_equal", lambda *_: True)
+    assert evidence.main(["--check-ancestor", SHA_A, SHA_B]) == 0
+    assert "ancestry verified" in capsys.readouterr().err
 
 
 def test_primary_job_name_is_read_from_gate_v2_job_id():
@@ -341,12 +415,20 @@ def test_v2_without_eligible_candidate_alerts_only_when_stale(
 ):
     api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
     monkeypatch.setattr(evidence, "_api_json", api)
+    monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
     stale_time = (
         datetime.now(timezone.utc)
         - timedelta(hours=age_hours)
     ).isoformat()
     assert evidence.main(
-        ["--candidate", SHA_A, "--current-v2-commit-time", stale_time]
+        [
+            "--candidate",
+            SHA_A,
+            "--main-tip",
+            SHA_C,
+            "--current-v2-commit-time",
+            stale_time,
+        ]
     ) == expected_exit
     output = capsys.readouterr().err
     assert ("::error::" in output) is expects_error

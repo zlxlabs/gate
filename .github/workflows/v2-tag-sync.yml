@@ -4,14 +4,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      canary_run_id:
-        description: "A canary run ID to use for the workflow-token permission probe"
-        required: true
-        type: string
-  # Hourly polling is intentional: the canary attempts roughly every 11
-  # minutes, so this gives it several chances while keeping tag promotion
-  # decoupled from the push that first introduced a commit. v2 may lag main;
+  repository_dispatch:
+    types: [canary-verified]
+  # Best-effort polling only: GitHub may drop an entire run of scheduled
+  # events, so correctness must not depend on this clock. v2 may lag main;
   # it only points at the newest main commit the canary actually ran green.
   schedule:
     - cron: "17 * * * *"
@@ -26,7 +22,6 @@ permissions:
 env:
   V2_LAG_HOURS: "6"
   V2_LAG_MAIN_COMMITS: ""
-  V2_STUCK_VERIFIED_CYCLES: "2"
 
 jobs:
   sync:
@@ -37,56 +32,6 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-
-      - name: Restore v2 stuck-verified cycle state
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: v2-stuck-verified.json
-          key: v2-stuck-verified-${{ github.run_id }}
-          restore-keys: |
-            v2-stuck-verified-
-
-      - name: Probe canary Actions API permissions
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          CANARY_RUN_ID: ${{ inputs.canary_run_id }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! [[ "${CANARY_RUN_ID}" =~ ^[0-9]+$ ]]; then
-            echo "::error::workflow-token permission probe failed: canary run ID is not numeric"
-            exit 1
-          fi
-          canary_api_base="https://api.github.com/repos/zlxlabs/ci-infra-canary"
-          api_headers=(
-            --header "Accept: application/vnd.github+json"
-            --header "Authorization: Bearer ${GITHUB_TOKEN}"
-            --header "X-GitHub-Api-Version: 2022-11-28"
-          )
-          probe_canary_endpoint() {
-            local label="$1"
-            local endpoint="$2"
-            local status=000
-            local curl_status=0
-            if status="$(curl --silent --show-error "${api_headers[@]}" \
-              --output /dev/null --write-out '%{http_code}' "${endpoint}")"; then
-              :
-            else
-              curl_status=$?
-            fi
-            echo "permission probe: ${label} status=${status}"
-            if [ "${curl_status}" -ne 0 ] || ! [[ "${status}" =~ ^2[0-9][0-9]$ ]]; then
-              echo "::error::workflow-token permission probe failed: ${label} status=${status}"
-              exit 1
-            fi
-          }
-          probe_canary_endpoint "run list" "${canary_api_base}/actions/runs?per_page=1"
-          probe_canary_endpoint "run detail run_id=${CANARY_RUN_ID}" \
-            "${canary_api_base}/actions/runs/${CANARY_RUN_ID}"
-          probe_canary_endpoint "run jobs run_id=${CANARY_RUN_ID}" \
-            "${canary_api_base}/actions/runs/${CANARY_RUN_ID}/jobs?per_page=1"
-          echo "workflow-token permission probe passed: repository=zlxlabs/ci-infra-canary run_id=${CANARY_RUN_ID}"
 
       - name: Evaluate migration switch and breaker
         id: guard
@@ -127,9 +72,11 @@ jobs:
           for candidate_sha in "${candidate_shas[@]}"; do
             candidate_args+=(--candidate "${candidate_sha}")
           done
+          main_tip="$(git rev-parse refs/remotes/origin/main)"
           current_v2_commit_time="$(git show -s --format=%cI 'refs/tags/v2^{commit}')"
           target_sha="$(python3 scripts/v2_tag_promotion_evidence.py \
             "${candidate_args[@]}" \
+            --main-tip "${main_tip}" \
             --current-v2-commit-time "${current_v2_commit_time}")"
           echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
 
@@ -188,9 +135,7 @@ jobs:
         id: lag
         if: always() && steps.guard.outcome == 'success'
         env:
-          MOVE: ${{ steps.monotonicity.outputs.move }}
           TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
-          EVENT_NAME: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -198,12 +143,4 @@ jobs:
           main_ls="$(git ls-remote origin refs/heads/main)"
           python3 tests/v2_lag_observe.py \
             --v2-ls-remote "${v2_ls}" \
-            --main-ls-remote "${main_ls}" \
-            --state-path v2-stuck-verified.json
-
-      - name: Save v2 stuck-verified cycle state
-        if: always() && steps.lag.outcome != 'skipped'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: v2-stuck-verified.json
-          key: v2-stuck-verified-${{ github.run_id }}
+            --main-ls-remote "${main_ls}"
