@@ -4,9 +4,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-  # Hourly polling is intentional: the canary attempts roughly every 11
-  # minutes, so this gives it several chances while keeping tag promotion
-  # decoupled from the push that first introduced a commit. v2 may lag main;
+  # Best-effort polling only: GitHub may drop an entire run of scheduled
+  # events, so correctness must not depend on this clock. v2 may lag main;
   # it only points at the newest main commit the canary actually ran green.
   schedule:
     - cron: "17 * * * *"
@@ -21,7 +20,6 @@ permissions:
 env:
   V2_LAG_HOURS: "6"
   V2_LAG_MAIN_COMMITS: ""
-  V2_STUCK_VERIFIED_CYCLES: "2"
 
 jobs:
   sync:
@@ -32,14 +30,6 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-
-      - name: Restore v2 stuck-verified cycle state
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: v2-stuck-verified.json
-          key: v2-stuck-verified-${{ github.run_id }}
-          restore-keys: |
-            v2-stuck-verified-
 
       - name: Evaluate migration switch and breaker
         id: guard
@@ -143,9 +133,7 @@ jobs:
         id: lag
         if: always() && steps.guard.outcome == 'success'
         env:
-          MOVE: ${{ steps.monotonicity.outputs.move }}
           TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
-          EVENT_NAME: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -154,11 +142,3 @@ jobs:
           python3 tests/v2_lag_observe.py \
             --v2-ls-remote "${v2_ls}" \
             --main-ls-remote "${main_ls}" \
-            --state-path v2-stuck-verified.json
-
-      - name: Save v2 stuck-verified cycle state
-        if: always() && steps.lag.outcome != 'skipped'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: v2-stuck-verified.json
-          key: v2-stuck-verified-${{ github.run_id }}

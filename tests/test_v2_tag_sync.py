@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import subprocess
@@ -9,11 +8,8 @@ import yaml
 
 from scripts.v2_tag_guard import HOLD_MARKER, main, verify_remote_tag
 from tests.v2_lag_observe import (
-    STUCK_SCHEMA,
     evaluate_v2_lag,
-    load_stuck_verified_state,
     parse_ls_remote_sha,
-    save_stuck_verified_state,
 )
 
 
@@ -37,7 +33,6 @@ def test_sync_workflow_is_main_push_and_has_contents_write():
     assert raw["env"] == {
         "V2_LAG_HOURS": "6",
         "V2_LAG_MAIN_COMMITS": "",
-        "V2_STUCK_VERIFIED_CYCLES": "2",
     }
 
 
@@ -85,21 +80,15 @@ def test_evidence_selection_is_before_contract_and_move():
     assert move["if"] == "steps.monotonicity.outputs.move == 'true'"
     assert "TARGET_SHA" in move["env"]
     lag = next(step for step in steps if step.get("id") == "lag")
-    save = next(step for step in steps if step.get("name") == "Save v2 stuck-verified cycle state")
     assert steps.index(move) < steps.index(lag)
-    assert steps.index(lag) < steps.index(save)
-    assert steps.index(save) == len(steps) - 1
     assert "move == 'true'" not in lag.get("if", "")
     assert "always()" in lag["if"]
     assert "git ls-remote origin refs/tags/v2" in lag["run"]
     assert "git ls-remote origin refs/heads/main" in lag["run"]
     assert "python3 tests/v2_lag_observe.py" in lag["run"]
     assert "git rev-parse" not in lag["run"]
-    restore = next(step for step in steps if step.get("name") == "Restore v2 stuck-verified cycle state")
-    assert restore["uses"].startswith("actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830")
-    assert save["uses"].startswith("actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830")
-    assert restore["with"]["path"] == save["with"]["path"] == "v2-stuck-verified.json"
-    assert "always()" in save["if"]
+    assert "v2-stuck-verified" not in lag["run"]
+    assert "state-path" not in lag["run"]
 
 
 def test_disabled_switch_skips_entire_evidence_step():
@@ -277,22 +266,17 @@ def _quad_kwargs(**overrides):
         "main_sha": "b" * 40,
         "behind_main": 3,
         "age_h": 1,
-        "move": "false",
         "target_sha": v2,
-        "event_name": "schedule",
-        "previous_missed": 0,
         "lag_hours": 6,
         "lag_main_commits": None,
-        "stuck_threshold": 2,
     }
     payload.update(overrides)
     return payload
 
 
-def test_lag_summary_quadruplet_present_for_both_move_values():
-    for move, target in (("false", "a" * 40), ("true", "b" * 40)):
-        v2 = target if move == "true" else "a" * 40
-        summary, reasons, _ = evaluate_v2_lag(**_quad_kwargs(move=move, target_sha=target, v2_sha=v2))
+def test_lag_summary_quadruplet_present_for_current_and_newer_targets():
+    for target, v2 in (("a" * 40, "a" * 40), ("b" * 40, "a" * 40)):
+        summary, reasons = evaluate_v2_lag(**_quad_kwargs(target_sha=target, v2_sha=v2))
         assert reasons == []
         for field in ("v2_sha", "main_sha", "behind_main", "age_h"):
             assert f"- {field}:" in summary
@@ -301,23 +285,21 @@ def test_lag_summary_quadruplet_present_for_both_move_values():
 @pytest.mark.parametrize(
     "overrides, reason",
     [
-        ({"age_h": 0, "lag_hours": 0, "move": "true", "target_sha": "b" * 40, "v2_sha": "a" * 40}, "age_h"),
-        ({"lag_main_commits": 0, "move": "true", "target_sha": "b" * 40, "v2_sha": "a" * 40}, "behind_main"),
-        ({"move": "false", "target_sha": "b" * 40, "v2_sha": "a" * 40}, "newer_target_without_move"),
-        ({"move": "true", "target_sha": "b" * 40, "v2_sha": "a" * 40, "stuck_threshold": 0}, "stuck_verified_cycles"),
+        ({"age_h": 0, "lag_hours": 0, "target_sha": "b" * 40, "v2_sha": "a" * 40}, "age_h"),
+        ({"lag_main_commits": 0, "target_sha": "b" * 40, "v2_sha": "a" * 40}, "behind_main"),
     ],
 )
 def test_threshold_env_zero_reports_default_does_not(overrides, reason):
-    summary, reasons, _ = evaluate_v2_lag(**_quad_kwargs(**overrides))
+    summary, reasons = evaluate_v2_lag(**_quad_kwargs(**overrides))
     assert reason in reasons
     assert "- v2_sha:" in summary
-    _, quiet, _ = evaluate_v2_lag(**_quad_kwargs())
+    _, quiet = evaluate_v2_lag(**_quad_kwargs())
     assert quiet == []
 
 
 def test_age_h_over_threshold_without_candidate_does_not_report():
     for target in ("", "a" * 40):
-        summary, reasons, _ = evaluate_v2_lag(
+        summary, reasons = evaluate_v2_lag(
             **_quad_kwargs(age_h=9, lag_main_commits=0, target_sha=target)
         )
         assert reasons == []
@@ -325,76 +307,8 @@ def test_age_h_over_threshold_without_candidate_does_not_report():
 
 
 def test_age_h_over_threshold_with_newer_candidate_reports():
-    summary, reasons, _ = evaluate_v2_lag(
-        **_quad_kwargs(age_h=9, move="true", target_sha="b" * 40, v2_sha="a" * 40)
+    summary, reasons = evaluate_v2_lag(
+        **_quad_kwargs(age_h=9, target_sha="b" * 40, v2_sha="a" * 40)
     )
     assert "age_h" in reasons
     assert "- age_h: 9" in summary
-
-
-def test_stuck_verified_cycles_count_reset_and_threshold():
-    miss = {"move": "true", "target_sha": "b" * 40, "v2_sha": "a" * 40}
-    _, reasons_1, missed_1 = evaluate_v2_lag(**_quad_kwargs(**miss, previous_missed=0))
-    _, reasons_2, missed_2 = evaluate_v2_lag(**_quad_kwargs(**miss, previous_missed=1))
-    _, reasons_ok, missed_ok = evaluate_v2_lag(
-        **_quad_kwargs(move="true", target_sha="b" * 40, v2_sha="b" * 40, previous_missed=2)
-    )
-    assert (missed_1, "stuck_verified_cycles" in reasons_1) == (1, False)
-    assert (missed_2, "stuck_verified_cycles" in reasons_2) == (2, True)
-    assert (missed_ok, "stuck_verified_cycles" in reasons_ok) == (0, False)
-
-
-def test_stuck_state_roundtrip_and_unknown_schema_fail_loud(tmp_path):
-    path = tmp_path / "v2-stuck-verified.json"
-    assert load_stuck_verified_state(path) == 0
-    save_stuck_verified_state(path, 2)
-    assert path.read_text(encoding="utf-8") == (
-        '{\n  "missed_cycles": 2,\n  "schema": "' + STUCK_SCHEMA + '"\n}\n'
-    )
-    assert load_stuck_verified_state(path) == 2
-    path.write_text('{"schema": "other", "missed_cycles": 1}\n', encoding="utf-8")
-    with pytest.raises(ValueError, match="schema mismatch"):
-        load_stuck_verified_state(path)
-
-
-def test_cli_persists_stuck_state_across_process_boundary(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "test",
-        "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "test",
-        "GIT_COMMITTER_EMAIL": "test@example.com",
-        "GIT_COMMITTER_DATE": "2026-09-18T00:00:00",
-    }
-    def git(*args):
-        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env, text=True)
-    git("init")
-    git("commit", "--allow-empty", "-m", "base")
-    v2_sha = git("rev-parse", "HEAD").stdout.strip()
-    git("tag", "v2")
-    git("commit", "--allow-empty", "-m", "ahead")
-    main_sha = git("rev-parse", "HEAD").stdout.strip()
-    v2_ls = git("ls-remote", ".", "refs/tags/v2").stdout
-    assert parse_ls_remote_sha(v2_ls, "refs/tags/v2") == v2_sha
-    state = tmp_path / "state.json"
-    summary = tmp_path / "summary.md"
-    cmd = [
-        "python3", str(REPO_ROOT / "tests" / "v2_lag_observe.py"),
-        "--v2-ls-remote", v2_ls,
-        "--main-ls-remote", f"{main_sha}\trefs/heads/main\n",
-        "--state-path", str(state), "--summary-path", str(summary),
-        "--move", "true", "--target-sha", main_sha, "--event-name", "schedule",
-        "--lag-hours", "6", "--stuck-cycles", "2", "--now", "1758153600",
-    ]
-    first = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, check=False)
-    assert first.returncode == 0, first.stderr
-    assert json.loads(state.read_text(encoding="utf-8")) == {"missed_cycles": 1, "schema": STUCK_SCHEMA}
-    second = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, check=False)
-    assert second.returncode == 1
-    assert "stuck_verified_cycles" in second.stderr
-    text = summary.read_text(encoding="utf-8")
-    assert f"- v2_sha: {v2_sha}" in text and f"- main_sha: {main_sha}" in text
-    assert "- behind_main:" in text and "- age_h:" in text
-    assert json.loads(state.read_text(encoding="utf-8"))["missed_cycles"] == 2
