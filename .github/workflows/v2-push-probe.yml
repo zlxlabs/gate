@@ -1,0 +1,120 @@
+name: v2 push probe
+on:
+  pull_request:
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history and tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Probe scratch tag pushes
+        shell: bash
+        run: |
+          set -euo pipefail
+          TIP="$(git rev-parse refs/remotes/origin/main)"
+          mapfile -t candidates < <(git log --format=%H -n 30 refs/remotes/origin/main)
+          if [ "${#candidates[@]}" -eq 0 ]; then
+            echo "::error::origin/main has no candidate commits"
+            exit 1
+          fi
+          PROBE_A=""
+          for ((index=${#candidates[@]} - 1; index >= 0; index--)); do
+            candidate="${candidates[index]}"
+            if [ "${candidate}" = "${TIP}" ]; then
+              continue
+            fi
+            diff_status=0
+            git diff --quiet "${candidate}" "${TIP}" -- .github/workflows || diff_status=$?
+            if [ "${diff_status}" -eq 0 ]; then
+              PROBE_A="${candidate}"
+              break
+            elif [ "${diff_status}" -ne 1 ]; then
+              echo "::error::could not compare ${candidate} with ${TIP} (git diff exit ${diff_status})"
+              exit "${diff_status}"
+            fi
+          done
+          PROBE_B=""
+          for candidate in "${candidates[@]}"; do
+            if [ "${candidate}" = "${TIP}" ]; then
+              continue
+            fi
+            diff_status=0
+            git diff --quiet "${candidate}" "${TIP}" -- .github/workflows || diff_status=$?
+            if [ "${diff_status}" -eq 1 ]; then
+              PROBE_B="${candidate}"
+              break
+            elif [ "${diff_status}" -ne 0 ]; then
+              echo "::error::could not compare ${candidate} with ${TIP} (git diff exit ${diff_status})"
+              exit "${diff_status}"
+            fi
+          done
+          if [ -z "${PROBE_A}" ] || [ -z "${PROBE_B}" ]; then
+            echo "::error::could not compute both behind candidates without falling back to TIP"
+            exit 1
+          fi
+          results_file="${RUNNER_TEMP}/v2-push-probe-results.tsv"
+          : > "${results_file}"
+
+          push_probe() {
+            local probe="$1"
+            local target_sha="$2"
+            local target_ref="$3"
+            local workflows_same="$4"
+            local stderr_file="${RUNNER_TEMP}/${probe}-push.stderr"
+            local push_exit=0
+            local verdict="rejected"
+
+            set +e
+            git push origin "${target_sha}:${target_ref}" --force 2>"${stderr_file}"
+            push_exit=$?
+            set -e
+
+            if [ "${push_exit}" -eq 0 ]; then
+              verdict="accepted"
+            fi
+            behind_tip="$(git rev-list --count "${target_sha}..${TIP}")"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "${probe}" "${target_sha}" "${behind_tip}" "${workflows_same}" "${push_exit}" "${verdict}" \
+              >> "${results_file}"
+            echo "=== ${probe} push stderr (exit_code=${push_exit}) ==="
+            if [ -s "${stderr_file}" ]; then
+              cat "${stderr_file}"
+            else
+              echo "(empty)"
+            fi
+            echo "=== ${probe} push recorded ==="
+          }
+
+          push_probe "probe-a" "${PROBE_A}" "refs/tags/probe-a" true
+          push_probe "probe-b" "${PROBE_B}" "refs/tags/probe-b" false
+          push_probe "probe-c" "${TIP}" "refs/tags/probe-c" true
+
+          echo "probe target_sha behind_tip workflows_same_as_tip push_exit verdict"
+          while IFS=$'\t' read -r probe target_sha behind_tip workflows_same push_exit verdict; do
+            printf '%s %s %s %s %s %s\n' \
+              "${probe}" "${target_sha}" "${behind_tip}" "${workflows_same}" "${push_exit}" "${verdict}"
+          done < "${results_file}"
+
+          cleanup_tag() {
+            local target_ref="$1"
+            local cleanup_name="${target_ref##*/}"
+            local stderr_file="${RUNNER_TEMP}/${cleanup_name}-delete.stderr"
+            local cleanup_exit=0
+
+            set +e
+            git push origin --delete "${target_ref}" 2>"${stderr_file}"
+            cleanup_exit=$?
+            set -e
+            echo "cleanup ${target_ref} exit_code=${cleanup_exit}"
+            if [ "${cleanup_exit}" -ne 0 ]; then
+              cat "${stderr_file}"
+            fi
+          }
+
+          cleanup_tag "refs/tags/probe-a"
+          cleanup_tag "refs/tags/probe-b"
+          cleanup_tag "refs/tags/probe-c"
