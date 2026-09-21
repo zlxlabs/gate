@@ -117,7 +117,7 @@ git status --short --untracked-files=all 实际输出：无输出（exit 0）。
 ## 现场备注
 
 - pickup 现场无交接单，工作树初始干净，当前 checkout 停在 card/gate-20260921-02。
-- 协作状态扫描识别本派卡为自己的 dispatch；push 命令 exit 0 且远端返回新建分支，但随后两次 ls-remote 复核均因 SSH 连接关闭失败，未以本地 tracking ref 代替远端结论。
+- 协作状态扫描识别本派卡为自己的 dispatch；初次 SSH push exit 0，增量 SSH push/ls-remote 因连接关闭；改用不走 SSH URL 重写的 HTTPS + gh credential helper push exit 0，GitHub API 复核与本地 HEAD 一致。
 - 收件箱扫描完成；开放 issue 中未发现与本卡直接冲突的事项。
 - archive_orphan_debts 巡检探针因内部 fetch 远端阻塞，按长命令边界终止，exit 130；不能据此判断有主/无主欠账。
 - memory 巡检原样失败：memory 巡检报告不可用：memory_dir_mismatch（/home/zlx/.local/state/memory-doctor/latest.json）。
