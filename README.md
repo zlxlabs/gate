@@ -141,8 +141,7 @@ artifact。Caller 必须透传两个 org 级 secret（`workflow_call.secrets` �
 
 下游 caller 不传时，S3 步骤明确报错（文案含「SILO_ACCESS_KEY 未传入」），禁止静默跳过。
 fleet 正常拓扑是全 self-hosted；`runner: hosted` 或控制面落到 GitHub-hosted 时，
-MagicDNS `100.100.100.100` 解析 Silo 主机名失败即红（tailnet 不可达），没有 GitHub
-artifact 兜底。
+MagicDNS `100.100.100.100` 解析 Silo 主机名失败即红，没有 GitHub artifact 兜底。
 
 Silo 推广已完成，`.github/v2-tag-sync.hold` 熔断文件已移除，`v2` 移动 tag 随主干前移。
 下游 caller 仍必须透传 `SILO_ACCESS_KEY` 与 `SILO_SECRET_KEY`（不传则 S3 步骤红）。
