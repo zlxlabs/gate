@@ -80,9 +80,11 @@ jobs:
           for candidate_sha in "${candidate_shas[@]}"; do
             candidate_args+=(--candidate "${candidate_sha}")
           done
+          main_tip="$(git rev-parse refs/remotes/origin/main)"
           current_v2_commit_time="$(git show -s --format=%cI 'refs/tags/v2^{commit}')"
           target_sha="$(python3 scripts/v2_tag_promotion_evidence.py \
             "${candidate_args[@]}" \
+            --main-tip "${main_tip}" \
             --current-v2-commit-time "${current_v2_commit_time}")"
           echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
 

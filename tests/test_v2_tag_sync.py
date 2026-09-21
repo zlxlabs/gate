@@ -30,6 +30,7 @@ def test_sync_workflow_is_main_push_and_has_contents_write():
     raw, trigger = _load()
     assert trigger["push"] == {"branches": ["main"]}
     assert "workflow_dispatch" in trigger
+    assert not trigger["workflow_dispatch"]
     assert trigger["schedule"] == [{"cron": "17 * * * *"}]
     assert raw["permissions"] == {"contents": "write"}
     assert raw["jobs"]["sync"]["if"] == "github.ref == 'refs/heads/main'"
@@ -77,6 +78,8 @@ def test_evidence_selection_is_before_contract_and_move():
     move = next(step for step in steps if step.get("name") == "Move v2 to selected canary-verified main commit")
     assert evidence["if"] == "steps.guard.outputs.advance == 'true'"
     assert "scripts/v2_tag_promotion_evidence.py" in evidence["run"]
+    assert 'main_tip="$(git rev-parse refs/remotes/origin/main)"' in evidence["run"]
+    assert '--main-tip "${main_tip}"' in evidence["run"]
     assert monotonicity["if"] == "steps.evidence.outputs.target_sha != ''"
     assert contract["if"] == "steps.monotonicity.outputs.move == 'true'"
     assert move["if"] == "steps.monotonicity.outputs.move == 'true'"
