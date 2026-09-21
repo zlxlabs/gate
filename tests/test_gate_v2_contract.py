@@ -221,8 +221,8 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert resolve["env"]["GH_REPO"] == "${{ github.repository }}"
     assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
     assert 'silo_key="d14/${GITHUB_REPOSITORY_ID}/${audit_name}/primary-review-audit.json"' in resolve["run"]
-    assert "silo_store.py\" get" in resolve["run"] or "$SILO_STORE\" get" in resolve["run"] or "$SILO_STORE get" in resolve["run"]
-    assert resolve["run"].index("$SILO_STORE") < resolve["run"].index("gh run download")
+    assert '"$SILO_EXEC" get' in resolve["run"]
+    assert resolve["run"].index("$SILO_EXEC") < resolve["run"].index("gh run download")
     assert 'if [ "$silo_rc" -eq 2 ]; then' in resolve["run"]
     assert 'gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
     assert "upload-artifact" not in text
@@ -257,7 +257,7 @@ def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_arti
     first_s3 = next(
         index
         for index, step in enumerate(control["steps"])
-        if "$SILO_STORE" in str(step.get("run", ""))
+        if "$SILO_EXEC" in str(step.get("run", ""))
         and any(token in str(step.get("run", "")) for token in (" put ", " put-dir ", " get "))
     )
     assert dns_index < first_s3
@@ -355,6 +355,7 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
         "scripts/silo_store.py",
+        "scripts/silo_exec.sh",
     }
     helper = BOUNDED_RETRY_HELPER.read_text(encoding="utf-8")
     assert '["sparse-checkout", "init", "--no-cone"]' in helper
@@ -372,6 +373,7 @@ def test_disposition_checkout_uses_reusable_workflow_identity():
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
         "scripts/silo_store.py",
+        "scripts/silo_exec.sh",
     ])
     assert not any(step.get("name") == "Require 40-hex gate_ref" for step in raw["jobs"]["control"]["steps"])
     assert "inputs." + "gate_ref" not in DISPOSITION_WORKFLOW.read_text()
@@ -435,7 +437,7 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
         first_transfer = None
         for index, step in enumerate(steps):
             run = str(step.get("run", ""))
-            if "$SILO_STORE" not in run:
+            if "$SILO_EXEC" not in run:
                 continue
             if any(token in run for token in (" put ", " put-dir ", " get ", " resolve")):
                 first_transfer = index
@@ -480,13 +482,23 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
 
 def test_silo_store_env_aligns_with_job_checkout_path():
     raw, _ = _load_workflow()
+    checkout_dirs = {
+        "quality": "_gate-silo-src",
+        "primary": "_gate-silo-src",
+        "ocr": "_gate-silo-src",
+        "gate": "_gate-aggregator-src",
+        "ledger": "_gate-aggregator-src",
+    }
     for job_name in ("quality", "primary", "ocr", "gate", "ledger"):
         job = raw["jobs"][job_name]
         silo_store_env = job.get("env", {}).get("SILO_STORE", "")
-        assert silo_store_env.endswith("/scripts/silo_store.py"), (
-            f"{job_name}: SILO_STORE must point to scripts/silo_store.py"
+        checkout_dir = checkout_dirs[job_name]
+        assert silo_store_env == f"${{{{ github.workspace }}}}/{checkout_dir}/scripts/silo_store.py", (
+            f"{job_name}: SILO_STORE must point to an absolute scripts/silo_store.py"
         )
-        checkout_dir = silo_store_env.split("/")[0]
+        assert job["env"]["SILO_EXEC"] == (
+            f"${{{{ github.workspace }}}}/{checkout_dir}/scripts/silo_exec.sh"
+        )
         checkout_step = next(
             (
                 s
@@ -739,7 +751,7 @@ def test_advisory_event_upload_declares_three_day_retention():
         if step.get("name") == "Upload advisory review event"
     )
     assert "--tier d3" in upload["run"]
-    assert "$SILO_STORE" in upload["run"]
+    assert "$SILO_EXEC" in upload["run"]
 
 
 def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
@@ -944,7 +956,7 @@ def test_gate_terminal_upload_declares_explicit_retention():
         if step.get("name") == "Upload gate terminal envelope"
     )
     assert "--tier d30" in upload["run"]
-    assert "$SILO_STORE" in upload["run"]
+    assert "$SILO_EXEC" in upload["run"]
     assert upload["env"]["ARTIFACT_NAME"] == (
         "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
         "-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -977,7 +989,7 @@ def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication(
     assert upload["env"]["ARTIFACT_NAME"] == CONVERGENCE_RECEIPT_NAME_EXPR
     assert upload["env"]["RECEIPT_DIR"] == CONVERGENCE_RECEIPT_PATH
     assert "--tier d3" in upload["run"]
-    assert "$SILO_STORE" in upload["run"]
+    assert "$SILO_EXEC" in upload["run"]
     assert "|| true" not in upload["run"]
 
 
@@ -1102,7 +1114,7 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     assert resolver["continue-on-error"] is True
     assert resolver["env"]["AUDIT_PREFIX"] == ARTIFACT_PREFIX_EXPR
     resolver_run = resolver["run"]
-    assert "$SILO_STORE" in resolver_run
+    assert "$SILO_EXEC" in resolver_run
     assert "resolve" in resolver_run
     assert "--tier d14" in resolver_run
     assert "--attempt" in resolver_run
@@ -1115,7 +1127,7 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
     assert download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-audit-artifact.outputs.artifact_id }}"
     assert download["env"]["DEST"] == "${{ runner.temp }}/primary-audit"
-    assert "$SILO_STORE" in download["run"]
+    assert "$SILO_EXEC" in download["run"]
     assert " get " in download["run"] or "\n          get " in download["run"] or "silo_store.py\" get" in download["run"]
     assert download["continue-on-error"] is True
     assert download["if"] == (
@@ -1157,7 +1169,7 @@ def test_artifact_listing_resolvers_retry_with_bounded_timeout(job_name, step_na
     step = next(s for s in raw["jobs"][job_name]["steps"] if s.get("name") == step_name)
     run = step["run"]
 
-    assert "$SILO_STORE" in run
+    assert "$SILO_EXEC" in run
     assert " resolve" in run
     assert "--attempt" in run
     assert "SILO_ACCESS_KEY 未传入" in run
@@ -1235,7 +1247,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     )
     assert upload["env"]["LEDGER_PATH"] == "${{ runner.temp }}/review-ledger/ledger.jsonl"
     assert "--tier d30" in upload["run"]
-    assert "$SILO_STORE" in upload["run"]
+    assert "$SILO_EXEC" in upload["run"]
 
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:
@@ -1287,7 +1299,7 @@ def test_review_ledger_input_uploads_declare_one_day_retention():
     )
     assert "--tier d1" in upload["run"]
     assert "--tier d1" in retry["run"]
-    assert "$SILO_STORE" in upload["run"]
+    assert "$SILO_EXEC" in upload["run"]
 
 
 def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
@@ -1319,7 +1331,7 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
     assert resolver["env"]["REVIEW_EXPECTED"] == raw["jobs"]["primary"]["if"]
     run = resolver["run"]
     for marker in (
-        "$SILO_STORE", "resolve", "--attempt",
+        "$SILO_EXEC", "resolve", "--attempt",
         "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
         "terminal_source_attempt",
     ):
@@ -1988,7 +2000,7 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
     assert upload["env"]["ARTIFACT_NAME"] == PANEL_DELIVERY_NAME_EXPR
     assert upload["env"]["PANEL_PATH"] == "${{ runner.temp }}/gate-status-panel-delivery.json"
     assert "--tier d3" in upload["run"]
-    assert "$SILO_STORE" in upload["run"]
+    assert "$SILO_EXEC" in upload["run"]
     assert upload["id"] == "upload-gate-status-panel-diagnostic"
     assert upload["continue-on-error"] is True
     assert upload["env"]["PANEL_PATH"] == publish_step["env"]["PANEL_DELIVERY_PATH"]

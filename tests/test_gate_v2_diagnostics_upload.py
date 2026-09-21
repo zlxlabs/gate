@@ -42,7 +42,7 @@ def test_primary_writes_restricted_manifest_before_diagnostics_upload():
     assert upload["env"]["DIAGNOSTICS_DIR"] == DIAGNOSTICS_DIR
     assert "--tier d3" in upload["run"]
     assert "--empty skip" in upload["run"]
-    assert "$SILO_STORE" in upload["run"]
+    assert "$SILO_EXEC" in upload["run"]
 
 
 def _manifest_program():

@@ -48,7 +48,8 @@ jobs:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
-      SILO_STORE: scripts/silo_store.py
+      SILO_STORE: ${{ github.workspace }}/scripts/silo_store.py
+      SILO_EXEC: ${{ github.workspace }}/scripts/silo_exec.sh
     steps:
       - name: Checkout disposition producer
         env:
@@ -58,6 +59,7 @@ jobs:
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
             scripts/silo_store.py
+            scripts/silo_exec.sh
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -105,9 +107,8 @@ jobs:
           silo_key="d14/${GITHUB_REPOSITORY_ID}/${audit_name}/primary-review-audit.json"
           dest="$audit_dir/primary-review-audit.json"
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
           set +e
-          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" get --key "$silo_key" --dest "$dest"
+          "$SILO_EXEC" get --key "$silo_key" --dest "$dest"
           silo_rc=$?
           set -e
           if [ "$silo_rc" -eq 2 ]; then
@@ -224,8 +225,7 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
-          uv run --python 3.12 --with boto3 -- python3 "$SILO_STORE" put-dir \
+          "$SILO_EXEC" put-dir \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
