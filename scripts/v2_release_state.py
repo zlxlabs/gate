@@ -19,19 +19,21 @@ MAIN_REF = "refs/heads/main"
 QUERY_FAILED = "V2-RELEASE-STATE-QUERY-FAILED"
 
 
-def _ls_remote(remote: str, *refs: str) -> tuple[str | None, int]:
+def _run_git(arguments: list[str]) -> tuple[str | None, int]:
     try:
         result = subprocess.run(
-            ["git", "ls-remote", remote, *refs],
+            ["git", *arguments],
             check=False,
             capture_output=True,
             text=True,
         )
     except OSError:
         return None, 127
-    if result.returncode != 0:
-        return None, result.returncode
-    return result.stdout, 0
+    return (result.stdout, 0) if result.returncode == 0 else (None, result.returncode)
+
+
+def _ls_remote(remote: str, *refs: str) -> tuple[str | None, int]:
+    return _run_git(["ls-remote", remote, *refs])
 
 
 def _v2_sha(output: str) -> str | None:
@@ -56,36 +58,20 @@ def _main_sha(output: str) -> str | None:
 
 
 def _commit_timestamp(sha: str) -> tuple[int | None, int]:
+    output, status = _run_git(["log", "-1", "--format=%ct", sha])
+    if output is None:
+        return None, status
     try:
-        result = subprocess.run(
-            ["git", "log", "-1", "--format=%ct", sha],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None, 127
-    if result.returncode != 0:
-        return None, result.returncode
-    try:
-        return int(result.stdout.strip()), 0
+        return int(output.strip()), 0
     except ValueError:
         return None, 0
 
 
 def _oldest_unreleased_sha(v2_sha: str, main_sha: str) -> tuple[str | None, int]:
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", f"{v2_sha}..{main_sha}"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None, 127
-    if result.returncode != 0:
-        return None, result.returncode
-    lines = result.stdout.splitlines()
+    output, status = _run_git(["rev-list", f"{v2_sha}..{main_sha}"])
+    if output is None:
+        return None, status
+    lines = output.splitlines()
     return (lines[-1] if lines else ""), 0
 
 
