@@ -276,22 +276,25 @@ def select_latest_verified_commit(
         if candidate not in seen:
             ordered.append(candidate)
             seen.add(candidate)
-    checked: list[CandidateResult] = []
-    workflow_compatible: list[str] = []
+    workflow_status: list[tuple[str, bool]] = []
     for candidate in ordered:
         if workflows_match_main_tip(candidate, main_tip):
-            workflow_compatible.append(candidate)
+            workflow_status.append((candidate, True))
         else:
-            checked.append(
+            workflow_status.append((candidate, False))
+    if not any(compatible for _, compatible in workflow_status):
+        return PromotionResult(
+            None,
+            tuple(
                 CandidateResult(
                     candidate,
                     False,
                     "candidate .github/workflows differs from main tip; "
                     "promotion requires matching workflow files",
                 )
-            )
-    if not workflow_compatible:
-        return PromotionResult(None, tuple(checked))
+                for candidate, _ in workflow_status
+            ),
+        )
 
     api_reader = api_reader or _api_json
     response_cache: dict[str, object] = {}
@@ -302,7 +305,18 @@ def select_latest_verified_commit(
         return response_cache[endpoint]
 
     runs = _load_runs(read_once)
-    for candidate in workflow_compatible:
+    checked: list[CandidateResult] = []
+    for candidate, compatible in workflow_status:
+        if not compatible:
+            checked.append(
+                CandidateResult(
+                    candidate,
+                    False,
+                    "candidate .github/workflows differs from main tip; "
+                    "promotion requires matching workflow files",
+                )
+            )
+            continue
         result = _candidate_result(candidate, runs, read_once)
         checked.append(result)
         if result.eligible:

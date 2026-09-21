@@ -295,6 +295,21 @@ def test_workflow_mismatch_is_ineligible_before_canary_evidence(monkeypatch):
     assert "workflows differs from main tip" in result.checked[0].reason
 
 
+def test_workflow_filter_preserves_candidate_report_order(monkeypatch):
+    monkeypatch.setattr(
+        evidence,
+        "workflows_match_main_tip",
+        lambda candidate, main_tip: candidate == SHA_A,
+    )
+    api = FakeAPI(
+        [_run(1)],
+        {"1": _detail(gate_sha=SHA_B)},
+        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+    )
+    result = evidence.select_latest_verified_commit([SHA_A, SHA_B], SHA_C, api)
+    assert [row.sha for row in result.checked] == [SHA_A, SHA_B]
+
+
 @pytest.mark.parametrize(
     ("returncode", "expected"),
     [(0, True), (1, False)],
