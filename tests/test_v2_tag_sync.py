@@ -1,12 +1,14 @@
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
 from scripts.v2_tag_guard import HOLD_MARKER, main, verify_remote_tag
+from tests import v2_lag_observe
 from tests.v2_lag_observe import (
     evaluate_v2_lag,
     parse_ls_remote_sha,
@@ -312,3 +314,97 @@ def test_age_h_over_threshold_with_newer_candidate_reports():
     )
     assert "age_h" in reasons
     assert "- age_h: 9" in summary
+
+
+def _git_with_dates(repo: Path, *date_and_message: tuple[str, str]) -> list[str]:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, env=env)
+    commits = []
+    for date, message in date_and_message:
+        commit_env = {**env, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", message],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            env=commit_env,
+        )
+        commits.append(
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, env=commit_env).strip()
+        )
+    return commits
+
+
+def test_lag_age_uses_oldest_unpromoted_commit_not_old_v2_commit(tmp_path):
+    repo = tmp_path / "age-repo"
+    repo.mkdir()
+    v2_sha, first_unpromoted, main_sha = _git_with_dates(
+        repo,
+        ("2026-09-10T00:00:00Z", "v2 base"),
+        ("2026-09-20T00:00:00Z", "first unpromoted"),
+        ("2026-09-21T00:00:00Z", "main tip"),
+    )
+    summary = tmp_path / "summary.md"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "tests" / "v2_lag_observe.py"),
+            "--v2-ls-remote",
+            f"{v2_sha}\trefs/tags/v2\n",
+            "--main-ls-remote",
+            f"{main_sha}\trefs/heads/main\n",
+            "--summary-path",
+            str(summary),
+            "--target-sha",
+            main_sha,
+            "--lag-hours",
+            "100",
+            "--now",
+            "1789992000",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    report = summary.read_text(encoding="utf-8")
+    assert "- age_h: 36" in report
+    assert "- age_h_basis: oldest commit in v2..main (hours)" in report
+    assert first_unpromoted != v2_sha
+
+
+@pytest.mark.parametrize("failed_command", ["log", "rev-list"])
+def test_lag_git_history_failure_is_fail_loud(monkeypatch, tmp_path, failed_command):
+    calls = []
+
+    def broken_check_output(command, text):
+        calls.append(command)
+        if command[1] == failed_command:
+            raise subprocess.CalledProcessError(128, command)
+        if command[1] == "log":
+            return "1758326400\n"
+        return "1\n"
+
+    monkeypatch.setattr(v2_lag_observe.subprocess, "check_output", broken_check_output)
+    summary = tmp_path / "summary.md"
+    with pytest.raises(subprocess.CalledProcessError):
+        v2_lag_observe.main(
+            [
+                "--v2-ls-remote",
+                f"{'a' * 40}\trefs/tags/v2\n",
+                "--main-ls-remote",
+                f"{'b' * 40}\trefs/heads/main\n",
+                "--summary-path",
+                str(summary),
+                "--target-sha",
+                "b" * 40,
+            ]
+        )
+    assert any(command[1] == failed_command for command in calls)

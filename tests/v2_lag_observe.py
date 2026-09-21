@@ -37,6 +37,7 @@ def evaluate_v2_lag(
         "## v2 lag\n\n"
         f"- v2_sha: {v2_sha}\n- main_sha: {main_sha}\n"
         f"- behind_main: {behind_main}\n- age_h: {age_h}\n"
+        "- age_h_basis: oldest commit in v2..main (hours)\n"
         f"- target_sha: {target_sha or '(none)'}\n"
         f"- reasons: {', '.join(reasons) if reasons else '(none)'}\n"
     )
@@ -59,15 +60,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     v2_sha = parse_ls_remote_sha(args.v2_ls_remote, "refs/tags/v2")
     main_sha = parse_ls_remote_sha(args.main_ls_remote, "refs/heads/main")
-    committer = int(subprocess.check_output(["git", "log", "-1", "--format=%ct", v2_sha], text=True).strip())
+    unpromoted_commit_times = subprocess.check_output(
+        ["git", "log", "--format=%ct", "--reverse", f"{v2_sha}..{main_sha}"],
+        text=True,
+    ).splitlines()
     behind = int(subprocess.check_output(["git", "rev-list", "--count", f"{v2_sha}..{main_sha}"], text=True).strip())
     now = args.now if args.now is not None else int(time.time())
     lag_main = None if args.lag_main_commits == "" else int(args.lag_main_commits)
+    age_h = 0
+    if unpromoted_commit_times:
+        oldest_unpromoted = int(unpromoted_commit_times[0].strip())
+        age_h = max(0, (now - oldest_unpromoted) // 3600)
     summary, reasons = evaluate_v2_lag(
         v2_sha=v2_sha,
         main_sha=main_sha,
         behind_main=behind,
-        age_h=max(0, (now - committer) // 3600),
+        age_h=age_h,
         target_sha=args.target_sha,
         lag_hours=int(args.lag_hours),
         lag_main_commits=lag_main,
