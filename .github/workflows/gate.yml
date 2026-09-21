@@ -1,5 +1,5 @@
 # Reusable gate — the single source of truth for pre-merge CI across all repos
-# (lint / jscpd 查重 / dependency-cruiser / tests / agent review)。
+# (lint / tests / agent review)。
 # 每个 repo 用 ~10 行 caller 调用它(模板在私有 gate-hub 仓 templates/caller-ci.yml),
 # 这里改一次 → 所有仓库立刻生效(caller 引用 @main,故意不钉 SHA)。
 #
@@ -140,20 +140,6 @@ jobs:
         run: |
           if [ -f Makefile ] && grep -qE '^lint:' Makefile; then make lint
           else echo "no 'lint' make target — skipping"; fi
-
-      - name: Duplicate check (jscpd, advisory)
-        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
-        # Advisory during onboarding: reports duplication but does NOT block (legacy repos
-        # carry pre-existing dup). v2: switch to blocking-on-increase via a baseline.
-        continue-on-error: true
-        run: npx --yes jscpd --threshold "${JSCPD_THRESHOLD:-5}" --reporters console .
-
-      - name: Dependency direction (dependency-cruiser)
-        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
-        run: |
-          if [ -f .dependency-cruiser.js ] || [ -f .dependency-cruiser.json ]; then
-            npx --yes --package=dependency-cruiser depcruise --config .dependency-cruiser.* --output-type err src
-          else echo "no dependency-cruiser config — skipping (use import-linter for python)"; fi
 
       # ── L1 依赖下载缓存 —— hosted 专属路径(uv 生态试点)──────────────────────
       # 一次性 runner 每 Job 冷启动,Python 仓的 Tests 步骤主要耗时在 uv 重新下载

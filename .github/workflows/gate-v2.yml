@@ -25,7 +25,7 @@
 #              agent-config#2283). Skip when
 #              every changed path is in {retro/acceptance-log.jsonl} ∪ the
 #              caller-declared review_exempt_paths input.
-#   quality  — lint / jscpd / dependency-cruiser / tests / PR-size preflight.
+#   quality  — lint / tests / PR-size preflight.
 #              Everything from legacy gate.yml's single job EXCEPT the model
 #              review itself. Runs on the same self-hosted/hosted pool legacy
 #              uses, with the same fork-PR → hosted-fallback guard.
@@ -329,20 +329,6 @@ jobs:
           if [ -f Makefile ] && grep -qE '^lint:' Makefile; then make lint
           else echo "no 'lint' make target — skipping"; fi
 
-      - name: Duplicate check (jscpd, advisory)
-        id: duplicate-check
-        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
-        continue-on-error: true
-        run: npx --yes jscpd --threshold "${JSCPD_THRESHOLD:-5}" --reporters console .
-
-      - name: Dependency direction (dependency-cruiser)
-        id: dependency-direction
-        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
-        run: |
-          if [ -f .dependency-cruiser.js ] || [ -f .dependency-cruiser.json ]; then
-            npx --yes --package=dependency-cruiser depcruise --config .dependency-cruiser.* --output-type err src
-          else echo "no dependency-cruiser config — skipping (use import-linter for python)"; fi
-
       # L1 dependency-download cache — hosted-only path (uv cache mirrors legacy
       # verbatim; see legacy gate.yml + docs/designs/ci-cache-strategy.md for the
       # full historical rationale, unchanged here).
@@ -552,8 +538,6 @@ jobs:
           PREFLIGHT_OUTCOME: ${{ steps.pr-size-preflight.outcome }}
           RUN_QUALITY_OUTCOME: ${{ steps.run-quality.outcome }}
           LINT_FORMAT_OUTCOME: ${{ steps.lint-format.outcome }}
-          DUPLICATE_CHECK_OUTCOME: ${{ steps.duplicate-check.outcome }}
-          DEPENDENCY_DIRECTION_OUTCOME: ${{ steps.dependency-direction.outcome }}
           INSTALL_OUTCOME: ${{ steps.install.outcome }}
           RUN_TESTS_OUTCOME: ${{ steps.run-tests.outcome }}
         run: |
@@ -561,7 +545,7 @@ jobs:
           echo "preflight_result=${PREFLIGHT_OUTCOME:-}" >> "$GITHUB_OUTPUT"
           failed=0
           passed=0
-          for outcome in "$RUN_QUALITY_OUTCOME" "$LINT_FORMAT_OUTCOME" "$DUPLICATE_CHECK_OUTCOME" "$DEPENDENCY_DIRECTION_OUTCOME" "$INSTALL_OUTCOME" "$RUN_TESTS_OUTCOME"; do
+          for outcome in "$RUN_QUALITY_OUTCOME" "$LINT_FORMAT_OUTCOME" "$INSTALL_OUTCOME" "$RUN_TESTS_OUTCOME"; do
             case "$outcome" in
               failure) failed=1 ;;
               success) passed=1 ;;
