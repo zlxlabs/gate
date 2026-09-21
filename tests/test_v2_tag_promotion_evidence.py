@@ -365,6 +365,12 @@ def test_ancestor_check_accepts_equal_without_git_call(monkeypatch):
     assert evidence.is_descendant_or_equal(SHA_A, SHA_A)
 
 
+def test_cli_ancestor_check_does_not_require_main_tip(monkeypatch, capsys):
+    monkeypatch.setattr(evidence, "is_descendant_or_equal", lambda *_: True)
+    assert evidence.main(["--check-ancestor", SHA_A, SHA_B]) == 0
+    assert "ancestry verified" in capsys.readouterr().err
+
+
 def test_primary_job_name_is_read_from_gate_v2_job_id():
     workflow = (Path(__file__).parents[1] / ".github/workflows/gate-v2.yml").read_text()
     assert "\n  primary:\n" in workflow

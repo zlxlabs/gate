@@ -341,7 +341,7 @@ def is_descendant_or_equal(current_sha: str, target_sha: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", action="append")
-    parser.add_argument("--main-tip", required=True)
+    parser.add_argument("--main-tip")
     parser.add_argument("--check-ancestor", nargs=2, metavar=("CURRENT", "TARGET"))
     parser.add_argument("--current-v2-commit-time")
     args = parser.parse_args(argv)
@@ -357,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
         print("v2 promotion ancestry verified", file=sys.stderr)
         return 0
     try:
+        if not args.main_tip:
+            raise EvidenceQueryError("--main-tip is required for candidate selection")
         result = select_latest_verified_commit(args.candidate or [], args.main_tip)
     except EvidenceQueryError as exc:
         print(f"v2 promotion evidence query failed: {exc}", file=sys.stderr)
