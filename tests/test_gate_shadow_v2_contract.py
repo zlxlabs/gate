@@ -256,8 +256,6 @@ def test_shadow_workflow_has_no_gate_source_checkout_or_caller_quality_step():
     caller_quality_markers = (
         "scripts/gate-quality",
         "make lint",
-        "jscpd",
-        "depcruise",
         "npm test",
         "pytest",
         "uv sync",

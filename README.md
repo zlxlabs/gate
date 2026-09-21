@@ -1,7 +1,7 @@
 # gate
 
-全部 zlxlabs / 个人仓库共用的**复用 pre-merge 门禁**（lint / jscpd 查重 /
-dependency-cruiser / tests / Codex review）。这是私有 `zlxlabs/gate-hub` 的
+全部 zlxlabs / 个人仓库共用的**复用 pre-merge 门禁**（lint / tests /
+Codex review）。这是私有 `zlxlabs/gate-hub` 的
 "纯逻辑公开半"——本仓只有这一份 reusable workflow 和它的契约测试；仓库清单
 （registry）、Codex review 的 prompt/策略（烧在 self-hosted runner 镜像里）、
 runner 基建、onboard 工具全部留在私有 gate-hub。

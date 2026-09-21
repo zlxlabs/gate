@@ -2223,8 +2223,6 @@ def test_quality_removes_gate_sources_before_any_caller_check():
         for name in (
             "Run scripts/gate-quality",
             "Lint / format",
-            "Duplicate check (jscpd, advisory)",
-            "Dependency direction (dependency-cruiser)",
             "Install dependencies",
             "Tests",
         )
@@ -2245,8 +2243,6 @@ def test_quality_removes_gate_sources_before_any_caller_check():
     for name in (
         "Run scripts/gate-quality",
         "Lint / format",
-        "Duplicate check (jscpd, advisory)",
-        "Dependency direction (dependency-cruiser)",
         "Install dependencies",
         "Tests",
     ):
@@ -2258,8 +2254,6 @@ def test_v2_aggregator_jobs_do_not_execute_caller_quality_code():
     caller_markers = (
         "scripts/gate-quality",
         "make lint",
-        "jscpd",
-        "depcruise",
         "npm test",
         "pytest",
         "uv sync",
@@ -2370,8 +2364,7 @@ def test_quality_entry_contract_covers_missing_non_executable_and_executable_sta
     assert names.index("PR size preflight") < names.index("Run scripts/gate-quality")
 
     legacy_steps = [step for step in steps if step.get("name") in {
-        "Lint / format", "Duplicate check (jscpd, advisory)",
-        "Dependency direction (dependency-cruiser)", "Install dependencies", "Tests",
+        "Lint / format", "Install dependencies", "Tests",
     }]
     assert legacy_steps
     for step in legacy_steps:
@@ -2595,8 +2588,6 @@ def test_ocr_job_timeout_and_internal_budget_follow_shadow_reserve_shape():
 CALLER_CHECKS_BUSINESS_STEPS = {
     "Run scripts/gate-quality": "run-quality",
     "Lint / format": "lint-format",
-    "Duplicate check (jscpd, advisory)": "duplicate-check",
-    "Dependency direction (dependency-cruiser)": "dependency-direction",
     "Install dependencies": "install",
     "Tests": "run-tests",
 }

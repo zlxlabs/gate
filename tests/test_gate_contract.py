@@ -214,8 +214,7 @@ def test_quality_entry_non_executable_fails_without_legacy_fallback():
     assert f"{QUALITY_ENTRY_PATH} exists but is not executable" in run
     assert "exit 1" in run
     legacy_steps = [step for step in steps if step.get("name") in {
-        "Lint / format", "Duplicate check (jscpd, advisory)",
-        "Dependency direction (dependency-cruiser)", "Install dependencies", "Tests",
+        "Lint / format", "Install dependencies", "Tests",
     }]
     assert legacy_steps
     for step in legacy_steps:
