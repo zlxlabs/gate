@@ -25,6 +25,7 @@ from _gha_lint import (
     materialize_jobs_api_snippet_for_probe,
     probe_jobs_api_failure_exit_code,
 )
+from test_pr_size_preflight import _repo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
@@ -33,6 +34,7 @@ CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-v2.yml"
 DISPOSITION_CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-disposition.yml"
 DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+PREFLIGHT_SCRIPT = REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
 ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
@@ -2718,3 +2720,70 @@ def test_caller_checks_maps_action_payload_to_aggregator_state(tmp_path, outcome
     subprocess.run(["bash", "-c", record["run"]], env=env, check=True)
     lines = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert lines["preflight_result"] == expected
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "expected_classification", "expected_text"),
+    [
+        ("unavailable", "unavailable", "review_unavailable", "git measurement failed"),
+        ("blocked", "blocked", "ci_failure", "split the PR"),
+    ],
+)
+def test_real_preflight_payload_reaches_workflow_and_aggregator_cli(
+    tmp_path, mode, expected_status, expected_classification, expected_text,
+):
+    repo, base_sha, head_sha = _repo(tmp_path, 30)
+
+    producer_output = tmp_path / "producer-output"
+    producer_env = os.environ.copy()
+    producer_env.update({"GITHUB_OUTPUT": str(producer_output), "PR_NUMBER": "0"})
+    producer_env.pop("GH_TOKEN", None)
+    producer_base = "0" * 40 if mode == "unavailable" else base_sha
+    producer = subprocess.run(
+        [sys.executable, str(PREFLIGHT_SCRIPT), "--base-sha", producer_base, "--head-sha", head_sha,
+         "--max-diff-lines", "1", "--warn-lines", "2", "--max-review-shards", "1",
+         "--output", str(tmp_path / "pr-size-preflight.json")],
+        cwd=repo, env=producer_env, capture_output=True, text=True, check=False,
+    )
+    assert producer.returncode == 1
+    producer_payload = json.loads((tmp_path / "pr-size-preflight.json").read_text())
+    producer_lines = dict(line.split("=", 1) for line in producer_output.read_text().splitlines())
+    assert producer_payload["preflight_result"] == expected_status
+    assert producer_lines["preflight-result"] == expected_status
+
+    raw_workflow, _ = _load_workflow()
+    record = next(s for s in raw_workflow["jobs"]["quality"]["steps"] if s.get("id") == "caller-checks-outcome")
+    workflow_output = tmp_path / "workflow-output"
+    workflow_env = os.environ.copy()
+    workflow_env.update({
+        "GITHUB_OUTPUT": str(workflow_output), "PREFLIGHT_OUTCOME": "failure",
+        "PREFLIGHT_STATUS": producer_lines["preflight-result"], "RUN_QUALITY_OUTCOME": "success",
+        "LINT_FORMAT_OUTCOME": "success", "INSTALL_OUTCOME": "success", "RUN_TESTS_OUTCOME": "success",
+    })
+    subprocess.run(["bash", "-c", record["run"]], env=workflow_env, check=True)
+    workflow_lines = dict(line.split("=", 1) for line in workflow_output.read_text().splitlines())
+    assert workflow_lines["preflight_result"] == expected_status
+
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps({
+        "kind": "primary_review", "schema_version": 1, "repository_id": 123,
+        "head_sha": "a" * 40, "run_id": 999, "run_attempt": 1, "pr": 42,
+        "verdict": "pass", "reviewer": "test",
+    }))
+    aggregator_summary = tmp_path / "aggregator-summary.md"
+    aggregator = subprocess.run(
+        [sys.executable, str(AGGREGATOR_SCRIPT), "--quality-result", "failure", "--caller-checks", "passed",
+         "--preflight-result", workflow_lines["preflight_result"], "--primary-result", "success", "--runner", "self",
+         "--is-draft", "false", "--review-expected", "true", "--repository-id", "123", "--repository", "zlxlabs/gate",
+         "--head-sha", "a" * 40, "--run-id", "999", "--run-attempt", "1", "--pr-number", "42",
+         "--audit-source-attempt", "1", "--audit-artifact-name", "primary-audit-v2-1", "--audit-dir", str(audit_dir),
+         "--summary-path", str(aggregator_summary), "--terminal-path", str(tmp_path / "gate-terminal.json")],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert aggregator.returncode == 1
+    summary = aggregator_summary.read_text()
+    assert f"classification=`{expected_classification}`" in summary
+    assert expected_text in summary
+    if mode == "unavailable":
+        assert "split the PR" not in summary
