@@ -818,15 +818,16 @@ def record_dispositions(
         if _legacy_disposition_stub(receipt):
             statuses.append(_disposition_status(receipt, valid=False, active=False, reason="absent_legacy_stub"))
             continue
-        payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        if payload_signature in seen_payloads:
-            statuses.append(_disposition_status(receipt, valid=True, active=True, reason="duplicate_receipt_noop"))
-            continue
-        seen_payloads.add(payload_signature)
         status = validate_disposition_receipt(
             receipt, scope=scope, primary=primary, audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
         )
+        if status.active and status.valid:
+            payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if payload_signature in seen_payloads:
+                statuses.append(_disposition_status(receipt, valid=True, active=True, reason="duplicate_receipt_noop"))
+                continue
+            seen_payloads.add(payload_signature)
         statuses.append(status)
         if status.active and status.valid:
             target_id = receipt.finding_id
