@@ -215,6 +215,43 @@ def test_measurement_fetches_only_missing_pr_endpoints_from_a_shallow_clone(tmp_
     ).returncode == 0
 
 
+def test_git_measurement_failure_publishes_unavailable_payload_and_fails(tmp_path, monkeypatch):
+    module = _module()
+    repo, base, head = _repo(tmp_path, 1)
+    result_path = tmp_path / "main-result.json"
+    output_path = tmp_path / "github-output"
+    summary_path = tmp_path / "github-summary.md"
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "preflight.py",
+            "--base-sha", "0" * 40,
+            "--head-sha", head,
+            "--max-diff-lines", "20",
+            "--warn-lines", "40",
+            "--max-review-shards", "3",
+            "--output", str(result_path),
+        ],
+    )
+
+    assert module.main() == 1
+
+    result = json.loads(result_path.read_text())
+    assert result["classification"] == "unavailable"
+    assert result["review_plan"] == "unavailable"
+    assert result["reviewable"] is False
+    assert result["measurement_status"] == "unavailable"
+    assert "git measurement" in result["measurement_error"]
+    assert b"preflight-result=unavailable\n" in output_path.read_bytes()
+    assert "infrastructure recovery" in summary_path.read_text()
+
+
 def test_warning_comment_tells_agent_to_split_without_claiming_review_failed():
     module = _module()
     result = {
@@ -442,6 +479,7 @@ def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, mon
         separators=(",", ":"),
     ).encode()
     assert b"reviewable-lines=10\n" in output_bytes
+    assert b"preflight-result=success\n" in output_bytes
     assert b"excluded-files=" + expected_excluded + b"\n" in output_bytes
     assert b"Reviewable text: 10 lines" in summary_bytes
     assert b"`exports/survey.doc.html`" not in summary_bytes
@@ -505,6 +543,8 @@ def test_main_preserves_size_decision_when_sticky_comment_disconnects(
     ]
     assert f"Status: `{expected_classification}`" in summary_path.read_text()
     assert "reviewable-lines=10\n" in output_path.read_text()
+    expected_result = "blocked" if expected_classification == "blocked" else "success"
+    assert f"preflight-result={expected_result}\n" in output_path.read_text()
     assert "excluded-files=" in output_path.read_text()
     captured = capsys.readouterr()
     assert "RemoteDisconnected" in captured.out

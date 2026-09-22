@@ -2638,6 +2638,11 @@ def test_caller_checks_record_step_covers_every_business_step():
         assert value in run
     assert "preflight_result=" in run
     assert "GITHUB_OUTPUT" in run
+    assert record["env"]["PREFLIGHT_STATUS"] == "${{ steps.pr-size-preflight.outputs.preflight-result }}"
+    assert "success:success" in run
+    assert "failure:blocked" in run
+    assert "failure:unavailable" in run
+    assert "preflight_result=unavailable" in run
 
 
 def test_quality_exposes_caller_checks_evidence_outputs():
@@ -2680,3 +2685,36 @@ def test_caller_checks_evidence_path_uses_no_log_keyword_matching():
         assert not any(keyword in line for line in evidence_lines), (
             f"aggregator evidence判据 must not match {keyword!r}"
         )
+
+
+def test_preflight_action_publishes_structured_result_output():
+    raw, _ = _load_workflow()
+    preflight = next(s for s in _quality_steps(raw) if s.get("id") == "pr-size-preflight")
+    action = (REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "action.yml").read_text()
+    assert "preflight-result:" in action
+    assert "steps.measure.outputs.preflight-result" in action
+    assert preflight["uses"] == "./_gate-action-src/.github/actions/pr-size-preflight"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "expected"),
+    [("success", "success", "success"), ("failure", "blocked", "blocked"),
+     ("failure", "unavailable", "unavailable"), ("failure", "", "unavailable")],
+)
+def test_caller_checks_maps_action_payload_to_aggregator_state(tmp_path, outcome, status, expected):
+    raw, _ = _load_workflow()
+    record = next(s for s in _quality_steps(raw) if s.get("id") == "caller-checks-outcome")
+    output = tmp_path / "github-output"
+    env = os.environ.copy()
+    env.update({
+        "GITHUB_OUTPUT": str(output),
+        "PREFLIGHT_OUTCOME": outcome,
+        "PREFLIGHT_STATUS": status,
+        "RUN_QUALITY_OUTCOME": "success",
+        "LINT_FORMAT_OUTCOME": "success",
+        "INSTALL_OUTCOME": "success",
+        "RUN_TESTS_OUTCOME": "success",
+    })
+    subprocess.run(["bash", "-c", record["run"]], env=env, check=True)
+    lines = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert lines["preflight_result"] == expected

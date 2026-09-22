@@ -536,13 +536,24 @@ jobs:
         if: always()
         env:
           PREFLIGHT_OUTCOME: ${{ steps.pr-size-preflight.outcome }}
+          PREFLIGHT_STATUS: ${{ steps.pr-size-preflight.outputs.preflight-result }}
           RUN_QUALITY_OUTCOME: ${{ steps.run-quality.outcome }}
           LINT_FORMAT_OUTCOME: ${{ steps.lint-format.outcome }}
           INSTALL_OUTCOME: ${{ steps.install.outcome }}
           RUN_TESTS_OUTCOME: ${{ steps.run-tests.outcome }}
         run: |
           set -euo pipefail
-          echo "preflight_result=${PREFLIGHT_OUTCOME:-}" >> "$GITHUB_OUTPUT"
+          # The composite action publishes a structured producer result. The
+          # outcome alone cannot distinguish a measured budget block from a
+          # failed git measurement. Any missing or inconsistent payload stays
+          # unavailable so it cannot pass or claim a size overflow.
+          case "${PREFLIGHT_OUTCOME:-}:${PREFLIGHT_STATUS:-}" in
+            success:success) preflight_result=success ;;
+            failure:blocked) preflight_result=blocked ;;
+            failure:unavailable) preflight_result=unavailable ;;
+            *) preflight_result=unavailable ;;
+          esac
+          echo "preflight_result=$preflight_result" >> "$GITHUB_OUTPUT"
           failed=0
           passed=0
           for outcome in "$RUN_QUALITY_OUTCOME" "$LINT_FORMAT_OUTCOME" "$INSTALL_OUTCOME" "$RUN_TESTS_OUTCOME"; do

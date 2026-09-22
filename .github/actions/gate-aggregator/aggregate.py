@@ -145,9 +145,11 @@ QUALITY_RESULT_DOMAIN = PRIMARY_RESULT_DOMAIN
 # 不是第四个值——它是“证据缺席”（job 在记录步之前死掉、或调用方工作流尚未
 # 升级），与 not_started/passed 同归 unavailable，绝不能默认 fail。
 CALLER_CHECKS_DOMAIN = ("not_started", "passed", "failed")
-# PR size preflight 步骤的 steps.<id>.outcome。"failure" 是正当红（PR 太大
-# 要拆）；其余（含缺席空值）都不干扰 caller_checks 判据。
-PREFLIGHT_RESULT_DOMAIN = ("", "success", "failure", "skipped", "cancelled")
+# PR size preflight producer's structured result. `blocked` means a measured
+# budget overflow; `unavailable` means measurement failed and must be treated
+# as infrastructure failure. Empty/legacy job states are retained only for
+# callers whose evidence step never ran, and never imply a passing gate.
+PREFLIGHT_RESULT_DOMAIN = ("", "success", "blocked", "unavailable", "skipped", "cancelled")
 TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
 TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip", "review_expected_stale", "pr_state_unverifiable")
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
@@ -820,13 +822,18 @@ def evaluate(
     elif quality_reason is not None:
         if quality_reason == "quality_failure":
             # gate#199 根治：quality=failure 是 job 级标量，混同了门禁控制面
-            # 步骤失败与业务检查真失败。只有记录步证据 caller_checks=failed
-            # 才能定罪为代码问题；其余一律基础设施不可用（fail-closed 到
-            # unavailable，绝不默认 fail）。PR size preflight 单算一相：
-            # preflight 红是正当红（PR 太大要拆），仍走 fail。
-            if preflight_result == "failure":
-                problems.append("PR size preflight failed (PR exceeds the single-review budget) — split the PR and retry")
+            # 步骤失败与业务检查真失败。只有结构化证据明确表明预算
+            # blocked，才把 preflight 红归因于代码改动；测量 unavailable
+            # 必须留在基础设施桶，不能冒充超预算，也不能放行。
+            if preflight_result == "blocked":
+                problems.append("PR size preflight blocked (PR exceeds the single-review budget) — split the PR and retry")
                 classification, reason_code = "ci_failure", "quality_failure"
+            elif preflight_result == "unavailable":
+                problems.append(
+                    "PR size preflight was unavailable (git measurement failed) — "
+                    "treated as an infrastructure problem, not a size decision"
+                )
+                classification, reason_code = "review_unavailable", "quality_infra"
             elif caller_checks == "failed":
                 problems.append("quality business checks reported failure (caller_checks=failed) — a code problem")
                 classification, reason_code = "ci_failure", "quality_failure"
@@ -841,6 +848,31 @@ def evaluate(
             classification, reason_code = "ci_failure", quality_reason
     else:
         classification, reason_code = primary_classification, primary_reason
+    # A structured unavailable result is a measurement failure, not a size
+    # verdict. Keep the gate closed even if a malformed caller reports a
+    # successful quality job; a skipped quality job remains the primary
+    # short-circuit path and is judged by its primary result above.
+    if (
+        preflight_result == "unavailable"
+        and quality_result in ("success", "failure")
+        and primary_classification not in ("code_fail", "integration_error")
+        and (classification, reason_code) != ("review_unavailable", "quality_infra")
+    ):
+        problems.append(
+            "PR size preflight was unavailable (git measurement failed) — "
+            "treated as an infrastructure problem, not a size decision"
+        )
+        classification, reason_code = "review_unavailable", "quality_infra"
+    elif (
+        preflight_result == "blocked"
+        and quality_result == "success"
+        and primary_classification not in ("code_fail", "integration_error")
+    ):
+        problems.append(
+            "PR size preflight reported a budget block despite a successful quality job — "
+            "fail-closed as a quality failure"
+        )
+        classification, reason_code = "ci_failure", "quality_failure"
     gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[classification]
     outcome = Outcome(
         ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,
@@ -2493,7 +2525,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quality-result", required=True, help="needs.quality.result")
     parser.add_argument("--caller-checks", default="", help="needs.quality.outputs.caller_checks (not_started|passed|failed; empty when the evidence step never ran)")
-    parser.add_argument("--preflight-result", default="", help="PR size preflight step outcome (failure means the PR exceeds the single-review budget)")
+    parser.add_argument("--preflight-result", default="", help="structured PR size preflight result (blocked means the measured PR exceeds the single-review budget; unavailable means measurement failed)")
     parser.add_argument("--primary-result", required=True, help="needs.primary.result")
     parser.add_argument("--runner", required=True, help="inputs.runner ('self'/'hosted') — validated strictly")
     parser.add_argument("--is-draft", required=True, help="github.event.pull_request.draft ('true'/'false')")
