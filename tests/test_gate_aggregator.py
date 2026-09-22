@@ -54,6 +54,7 @@ def test_single_round_gate_outcome_is_not_convergence_state():
     outcome = AGG.evaluate(
         quality_result="success",
         primary_result="success",
+        preflight_result="success",
         runner="self",
         is_draft=False,
         review_expected=True,
@@ -115,6 +116,7 @@ def _base_kwargs(**overrides):
     kwargs = dict(
         quality_result="success",
         primary_result="success",
+        preflight_result="success",
         runner="self",
         is_draft=False,
         review_expected=True,
@@ -496,6 +498,7 @@ def _cli_args(audit_dir, summary_path, **overrides):
     values = dict(
         quality_result="success",
         primary_result="success",
+        preflight_result="success",
         runner="self",
         is_draft="false",
         review_expected="true",
@@ -3492,6 +3495,18 @@ def test_preflight_unavailable_never_passes_even_when_quality_result_is_not_red(
     assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
         "review_unavailable", "quality_infra", "unavailable"
     )
+
+
+@pytest.mark.parametrize("preflight_result", ["", "skipped", "cancelled"])
+def test_quality_success_requires_explicit_preflight_success(preflight_result):
+    outcome = AGG.evaluate(
+        **_base_kwargs(quality_result="success", caller_checks="passed", preflight_result=preflight_result)
+    )
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
+        "review_unavailable", "quality_infra", "unavailable"
+    )
+    assert not any("split the PR" in problem for problem in outcome.problems)
 
 
 def test_unknown_caller_checks_value_fails_closed():

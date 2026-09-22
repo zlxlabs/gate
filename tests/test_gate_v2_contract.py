@@ -2692,16 +2692,17 @@ def test_caller_checks_evidence_path_uses_no_log_keyword_matching():
 def test_preflight_action_publishes_structured_result_output():
     raw, _ = _load_workflow()
     preflight = next(s for s in _quality_steps(raw) if s.get("id") == "pr-size-preflight")
-    action = (REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "action.yml").read_text()
-    assert "preflight-result:" in action
-    assert "steps.measure.outputs.preflight-result" in action
+    action = yaml.safe_load((REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "action.yml").read_text())
+    assert action["outputs"]["preflight-result"]["value"] == "${{ steps.measure.outputs.preflight-result }}"
     assert preflight["uses"] == "./_gate-action-src/.github/actions/pr-size-preflight"
 
 
 @pytest.mark.parametrize(
     ("outcome", "status", "expected"),
     [("success", "success", "success"), ("failure", "blocked", "blocked"),
-     ("failure", "unavailable", "unavailable"), ("failure", "", "unavailable")],
+     ("failure", "unavailable", "unavailable"), ("failure", "", "unavailable"),
+     ("success", "", "unavailable"), ("skipped", "", "unavailable"),
+     ("cancelled", "", "unavailable"), ("failure", "unknown", "unavailable")],
 )
 def test_caller_checks_maps_action_payload_to_aggregator_state(tmp_path, outcome, status, expected):
     raw, _ = _load_workflow()

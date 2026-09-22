@@ -874,6 +874,16 @@ def evaluate(
             "fail-closed as a quality failure"
         )
         classification, reason_code = "ci_failure", "quality_failure"
+    elif (
+        preflight_result in ("", "skipped", "cancelled")
+        and quality_result == "success"
+        and primary_classification == "code_pass"
+    ):
+        problems.append(
+            "PR size preflight evidence was missing or non-terminal — "
+            "treated as an infrastructure problem, not a size decision"
+        )
+        classification, reason_code = "review_unavailable", "quality_infra"
     gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[classification]
     outcome = Outcome(
         ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,

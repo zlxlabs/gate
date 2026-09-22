@@ -201,7 +201,7 @@ def build_unavailable_result(
     max_diff_lines: int,
     warn_lines: int,
     max_review_shards: int,
-    error: subprocess.CalledProcessError,
+    error: subprocess.CalledProcessError | ValueError,
 ) -> dict[str, Any]:
     """Publish a failed git measurement as unavailable, never as a size decision."""
     return {
@@ -222,7 +222,11 @@ def build_unavailable_result(
         "review_plan": "unavailable",
         "preflight_result": "unavailable",
         "measurement_status": "unavailable",
-        "measurement_error": f"git measurement failed (exit={error.returncode})",
+        "measurement_error": (
+            f"git measurement failed (exit={error.returncode})"
+            if isinstance(error, subprocess.CalledProcessError)
+            else "git measurement validation failed"
+        ),
         "thresholds": {
             "single_turn_lines": max_diff_lines,
             "warn_lines": warn_lines,
@@ -385,7 +389,7 @@ def main() -> int:
             warn_lines=args.warn_lines,
             max_review_shards=args.max_review_shards,
         )
-    except subprocess.CalledProcessError as error:
+    except (subprocess.CalledProcessError, ValueError) as error:
         result = build_unavailable_result(
             args.base_sha,
             args.head_sha,

@@ -1,6 +1,8 @@
 import importlib.util
 import http.client
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -84,6 +86,49 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
     assert result["deletions"] == 1
     assert result["thresholds"]["hard_lines"] == 36
     assert result["classification"] in {"warning", "blocked"}
+
+
+def test_cli_publishes_unavailable_for_measurement_validation_failure(tmp_path):
+    repo, base, head = _repo(tmp_path, 2)
+    git_bin = tmp_path / "bin"
+    git_bin.mkdir()
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git = git_bin / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess\n"
+        "import sys\n"
+        "if sys.argv[1:3] == ['diff', '--numstat']:\n"
+        "    sys.stdout.buffer.write(b'broken-record\\0')\n"
+        "    raise SystemExit(0)\n"
+        f"raise SystemExit(subprocess.call([{real_git!r}, *sys.argv[1:]]))\n"
+    )
+    fake_git.chmod(0o755)
+    output_path = tmp_path / "github-output"
+    summary_path = tmp_path / "github-summary.md"
+    result_path = tmp_path / "result.json"
+    env = os.environ.copy()
+    env.update({
+        "PATH": str(git_bin) + os.pathsep + env["PATH"],
+        "GITHUB_OUTPUT": str(output_path),
+        "GITHUB_STEP_SUMMARY": str(summary_path),
+        "PR_NUMBER": "0",
+    })
+    env.pop("GH_TOKEN", None)
+    completed = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "--base-sha", base, "--head-sha", head,
+         "--max-diff-lines", "20", "--warn-lines", "40", "--max-review-shards", "3",
+         "--output", str(result_path)],
+        cwd=repo, env=env, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 1
+    result = json.loads(result_path.read_text())
+    assert result["classification"] == "unavailable"
+    assert result["preflight_result"] == "unavailable"
+    assert result["measurement_status"] == "unavailable"
+    assert "broken-record" not in result["measurement_error"]
+    assert b"preflight-result=unavailable\n" in output_path.read_bytes()
 
 
 def test_size_filter_fixture_uses_real_git_diff_and_applies_r1_r2_r3(tmp_path):
