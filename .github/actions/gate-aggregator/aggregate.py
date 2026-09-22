@@ -824,7 +824,8 @@ def evaluate(
             # gate#199 根治：quality=failure 是 job 级标量，混同了门禁控制面
             # 步骤失败与业务检查真失败。只有结构化证据明确表明预算
             # blocked，才把 preflight 红归因于代码改动；测量 unavailable
-            # 必须留在基础设施桶，不能冒充超预算，也不能放行。
+            # 必须优先留在基础设施桶，即使其他业务步骤也失败；不能
+            # 冒充超预算，也不能放行。
             if preflight_result == "blocked":
                 problems.append("PR size preflight blocked (PR exceeds the single-review budget) — split the PR and retry")
                 classification, reason_code = "ci_failure", "quality_failure"

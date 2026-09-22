@@ -3484,6 +3484,17 @@ def test_preflight_unavailable_is_infrastructure_failure_without_size_claim():
     assert not any("split the PR" in problem for problem in outcome.problems)
 
 
+def test_preflight_unavailable_precedes_business_failure_without_size_claim():
+    outcome = AGG.evaluate(
+        **_base_kwargs(quality_result="failure", caller_checks="failed", preflight_result="unavailable")
+    )
+    assert outcome.ok is False
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
+        "review_unavailable", "quality_infra", "unavailable"
+    )
+    assert not any("split the PR" in problem for problem in outcome.problems)
+
+
 @pytest.mark.parametrize("quality_result", ["success", "failure"])
 def test_preflight_unavailable_never_passes_even_when_quality_result_is_not_red(quality_result):
     outcome = AGG.evaluate(
