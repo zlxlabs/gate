@@ -356,21 +356,9 @@ def _append_summary(result: dict[str, Any], path: str) -> None:
 
 
 def _append_action_outputs(result: dict[str, Any], path: str) -> None:
-    preflight_result = result.get("preflight_result")
-    if not preflight_result:
-        try:
-            preflight_result = {
-                "single": "success",
-                "sharded": "success",
-                "warning": "success",
-                "blocked": "blocked",
-                "unavailable": "unavailable",
-            }[result["classification"]]
-        except KeyError as error:
-            raise ValueError("preflight result has an unknown classification") from error
     with open(path, "a", encoding="utf-8") as output:
         output.write(f"reviewable-lines={result['reviewable_lines'] if result['reviewable_lines'] is not None else ''}\n")
-        output.write(f"preflight-result={preflight_result}\n")
+        output.write(f"preflight-result={result['preflight_result']}\n")
         output.write(
             "excluded-files="
             + json.dumps(result["excluded_files"], ensure_ascii=False, separators=(",", ":"))

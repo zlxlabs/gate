@@ -292,6 +292,7 @@ def test_summary_and_action_outputs_show_excluded_file_details(tmp_path):
         "deletions": 0,
         "changed_files": 4,
         "review_plan": "single",
+        "preflight_result": "success",
         "excluded_files": [
             {"path": "docs.pdf", "rule": "R2", "raw_lines": 9},
         ],
