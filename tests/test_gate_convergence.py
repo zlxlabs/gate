@@ -734,6 +734,80 @@ def test_duplicate_disposition_is_idempotent():
     assert len(first.recorded_receipts) == 1
     assert len(replay.recorded_receipts) == 1
     assert first.primary_p1_ids == replay.primary_p1_ids == primary.p1_ids
+    assert [(status.valid, status.active, status.reason_code) for status in replay.statuses] == [
+        (True, True, "active_false_positive"),
+        (True, True, "duplicate_receipt_noop"),
+    ]
+
+
+def test_duplicate_invalid_disposition_remains_rejected_each_time():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary, disposition="accepted")
+    audit = CONV.record_dispositions(
+        primary.p1_ids, (receipt, receipt), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64,
+    )
+
+    assert [(status.valid, status.active, status.reason_code) for status in audit.statuses] == [
+        (False, False, "unknown_disposition"),
+        (False, False, "unknown_disposition"),
+    ]
+    assert audit.recorded_receipts == ()
+    assert audit.recorded_finding_ids == ()
+    assert audit.rejected_receipts == (
+        (receipt, "unknown_disposition"),
+        (receipt, "unknown_disposition"),
+    )
+
+
+def test_invalid_and_valid_same_finding_are_order_independent():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    valid = _disposition(primary=primary)
+    invalid = replace(valid, disposition="accepted")
+
+    for receipts in ((invalid, valid), (valid, invalid)):
+        audit = CONV.record_dispositions(
+            primary.p1_ids, receipts, scope=SCOPE, primary=primary,
+            audit_digest="a" * 64,
+        )
+        assert audit.primary_p1_ids == primary.p1_ids
+        assert audit.recorded_receipts == (valid,)
+        assert audit.recorded_finding_ids == ("p1",)
+        assert audit.rejected_receipts == ((invalid, "unknown_disposition"),)
+        assert [(status.valid, status.active, status.reason_code) for status in audit.statuses] == [
+            (False, False, "unknown_disposition") if receipts[0] is invalid else (True, True, "active_false_positive"),
+            (True, True, "active_false_positive") if receipts[1] is valid else (False, False, "unknown_disposition"),
+        ]
+
+
+@pytest.mark.parametrize("inactive_kind", ["expired", "trigger"], ids=["expired-epoch", "inactive-trigger"])
+def test_repeated_non_active_disposition_is_never_activated_by_deduplication(inactive_kind):
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    receipt = _disposition(primary=primary)
+    if inactive_kind == "expired":
+        receipt = replace(receipt, epoch="expired-epoch")
+        expected_reason = "epoch_mismatch_stale"
+    else:
+        primary = replace(primary, p1_findings=(("p1", "major", "measured"),))
+        receipt = _disposition(primary=primary)
+        expected_reason = "finding_trigger_not_inferred"
+
+    audit = CONV.record_dispositions(
+        primary.p1_ids, (receipt, receipt), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64,
+    )
+
+    assert [(status.valid, status.active, status.reason_code) for status in audit.statuses] == [
+        (False, False, expected_reason),
+        (False, False, expected_reason),
+    ]
+    assert audit.primary_p1_ids == primary.p1_ids
+    assert audit.recorded_receipts == ()
+    assert audit.recorded_finding_ids == ()
+    assert audit.rejected_receipts == (
+        (receipt, expected_reason),
+        (receipt, expected_reason),
+    )
 
 
 def test_malformed_disposition_input_preserves_typed_rejection():

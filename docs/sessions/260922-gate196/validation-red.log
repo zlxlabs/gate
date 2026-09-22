@@ -1,0 +1,28 @@
+Preparing worktree (detached HEAD b353622)
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________ test_duplicate_invalid_disposition_remains_rejected_each_time _________
+
+    def test_duplicate_invalid_disposition_remains_rejected_each_time():
+        primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+        receipt = _disposition(primary=primary, disposition="accepted")
+        audit = CONV.record_dispositions(
+            primary.p1_ids, (receipt, receipt), scope=SCOPE, primary=primary,
+            audit_digest="a" * 64,
+        )
+
+>       assert [(status.valid, status.active, status.reason_code) for status in audit.statuses] == [
+            (False, False, "unknown_disposition"),
+            (False, False, "unknown_disposition"),
+        ]
+E       AssertionError: assert [(False, Fals...eceipt_noop')] == [(False, Fals...disposition')]
+E
+E         At index 1 diff: (True, True, 'duplicate_receipt_noop') != (False, False, 'unknown_disposition')
+E         Use -v to get more diff
+
+tests/test_gate_convergence.py:751: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_gate_convergence.py::test_duplicate_invalid_disposition_remains_rejected_each_time
+1 failed in 0.15s
+scratch-worktree: removing dirty worktree with 1 change(s): /home/zlx/scratchpad/vt-u4Wckb/worktree
+scratch-worktree:    M tests/test_gate_convergence.py
