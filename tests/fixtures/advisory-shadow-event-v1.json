@@ -1,0 +1,31 @@
+{
+  "kind": "shadow_review",
+  "schema_version": 1,
+  "repository_id": 1258188460,
+  "repository": "zlxlabs/gate",
+  "pr": 893,
+  "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "head_sha": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+  "diff_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "policy_version": "v2",
+  "policy_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "registry_commit": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+  "caller_sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "reusable_workflow_sha": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+  "run_id": 12345,
+  "run_attempt": 2,
+  "job_id": 45678,
+  "reviewer": "claude-glm-5-3",
+  "status": "auth_unavailable",
+  "result": null,
+  "cost": null,
+  "tokens": null,
+  "failure_evidence": {
+    "reason_code": "auth_unavailable",
+    "reason": "认证配置不可用，请查看 job 日志",
+    "adapter_exit_code": null,
+    "cli_rc": null,
+    "phase": null,
+    "termination": null
+  }
+}
