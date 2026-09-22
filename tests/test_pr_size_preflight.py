@@ -1,6 +1,8 @@
 import importlib.util
 import http.client
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -84,6 +86,49 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
     assert result["deletions"] == 1
     assert result["thresholds"]["hard_lines"] == 36
     assert result["classification"] in {"warning", "blocked"}
+
+
+def test_cli_publishes_unavailable_for_measurement_validation_failure(tmp_path):
+    repo, base, head = _repo(tmp_path, 2)
+    git_bin = tmp_path / "bin"
+    git_bin.mkdir()
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git = git_bin / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess\n"
+        "import sys\n"
+        "if sys.argv[1:3] == ['diff', '--numstat']:\n"
+        "    sys.stdout.buffer.write(b'broken-record\\0')\n"
+        "    raise SystemExit(0)\n"
+        f"raise SystemExit(subprocess.call([{real_git!r}, *sys.argv[1:]]))\n"
+    )
+    fake_git.chmod(0o755)
+    output_path = tmp_path / "github-output"
+    summary_path = tmp_path / "github-summary.md"
+    result_path = tmp_path / "result.json"
+    env = os.environ.copy()
+    env.update({
+        "PATH": str(git_bin) + os.pathsep + env["PATH"],
+        "GITHUB_OUTPUT": str(output_path),
+        "GITHUB_STEP_SUMMARY": str(summary_path),
+        "PR_NUMBER": "0",
+    })
+    env.pop("GH_TOKEN", None)
+    completed = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "--base-sha", base, "--head-sha", head,
+         "--max-diff-lines", "20", "--warn-lines", "40", "--max-review-shards", "3",
+         "--output", str(result_path)],
+        cwd=repo, env=env, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 1
+    result = json.loads(result_path.read_text())
+    assert result["classification"] == "unavailable"
+    assert result["preflight_result"] == "unavailable"
+    assert result["measurement_status"] == "unavailable"
+    assert "broken-record" not in result["measurement_error"]
+    assert b"preflight-result=unavailable\n" in output_path.read_bytes()
 
 
 def test_size_filter_fixture_uses_real_git_diff_and_applies_r1_r2_r3(tmp_path):
@@ -215,6 +260,43 @@ def test_measurement_fetches_only_missing_pr_endpoints_from_a_shallow_clone(tmp_
     ).returncode == 0
 
 
+def test_git_measurement_failure_publishes_unavailable_payload_and_fails(tmp_path, monkeypatch):
+    module = _module()
+    repo, base, head = _repo(tmp_path, 1)
+    result_path = tmp_path / "main-result.json"
+    output_path = tmp_path / "github-output"
+    summary_path = tmp_path / "github-summary.md"
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "preflight.py",
+            "--base-sha", "0" * 40,
+            "--head-sha", head,
+            "--max-diff-lines", "20",
+            "--warn-lines", "40",
+            "--max-review-shards", "3",
+            "--output", str(result_path),
+        ],
+    )
+
+    assert module.main() == 1
+
+    result = json.loads(result_path.read_text())
+    assert result["classification"] == "unavailable"
+    assert result["review_plan"] == "unavailable"
+    assert result["reviewable"] is False
+    assert result["measurement_status"] == "unavailable"
+    assert "git measurement" in result["measurement_error"]
+    assert b"preflight-result=unavailable\n" in output_path.read_bytes()
+    assert "infrastructure recovery" in summary_path.read_text()
+
+
 def test_warning_comment_tells_agent_to_split_without_claiming_review_failed():
     module = _module()
     result = {
@@ -255,6 +337,7 @@ def test_summary_and_action_outputs_show_excluded_file_details(tmp_path):
         "deletions": 0,
         "changed_files": 4,
         "review_plan": "single",
+        "preflight_result": "success",
         "excluded_files": [
             {"path": "docs.pdf", "rule": "R2", "raw_lines": 9},
         ],
@@ -442,6 +525,7 @@ def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, mon
         separators=(",", ":"),
     ).encode()
     assert b"reviewable-lines=10\n" in output_bytes
+    assert b"preflight-result=success\n" in output_bytes
     assert b"excluded-files=" + expected_excluded + b"\n" in output_bytes
     assert b"Reviewable text: 10 lines" in summary_bytes
     assert b"`exports/survey.doc.html`" not in summary_bytes
@@ -505,6 +589,8 @@ def test_main_preserves_size_decision_when_sticky_comment_disconnects(
     ]
     assert f"Status: `{expected_classification}`" in summary_path.read_text()
     assert "reviewable-lines=10\n" in output_path.read_text()
+    expected_result = "blocked" if expected_classification == "blocked" else "success"
+    assert f"preflight-result={expected_result}\n" in output_path.read_text()
     assert "excluded-files=" in output_path.read_text()
     captured = capsys.readouterr()
     assert "RemoteDisconnected" in captured.out

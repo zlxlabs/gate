@@ -133,6 +133,7 @@ def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
     argv = [
         sys.executable, str(AGGREGATE_PATH),
         "--quality-result", "success", "--primary-result", "success",
+        "--preflight-result", "success",
         "--runner", "self", "--is-draft", "false", "--review-expected", "true",
         "--repository-id", str(SCOPE.repository_id), "--repository", "zlxlabs/gate",
         "--head-sha", SCOPE.head_sha, "--run-id", "77", "--run-attempt", "1",

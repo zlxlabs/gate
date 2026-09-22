@@ -184,6 +184,49 @@ def measure(
         "classification": classification,
         "reviewable": reviewable,
         "review_plan": "blocked" if not reviewable else ("single" if classification == "single" else "sharded"),
+        "preflight_result": "blocked" if classification == "blocked" else "success",
+        "thresholds": {
+            "single_turn_lines": max_diff_lines,
+            "warn_lines": warn_lines,
+            "hard_lines": max_diff_lines * max_review_shards,
+            "max_review_shards": max_review_shards,
+        },
+    }
+
+
+def build_unavailable_result(
+    base_sha: str,
+    head_sha: str,
+    *,
+    max_diff_lines: int,
+    warn_lines: int,
+    max_review_shards: int,
+    error: subprocess.CalledProcessError | ValueError,
+) -> dict[str, Any]:
+    """Publish a failed git measurement as unavailable, never as a size decision."""
+    return {
+        "schema_version": 1,
+        "size_filter_contract": SIZE_FILTER_CONTRACT,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "diff_lines": None,
+        "reviewable_lines": None,
+        "raw_patch_lines": None,
+        "changed_lines": None,
+        "additions": None,
+        "deletions": None,
+        "changed_files": None,
+        "excluded_files": [],
+        "classification": "unavailable",
+        "reviewable": False,
+        "review_plan": "unavailable",
+        "preflight_result": "unavailable",
+        "measurement_status": "unavailable",
+        "measurement_error": (
+            f"git measurement failed (exit={error.returncode})"
+            if isinstance(error, subprocess.CalledProcessError)
+            else "git measurement validation failed"
+        ),
         "thresholds": {
             "single_turn_lines": max_diff_lines,
             "warn_lines": warn_lines,
@@ -197,7 +240,11 @@ def render_comment(result: dict[str, Any]) -> str:
     kind = result["classification"]
     thresholds = result["thresholds"]
     reviewable_lines = result["reviewable_lines"]
-    if kind == "blocked":
+    if kind == "unavailable":
+        title = "⚠️ PR 体积预检：基础设施不可用"
+        explanation = "Git 无法读取 PR 的 base/head 对象，未能测量审查 Patch；门禁保持阻断，不能据此判断 PR 体积。"
+        action = "请先恢复 Git 对象读取或网络连接后重新运行；当前结果不会放行，也不要求拆分 PR。"
+    elif kind == "blocked":
         title = "⛔ PR 体积预检：超过完整审查能力，已拦截"
         explanation = (
             f"当前审查 Patch 为 **{reviewable_lines} 行**，超过最多 "
@@ -222,13 +269,21 @@ def render_comment(result: dict[str, Any]) -> str:
         title = "✅ PR 体积已回到单轮审查范围"
         explanation = f"当前审查 Patch 为 **{reviewable_lines} 行**，可由 Codex 单轮完整审查。"
         action = "此前的大 PR 提醒已解除。"
-    changed_lines = result.get("changed_lines", result["additions"] + result["deletions"])
+    if kind == "unavailable":
+        changed_lines = "未知"
+        additions = deletions = "未知"
+        changed_files = "未知"
+    else:
+        changed_lines = result.get("changed_lines", result["additions"] + result["deletions"])
+        additions = result["additions"]
+        deletions = result["deletions"]
+        changed_files = result["changed_files"]
     return (
         f"{MARKER}\n\n### {title}\n\n{explanation}\n\n"
-        f"- 文件：{result['changed_files']}\n"
-        f"- 实际增删：{changed_lines} 行（+{result['additions']} / -{result['deletions']}）\n"
-        f"- 审查 Patch：{reviewable_lines} 行（可审文本口径）\n"
-        f"- 原始 Patch：{result['raw_patch_lines']} 行（含被排除文件）\n"
+        f"- 文件：{changed_files}\n"
+        f"- 实际增删：{changed_lines} 行（+{additions} / -{deletions}）\n"
+        f"- 审查 Patch：{reviewable_lines if reviewable_lines is not None else '未知'} 行（可审文本口径）\n"
+        f"- 原始 Patch：{result['raw_patch_lines'] if result['raw_patch_lines'] is not None else '未知'} 行（含被排除文件）\n"
         f"- Reviewed commit: `{result['head_sha']}`\n\n{action}\n"
     )
 
@@ -273,16 +328,25 @@ def post_sticky_comment(result: dict[str, Any], *, token: str, repository: str, 
 
 
 def _append_summary(result: dict[str, Any], path: str) -> None:
-    status = {"single": "single", "sharded": "sharded", "warning": "warning", "blocked": "blocked"}[result["classification"]]
-    summary_text = (
-        "### PR size preflight\n\n"
-        f"- Status: `{status}`\n- Review patch: {result['diff_lines']} lines\n"
-        f"- Reviewable text: {result['reviewable_lines']} lines\n"
-        f"- Raw patch: {result['raw_patch_lines']} lines\n"
-        f"- Changed: {result.get('changed_lines', result['additions'] + result['deletions'])} lines "
-        f"(+{result['additions']} / -{result['deletions']})\n"
-        f"- Files: {result['changed_files']}\n- Plan: `{result['review_plan']}`\n"
-    )
+    status = result["classification"]
+    if status == "unavailable":
+        summary_text = (
+            "### PR size preflight\n\n"
+            "- Status: `unavailable`\n"
+            "- Measurement: unavailable (git measurement failed)\n"
+            "- Gate decision: blocked pending infrastructure recovery\n"
+            "- Plan: `unavailable`\n"
+        )
+    else:
+        summary_text = (
+            "### PR size preflight\n\n"
+            f"- Status: `{status}`\n- Review patch: {result['diff_lines']} lines\n"
+            f"- Reviewable text: {result['reviewable_lines']} lines\n"
+            f"- Raw patch: {result['raw_patch_lines']} lines\n"
+            f"- Changed: {result.get('changed_lines', result['additions'] + result['deletions'])} lines "
+            f"(+{result['additions']} / -{result['deletions']})\n"
+            f"- Files: {result['changed_files']}\n- Plan: `{result['review_plan']}`\n"
+        )
     excluded_files = result["excluded_files"]
     if excluded_files:
         summary_text += "- Excluded files:\n"
@@ -297,7 +361,8 @@ def _append_summary(result: dict[str, Any], path: str) -> None:
 
 def _append_action_outputs(result: dict[str, Any], path: str) -> None:
     with open(path, "a", encoding="utf-8") as output:
-        output.write(f"reviewable-lines={result['reviewable_lines']}\n")
+        output.write(f"reviewable-lines={result['reviewable_lines'] if result['reviewable_lines'] is not None else ''}\n")
+        output.write(f"preflight-result={result['preflight_result']}\n")
         output.write(
             "excluded-files="
             + json.dumps(result["excluded_files"], ensure_ascii=False, separators=(",", ":"))
@@ -317,12 +382,22 @@ def main() -> int:
     if min(args.max_diff_lines, args.warn_lines, args.max_review_shards) <= 0:
         parser.error("all thresholds must be positive")
 
-    result = measure(
-        Path.cwd(), args.base_sha, args.head_sha,
-        max_diff_lines=args.max_diff_lines,
-        warn_lines=args.warn_lines,
-        max_review_shards=args.max_review_shards,
-    )
+    try:
+        result = measure(
+            Path.cwd(), args.base_sha, args.head_sha,
+            max_diff_lines=args.max_diff_lines,
+            warn_lines=args.warn_lines,
+            max_review_shards=args.max_review_shards,
+        )
+    except (subprocess.CalledProcessError, ValueError) as error:
+        result = build_unavailable_result(
+            args.base_sha,
+            args.head_sha,
+            max_diff_lines=args.max_diff_lines,
+            warn_lines=args.warn_lines,
+            max_review_shards=args.max_review_shards,
+            error=error,
+        )
     result.update({
         "repository": os.environ.get("GITHUB_REPOSITORY", "unknown"),
         "pr_number": int(os.environ.get("PR_NUMBER", "0") or 0),
@@ -343,6 +418,9 @@ def main() -> int:
         except Exception as error:
             print(f"::warning::could not update PR size comment ({type(error).__name__}): {error}")
 
+    if result["classification"] == "unavailable":
+        print("::error::PR size preflight unavailable: git measurement failed; infrastructure recovery is required")
+        return 1
     if result["classification"] == "blocked":
         print("::error::PR exceeds complete Codex review capacity; split it into small or stacked PRs")
         return 1
