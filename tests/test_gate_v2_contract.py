@@ -36,6 +36,7 @@ DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 PREFLIGHT_SCRIPT = REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
 ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
+ADVISORY_EVENT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "advisory-shadow-event-v1.json"
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
@@ -764,6 +765,167 @@ def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
     assert upload_step["env"]["ADVISORY_DIR"] == "${{ runner.temp }}/shadow-events/advisory"
     assert "--tier d3" in upload_step["run"]
     assert "advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}" in upload_step["env"]["ARTIFACT_NAME"]
+    checkout_step = next(s for s in ocr["steps"] if s.get("name") == "Checkout outbound scrub at this workflow's own commit")
+    post_step = next(s for s in ocr["steps"] if s.get("name") == "Post advisory PR comment")
+    summary_step = next(s for s in ocr["steps"] if s.get("name") == "Record advisory terminal summary")
+    names = [step.get("name") for step in ocr["steps"]]
+    assert checkout_step["id"] == "checkout-advisory-scrub"
+    assert post_step["id"] == "post-advisory-comment"
+    assert summary_step["id"] == "advisory-terminal-summary"
+    assert names.index(summary_step["name"]) > names.index(post_step["name"])
+    assert names.index(summary_step["name"]) < names.index("Checkout silo store at this workflow's own commit")
+    assert summary_step["if"] == "always() && matrix.reviewer != '__none__'"
+    assert summary_step["env"]["SCRUB_CHECKOUT_OUTCOME"] == "${{ steps.checkout-advisory-scrub.outcome }}"
+    assert summary_step["env"]["COMMENT_STEP_OUTCOME"] == "${{ steps.post-advisory-comment.outcome }}"
+    assert "scrub_outbound.py" not in summary_step["run"]
+    assert "cat \"$event_path\"" not in summary_step["run"]
+
+
+def _advisory_terminal_summary_step():
+    raw, _ = _load_workflow()
+    return next(
+        step
+        for step in raw["jobs"]["ocr"]["steps"]
+        if step.get("name") == "Record advisory terminal summary"
+    )
+
+
+def _run_advisory_terminal_summary(tmp_path, *, event=None, delivery=None,
+                                   scrub_outcome="failure", post_outcome="failure"):
+    step = _advisory_terminal_summary_step()
+    runner_temp = tmp_path / "runner-temp"
+    advisory_dir = runner_temp / "shadow-events" / "advisory"
+    advisory_dir.mkdir(parents=True)
+    identity = {
+        "repository_id": "1258188460",
+        "head_sha": "h" * 40,
+        "run_id": "12345",
+        "run_attempt": "2",
+        "reviewer": "claude-glm-5-3",
+    }
+    if event is not None:
+        (advisory_dir / (
+            "shadow-review-v1-{repository_id}-{head_sha}-{reviewer}-{run_id}-{run_attempt}.json"
+            .format(**identity)
+        )).write_text(json.dumps(event), encoding="utf-8")
+    if delivery is not None:
+        (advisory_dir / "advisory-delivery-claude-glm-5-3.json").write_text(
+            json.dumps(delivery), encoding="utf-8"
+        )
+    summary = tmp_path / "summary.md"
+    expression_values = {
+        "${{ runner.temp }}": str(runner_temp),
+        "${{ github.repository_id }}": identity["repository_id"],
+        "${{ github.event.pull_request.head.sha }}": identity["head_sha"],
+        "${{ github.run_id }}": identity["run_id"],
+        "${{ github.run_attempt }}": identity["run_attempt"],
+        "${{ steps.checkout-advisory-scrub.outcome }}": scrub_outcome,
+        "${{ steps.post-advisory-comment.outcome }}": post_outcome,
+    }
+    run = step["run"]
+    for expression, value in expression_values.items():
+        run = run.replace(expression, value)
+    env = dict(os.environ)
+    env.update({
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "REVIEWER": identity["reviewer"],
+        "REVIEW_SHADOW_EVENT_DIR": str(runner_temp / "shadow-events"),
+        "REVIEW_REPOSITORY_ID": identity["repository_id"],
+        "REVIEW_HEAD_SHA": identity["head_sha"],
+        "REVIEW_RUN_ID": identity["run_id"],
+        "REVIEW_RUN_ATTEMPT": identity["run_attempt"],
+        "SCRUB_CHECKOUT_OUTCOME": scrub_outcome,
+        "COMMENT_STEP_OUTCOME": post_outcome,
+    })
+    proc = subprocess.run(["bash", "-c", run], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, check=False)
+    return proc, summary.read_text(encoding="utf-8") if summary.exists() else ""
+
+
+def _producer_event_fixture():
+    return json.loads(ADVISORY_EVENT_FIXTURE.read_text(encoding="utf-8"))
+
+
+def test_advisory_terminal_summary_survives_scrub_checkout_failure_and_keeps_typed_status(tmp_path):
+    event = _producer_event_fixture()
+    proc, summary = _run_advisory_terminal_summary(
+        tmp_path, event=event, scrub_outcome="failure", post_outcome="failure",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "Review artifact: `available`" in summary
+    assert "Review status: `auth_unavailable`" in summary
+    assert "Comment delivery: `unknown`" in summary
+    assert "Outbound scrub checkout: `failure`" in summary
+    assert "secret-token" not in summary
+
+
+def test_advisory_terminal_summary_distinguishes_missing_review_from_unknown_delivery(tmp_path):
+    proc, summary = _run_advisory_terminal_summary(
+        tmp_path, scrub_outcome="failure", post_outcome="failure",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "Review artifact: `unavailable`" in summary
+    assert "Review status: `unavailable`" in summary
+    assert "Comment delivery: `unknown`" in summary
+    assert "Review artifact reason: `missing`" in summary
+
+
+@pytest.mark.parametrize("delivery", ["created", "updated", "not_created"])
+def test_advisory_terminal_summary_uses_only_current_delivery_whitelist(tmp_path, delivery):
+    proc, summary = _run_advisory_terminal_summary(
+        tmp_path, event=_producer_event_fixture(),
+        delivery={
+            "schema_version": 1,
+            "kind": "gate_v2_ocr_advisory_delivery",
+            "reviewer": "claude-glm-5-3",
+            "delivery": delivery,
+            "operation": "POST",
+            "body": "secret-token must never be printed",
+        },
+        scrub_outcome="success", post_outcome="success",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert f"Comment delivery: `{delivery}`" in summary
+    assert "secret-token" not in summary
+
+
+def test_advisory_terminal_summary_rejects_stale_event_identity(tmp_path):
+    event = _producer_event_fixture()
+    event["head_sha"] = "x" * 40
+    proc, summary = _run_advisory_terminal_summary(
+        tmp_path, event=event, scrub_outcome="success", post_outcome="success",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "Review artifact: `unavailable`" in summary
+    assert "Review artifact reason: `invalid`" in summary
+
+
+def test_advisory_terminal_summary_rejects_invalid_delivery_diagnostic(tmp_path):
+    proc, summary = _run_advisory_terminal_summary(
+        tmp_path, event=_producer_event_fixture(),
+        delivery={"delivery": "sent", "body": "secret-token"},
+        scrub_outcome="failure", post_outcome="failure",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "Review artifact: `available`" in summary
+    assert "Comment delivery: `unknown`" in summary
+    assert "Delivery diagnostic: `invalid`" in summary
+    assert "secret-token" not in summary
+
+
+def test_advisory_terminal_summary_does_not_trust_delivery_when_scrub_checkout_failed(tmp_path):
+    proc, summary = _run_advisory_terminal_summary(
+        tmp_path, event=_producer_event_fixture(),
+        delivery={
+            "schema_version": 1,
+            "kind": "gate_v2_ocr_advisory_delivery",
+            "reviewer": "claude-glm-5-3",
+            "delivery": "created",
+        },
+        scrub_outcome="failure", post_outcome="success",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "Comment delivery: `unknown`" in summary
 
 
 def test_advisory_event_upload_declares_three_day_retention():

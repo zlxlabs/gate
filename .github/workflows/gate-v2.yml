@@ -1039,6 +1039,7 @@ jobs:
         run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" "$PR_NUMBER" "$REVIEWER"
 
       - name: Checkout outbound scrub at this workflow's own commit
+        id: checkout-advisory-scrub
         if: always() && matrix.reviewer != '__none__'
         env:
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
@@ -1053,6 +1054,7 @@ jobs:
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Post advisory PR comment
+        id: post-advisory-comment
         if: always() && matrix.reviewer != '__none__'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1236,6 +1238,89 @@ jobs:
             echo "::warning::OCR advisory sticky self-heal was partial: $self_heal_error"
           fi
           echo "OCR advisory sticky $operation succeeded for reviewer $REVIEWER"
+
+      - name: Record advisory terminal summary
+        id: advisory-terminal-summary
+        if: always() && matrix.reviewer != '__none__'
+        env:
+          REVIEWER: ${{ matrix.reviewer }}
+          REVIEW_SHADOW_EVENT_DIR: ${{ runner.temp }}/shadow-events
+          REVIEW_REPOSITORY_ID: ${{ github.repository_id }}
+          REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_RUN_ID: ${{ github.run_id }}
+          REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SCRUB_CHECKOUT_OUTCOME: ${{ steps.checkout-advisory-scrub.outcome }}
+          COMMENT_STEP_OUTCOME: ${{ steps.post-advisory-comment.outcome }}
+        run: |
+          set -u
+          advisory_dir="$REVIEW_SHADOW_EVENT_DIR/advisory"
+          event_path="$advisory_dir/shadow-review-v1-${REVIEW_REPOSITORY_ID}-${REVIEW_HEAD_SHA}-${REVIEWER}-${REVIEW_RUN_ID}-${REVIEW_RUN_ATTEMPT}.json"
+          review_artifact="unavailable"
+          review_status="unavailable"
+          review_reason="missing"
+          if [ -f "$event_path" ] && [ ! -L "$event_path" ]; then
+            event_status=""
+            event_status="$(jq -er \
+              --argjson repository_id "$REVIEW_REPOSITORY_ID" \
+              --arg head_sha "$REVIEW_HEAD_SHA" \
+              --argjson run_id "$REVIEW_RUN_ID" \
+              --argjson run_attempt "$REVIEW_RUN_ATTEMPT" \
+              --arg reviewer "$REVIEWER" \
+              'if .kind == "shadow_review" and .schema_version == 1
+                and .repository_id == $repository_id and .head_sha == $head_sha
+                and .run_id == $run_id and .run_attempt == $run_attempt
+                and .reviewer == $reviewer then .status else empty end' \
+              "$event_path" 2>/dev/null)" || event_status=""
+            case "$event_status" in
+              pass|fail|capacity_skipped|auth_unavailable|rate_limited|budget_exhausted|model_error|schema_invalid|artifact_missing|upload_error|timeout|cancelled|not_started_cancelled|skipped_by_policy|unexpected_skipped|job_failure_unknown|unsupported_conclusion|stale|policy_mismatch)
+                review_artifact="available"
+                review_status="$event_status"
+                review_reason="validated"
+                ;;
+              *) review_reason="invalid" ;;
+            esac
+          fi
+
+          scrub_checkout_outcome="unavailable"
+          case "${SCRUB_CHECKOUT_OUTCOME:-}" in
+            success|failure|cancelled|skipped) scrub_checkout_outcome="$SCRUB_CHECKOUT_OUTCOME" ;;
+          esac
+          comment_step_outcome="unavailable"
+          case "${COMMENT_STEP_OUTCOME:-}" in
+            success|failure|cancelled|skipped) comment_step_outcome="$COMMENT_STEP_OUTCOME" ;;
+          esac
+
+          delivery_path="$advisory_dir/advisory-delivery-${REVIEWER}.json"
+          delivery_diagnostic="missing"
+          comment_delivery="unknown"
+          if [ -f "$delivery_path" ] && [ ! -L "$delivery_path" ]; then
+            delivery_value=""
+            delivery_value="$(jq -er \
+              --arg reviewer "$REVIEWER" \
+              'if .schema_version == 1 and .kind == "gate_v2_ocr_advisory_delivery"
+                and .reviewer == $reviewer then .delivery else empty end' \
+              "$delivery_path" 2>/dev/null)" || delivery_value=""
+            case "$delivery_value" in
+              created|updated|not_created)
+                delivery_diagnostic="available"
+                if [ "$scrub_checkout_outcome" = "success" ] && [ "$comment_step_outcome" = "success" ]; then
+                  comment_delivery="$delivery_value"
+                fi
+                ;;
+              *) delivery_diagnostic="invalid" ;;
+            esac
+          fi
+
+          {
+            printf '%s\n\n' '### OCR advisory terminal summary'
+            printf '%s\n' "- Review artifact: \`$review_artifact\`" \
+              "- Review status: \`$review_status\`" \
+              "- Review artifact reason: \`$review_reason\`" \
+              "- Comment delivery: \`$comment_delivery\`" \
+              "- Delivery diagnostic: \`$delivery_diagnostic\`" \
+              "- Outbound scrub checkout: \`$scrub_checkout_outcome\`" \
+              "- Comment step: \`$comment_step_outcome\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout silo store at this workflow's own commit
         if: always() && matrix.reviewer != '__none__'
