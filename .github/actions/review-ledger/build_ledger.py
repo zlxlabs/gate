@@ -54,8 +54,9 @@ LEDGER_ENTRY_REQUIRED_FIELDS = (
     "primary_identity", "review", "finding_dispositions", "false_positive_count",
 )
 LEDGER_ENTRY_OPTIONAL_FIELDS = (
-    "disposition_receipt_consumption", "terminal_source_attempt",
+    "disposition_receipt_consumption", "terminal_source_attempt", "finding_relation",
 )
+_RELATION_VALUES = frozenset({"new", "repeat", "conflict"})
 LEDGER_ENTRY_FIELDS = LEDGER_ENTRY_REQUIRED_FIELDS + LEDGER_ENTRY_OPTIONAL_FIELDS
 
 
@@ -477,6 +478,32 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
     }
 
 
+def _validate_finding_relation(block: Any) -> dict[str, Any]:
+    if not isinstance(block, dict) or block.get("schema_version") != 1:
+        raise ValueError("GATE-FINDING-RELATION-UNKNOWN: block schema")
+    counts = block.get("counts")
+    if not isinstance(counts, dict) or set(counts) != set(_RELATION_VALUES):
+        raise ValueError("GATE-FINDING-RELATION-UNKNOWN: counts")
+    for name in _RELATION_VALUES:
+        if not _strict_int(counts.get(name)) or counts[name] < 0:
+            raise ValueError(f"GATE-FINDING-RELATION-UNKNOWN: count {name}")
+    items = block.get("items")
+    if not isinstance(items, list) or sum(counts[name] for name in _RELATION_VALUES) != len(items):
+        raise ValueError("GATE-FINDING-RELATION-UNKNOWN: counts do not match items")
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("GATE-FINDING-RELATION-UNKNOWN: item")
+        relation = item.get("relation_to_previous")
+        if relation not in _RELATION_VALUES:
+            raise ValueError(f"GATE-FINDING-RELATION-UNKNOWN: {relation!r}")
+        if relation != "new" and (not isinstance(item.get("previous_finding_id"), str) or not item["previous_finding_id"]):
+            raise ValueError(f"GATE-FINDING-RELATION-UNKNOWN: {relation} missing previous_finding_id")
+    terminal = block.get("review_terminal")
+    if terminal not in {"unchanged", "manual_required"} or (counts["conflict"] > 0) != (terminal == "manual_required"):
+        raise ValueError(f"GATE-FINDING-RELATION-UNKNOWN: review_terminal {terminal!r}")
+    return block
+
+
 def _disposition_receipt_consumption_from_terminal(
     envelope: dict[str, Any], *, repository: str, pr_number: int,
     run_id: int, run_attempt: int, head_sha: str,
@@ -562,6 +589,8 @@ def build_entry(
         source_attempt = terminal_envelope.get("run_attempt")
         if source_attempt != run_attempt:
             entry["terminal_source_attempt"] = source_attempt
+        if "finding_relation" in terminal_envelope:
+            entry["finding_relation"] = _validate_finding_relation(terminal_envelope["finding_relation"])
     return entry
 
 

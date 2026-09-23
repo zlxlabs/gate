@@ -3550,3 +3550,94 @@ def test_cli_evidence_reaches_the_verdict(tmp_path, monkeypatch):
     summary = summary_path.read_text()
     assert "quality_infra" in summary
     assert "review_unavailable" in summary
+
+
+def _relation_audit(**finding):
+    record = _valid_scoped_primary_record(verdict="pass")
+    record["result"] = {"verdict": "pass", "findings": [finding]}
+    return record
+
+
+def _write_relation_audit(tmp_path, finding):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_relation_audit(**finding)))
+    return audit_dir
+
+
+def test_same_finding_id_is_repeat_with_previous_pointer(tmp_path, capsys):
+    finding = {
+        "id": "same-id", "severity": "minor", "file": "a.py", "line": 3,
+        "category": "correctness", "issue": "kept", "acceptance": "kept",
+    }
+    audit_dir = _write_relation_audit(tmp_path, finding)
+    previous = tmp_path / "previous.json"
+    previous.write_text(json.dumps({"available": True, "detail": "", "findings": [finding]}))
+    summary = tmp_path / "summary.md"
+    rc = AGG.main(_cli_args(audit_dir, summary) + ["--previous-findings-path", str(previous)])
+    assert rc == 0
+    terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
+    item = terminal["finding_relation"]["items"][0]
+    assert item["relation_to_previous"] == "repeat"
+    assert item["previous_finding_id"] == "same-id"
+    assert terminal["finding_relation"]["counts"] == {"new": 0, "repeat": 1, "conflict": 0}
+    assert "GATE-FINDING-RELATION-DEGRADED" not in capsys.readouterr().out
+
+
+def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
+    current = {
+        "id": "round-b", "severity": "major", "file": "scripts/retro/log_acceptance.py", "line": 40,
+        "category": "correctness", "issue": "must not advance the lease",
+        "acceptance": "leave the lease at evidence",
+    }
+    previous_finding = {
+        "id": "round-a", "severity": "major", "file": "scripts/retro/log_acceptance.py", "line": 40,
+        "category": "correctness", "issue": "must advance the lease",
+        "acceptance": "advance the lease to closed",
+    }
+    audit_dir = _write_relation_audit(tmp_path, current)
+    previous = tmp_path / "previous.json"
+    previous.write_text(json.dumps({"available": True, "detail": "", "findings": [previous_finding]}))
+    summary = tmp_path / "summary.md"
+    receipt = tmp_path / "convergence-receipt.json"
+    rc = AGG.main(_cli_args(
+        audit_dir, summary, convergence_receipt_path=str(receipt),
+    ) + ["--previous-findings-path", str(previous)])
+    terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
+    relation = terminal["finding_relation"]
+    assert rc == 1
+    assert terminal["gate_result"] != "pass"
+    assert relation["review_terminal"] == "manual_required"
+    assert relation["counts"]["conflict"] == 1
+    assert relation["items"][0]["relation_to_previous"] == "conflict"
+    assert relation["items"][0]["previous_finding_id"] == "round-a"
+    assert json.loads(receipt.read_text())["decision"] != "converged"
+    body = AGG.render_status_panel([AGG._terminal_row(
+        terminal, repository="zlxlabs/gate", repository_id=123, pr_number=42,
+    )])
+    assert "manual_required" in body and "round-a" in body
+    same = dict(previous_finding, id="other", acceptance=current["acceptance"], issue=current["issue"])
+    assert AGG.relate_findings([current], [same])[0]["relation_to_previous"] == "new"
+
+
+def test_unknown_relation_value_is_rejected():
+    with pytest.raises(AGG.FindingRelationError, match="GATE-FINDING-RELATION-UNKNOWN"):
+        AGG.relate_findings([{"id": "a", "relation_to_previous": "maybe"}], [])
+
+
+def test_missing_previous_ledger_marks_new_and_job_succeeds(tmp_path, capsys):
+    finding = {
+        "id": "only-now", "severity": "minor", "file": "a.py", "line": 1,
+        "category": "testing", "issue": "nit", "acceptance": "none",
+    }
+    audit_dir = _write_relation_audit(tmp_path, finding)
+    summary = tmp_path / "summary.md"
+    rc = AGG.main(_cli_args(audit_dir, summary) + ["--previous-findings-path", str(tmp_path / "missing.json")])
+    out = capsys.readouterr().out
+    terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
+    item = terminal["finding_relation"]["items"][0]
+    assert rc == 0
+    assert terminal["gate_result"] == "pass"
+    assert item["relation_to_previous"] == "new"
+    assert "previous_finding_id" not in item
+    assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=previous-findings-file-missing" in out
