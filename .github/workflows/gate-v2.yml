@@ -691,9 +691,59 @@ jobs:
           fi
           echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
 
+      - name: Inject previous-round findings into primary review context
+        env:
+          DESIGN_DOC_INPUT: ${{ inputs.design_doc }}
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-silo-src
+          GATE_CHECKOUT_SPARSE: |
+            scripts/silo_store.py
+            scripts/silo_exec.sh
+            scripts/scrub_outbound.py
+            .github/actions/gate-aggregator/aggregate.py
+            .github/actions/gate-aggregator/convergence.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set +e
+          (
+            set -euo pipefail
+            python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+            [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+            python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
+            SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
+              echo "::error::Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+              exit 1
+            }
+            SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
+            if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
+              echo "::error::Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
+              exit 1
+            fi
+            if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
+            elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
+            else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
+            fi
+            python3 _gate-silo-src/.github/actions/gate-aggregator/aggregate.py --render-previous-context \
+              --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+              --design-doc "$DESIGN_DOC_INPUT" --output .gate-review-context.md \
+              --previous-json "${RUNNER_TEMP}/previous-findings.json"
+          )
+          inject_status=$?
+          set -euo pipefail
+          echo "DESIGN_DOC=${DESIGN_DOC_INPUT}" >> "$GITHUB_ENV"
+          if [ "$inject_status" -ne 0 ]; then
+            echo "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=inject-step-failed"
+          elif [ -s .gate-review-context.md ]; then
+            echo "DESIGN_DOC=.gate-review-context.md" >> "$GITHUB_ENV"
+          fi
+
       - name: Run review-primary
         env:
-          DESIGN_DOC: ${{ inputs.design_doc }}
           GATE_TIER: ${{ inputs.tier }}
           MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
           MAX_REVIEW_SHARDS: ${{ inputs.max_review_shards }}
@@ -738,6 +788,23 @@ jobs:
         # `git -C GATE_HUB_DIR` artifact disappear on its own, since python3 correctly
         # treats that text as an inert string literal instead of shell source.
         run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
+
+      - name: Annotate primary findings with cross-round relation
+        if: always()
+        run: |
+          set -euo pipefail
+          audit="${{ runner.temp }}/primary-review-audit.json"
+          if [ ! -f "$audit" ]; then
+            exit 0
+          fi
+          agg="_gate-silo-src/.github/actions/gate-aggregator/aggregate.py"
+          if [ ! -f "$agg" ]; then
+            echo "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=aggregator-source-missing"
+            exit 0
+          fi
+          python3 "$agg" --annotate-primary-audit \
+            --audit-path "$audit" \
+            --previous-findings-path "${RUNNER_TEMP}/previous-findings.json"
 
       - name: Write primary review diagnostics manifest
         # Best-effort finalizer for failed/cancelled review-primary; it records

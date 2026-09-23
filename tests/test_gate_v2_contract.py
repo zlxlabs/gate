@@ -636,7 +636,7 @@ def test_workflow_sha_checkouts_use_centralized_bounded_retry():
                 assert_workflow_sha_checkout(step)
             if uses.startswith("actions/checkout"):
                 assert (step.get("with") or {}).get("ref") != "${{ job.workflow_sha }}"
-    assert len(sites) == 9
+    assert len(sites) == 10
     producer = next(
         step for step in disposition["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
@@ -2950,3 +2950,17 @@ def test_real_preflight_payload_reaches_workflow_and_aggregator_cli(
     assert expected_text in summary
     if mode == "unavailable":
         assert "split the PR" not in summary
+
+
+def test_primary_injects_previous_findings_and_names_the_degrade_line():
+    # GATE-FINDING-RELATION-DEGRADED: file:tests/test_gate_v2_contract.py:1
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["primary"]["steps"]
+    names = [step.get("name") for step in steps]
+    inject = names.index("Inject previous-round findings into primary review context")
+    review = names.index("Run review-primary")
+    annotate = names.index("Annotate primary findings with cross-round relation")
+    assert inject < review < annotate
+    assert "GATE-FINDING-RELATION-DEGRADED" in WORKFLOW.read_text(encoding="utf-8")
+    run_step = steps[review]
+    assert "DESIGN_DOC" not in run_step.get("env", {})

@@ -1357,3 +1357,35 @@ def test_unsupported_terminal_schema_is_fail_loud(tmp_path):
     path = _write_terminal(tmp_path, {"schema_version": 2, "kind": "gate_terminal"})
     with pytest.raises(ValueError, match="unsupported schema"):
         module.load_gate_terminal_envelope(path)
+
+
+def _relation_block(relation, previous_id=None):
+    item = {"id": "f1", "relation_to_previous": relation, "file": "a.py", "line": 1}
+    if previous_id:
+        item["previous_finding_id"] = previous_id
+    counts = {"new": 0, "repeat": 0, "conflict": 0}
+    counts[relation] = 1
+    return {
+        "schema_version": 1,
+        "counts": counts,
+        "review_terminal": "manual_required" if relation == "conflict" else "unchanged",
+        "items": [item],
+    }
+
+
+def test_ledger_copies_finding_relation_counts():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    terminal["finding_relation"] = _relation_block("repeat", "f1")
+    entry = _build_from_terminal(module, terminal)
+    assert entry["finding_relation"]["counts"] == {"new": 0, "repeat": 1, "conflict": 0}
+
+
+def test_ledger_rejects_unknown_finding_relation():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    block = _relation_block("new")
+    block["items"][0]["relation_to_previous"] = "maybe"
+    terminal["finding_relation"] = block
+    with pytest.raises(ValueError, match="GATE-FINDING-RELATION-UNKNOWN"):
+        _build_from_terminal(module, terminal)
