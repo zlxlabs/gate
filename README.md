@@ -232,13 +232,27 @@ GitHub 在点击 Re-run 时会删除同一 run 的旧 artifact，因此每个 PR
 `github-actions[bot]` 维护的精简 sticky state comment（含 Reviewer / failover 提示），
 作为跨 rerun 游标；完整数据仍只在 artifact。
 
-确认误报或人工处置时，在 PR 评论中使用一行机器可读记录：
+### 确认误报或人工处置
+
+PR 评论中的以下行只是观察记录：评论本身不会触发任何工作流，也不会直接处置 finding。
 
 ```text
 Codex finding disposition: correctness.example-id = false-positive — 说明证据
 ```
 
 处置值支持 `false-positive`、`accepted`、`fixed`、`wont-fix`；作者、理由和评论链接会进入后续账本。
+若要真正提交 disposition receipt，必须显式调用 `.github/workflows/gate-v2-disposition.yml`：
+使用 `workflow_dispatch` 手工派发，或由 `workflow_call` 调用，并提供五个必填字段
+`pr_number`、`primary_run_id`、`primary_run_attempt`、`finding_id`、`reason`。仅贴评论，或贴评论后
+重跑其他工作流，都不会触发这个 disposition workflow。
+
+即使 receipt 通过 identity、epoch、digest 的全部校验，disposition 也只是审计记录：不会移除
+对应 finding，不会改变本轮或未来任何一轮的 P1 集合，不会增加 clean streak，也不会让终态变绿。
+这是 gate-hub#810 锁定的 record-only 语义，详见 `docs/design/clean-streak-convergence.md` 增量 2。
+
+让误报真正收敛，必须让下一轮 primary 观察到代码事实已经改变：修复代码，或把“无其他调用方”等
+事实落成仓内可执行的守卫测试（实测案例见 zlxlabs/gate-hub#1044）。确实走投无路时，才使用
+现有的人工 admin bypass 合并；disposition 不是放行通道。
 
 ## 公开仓安全模型（四层）
 
