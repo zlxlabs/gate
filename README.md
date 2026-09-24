@@ -251,7 +251,7 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
 这是 gate-hub#810 锁定的 record-only 语义，详见 `docs/design/clean-streak-convergence.md` 增量 2。
 
 让误报真正收敛，必须让下一轮 primary 观察到代码事实已经改变：修复代码，或把“无其他调用方”等
-事实落成仓内可执行的守卫测试（参考 gate-hub#1035／#3008 已验证的模式）。确实走投无路时，才使用
+事实落成仓内可执行的守卫测试（实测案例见 zlxlabs/gate-hub#1044）。确实走投无路时，才使用
 现有的人工 admin bypass 合并；disposition 不是放行通道。
 
 ## 公开仓安全模型（四层）
