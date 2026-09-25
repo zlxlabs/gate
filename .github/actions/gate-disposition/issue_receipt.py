@@ -220,14 +220,18 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
     )
     matching = _matching_finding(_audit_findings(audit), finding_id)
     stable_key = _CONVERGENCE.canonical_finding_key(matching)
-    p1_matches = [
-        finding for finding in _audit_findings(audit)
-        if finding.get("severity") in P1_SEVERITIES
-        and _CONVERGENCE.canonical_finding_key(finding) == stable_key
-    ]
+    p1_matches = _CONVERGENCE.narrow_stable_key_matches_by_id(
+        [
+            (finding.get("id"), finding) for finding in _audit_findings(audit)
+            if finding.get("severity") in P1_SEVERITIES
+            and _CONVERGENCE.canonical_finding_key(finding) == stable_key
+        ],
+        finding_id,
+    )
     if len(p1_matches) > 1:
         raise ValueError(
-            f"finding key {stable_key!r} matches {len(p1_matches)} P1 findings, "
+            f"finding key {stable_key!r} matches {len(p1_matches)} P1 findings and "
+            f"finding_id {finding_id!r} does not single out one of them, "
             "cannot determine the disposition target"
         )
     if matching.get("severity") not in P1_SEVERITIES:

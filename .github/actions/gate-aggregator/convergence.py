@@ -556,6 +556,28 @@ def _stable_primary_matches(
     return matches
 
 
+def narrow_stable_key_matches_by_id(
+    matches: list[tuple[str, Any]],
+    finding_id: str,
+) -> list[tuple[str, Any]]:
+    """Narrow same-key P1 matches with the receipt's exact finding id (gate#240).
+
+    The stable finding key stays the disposition binding target.  Only when
+    the key matches several current P1s does the caller's exact finding_id
+    take part: hitting exactly one of them disambiguates the target, and any
+    other outcome keeps the full match set so callers fail closed with
+    finding_key_ambiguous.  A single match is returned untouched so a receipt
+    stays consumable when reruns drift the finding id.
+    """
+
+    if len(matches) <= 1:
+        return matches
+    id_matches = [match for match in matches if match[0] == finding_id]
+    if len(id_matches) == 1:
+        return id_matches
+    return matches
+
+
 def _actionable_disposition_reason(
     code: str,
     receipt: DispositionReceipt,
@@ -627,8 +649,9 @@ def _ambiguous_finding_key_status(
         reason="finding_key_ambiguous",
         message=(
             f"finding_key_ambiguous: finding key {finding_key!r} matches "
-            f"{len(matches)} current P1 findings, so the disposition target cannot be "
-            f"determined; current head_sha {scope.head_sha!r}. Register only after the "
+            f"{len(matches)} current P1 findings and the receipt finding_id does not "
+            f"resolve the collision, so the disposition target cannot be determined; "
+            f"current head_sha {scope.head_sha!r}. Register only after the "
             f"duplicate key is resolved. Current P1 keys: "
             f"{json.dumps(list(_current_p1_keys(primary)), ensure_ascii=False, separators=(",", ":"))}"
         ),
@@ -738,7 +761,9 @@ def validate_disposition_receipt(
         )
 
     if receipt.finding_key:
-        matches = _stable_primary_matches(receipt.finding_key, primary)
+        matches = narrow_stable_key_matches_by_id(
+            _stable_primary_matches(receipt.finding_key, primary), receipt.finding_id,
+        )
         ambiguous = _ambiguous_finding_key_status(
             receipt, finding_key=receipt.finding_key, matches=matches,
             scope=scope, primary=primary,
@@ -883,7 +908,9 @@ def record_dispositions(
         if status.active and status.valid:
             target_id = receipt.finding_id
             if receipt.finding_key:
-                stable_matches = _stable_primary_matches(receipt.finding_key, primary)
+                stable_matches = narrow_stable_key_matches_by_id(
+                    _stable_primary_matches(receipt.finding_key, primary), receipt.finding_id,
+                )
                 if len(stable_matches) == 1:
                     target_id = stable_matches[0][0]
             recorded.append(receipt)
@@ -903,14 +930,20 @@ def record_dispositions(
 
 
 def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
-    """Reconstruct the producer artifact name bound to one receipt payload."""
+    """Reconstruct the producer artifact name bound to one receipt payload.
+
+    The target component hashes finding_key AND finding_id: same-key
+    receipts for distinct same-key P1s must not share an artifact name, or
+    the dual-read merge (keyed by name) would drop one of them.
+    """
 
     digest_prefix = receipt.audit_digest[:12]
-    target_component = (
-        hashlib.sha256(receipt.finding_key.encode("utf-8")).hexdigest()[:12]
-        if receipt.finding_key
-        else receipt.finding_id
-    )
+    if receipt.finding_key:
+        target_component = hashlib.sha256(
+            _canonical_json([receipt.finding_key, receipt.finding_id])
+        ).hexdigest()[:12]
+    else:
+        target_component = receipt.finding_id
     return (
         f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}-"
         f"{receipt.epoch}-{digest_prefix}-{target_component}"

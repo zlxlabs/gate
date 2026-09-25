@@ -243,3 +243,63 @@ def test_same_key_audit_still_rejects_unknown_finding_id(tmp_path):
     assert result.returncode != 0
     assert "finding_id must identify exactly one canonical audit finding" in result.stderr
     assert not output_dir.exists()
+
+
+def _convergence_module():
+    path = ROOT / ".github" / "actions" / "gate-aggregator" / "convergence.py"
+    spec = importlib.util.spec_from_file_location("gate_convergence_issue_receipt_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_producer_receipt_bytes_consume_against_same_key_primary(tmp_path):
+    convergence = _convergence_module()
+    receipts = []
+    for finding_id in SAME_KEY_IDS:
+        result, output_dir = _issue_same_key(tmp_path / finding_id, finding_id=finding_id)
+        assert result.returncode == 0, result.stderr
+        artifact = json.loads(result.stdout)["artifact"]
+        receipts.append(
+            convergence.parse_disposition_receipt(json.loads((output_dir / artifact).read_bytes()))
+        )
+
+    scope = convergence.Scope(**SCOPE)
+    primary = convergence.CanonicalPrimary(
+        schema_version=1,
+        repository_id=SCOPE["repository_id"],
+        pr_number=SCOPE["pr_number"],
+        head_sha=SCOPE["head_sha"],
+        run_id=7,
+        run_attempt=1,
+        verdict="fail",
+        p1_ids=SAME_KEY_IDS,
+        p1_findings=tuple(
+            (finding_id, SAME_KEY_FINDING["severity"], SAME_KEY_FINDING["trigger_kind"],
+             SAME_KEY_FINDING["file"], SAME_KEY_FINDING["line"], SAME_KEY_FINDING["category"])
+            for finding_id in SAME_KEY_IDS
+        ),
+    )
+    audit_digest = convergence.canonical_audit_digest(_same_key_audit())
+
+    statuses = tuple(
+        convergence.validate_disposition_receipt(
+            receipt, scope=scope, primary=primary, audit_digest=audit_digest,
+        )
+        for receipt in receipts
+    )
+    assert [(status.valid, status.active) for status in statuses] == [(True, True), (True, True)]
+    assert [status.reason_code for status in statuses] == ["active_deferred", "active_deferred"]
+
+    full = convergence.record_dispositions(
+        primary.p1_ids, tuple(receipts), scope=scope, primary=primary, audit_digest=audit_digest,
+    )
+    assert full.recorded_finding_ids == SAME_KEY_IDS
+    assert full.remaining_p1_ids == ()
+
+    partial = convergence.record_dispositions(
+        primary.p1_ids, (receipts[0],), scope=scope, primary=primary, audit_digest=audit_digest,
+    )
+    assert partial.recorded_finding_ids == (SAME_KEY_IDS[0],)
+    assert partial.remaining_p1_ids == (SAME_KEY_IDS[1],)
