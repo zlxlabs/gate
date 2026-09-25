@@ -105,6 +105,7 @@ jobs:
         run: python3 -m pytest -q tests/test_gate_caller_contract_guard.py
 
       - name: Move v2 to selected canary-verified main commit
+        id: move
         if: steps.monotonicity.outputs.move == 'true'
         env:
           TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
@@ -130,6 +131,41 @@ jobs:
               0 if verify_remote_tag(sys.argv[1], int(sys.argv[2]), sys.argv[3]) else 1
           )
           PY
+
+      - name: Report v2 tag sync state
+        if: always()
+        env:
+          ENABLED: ${{ vars.V2_TAG_SYNC_ENABLED }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          ADVANCE: ${{ steps.guard.outputs.advance }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
+          MONOTONICITY_OUTCOME: ${{ steps.monotonicity.outcome }}
+          MOVE: ${{ steps.monotonicity.outputs.move }}
+          MOVE_OUTCOME: ${{ steps.move.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GUARD_OUTCOME}" != "success" ]]; then
+            state="query_failed"
+          elif [[ "${ADVANCE}" != "true" ]]; then
+            if [[ "${ENABLED}" != "true" ]]; then state="disabled"; else state="held"; fi
+          elif [[ "${EVIDENCE_OUTCOME}" != "success" ]]; then
+            state="query_failed"
+          elif [[ -z "${TARGET_SHA}" ]]; then
+            state="no_eligible_candidate"
+          elif [[ "${MONOTONICITY_OUTCOME}" != "success" ]]; then
+            state="query_failed"
+          elif [[ "${MOVE}" == "false" ]]; then
+            state="already_current"
+          elif [[ "${MOVE_OUTCOME}" == "success" ]]; then
+            state="promoted"
+          else
+            state="query_failed"
+          fi
+          state_line="V2-TAG-SYNC-STATE: ${state}"
+          echo "${state_line}"
+          echo "${state_line}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Report v2 lag quadruplet
         id: lag

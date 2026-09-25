@@ -208,6 +208,11 @@ def test_real_git_fixture_reports_overdue_consumer_path_content_lag(tmp_path):
 
 
 def test_real_git_fixture_ignores_overdue_docs_only_history(tmp_path):
+    assert {
+        ".github/workflows",
+        ".github/actions",
+        "scripts",
+    }.issubset(v2_release_state.CONTENT_PATHS)
     remote, checkout, env = _release_fixture(tmp_path)
     for index in range(2):
         (checkout / "docs/notes.md").write_text(f"docs update {index}\n")
