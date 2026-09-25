@@ -4069,6 +4069,41 @@ def test_render_previous_context_drops_invalid_dispositions_and_reports_count(tm
     assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=2" in out
 
 
+def test_render_previous_context_writes_only_previous_findings_json(tmp_path, monkeypatch):
+    _, _, objects = _previous_round_fixture_objects()
+    before = {path.name for path in tmp_path.iterdir()}
+    rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, objects)
+    assert rc == 0
+    assert set(payload) == {"available", "detail", "findings", "dispositions"}
+    assert {path.name for path in tmp_path.iterdir()} - before == {"previous-findings.json"}
+
+
+def test_render_previous_context_rejects_output_flag(tmp_path, monkeypatch):
+    ledger, _, objects = _previous_round_fixture_objects()
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(
+        AGG, "_silo_objects_under",
+        lambda prefix: [(key, raw) for key, raw in objects if key.startswith(prefix)],
+    )
+    target = tmp_path / "x"
+    with pytest.raises(SystemExit):
+        AGG.main([
+            "--render-previous-context",
+            "--repository-id", str(ledger["primary_identity"]["repository_id"]),
+            "--pr-number", str(ledger["pr_number"]),
+            "--run-id", "35989919390",
+            "--run-attempt", "1",
+            "--output", str(target),
+            "--previous-json", str(tmp_path / "previous-findings.json"),
+        ])
+    assert not target.exists()
+
+
+def test_previous_findings_context_renderer_removed():
+    assert not hasattr(AGG, "render_previous_findings_context")
+    assert not hasattr(AGG, "PREVIOUS_CONTEXT_MAX_CHARS")
+
+
 def test_render_previous_context_limits_dispositions_and_projects_deferred(tmp_path, monkeypatch, capsys):
     from datetime import datetime, timedelta, timezone
 

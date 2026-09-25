@@ -3205,3 +3205,21 @@ def test_primary_injects_previous_findings_and_names_the_degrade_line():
     run_step = steps[review]
     assert "DESIGN_DOC" not in run_step.get("env", {})
     assert "REVIEW_PREVIOUS_ROUND_PATH" not in run_step.get("env", {})
+
+
+def test_primary_does_not_splice_previous_findings_into_design_doc():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["primary"]["steps"]
+    names = [step.get("name") for step in steps]
+    inject = names.index("Inject previous-round findings into primary review context")
+    inject_step = steps[inject]
+    assert inject_step["env"]["DESIGN_DOC_INPUT"] == "${{ inputs.design_doc }}"
+    inject_run = inject_step.get("run", "")
+    assert ".gate-review-context.md" not in inject_run
+    assert "--design-doc" not in inject_run
+    assert "DESIGN_DOC=.gate-review-context.md" not in inject_run
+    lines = inject_run.splitlines()
+    export = 'echo "DESIGN_DOC=${DESIGN_DOC_INPUT}" >> "$GITHUB_ENV"'
+    assert lines.count(export) == 1
+    assert sum(1 for line in lines if "DESIGN_DOC=" in line) == 1
+    assert lines.index("inject_status=$?") < lines.index(export) < lines.index('if [ "$inject_status" -ne 0 ]; then')
