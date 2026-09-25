@@ -11,3 +11,10 @@
 - 本段结论：`previous-findings.json` 现在固定包含四个顶层键；成功时写入有效 false-positive/deferred 投影，最多 30 条，反证文本有界，失败时 dispositions 为空。聚合器测试通过：323 passed。
 - 关键决策与已否决方案：复用 Silo 专用回执读取函数和既有反证判据；没有触碰判决、relation 或 audit 注解路径。
 - 下一步唯一动作：在注入 step 成功且 JSON 非空时导出路径，并补 workflow 契约测试与设计文档。
+
+## Workflow 导出与消费契约
+
+- 当前阶段：implementing
+- 本段结论：注入成功分支现在仅在 `${RUNNER_TEMP}/previous-findings.json` 非空时导出 `REVIEW_PREVIOUS_ROUND_PATH`；`Run review-primary` 不新增显式 env。workflow 契约测试通过：189 passed；pin 检查通过。
+- 关键决策与已否决方案：卡面写 `/previous-findings.json`，但现有 CLI 实际写 `${RUNNER_TEMP}/previous-findings.json`；导出实际产物的绝对路径，避免 env 指向不存在的文件。保留 `DESIGN_DOC` 拼接与 primary audit 注解行为。
+- 下一步唯一动作：完成红验与全量验收，写报告并推送分支。

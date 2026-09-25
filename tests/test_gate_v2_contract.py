@@ -3073,5 +3073,19 @@ def test_primary_injects_previous_findings_and_names_the_degrade_line():
     annotate = names.index("Annotate primary findings with cross-round relation")
     assert inject < review < annotate
     assert "GATE-FINDING-RELATION-DEGRADED" in WORKFLOW.read_text(encoding="utf-8")
+    inject_run = steps[inject].get("run", "")
+    lines = inject_run.splitlines()
+    status_assignment = lines.index("inject_status=$?")
+    failure_branch = lines.index('if [ "$inject_status" -ne 0 ]; then')
+    outer_else = lines.index("else", failure_branch)
+    outer_fi = lines.index("fi", outer_else)
+    output_nonempty = lines.index('  if [ -s "${RUNNER_TEMP}/previous-findings.json" ]; then', outer_else)
+    export_line = lines.index('    echo "REVIEW_PREVIOUS_ROUND_PATH=${RUNNER_TEMP}/previous-findings.json" >> "$GITHUB_ENV"')
+    assert status_assignment < failure_branch < outer_else < output_nonempty < export_line < outer_fi
+    assert any(
+        '-s "${RUNNER_TEMP}/previous-findings.json"' in line
+        for line in lines[outer_else:outer_fi]
+    )
     run_step = steps[review]
     assert "DESIGN_DOC" not in run_step.get("env", {})
+    assert "REVIEW_PREVIOUS_ROUND_PATH" not in run_step.get("env", {})
