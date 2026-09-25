@@ -1771,6 +1771,7 @@ jobs:
           GATE_CHECKOUT_PATH: _gate-aggregator-src
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
+          echo "::notice::step-start: Checkout ledger action at this workflow's own commit"
           set -euo pipefail
           python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
           [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
@@ -1779,6 +1780,7 @@ jobs:
       - name: Resolve Silo hostname via MagicDNS
         if: always()
         run: |
+          echo "::notice::step-start: Resolve Silo hostname via MagicDNS"
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
             echo "::error::Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
@@ -1812,6 +1814,7 @@ jobs:
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
         run: |
+          echo "::notice::step-start: Resolve v2 ledger artifacts"
           set -euo pipefail
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           silo_resolve() {
@@ -1938,14 +1941,17 @@ jobs:
               if jobs_listing_path:
                   return json.loads(Path(jobs_listing_path).read_text(encoding="utf-8"))
               repo, run_id = attribution_repo()
-              proc = subprocess.run(
-                  [
-                      "gh", "api",
-                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}/jobs",
-                      "--paginate", "--slurp",
-                  ],
-                  check=False, capture_output=True, text=True,
-              )
+              try:
+                  proc = subprocess.run(
+                      [
+                          "gh", "api",
+                          f"repos/{repo}/actions/runs/{run_id}/attempts/{current}/jobs",
+                          "--paginate", "--slurp",
+                      ],
+                      check=False, capture_output=True, text=True, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  raise SystemExit("Resolve v2 ledger artifacts 超时：current-attempt jobs API 调用超过 30 秒")
               if proc.returncode != 0:
                   raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
               return json.loads(proc.stdout)
@@ -1954,13 +1960,16 @@ jobs:
               if attempt_listing_path:
                   return json.loads(Path(attempt_listing_path).read_text(encoding="utf-8"))
               repo, run_id = attribution_repo()
-              proc = subprocess.run(
-                  [
-                      "gh", "api",
-                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}",
-                  ],
-                  check=False, capture_output=True, text=True,
-              )
+              try:
+                  proc = subprocess.run(
+                      [
+                          "gh", "api",
+                          f"repos/{repo}/actions/runs/{run_id}/attempts/{current}",
+                      ],
+                      check=False, capture_output=True, text=True, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  raise SystemExit("Resolve v2 ledger artifacts 超时：current-attempt metadata API 调用超过 30 秒")
               if proc.returncode != 0:
                   raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
               return json.loads(proc.stdout)
@@ -2035,6 +2044,7 @@ jobs:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}
           DEST: ${{ runner.temp }}/review-ledger-input
         run: |
+          echo "::notice::step-start: Download v2 review ledger inputs"
           set -euo pipefail
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           "$SILO_EXEC" get \
@@ -2047,6 +2057,7 @@ jobs:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
           DEST: ${{ runner.temp }}/primary-audit
         run: |
+          echo "::notice::step-start: Download canonical primary audit for ledger"
           set -euo pipefail
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           "$SILO_EXEC" get \
@@ -2059,11 +2070,15 @@ jobs:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
           DEST: ${{ runner.temp }}/gate-terminal
         run: |
+          echo "::notice::step-start: Download gate terminal envelope for ledger"
           set -euo pipefail
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           "$SILO_EXEC" get \
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
+
+      - name: Mark Build v2 review effectiveness ledger start
+        run: 'echo "::notice::step-start: Build v2 review effectiveness ledger"'
 
       - name: Build v2 review effectiveness ledger
         timeout-minutes: 1
@@ -2086,6 +2101,7 @@ jobs:
           ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
         run: |
+          echo "::notice::step-start: Upload v2 review effectiveness ledger"
           set -euo pipefail
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           "$SILO_EXEC" put \

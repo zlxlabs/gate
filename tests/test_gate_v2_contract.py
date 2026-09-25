@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1578,6 +1579,33 @@ def test_ledger_build_step_has_one_minute_timeout():
     assert build["timeout-minutes"] == 1
 
 
+def test_ledger_steps_emit_start_progress_markers():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["ledger"]["steps"]
+    names = (
+        "Checkout ledger action at this workflow's own commit",
+        "Resolve Silo hostname via MagicDNS",
+        "Resolve v2 ledger artifacts",
+        "Download v2 review ledger inputs",
+        "Download canonical primary audit for ledger",
+        "Download gate terminal envelope for ledger",
+        "Build v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger",
+    )
+
+    assert len([step for step in steps if step.get("name") in names]) == len(names)
+    for name in names:
+        index = next(i for i, step in enumerate(steps) if step.get("name") == name)
+        step = steps[index]
+        marker = f'echo "::notice::step-start: {name}"'
+        if "uses" in step:
+            progress = steps[index - 1]
+            assert progress["name"] == f"Mark {name} start"
+            assert progress["run"] == marker
+        else:
+            assert step["run"].splitlines()[0] == marker
+
+
 def test_review_ledger_input_uploads_declare_one_day_retention():
     raw, _ = _load_workflow()
     quality_steps = raw["jobs"]["quality"]["steps"]
@@ -1691,7 +1719,7 @@ def _resolve_env_from_artifacts(artifacts, current: int) -> dict[str, str]:
 def _run_ledger_resolver(
     tmp_path, *, artifacts, current, review_expected="false",
     jobs=None, jobs_path=None, attempt=None, attempt_path=None,
-    extra_env=None,
+    extra_env=None, process_timeout=None,
 ):
     output = tmp_path / "github_output"
     output.write_text("", encoding="utf-8")
@@ -1731,15 +1759,42 @@ def _run_ledger_resolver(
     env.update(_resolve_env_from_artifacts(artifacts, current))
     if extra_env:
         env.update(extra_env)
-    result = subprocess.run(
-        argv,
-        input=_ledger_resolver_python(),
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            argv,
+            input=_ledger_resolver_python(),
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=process_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        result = subprocess.CompletedProcess(argv, 124, "", "resolver exceeded test harness timeout")
     return result, output.read_text(encoding="utf-8")
+
+
+def _write_ledger_gh_stub(tmp_path, *, target, mode):
+    executable = tmp_path / "gh-bin" / "gh"
+    executable.parent.mkdir()
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        f"target = {target!r}\n"
+        f"mode = {mode!r}\n"
+        "path = next(arg for arg in sys.argv if '/attempts/' in arg)\n"
+        "endpoint = 'jobs' if path.endswith('/jobs') else 'meta'\n"
+        "if endpoint == 'jobs' and target == 'meta':\n"
+        "    print('[{\\\"jobs\\\": []}]')\n"
+        "    raise SystemExit(0)\n"
+        "if endpoint == target and mode == 'hang':\n"
+        "    time.sleep(60)\n"
+        "if endpoint == target and mode == 'fail':\n"
+        "    raise SystemExit(23)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
 
 
 ISSUE_101_RUN_STARTED_AT = "2026-09-01T02:57:51Z"
@@ -1766,6 +1821,67 @@ def _issue_101_attempt2_jobs():
             {"name": "gate / notify", "id": 99721378564, "run_attempt": 2, "started_at": "2026-09-01T02:57:54Z", "conclusion": "skipped"},
         ]
     }
+
+
+@pytest.mark.parametrize(
+    ("target", "timeout_message"),
+    [
+        ("jobs", "Resolve v2 ledger artifacts 超时：current-attempt jobs API 调用超过 30 秒"),
+        ("meta", "Resolve v2 ledger artifacts 超时：current-attempt metadata API 调用超过 30 秒"),
+    ],
+)
+def test_ledger_resolver_times_out_for_each_current_attempt_api_call(
+    tmp_path, target, timeout_message,
+):
+    gh = _write_ledger_gh_stub(tmp_path, target=target, mode="hang")
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 101},
+    ]
+    started = time.perf_counter()
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=artifacts,
+        current=2,
+        extra_env={
+            "PATH": f"{gh.parent}:{os.environ['PATH']}",
+            "REPOSITORY": "owner/repo",
+            "RUN_ID": "123",
+        },
+        process_timeout=45,
+    )
+    elapsed = time.perf_counter() - started
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert timeout_message in combined
+    assert "Jobs API call failed while attributing a missing current-attempt terminal" not in combined
+    assert 20 <= elapsed < 40, f"dedicated 30-second timeout took {elapsed:.1f}s"
+
+
+@pytest.mark.parametrize("target", ["jobs", "meta"])
+def test_ledger_resolver_keeps_nonzero_api_failure_distinct_from_timeout(tmp_path, target):
+    gh = _write_ledger_gh_stub(tmp_path, target=target, mode="fail")
+    artifacts = [
+        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 101},
+    ]
+    result, _output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=artifacts,
+        current=2,
+        extra_env={
+            "PATH": f"{gh.parent}:{os.environ['PATH']}",
+            "REPOSITORY": "owner/repo",
+            "RUN_ID": "123",
+        },
+        process_timeout=45,
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Jobs API call failed while attributing a missing current-attempt terminal" in combined
+    assert "超时" not in combined
 
 
 def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(tmp_path):
