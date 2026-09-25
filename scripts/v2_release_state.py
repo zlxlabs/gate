@@ -17,6 +17,9 @@ DEFAULT_THRESHOLD_HOURS = 6
 TAG_REF = "refs/tags/v2"
 MAIN_REF = "refs/heads/main"
 QUERY_FAILED = "V2-RELEASE-STATE-QUERY-FAILED"
+CONTENT_LAG = "V2-RELEASE-STATE-CONTENT-LAG"
+CONTENT_CURRENT = "V2-RELEASE-STATE-CONTENT-CURRENT"
+CONTENT_PATHS = (".github/workflows", ".github/actions", "scripts")
 
 
 def _run_git(arguments: list[str]) -> tuple[str | None, int]:
@@ -103,6 +106,25 @@ def main(argv: list[str] | None = None) -> int:
     main_sha = _main_sha(main_output)
     if v2_sha is None or main_sha is None:
         return _query_failed(0)
+    if v2_sha == main_sha:
+        return 0
+
+    v2_trees, v2_tree_status = _run_git(
+        ["ls-tree", "--full-tree", v2_sha, "--", *CONTENT_PATHS]
+    )
+    if v2_trees is None:
+        return _query_failed(v2_tree_status)
+    main_trees, main_tree_status = _run_git(
+        ["ls-tree", "--full-tree", main_sha, "--", *CONTENT_PATHS]
+    )
+    if main_trees is None:
+        return _query_failed(main_tree_status)
+    if v2_trees == main_trees:
+        print(
+            f"{CONTENT_CURRENT}: v2_sha={v2_sha} main_sha={main_sha} "
+            f"paths={','.join(CONTENT_PATHS)}"
+        )
+        return 0
 
     oldest_unreleased_sha, rev_list_status = _oldest_unreleased_sha(v2_sha, main_sha)
     if oldest_unreleased_sha is None:
@@ -116,8 +138,9 @@ def main(argv: list[str] | None = None) -> int:
     lag_seconds = max(0, int(time.time()) - commit_timestamp)
     if lag_seconds > args.threshold_hours * 3600:
         print(
-            f"v2 behind main: v2_sha={v2_sha} main_sha={main_sha} "
+            f"{CONTENT_LAG}: v2_sha={v2_sha} main_sha={main_sha} "
             f"main_lead_hours={lag_seconds / 3600:.2f} "
+            f"paths={','.join(CONTENT_PATHS)} "
             "(oldest unreleased commit age; not v2 commit age)"
         )
         return 1

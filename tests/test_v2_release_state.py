@@ -24,6 +24,8 @@ def _runner(
     range_output: str = "",
     rev_list_status: int = 0,
     timestamps=None,
+    tree_status: int = 0,
+    content_diff: bool = True,
 ):
     def run(command, **_kwargs):
         if calls is not None:
@@ -33,6 +35,12 @@ def _runner(
             return SimpleNamespace(returncode=0, stdout=output, stderr="")
         if command[1] == "rev-list":
             return SimpleNamespace(returncode=rev_list_status, stdout=range_output, stderr="")
+        if command[1] == "ls-tree":
+            sha = command[3]
+            tree_output = "different-tree\n" if content_diff else "same-tree\n"
+            if content_diff:
+                tree_output += sha + "\n"
+            return SimpleNamespace(returncode=tree_status, stdout=tree_output, stderr="")
         if command[1:3] == ["log", "-1"]:
             commit_timestamp = (timestamps or {}).get(command[-1], timestamp)
             return SimpleNamespace(returncode=0, stdout=f"{commit_timestamp}\n", stderr="")
@@ -127,3 +135,115 @@ def test_annotated_tag_resolves_to_commit(tmp_path, monkeypatch):
     assert ["git", "ls-remote", "https://remote.test/repo", v2_release_state.MAIN_REF] in calls
     log = next(command for command in calls if command[1:3] == ["log", "-1"])
     assert log[-1] == MAIN_SHA
+
+
+def _git(cwd, *arguments, env=None):
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=cwd,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _release_fixture(tmp_path):
+    remote = tmp_path / "remote.git"
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
+    _git(tmp_path, "clone", str(remote), str(checkout))
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "release-state-test",
+        "GIT_AUTHOR_EMAIL": "release-state-test@example.com",
+        "GIT_COMMITTER_NAME": "release-state-test",
+        "GIT_COMMITTER_EMAIL": "release-state-test@example.com",
+        "GIT_AUTHOR_DATE": "2020-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2020-01-01T00:00:00+00:00",
+    }
+    for directory in (".github/workflows", ".github/actions", "scripts", "docs"):
+        (checkout / directory).mkdir(parents=True, exist_ok=True)
+    (checkout / ".github/workflows/gate-v2.yml").write_text("name: original\n")
+    (checkout / ".github/actions/action.yml").write_text("name: original\n")
+    (checkout / "scripts/release.py").write_text("original = True\n")
+    (checkout / "docs/notes.md").write_text("original\n")
+    _git(checkout, "add", ".")
+    _git(checkout, "commit", "-m", "initial release", env=env)
+    _git(checkout, "push", "origin", "main")
+    _git(checkout, "tag", "v2")
+    _git(checkout, "push", "origin", "refs/tags/v2")
+    return remote, checkout, env
+
+
+def _run_release_probe(checkout, remote):
+    return subprocess.run(
+        [
+            os.environ.get("PYTHON", "python3"),
+            str(Path(v2_release_state.__file__).resolve()),
+            "--remote",
+            str(remote),
+            "--threshold-hours",
+            "6",
+        ],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_real_git_fixture_reports_overdue_consumer_path_content_lag(tmp_path):
+    remote, checkout, env = _release_fixture(tmp_path)
+    (checkout / ".github/workflows/gate-v2.yml").write_text("name: changed\n")
+    _git(checkout, "add", ".github/workflows/gate-v2.yml")
+    _git(checkout, "commit", "-m", "change caller workflow", env=env)
+    _git(checkout, "push", "origin", "main")
+
+    result = _run_release_probe(checkout, remote)
+
+    assert result.returncode == 1
+    assert "V2-RELEASE-STATE-CONTENT-LAG" in result.stdout
+
+
+def test_real_git_fixture_ignores_overdue_docs_only_history(tmp_path):
+    remote, checkout, env = _release_fixture(tmp_path)
+    for index in range(2):
+        (checkout / "docs/notes.md").write_text(f"docs update {index}\n")
+        _git(checkout, "add", "docs/notes.md")
+        _git(checkout, "commit", "-m", f"docs update {index}", env=env)
+    _git(checkout, "push", "origin", "main")
+
+    result = _run_release_probe(checkout, remote)
+
+    assert result.returncode == 0
+    assert "V2-RELEASE-STATE-CONTENT-CURRENT" in result.stdout
+
+
+def test_real_git_fixture_keeps_remote_query_failure_distinct(tmp_path):
+    _, checkout, _ = _release_fixture(tmp_path)
+
+    result = _run_release_probe(checkout, tmp_path / "missing-remote.git")
+
+    assert result.returncode == 2
+    assert v2_release_state.QUERY_FAILED in result.stderr
+    assert "V2-RELEASE-STATE-CONTENT-LAG" not in result.stdout + result.stderr
+
+
+def test_tree_query_failure_is_inconclusive(monkeypatch, capsys):
+    monkeypatch.setattr(
+        v2_release_state.subprocess,
+        "run",
+        _runner(
+            f"{V2_SHA}\t{v2_release_state.TAG_REF}\n",
+            f"{MAIN_SHA}\t{v2_release_state.MAIN_REF}\n",
+            range_output=f"{UNRELEASED_SHA}\n",
+            tree_status=128,
+        ),
+    )
+
+    assert v2_release_state.main(["--remote", "https://remote.test/repo"]) == 2
+    output = capsys.readouterr()
+    assert v2_release_state.QUERY_FAILED in output.err
+    assert v2_release_state.CONTENT_LAG not in output.out + output.err
