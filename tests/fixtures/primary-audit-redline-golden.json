@@ -1,0 +1,79 @@
+{
+  "kind": "primary_review",
+  "schema_version": 2,
+  "spec_source": "event_payload",
+  "repository_id": 918273645,
+  "repository": "zlxlabs/example",
+  "pr": 7,
+  "policy_version": "v2",
+  "reviewer": "codex-sub",
+  "run_mode": "PAYLOAD_ONLY",
+  "verdict": "fail",
+  "attempts": [
+    {
+      "reviewer": "codex-sub",
+      "model": "configured/default (Codex CLI)",
+      "exit_code": 0,
+      "reason": "",
+      "cost_usd": null,
+      "tokens": null,
+      "diag_snippet": null
+    }
+  ],
+  "shadow_mode": "detached",
+  "expected_shadows": [],
+  "result": {
+    "verdict": "fail",
+    "summary": "结论",
+    "findings": [
+      {
+        "id": "correctness.data-loss",
+        "severity": "major",
+        "category": "correctness",
+        "file": "app.py",
+        "line": 1,
+        "trigger": "触发路径",
+        "evidence": "证据",
+        "issue": "问题",
+        "acceptance": "验收",
+        "redline": "数据丢失",
+        "title": "问题",
+        "summary": "证据",
+        "body": "问题"
+      },
+      {
+        "id": "reliability.below-redline",
+        "severity": "minor",
+        "category": "reliability",
+        "file": "app.py",
+        "line": 1,
+        "trigger": "触发路径",
+        "evidence": "证据",
+        "issue": "问题",
+        "acceptance": "验收",
+        "redline": "none",
+        "original_severity": "major",
+        "title": "问题",
+        "summary": "证据",
+        "body": "问题"
+      },
+      {
+        "id": "correctness.unannotated",
+        "severity": "major",
+        "category": "correctness",
+        "file": "app.py",
+        "line": 1,
+        "trigger": "触发路径",
+        "evidence": "证据",
+        "issue": "问题",
+        "acceptance": "验收",
+        "title": "问题",
+        "summary": "证据",
+        "body": "问题"
+      }
+    ]
+  },
+  "cost": null,
+  "tokens": null,
+  "tier": "internal"
+}
