@@ -253,6 +253,10 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
   不查询 issue 是否存在或仍为 open。仅 `personal`、`internal` tier 可用，`saas` 拒绝。
 - 两种回执都绑定 `head_sha`、`audit_digest`、`epoch` 和唯一 finding。每张回执只覆盖指向的一条 P1；
   全部 P1 都被有效回执覆盖时，本轮按无 P1 进入 clean-streak 计算；部分覆盖时，未覆盖 P1 仍阻断。
+- 同一稳定键（同 `file`/`line`/`category`/`severity`，典型是同文件 `line: null`）命中多条当前 P1 时，
+  以回执的精确 `finding_id` 消歧：恰好命中其中一条即可签发、可消费，两张回执产物名也不同；
+  `finding_id` 命中 0 条仍按 `finding_key_ambiguous` 拒绝。稳定键只命中一条时行为不变——
+  rerun 漂移导致回执 `finding_id` 与当前 id 不等，该条 P1 仍可正常处置。
 
 `docs/design/clean-streak-convergence.md` 和 `docs/sessions/260925-disposition-exit/design.md` 记录了
 当前契约。gate-hub#810 的身份顾虑仍成立：回执不证明人工审批，但 owner 已裁决接受身份不可证，改用证据约束和留痕；
