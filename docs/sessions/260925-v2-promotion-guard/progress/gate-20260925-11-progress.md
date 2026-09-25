@@ -15,3 +15,9 @@
 - 本段结论：设计文档记录 Actions 日志/Summary 与 gate-hub timer、探针、systemd OnFailure、finding-v1 sink 的链路，并明确 shell fetch 退出码同形及 sink 到人的未证实边界。
 - 关键决策与已否决方案：finding 默认 sink 为 `/home/zlx/.local/state/gate-hub/findings.jsonl`，仍允许 `GATE_HUB_FINDINGS_PATH` 覆盖；不把写入 sink 等同于已送达人员。
 - 下一步唯一动作：跑全量测试、部分克隆真实远端探针和最终洁净状态核验。
+
+## 里程碑 4
+- 当前阶段：completed
+- 本段结论：全量测试 1140 passed；固定 workflow pin 检查、actionlint、diff check 通过；在巡检使用的 `blob:none` 部分克隆内对真实远端运行本工作树探针，退出 0 且无输出。
+- 关键决策与已否决方案：空路径集合反向验证按预期以 `AssertionError` 转红；临时 clone 经 GitHub SSH 通道失败后未重试，改用已核实的巡检部分克隆完成真实调用。
+- 下一步唯一动作：将分支和报告交回主脑进行验收与 merge-commit 合并。
