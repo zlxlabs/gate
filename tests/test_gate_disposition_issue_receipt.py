@@ -125,15 +125,15 @@ def test_false_positive_producer_requires_refuted_result(tmp_path):
 
 
 @pytest.mark.parametrize("tracking_issue", ["#12", "https://github.com/zlxlabs/gate/issues/12"])
-def test_deferred_producer_accepts_same_repository_issue_reference(tmp_path, tracking_issue):
+def test_deferred_producer_reports_tier_rejection_for_valid_same_repository_reference(
+    tmp_path, tracking_issue,
+):
     result, output_dir = _issue(tmp_path, disposition="deferred", tracking_issue=tracking_issue)
 
-    assert result.returncode == 0, result.stderr
-    artifact = json.loads(result.stdout)["artifact"]
-    payload = json.loads((output_dir / artifact).read_bytes())
-    assert payload["disposition"] == "deferred"
-    assert payload["tracking_issue"] == tracking_issue
-    assert "counterevidence" not in payload
+    assert result.returncode != 0
+    assert "deferred_not_allowed_for_tier" in result.stderr
+    assert "tracking_issue_" not in result.stderr
+    assert not output_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -205,7 +205,8 @@ def _same_key_audit():
     return audit
 
 
-def _issue_same_key(tmp_path, *, finding_id, disposition="deferred", tracking_issue="#12"):
+def _issue_same_key(tmp_path, *, finding_id, disposition="false-positive",
+                    counterevidence=COUNTEREVIDENCE):
     tmp_path.mkdir(parents=True, exist_ok=True)
     audit_path = tmp_path / "audit.json"
     audit_path.write_text(json.dumps(_same_key_audit()))
@@ -219,13 +220,15 @@ def _issue_same_key(tmp_path, *, finding_id, disposition="deferred", tracking_is
         "--reason", "canonical evidence reviewed", "--scope-json", json.dumps(SCOPE),
         "--approver", "owner", "--approver-id", "10",
         "--approved-at", "2026-09-25T09:00:00Z", "--triggering-actor", "owner",
-        "--disposition", disposition, "--tracking-issue", tracking_issue,
+        "--disposition", disposition,
     ]
+    if counterevidence is not None:
+        command.extend(("--counterevidence-json", json.dumps(counterevidence)))
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     return result, output_dir
 
 
-def test_same_key_null_line_p1s_issue_distinct_deferred_receipts_per_finding_id(tmp_path):
+def test_same_key_null_line_p1s_issue_distinct_false_positive_receipts_per_finding_id(tmp_path):
     first, first_dir = _issue_same_key(tmp_path / "first", finding_id=SAME_KEY_IDS[0])
     second, second_dir = _issue_same_key(tmp_path / "second", finding_id=SAME_KEY_IDS[1])
 
@@ -294,7 +297,9 @@ def test_producer_receipt_bytes_consume_against_same_key_primary(tmp_path):
         for receipt in receipts
     )
     assert [(status.valid, status.active) for status in statuses] == [(True, True), (True, True)]
-    assert [status.reason_code for status in statuses] == ["active_deferred", "active_deferred"]
+    assert [status.reason_code for status in statuses] == [
+        "active_false_positive", "active_false_positive",
+    ]
 
     full = convergence.record_dispositions(
         primary.p1_ids, tuple(receipts), scope=scope, primary=primary, audit_digest=audit_digest,

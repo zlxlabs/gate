@@ -259,8 +259,7 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
                 raise ValueError("tracking_issue_invalid")
             if not isinstance(repository, str) or f"{match.group(1)}/{match.group(2)}".casefold() != repository.casefold():
                 raise ValueError("tracking_issue_repository_mismatch")
-        if scope["tier"] == "saas":
-            raise ValueError("deferred_not_allowed_for_tier")
+        raise ValueError(_CONVERGENCE.DEFERRED_RECEIPT_REJECT_REASON)
     fields = {
         "schema_version": SCHEMA_VERSION,
         "disposition": disposition,

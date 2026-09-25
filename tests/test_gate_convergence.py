@@ -744,15 +744,19 @@ def test_same_key_p1s_disambiguate_by_exact_receipt_finding_id():
     assert recorded.remaining_p1_ids == ("p2",)
 
 
-def test_same_key_p1_deferred_disambiguates_to_active_deferred():
-    primary = _stable_primary(ids=("p1", "p2"), line=None)
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+def test_same_key_p1_deferred_receipt_is_rejected_at_every_tier(tier):
+    scope = _scope(tier=tier)
+    primary = _stable_primary(scope, ids=("p1", "p2"), line=None)
     receipt = _stable_disposition(
-        primary=primary, disposition="deferred", counterevidence=None, tracking_issue="#12",
+        scope, primary=primary, disposition="deferred", counterevidence=None, tracking_issue="#12",
     )
     status = CONV.validate_disposition_receipt(
-        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        receipt, scope=scope, primary=primary, audit_digest="a" * 64,
     )
-    assert (status.valid, status.active, status.reason_code) == (True, True, "active_deferred")
+    assert (status.valid, status.active, status.reason_code) == (
+        False, False, "deferred_not_allowed_for_tier",
+    )
 
 
 def test_same_key_p1s_stay_fail_closed_when_receipt_id_hits_none_of_them():

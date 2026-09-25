@@ -30,6 +30,9 @@ RECEIPT_KIND = "canonical_primary"
 DISPOSITION_KINDS = frozenset({"false-positive", "deferred"})
 DISPOSITION_RECEIPT_SCHEMA_VERSION = 3
 DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}"
+# gate-hub#1072 ruling 4(a): a deferred receipt may not release a P1 at any
+# tier — issuance and consumption share this single reason-code constant.
+DEFERRED_RECEIPT_REJECT_REASON = "deferred_not_allowed_for_tier"
 DISPOSITION_REASON_DISPLAY_MAX = 500
 
 # This is intentionally local to the public gate repository.  The private
@@ -713,11 +716,10 @@ def validate_disposition_receipt(
         tracking_reason = _tracking_issue_reason(receipt.tracking_issue, repository)
         if tracking_reason is not None:
             return _disposition_status(receipt, valid=False, active=False, reason=tracking_reason)
-        if scope.tier == "saas":
-            return _disposition_status(
-                receipt, valid=False, active=False,
-                reason="deferred_not_allowed_for_tier",
-            )
+        return _disposition_status(
+            receipt, valid=False, active=False,
+            reason=DEFERRED_RECEIPT_REJECT_REASON,
+        )
     target_field = "finding_key" if receipt.finding_key else "finding_id"
     required_text = ("repository_id", "epoch", "head_sha", "audit_digest", target_field, "reason")
     if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
