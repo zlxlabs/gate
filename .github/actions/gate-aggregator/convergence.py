@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Sequence
@@ -26,8 +27,8 @@ TERMINAL_DECISIONS = frozenset(
     {"collecting", "converged", "manual_required", "fail_closed"}
 )
 RECEIPT_KIND = "canonical_primary"
-DISPOSITION_KINDS = frozenset({"false-positive"})
-DISPOSITION_RECEIPT_SCHEMA_VERSION = 2
+DISPOSITION_KINDS = frozenset({"false-positive", "deferred"})
+DISPOSITION_RECEIPT_SCHEMA_VERSION = 3
 DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}"
 DISPOSITION_REASON_DISPLAY_MAX = 500
 
@@ -183,9 +184,11 @@ class DispositionReceipt:
     approved_at: str = ""
     triggering_actor: str = ""
     triggering_actor_source: str = ""
+    counterevidence: dict[str, Any] | None = None
+    tracking_issue: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "disposition": self.disposition,
             "repository_id": self.repository_id,
@@ -202,6 +205,11 @@ class DispositionReceipt:
             "triggering_actor": self.triggering_actor,
             "triggering_actor_source": self.triggering_actor_source,
         }
+        if self.counterevidence is not None:
+            payload["counterevidence"] = self.counterevidence
+        if self.tracking_issue is not None:
+            payload["tracking_issue"] = self.tracking_issue
+        return payload
 
 
 @dataclass(frozen=True)
@@ -233,6 +241,7 @@ class DispositionAudit:
     rejected_receipts: tuple[tuple[DispositionReceipt, str], ...]
     statuses: tuple[DispositionStatus, ...] = ()
     recorded_finding_ids: tuple[str, ...] = ()
+    remaining_p1_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -354,6 +363,7 @@ class RoundDecision:
     processing_key: ProcessingKey
     round_key: RoundKey
     event_id: str
+    remaining_p1_ids: tuple[str, ...] = ()
 
     @property
     def clean_streak(self) -> int:
@@ -645,6 +655,7 @@ def validate_disposition_receipt(
     primary: CanonicalPrimary,
     audit_digest: str,
     legacy_raw_audit_digest: str | None = None,
+    repository: str | None = None,
 ) -> DispositionStatus:
     """Validate one receipt against the current canonical audit round."""
 
@@ -662,10 +673,23 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, reason="malformed_scope")
     if not isinstance(primary, CanonicalPrimary):
         return _disposition_status(receipt, valid=False, active=False, reason="malformed_primary")
-    if receipt.schema_version not in (1, DISPOSITION_RECEIPT_SCHEMA_VERSION):
+    if receipt.schema_version != DISPOSITION_RECEIPT_SCHEMA_VERSION:
         return _disposition_status(receipt, valid=False, active=False, reason="schema_version_mismatch")
     if receipt.disposition not in DISPOSITION_KINDS:
         return _disposition_status(receipt, valid=False, active=False, reason="unknown_disposition")
+    if receipt.disposition == "false-positive":
+        evidence_reason = _counterevidence_reason(receipt)
+        if evidence_reason is not None:
+            return _disposition_status(receipt, valid=False, active=False, reason=evidence_reason)
+    elif receipt.disposition == "deferred":
+        tracking_reason = _tracking_issue_reason(receipt.tracking_issue, repository)
+        if tracking_reason is not None:
+            return _disposition_status(receipt, valid=False, active=False, reason=tracking_reason)
+        if scope.tier == "saas":
+            return _disposition_status(
+                receipt, valid=False, active=False,
+                reason="deferred_not_allowed_for_tier",
+            )
     target_field = "finding_key" if receipt.finding_key else "finding_id"
     required_text = ("repository_id", "epoch", "head_sha", "audit_digest", target_field, "reason")
     if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
@@ -760,12 +784,20 @@ def validate_disposition_receipt(
     else:
         finding_severity = finding[1] if isinstance(finding, tuple) and len(finding) >= 2 else None
         finding_trigger_kind = finding[2] if isinstance(finding, tuple) and len(finding) >= 3 else None
-    if finding is None or finding_severity not in P1_SEVERITIES or finding_trigger_kind != "inferred":
+    if finding is None or finding_severity not in P1_SEVERITIES:
+        return _disposition_status(
+            receipt, valid=False, active=False,
+            reason="finding_not_current_p1",
+        )
+    if receipt.disposition == "false-positive" and finding_trigger_kind != "inferred":
         return _disposition_status(
             receipt, valid=False, active=False,
             reason="finding_trigger_not_inferred",
         )
-    return _disposition_status(receipt, valid=True, active=True, reason="active_false_positive")
+    return _disposition_status(
+        receipt, valid=True, active=True,
+        reason=f"active_{receipt.disposition.replace('-', '_')}",
+    )
 
 
 def disposition_status(
@@ -775,6 +807,7 @@ def disposition_status(
     primary: CanonicalPrimary,
     audit_digest: str,
     legacy_raw_audit_digest: str | None = None,
+    repository: str | None = None,
 ) -> DispositionStatus:
     """Return the observational status view used by ledger/human summaries."""
 
@@ -784,6 +817,7 @@ def disposition_status(
         primary=primary,
         audit_digest=audit_digest,
         legacy_raw_audit_digest=legacy_raw_audit_digest,
+        repository=repository,
     )
 
 
@@ -795,12 +829,16 @@ def record_dispositions(
     primary: CanonicalPrimary,
     audit_digest: str,
     legacy_raw_audit_digest: str | None = None,
+    repository: str | None = None,
 ) -> DispositionAudit:
-    """Validate receipt claims for audit while retaining every primary P1."""
+    """Validate receipts and return the current P1s they cover exactly."""
 
     primary_ids = tuple(p1_ids) if isinstance(p1_ids, Sequence) and not isinstance(p1_ids, (str, bytes)) else ()
     if not isinstance(receipts, Sequence) or isinstance(receipts, (str, bytes)):
-        return DispositionAudit(primary_p1_ids=primary_ids, recorded_receipts=(), rejected_receipts=())
+        return DispositionAudit(
+            primary_p1_ids=primary_ids, recorded_receipts=(), rejected_receipts=(),
+            remaining_p1_ids=primary_ids,
+        )
     statuses: list[DispositionStatus] = []
     recorded: list[DispositionReceipt] = []
     recorded_finding_ids: list[str] = []
@@ -811,6 +849,7 @@ def record_dispositions(
             status = validate_disposition_receipt(
                 receipt, scope=scope, primary=primary, audit_digest=audit_digest,
                 legacy_raw_audit_digest=legacy_raw_audit_digest,
+                repository=repository,
             )
             statuses.append(status)
             rejected.append((status.receipt, status.reason_code))
@@ -821,6 +860,7 @@ def record_dispositions(
         status = validate_disposition_receipt(
             receipt, scope=scope, primary=primary, audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
+            repository=repository,
         )
         if status.active and status.valid:
             payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -839,12 +879,15 @@ def record_dispositions(
             recorded_finding_ids.append(target_id)
         elif status.reason_code != "absent_legacy_stub":
             rejected.append((receipt, status.reason_code))
+    covered = set(recorded_finding_ids)
+    remaining = tuple(finding_id for finding_id in primary_ids if finding_id not in covered)
     return DispositionAudit(
         primary_p1_ids=primary_ids,
         recorded_receipts=tuple(recorded),
         rejected_receipts=tuple(rejected),
         statuses=tuple(statuses),
         recorded_finding_ids=tuple(recorded_finding_ids),
+        remaining_p1_ids=remaining,
     )
 
 
@@ -906,6 +949,8 @@ def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
             triggering_actor_source=(
                 str(payload["triggering_actor_source"]) if "triggering_actor_source" in payload else ""
             ),
+            counterevidence=payload.get("counterevidence"),
+            tracking_issue=payload.get("tracking_issue"),
         )
     except (KeyError, TypeError) as exc:
         raise ReceiptValidationError("malformed disposition receipt") from exc
@@ -931,6 +976,31 @@ def _approved_at_has_time(value: Any) -> bool:
     except (ValueError, TypeError, AttributeError):
         return False
     return True
+
+
+def _counterevidence_reason(receipt: DispositionReceipt) -> str | None:
+    evidence = receipt.counterevidence
+    if not isinstance(evidence, dict):
+        return "counterevidence_required"
+    fields = ("command", "output", "result", "pointer")
+    if any(not isinstance(evidence.get(field), str) or not evidence[field].strip() for field in fields):
+        return "counterevidence_required"
+    if evidence["result"] != "refuted":
+        return "counterevidence_result_not_refuted"
+    return None
+
+
+def _tracking_issue_reason(value: Any, repository: str | None) -> str | None:
+    if not isinstance(value, str):
+        return "tracking_issue_invalid"
+    if re.fullmatch(r"#[1-9][0-9]*", value):
+        return None
+    match = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)", value)
+    if match is None:
+        return "tracking_issue_invalid"
+    if repository is None or f"{match.group(1)}/{match.group(2)}".casefold() != repository.casefold():
+        return "tracking_issue_repository_mismatch"
+    return None
 
 
 def _scope_errors(scope: Scope) -> list[str]:
@@ -1347,6 +1417,7 @@ def _decision(
     reason: str,
     accepted: bool,
     no_op: bool,
+    remaining_p1_ids: tuple[str, ...] = (),
 ) -> RoundDecision:
     return RoundDecision(
         state=state,
@@ -1357,6 +1428,7 @@ def _decision(
         processing_key=processing_key,
         round_key=round_key,
         event_id=event_id,
+        remaining_p1_ids=remaining_p1_ids,
     )
 
 
@@ -1368,12 +1440,12 @@ def evaluate_round(
     audit_digest: str,
     waiver_receipts: Sequence[DispositionReceipt] = (),
     processing_key: ProcessingKey,
+    repository: str | None = None,
 ) -> RoundDecision:
     """Consume exactly one canonical primary observation.
 
-    A clean round is defined solely by an eligible canonical primary whose
-    own current P1 projection is empty. ``waiver_receipts`` remains accepted
-    for callers but is ignored; receipt claims are audited by the aggregator.
+    A clean round has no current P1 findings left after active receipts are
+    validated against this exact primary audit.
     """
 
     scope_errors = _scope_errors(scope) if isinstance(scope, Scope) else ["scope must be Scope"]
@@ -1458,6 +1530,15 @@ def evaluate_round(
             accepted=False,
             no_op=False,
         )
+    disposition_audit = record_dispositions(
+        primary.p1_ids,
+        waiver_receipts,
+        scope=scope,
+        primary=primary,
+        audit_digest=audit_digest,
+        repository=repository,
+    )
+    remaining_p1_ids = disposition_audit.remaining_p1_ids
     # Epoch boundaries precede all idempotency checks. Old indexes cannot
     # consume a round in the new generation.
     if state.epoch != epoch:
@@ -1578,7 +1659,7 @@ def evaluate_round(
         )
 
     eligible = recorded.eligible_rounds + 1
-    streak = recorded.clean_streak + 1 if not primary.p1_ids else 0
+    streak = recorded.clean_streak + 1 if not remaining_p1_ids else 0
     # The threshold is deliberately checked before the eligible cap.
     if streak >= policy.clean_rounds:
         terminal = "converged"
@@ -1605,6 +1686,7 @@ def evaluate_round(
         reason=reason,
         accepted=True,
         no_op=False,
+        remaining_p1_ids=remaining_p1_ids,
     )
 
 

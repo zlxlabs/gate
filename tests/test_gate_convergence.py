@@ -151,6 +151,12 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
         audit_digest=audit_digest,
         finding_id=primary.p1_ids[0],
         reason="locked upstream behavior",
+        counterevidence={
+            "command": "pytest -q tests/test_example.py",
+            "output": "1 passed",
+            "result": "refuted",
+            "pointer": "tests/test_example.py::test_regression",
+        },
         approver="octocat",
         approver_id=1,
         approved_at="2026-08-30T12:00:00Z",
@@ -194,6 +200,12 @@ def _stable_disposition(scope=SCOPE, *, primary=None, audit_digest=None, **chang
         finding_id=finding[0],
         finding_key=key,
         reason="locked upstream behavior",
+        counterevidence={
+            "command": "pytest -q tests/test_example.py",
+            "output": "1 passed",
+            "result": "refuted",
+            "pointer": "tests/test_example.py::test_regression",
+        },
         approver="octocat",
         approver_id=1,
         approved_at="2026-08-30T12:00:00Z",
@@ -230,6 +242,58 @@ def test_disposition_receipt_is_bound_to_the_current_round():
         receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
     assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+
+
+@pytest.mark.parametrize(
+    ("disposition", "tier", "expected_remaining", "expected_streak", "expected_reason"),
+    [
+        ("false-positive", "personal", (), 1, "active_false_positive"),
+        ("false-positive", "saas", (), 1, "active_false_positive"),
+        ("deferred", "internal", (), 1, "active_deferred"),
+        ("deferred", "saas", ("p1",), 0, "deferred_not_allowed_for_tier"),
+    ],
+)
+def test_disposition_consumption_changes_only_currently_covered_p1(
+    disposition, tier, expected_remaining, expected_streak, expected_reason,
+):
+    scope = _scope(tier=tier)
+    audit_digest = "a" * 64
+    primary = _primary(scope, run_id=7, run_attempt=2, verdict="fail", p1_ids=("p1",))
+    receipt = _disposition(
+        scope, primary=primary, audit_digest=audit_digest,
+        disposition=disposition,
+        tracking_issue="#12" if disposition == "deferred" else None,
+    )
+
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=scope, primary=primary, audit_digest=audit_digest,
+    )
+    decision = CONV.evaluate_round(
+        state=CONV.initial_state(scope), scope=scope, primary=primary,
+        audit_digest=audit_digest, waiver_receipts=(receipt,),
+        processing_key=_key(scope, run_id=7, run_attempt=2),
+    )
+
+    assert status.reason_code == expected_reason
+    assert decision.remaining_p1_ids == expected_remaining
+    assert decision.clean_streak == expected_streak
+
+
+def test_partial_disposition_keeps_uncovered_primary_p1_blocking():
+    scope = _scope()
+    audit_digest = "b" * 64
+    primary = _primary(scope, run_id=8, run_attempt=1, verdict="fail", p1_ids=("covered", "uncovered"))
+    receipt = _disposition(
+        scope, primary=primary, audit_digest=audit_digest, finding_id="covered",
+    )
+    decision = CONV.evaluate_round(
+        state=CONV.initial_state(scope), scope=scope, primary=primary,
+        audit_digest=audit_digest, waiver_receipts=(receipt,),
+        processing_key=_key(scope, run_id=8, run_attempt=1),
+    )
+
+    assert decision.remaining_p1_ids == ("uncovered",)
+    assert decision.clean_streak == 0
 
 
 def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
@@ -272,7 +336,7 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
         ({"approved_at": "2026-08-30"}, "malformed_receipt"),
         ({"approved_at": "2026-08-30Tnot-a-time"}, "malformed_receipt"),
         ({"approver": 12}, "malformed_receipt"),
-        ({"schema_version": 3}, "schema_version_mismatch"),
+        ({"schema_version": 2}, "schema_version_mismatch"),
     ],
     ids=[
         "approver-empty",
@@ -286,7 +350,7 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
         "approved-at-bare-date",
         "approved-at-invalid-time",
         "approver-non-string",
-        "schema-version-v3",
+        "schema-version-v2",
     ],
 )
 def test_disposition_v2_auth_fields_are_rejected_as_claims_only(changes, reason):
@@ -305,7 +369,7 @@ def test_disposition_v2_auth_fields_are_rejected_as_claims_only(changes, reason)
     assert audit.rejected_receipts == ((receipt, reason),)
 
 
-def test_parse_v1_kind_is_rejected_and_schema_v1_current_kind_is_accepted():
+def test_old_disposition_schemas_are_rejected_even_with_counterevidence():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     receipt = _disposition(primary=primary)
     v1_kind_payload = {
@@ -322,34 +386,33 @@ def test_parse_v1_kind_is_rejected_and_schema_v1_current_kind_is_accepted():
     }
     with pytest.raises(CONV.ReceiptValidationError, match="unexpected disposition receipt kind"):
         CONV.parse_disposition_receipt(v1_kind_payload)
-    v1_payload = {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND, "schema_version": 1}
-    parsed_v1 = CONV.parse_disposition_receipt(v1_payload)
-    assert parsed_v1.schema_version == 1
-    v1_status = CONV.validate_disposition_receipt(
-        parsed_v1, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    old_payload = {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND, "schema_version": 2}
+    parsed_old = CONV.parse_disposition_receipt(old_payload)
+    assert parsed_old.schema_version == 2
+    old_status = CONV.validate_disposition_receipt(
+        parsed_old, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
-    assert (v1_status.valid, v1_status.active, v1_status.reason) == (True, True, "active_false_positive")
+    assert old_status.reason_code == "schema_version_mismatch"
     bare = CONV.parse_disposition_receipt({**v1_kind_payload, "kind": CONV.DISPOSITION_RECEIPT_KIND})
     assert bare.schema_version == 1
     assert CONV.validate_disposition_receipt(
         bare, scope=SCOPE, primary=primary, audit_digest="a" * 64,
-    ).reason == "malformed_receipt"
+    ).reason == "schema_version_mismatch"
 
 
-def test_validate_disposition_receipt_accepts_v1_and_v2_rejects_unknown():
+def test_validate_disposition_receipt_requires_current_schema():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
     v2 = _disposition(primary=primary)
-    v1 = replace(v2, schema_version=1)
-    unknown = replace(v2, schema_version=3)
-    for receipt in (v1, v2):
-        status = CONV.validate_disposition_receipt(
-            receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
-        )
-        assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
-    rejected = CONV.validate_disposition_receipt(
-        unknown, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    status = CONV.validate_disposition_receipt(
+        v2, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
-    assert rejected.reason == "schema_version_mismatch"
+    assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+    for old_version in (1, 2, 4):
+        rejected = CONV.validate_disposition_receipt(
+            replace(v2, schema_version=old_version), scope=SCOPE,
+            primary=primary, audit_digest="a" * 64,
+        )
+        assert rejected.reason == "schema_version_mismatch"
     assert rejected.active is False
 
 
@@ -672,7 +735,7 @@ def test_legacy_raw_bytes_digest_still_consumes_current_file():
     assert SCOPE.head_sha in rejected.reason
 
 
-def test_false_positive_claim_keeps_matching_primary_finding_blocking():
+def test_false_positive_claim_releases_only_its_matching_primary_finding():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("a", "b"))
     receipt = _disposition(primary=primary)
     receipt = replace(receipt, finding_id="b")
@@ -682,8 +745,9 @@ def test_false_positive_claim_keeps_matching_primary_finding_blocking():
         processing_key=_key(run_id=7, run_attempt=2),
     )
     assert result.decision == "collecting" and result.clean_streak == 0
+    assert result.remaining_p1_ids == ("a",)
     assert result.state.event_records[-1][2][2] == primary.p1_ids
-    # A new primary round with the same claim still retains its own P1.
+    # A receipt is bound to one audit digest, so a new round needs a new one.
     next_primary = _primary(run_id=8, run_attempt=1, p1_ids=("b",))
     next_receipt = _disposition(primary=next_primary, audit_digest="b" * 64, finding_id="b")
     next_result = CONV.evaluate_round(
@@ -691,7 +755,7 @@ def test_false_positive_claim_keeps_matching_primary_finding_blocking():
         audit_digest="b" * 64, waiver_receipts=(next_receipt,),
         processing_key=_key(run_id=8),
     )
-    assert next_result.clean_streak == 0 and next_result.decision == "collecting"
+    assert next_result.clean_streak == 1 and next_result.remaining_p1_ids == ()
 
 
 def test_rejected_disposition_claim_does_not_change_primary_round():
@@ -823,7 +887,7 @@ def test_malformed_disposition_input_preserves_typed_rejection():
 
 @pytest.mark.parametrize("p1_ids, verdict", [(('p1',), "fail"), ((), "pass")], ids=["primary-p1", "primary-clean"])
 @pytest.mark.parametrize("receipt_state", ["none", "valid", "duplicate", "stale", "invalid"])
-def test_disposition_receipt_state_never_changes_primary_round(p1_ids, verdict, receipt_state):
+def test_disposition_receipt_state_changes_only_covered_current_p1(p1_ids, verdict, receipt_state):
     primary = _primary(run_id=71, run_attempt=1, p1_ids=p1_ids, verdict=verdict)
     receipt_primary = primary if p1_ids else _primary(run_id=71, run_attempt=1, p1_ids=("p1",))
     valid = _disposition(primary=receipt_primary)
@@ -846,11 +910,14 @@ def test_disposition_receipt_state_never_changes_primary_round(p1_ids, verdict, 
         processing_key=_key(run_id=71, run_attempt=1),
     )
 
+    should_consume = bool(p1_ids) and receipt_state in {"valid", "duplicate"}
+    assert actual.remaining_p1_ids == (() if should_consume else p1_ids)
     assert (actual.decision, actual.clean_streak, actual.eligible_rounds) == (
-        expected.decision, expected.clean_streak, expected.eligible_rounds,
+        ("converged", 1, 1) if should_consume
+        else (expected.decision, expected.clean_streak, expected.eligible_rounds)
     )
     assert actual.state.event_records[-1][2][2] == p1_ids
-    assert actual.state.as_dict() == expected.state.as_dict()
+    assert (actual.state.as_dict() == expected.state.as_dict()) is not should_consume
 
 
 def test_comment_alone_cannot_change_required_decision():
