@@ -1,2 +1,6 @@
 __pycache__/
 *.py[cod]
+
+# 账本/咨询日志的 flock sidecar(agent-config 的写入器在账本旁生成,不是账本数据);
+# gate-hub 已有同款条目,本仓对齐:只在本地出现的锁文件每次记账都会重现
+*.jsonl.lock
