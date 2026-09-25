@@ -32,3 +32,10 @@
 - 本段结论：全量测试发现 G4 行构造器守卫仍匹配旧的 `receipt claim (` 文案，与新逐条留痕格式不符；更新为锁定当前唯一行构造器，定向测试通过。
 - 关键决策与已否决方案：不保留旧文案或兼容分支，测试直接约束新的 disposition/finding 行格式。
 - 下一步唯一动作：完成设计文档并重跑全量验证。
+
+### 2026-09-25 / 契约文档与全量验证
+
+- 当前阶段：implementing
+- 本段结论：README、收敛设计和新契约文档已更新；旧 record-only 会话文档仅追加重开缘由。全量 pytest 通过 1166 项，pin 检查、actionlint 和 diff whitespace 检查均通过。
+- 关键决策与已否决方案：gate-hub#1073 对 internal deferred 的现存验收文字与锁定决策冲突；实现按 internal 允许 deferred，需主脑修订 issue 判据。
+- 下一步唯一动作：验证 approver 上下文守卫的反向红例并完成提交、推送及报告。

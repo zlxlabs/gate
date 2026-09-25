@@ -234,25 +234,29 @@ GitHub 在点击 Re-run 时会删除同一 run 的旧 artifact，因此每个 PR
 
 ### 确认误报或人工处置
 
-PR 评论中的以下行只是观察记录：评论本身不会触发任何工作流，也不会直接处置 finding。
+PR 评论中的以下行只是观察记录：评论本身不会触发任何工作流，也不会直接处置 finding。gate-v2
+没有标签豁免，`codex-review-waived` 标签不会解除 finding；v2 caller 也不监听 `labeled` 事件。
 
 ```text
 Codex finding disposition: correctness.example-id = false-positive — 说明证据
 ```
 
-处置值支持 `false-positive`、`accepted`、`fixed`、`wont-fix`；作者、理由和评论链接会进入后续账本。
-若要真正提交 disposition receipt，必须显式调用 `.github/workflows/gate-v2-disposition.yml`：
-使用 `workflow_dispatch` 手工派发，或由 `workflow_call` 调用，并提供五个必填字段
-`pr_number`、`primary_run_id`、`primary_run_attempt`、`finding_id`、`reason`。仅贴评论，或贴评论后
-重跑其他工作流，都不会触发这个 disposition workflow。
+评论中的处置值（`false-positive`、`accepted`、`fixed`、`wont-fix`）及作者、理由和链接仍进入观察账本，
+但它们不是 v2 的放行入口。唯一受控出口是 `.github/workflows/gate-v2-disposition.yml`，通过
+`workflow_dispatch` 或 `workflow_call` 提交回执。老调用方仍只需提供五个必填字段
+`pr_number`、`primary_run_id`、`primary_run_attempt`、`finding_id`、`reason`；新字段均可选，
+但省略处置种类/证据的旧调用会被签发器明确拒绝，不会静默放行。
 
-即使 receipt 通过 identity、epoch、digest 的全部校验，disposition 也只是审计记录：不会移除
-对应 finding，不会改变本轮或未来任何一轮的 P1 集合，不会增加 clean streak，也不会让终态变绿。
-这是 gate-hub#810 锁定的 record-only 语义，详见 `docs/design/clean-streak-convergence.md` 增量 2。
+- `false-positive` 仅针对当前审计中的 inferred P1，必须提供 JSON 反证对象，包含非空 `command`、
+  `output`、`pointer`，且 `result` 必须为 `refuted`。
+- `deferred` 必须提供同仓跟踪 issue：`#<正整数>` 或本仓 GitHub `/issues/<正整数>` URL；只校验格式与仓库，
+  不查询 issue 是否存在或仍为 open。仅 `personal`、`internal` tier 可用，`saas` 拒绝。
+- 两种回执都绑定 `head_sha`、`audit_digest`、`epoch` 和唯一 finding。每张回执只覆盖指向的一条 P1；
+  全部 P1 都被有效回执覆盖时，本轮按无 P1 进入 clean-streak 计算；部分覆盖时，未覆盖 P1 仍阻断。
 
-让误报真正收敛，必须让下一轮 primary 观察到代码事实已经改变：修复代码，或把“无其他调用方”等
-事实落成仓内可执行的守卫测试（实测案例见 zlxlabs/gate-hub#1044）。确实走投无路时，才使用
-现有的人工 admin bypass 合并；disposition 不是放行通道。
+`docs/design/clean-streak-convergence.md` 和 `docs/sessions/260925-disposition-exit/design.md` 记录了
+当前契约。gate-hub#810 的身份顾虑仍成立：回执不证明人工审批，但 owner 已裁决接受身份不可证，改用证据约束和留痕；
+不会恢复标签豁免，也不要求管理员绕过。
 
 ## 公开仓安全模型（四层）
 
