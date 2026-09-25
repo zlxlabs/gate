@@ -4,7 +4,7 @@
 
 `relation_to_previous` 只有 `new` / `repeat` / `conflict`。`repeat` 是 id 相同，`previous_finding_id` 就是该 id。`conflict` 是同文件、同一整数行、双方都是 major 或 blocker，且 `issue` 与 `acceptance` 在空白折叠和 casefold 之后都不相同；指针是唯一对上的上一轮 id。对不上、没有上一轮、或候选多于一条，记 `new` 且不带指针。id 相同优先于 conflict。其它取值（例如 `"maybe"`）报 `GATE-FINDING-RELATION-UNKNOWN`，不会当成 `new`。比较前文本截到 240 字符。同位置但要求文本相同，记 `new`。
 
-上一轮只读门禁自己的 ledger：`d30/{repository_id}/codex-review-ledger-v2-{repository_id}-*`，取同一 `pr_number` 里 `(run_id, run_attempt)` 严格早于本轮的最新一条。不新查 GitHub，不读被评方仓。最多 30 条。注入主审提示词的正文上限 6000 字符，超出截断并标 `…[truncated]`。通道是 review-primary 已读的 `DESIGN_DOC`：原设计说明在前，清单接在 `PREVIOUS ROUND FINDINGS` 分隔段后。没有清单时不改 `DESIGN_DOC`。
+上一轮只读门禁自己的 ledger：`d30/{repository_id}/codex-review-ledger-v2-{repository_id}-*`，取同一 `pr_number` 里 `(run_id, run_attempt)` 严格早于本轮的最新一条。不新查 GitHub，不读被评方仓。最多 30 条。前轮 findings 与 dispositions 经 `${RUNNER_TEMP}/previous-findings.json` 由 `REVIEW_PREVIOUS_ROUND_PATH` 传给 review-primary，消费端按四键契约严格解析后渲染进主审提示词。`DESIGN_DOC` 只传调用方传入的原始设计文档，不再拼接前轮 findings。
 
 聚合器把 `finding_relation.counts` 写进本轮 gate terminal，ledger 原样抄走。`conflict` > 0 时 `review_terminal` 为 `manual_required`，并出现在既有状态面板的「跨轮冲突」一节。本轮若原本会 pass，终态改为 fail / `primary_findings`。clean-streak 状态机不改，避免写出和 streak 对不上的粘滞 `manual_required`。
 
@@ -20,4 +20,4 @@ false-positive disposition 仍计入终裁。不另做「不重复计入」：�
 
 每条只输出 `finding_id`、`disposition`、`head_sha`、`approved_at`、`reason`、`counterevidence`、`tracking_issue`。文本使用 `_clip_text` 限制为 240 字符，`head_sha` 保留原值；false-positive 的 `counterevidence` 是 command、output、result、pointer 四字段，`tracking_issue` 为 null；deferred 的 `counterevidence` 为 null，`tracking_issue` 保留其值。按 `approved_at` 倒序，最多 30 条。
 
-Silo 未配置或前轮 ledger 不可用时，JSON 的 `available` 为 false、`findings` 与 `dispositions` 都为空数组，并沿用 `GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=...`。成功注入后，只有 `${RUNNER_TEMP}/previous-findings.json` 非空才经 `$GITHUB_ENV` 导出 `REVIEW_PREVIOUS_ROUND_PATH`；变量值是该文件的绝对路径。消费端只要收到该变量，就必须把文件按上述四键契约严格解析，不接受缺键或非法 JSON。原 `DESIGN_DOC` 拼接与 `--annotate-primary-audit` 行为保留，直到消费端随 runner 镜像上线后另行收口。
+Silo 未配置或前轮 ledger 不可用时，JSON 的 `available` 为 false、`findings` 与 `dispositions` 都为空数组，并沿用 `GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=...`。成功注入后，只有 `${RUNNER_TEMP}/previous-findings.json` 非空才经 `$GITHUB_ENV` 导出 `REVIEW_PREVIOUS_ROUND_PATH`；变量值是该文件的绝对路径。消费端只要收到该变量，就必须把文件按上述四键契约严格解析，不接受缺键或非法 JSON。原 `DESIGN_DOC` 拼接通道已随消费端（gate-hub `7b4f322b` 起读 `REVIEW_PREVIOUS_ROUND_PATH`）上线删除；`--annotate-primary-audit` 行为保留。

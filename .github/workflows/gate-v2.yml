@@ -730,7 +730,6 @@ jobs:
             fi
             python3 _gate-silo-src/.github/actions/gate-aggregator/aggregate.py --render-previous-context \
               --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
-              --design-doc "$DESIGN_DOC_INPUT" --output .gate-review-context.md \
               --previous-json "${RUNNER_TEMP}/previous-findings.json"
           )
           inject_status=$?
@@ -741,9 +740,6 @@ jobs:
           else
             if [ -s "${RUNNER_TEMP}/previous-findings.json" ]; then
               echo "REVIEW_PREVIOUS_ROUND_PATH=${RUNNER_TEMP}/previous-findings.json" >> "$GITHUB_ENV"
-            fi
-            if [ -s .gate-review-context.md ]; then
-              echo "DESIGN_DOC=.gate-review-context.md" >> "$GITHUB_ENV"
             fi
           fi
 
