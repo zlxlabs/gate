@@ -11,3 +11,10 @@
 - 本段结论：`Aggregate required verdict` 现在传入 draft、fork、runner 和 classify 原始输出；REVIEW_EXPECTED、primary `if:` 及其判定顺序保持不变。契约测试逐项锁住输入表达式与 CLI 参数，producer 子进程测试还锁住紧凑排序 JSON 的实际 stdout 字节。
 - 关键决策与已否决方案：fork 事实由 head 仓与当前仓比较后作为布尔值传入；聚合器不调用 GitHub API 推导。
 - 下一步唯一动作：补齐设计契约文档并追加进度后跑全量验收。
+
+## 里程碑 3：设计契约与收尾验证
+
+- 当前阶段：implementing
+- 本段结论：设计文档记录了标记字段、有限值域、判定顺序和消费规则，也明确说明了 fail-closed 负例中 `primary=skipped, skip_reason=null` 的必要例外。实现与契约测试已提交，正在跑最终全量验证。
+- 关键决策与已否决方案：不伪报未执行的 primary 为 `executed`；负例保持真实执行状态并以非零退出和非 `skipped` 的 gate_result 失败。
+- 下一步唯一动作：跑卡面要求的全量测试、相关文件测试、pin 检查并保存完整报告。
