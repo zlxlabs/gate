@@ -249,7 +249,8 @@ def test_disposition_receipt_is_bound_to_the_current_round():
     [
         ("false-positive", "personal", (), 1, "active_false_positive"),
         ("false-positive", "saas", (), 1, "active_false_positive"),
-        ("deferred", "internal", (), 1, "active_deferred"),
+        ("deferred", "personal", ("p1",), 0, "deferred_not_allowed_for_tier"),
+        ("deferred", "internal", ("p1",), 0, "deferred_not_allowed_for_tier"),
         ("deferred", "saas", ("p1",), 0, "deferred_not_allowed_for_tier"),
     ],
 )

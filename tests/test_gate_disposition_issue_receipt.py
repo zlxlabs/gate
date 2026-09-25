@@ -154,20 +154,24 @@ def test_deferred_producer_rejects_invalid_or_cross_repository_reference(tmp_pat
     assert not output_dir.exists()
 
 
-def test_deferred_producer_rejects_saas_and_accepts_any_p1_trigger_kind(tmp_path):
-    rejected, rejected_dir = _issue(
-        tmp_path / "saas", disposition="deferred", tracking_issue="#12", tier="saas",
-    )
-    assert rejected.returncode != 0
-    assert "deferred_not_allowed_for_tier" in rejected.stderr
-    assert not rejected_dir.exists()
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+def test_deferred_producer_rejected_at_every_tier(tmp_path, tier):
+    result, output_dir = _issue(tmp_path / tier, disposition="deferred", tracking_issue="#12", tier=tier)
 
-    accepted, accepted_dir = _issue(
-        tmp_path / "measured", disposition="deferred", tracking_issue="#12", trigger_kind="measured",
+    assert result.returncode != 0
+    assert "deferred_not_allowed_for_tier" in result.stderr
+    assert not output_dir.exists()
+
+
+def test_false_positive_producer_rejects_measured_p1(tmp_path):
+    result, output_dir = _issue(
+        tmp_path, disposition="false-positive", counterevidence=COUNTEREVIDENCE,
+        trigger_kind="measured",
     )
-    assert accepted.returncode == 0, accepted.stderr
-    artifact = json.loads(accepted.stdout)["artifact"]
-    assert (accepted_dir / artifact).is_file()
+
+    assert result.returncode != 0
+    assert "finding_id must identify an inferred P1 finding" in result.stderr
+    assert not output_dir.exists()
 
 
 def test_legacy_five_input_producer_call_fails_closed_without_evidence(tmp_path):
