@@ -1579,6 +1579,33 @@ def test_ledger_build_step_has_one_minute_timeout():
     assert build["timeout-minutes"] == 1
 
 
+def test_ledger_steps_emit_start_progress_markers():
+    raw, _ = _load_workflow()
+    steps = raw["jobs"]["ledger"]["steps"]
+    names = (
+        "Checkout ledger action at this workflow's own commit",
+        "Resolve Silo hostname via MagicDNS",
+        "Resolve v2 ledger artifacts",
+        "Download v2 review ledger inputs",
+        "Download canonical primary audit for ledger",
+        "Download gate terminal envelope for ledger",
+        "Build v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger",
+    )
+
+    assert len([step for step in steps if step.get("name") in names]) == len(names)
+    for name in names:
+        index = next(i for i, step in enumerate(steps) if step.get("name") == name)
+        step = steps[index]
+        marker = f'echo "::notice::step-start: {name}"'
+        if "uses" in step:
+            progress = steps[index - 1]
+            assert progress["name"] == f"Mark {name} start"
+            assert progress["run"] == marker
+        else:
+            assert step["run"].splitlines()[0] == marker
+
+
 def test_review_ledger_input_uploads_declare_one_day_retention():
     raw, _ = _load_workflow()
     quality_steps = raw["jobs"]["quality"]["steps"]
