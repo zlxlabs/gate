@@ -1938,14 +1938,17 @@ jobs:
               if jobs_listing_path:
                   return json.loads(Path(jobs_listing_path).read_text(encoding="utf-8"))
               repo, run_id = attribution_repo()
-              proc = subprocess.run(
-                  [
-                      "gh", "api",
-                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}/jobs",
-                      "--paginate", "--slurp",
-                  ],
-                  check=False, capture_output=True, text=True,
-              )
+              try:
+                  proc = subprocess.run(
+                      [
+                          "gh", "api",
+                          f"repos/{repo}/actions/runs/{run_id}/attempts/{current}/jobs",
+                          "--paginate", "--slurp",
+                      ],
+                      check=False, capture_output=True, text=True, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  raise SystemExit("Resolve v2 ledger artifacts 超时：current-attempt jobs API 调用超过 30 秒")
               if proc.returncode != 0:
                   raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
               return json.loads(proc.stdout)
@@ -1954,13 +1957,16 @@ jobs:
               if attempt_listing_path:
                   return json.loads(Path(attempt_listing_path).read_text(encoding="utf-8"))
               repo, run_id = attribution_repo()
-              proc = subprocess.run(
-                  [
-                      "gh", "api",
-                      f"repos/{repo}/actions/runs/{run_id}/attempts/{current}",
-                  ],
-                  check=False, capture_output=True, text=True,
-              )
+              try:
+                  proc = subprocess.run(
+                      [
+                          "gh", "api",
+                          f"repos/{repo}/actions/runs/{run_id}/attempts/{current}",
+                      ],
+                      check=False, capture_output=True, text=True, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  raise SystemExit("Resolve v2 ledger artifacts 超时：current-attempt metadata API 调用超过 30 秒")
               if proc.returncode != 0:
                   raise SystemExit("Jobs API call failed while attributing a missing current-attempt terminal")
               return json.loads(proc.stdout)
