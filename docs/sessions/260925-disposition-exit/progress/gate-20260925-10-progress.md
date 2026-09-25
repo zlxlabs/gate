@@ -39,3 +39,10 @@
 - 本段结论：README、收敛设计和新契约文档已更新；旧 record-only 会话文档仅追加重开缘由。全量 pytest 通过 1166 项，pin 检查、actionlint 和 diff whitespace 检查均通过。
 - 关键决策与已否决方案：gate-hub#1073 对 internal deferred 的现存验收文字与锁定决策冲突；实现按 internal 允许 deferred，需主脑修订 issue 判据。
 - 下一步唯一动作：验证 approver 上下文守卫的反向红例并完成提交、推送及报告。
+
+### 2026-09-25 / approver 守卫反向验证
+
+- 当前阶段：implementing
+- 本段结论：将 `DISPOSITION_APPROVER` 临时改回 `github.triggering_actor` 后，契约测试以 approver 值 AssertionError 失败；还原后同一测试通过，workflow actionlint 与 diff whitespace 检查通过。
+- 关键决策与已否决方案：反向注入仅修改已提交 workflow 的一行并原样还原；未改闸基线或绕过守卫。
+- 下一步唯一动作：收集最终分支状态并推送、写入执行报告。
