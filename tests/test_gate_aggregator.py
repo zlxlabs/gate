@@ -955,6 +955,9 @@ def test_real_aggregator_subprocess_publishes_one_verdict_line(
     verdict_lines = [line for line in result.stdout.splitlines() if line.startswith(prefix)]
     assert len(verdict_lines) == 1
     verdict = json.loads(verdict_lines[0][len(prefix):])
+    assert verdict_lines[0] == prefix + json.dumps(
+        verdict, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
     assert verdict == {
         "classification": expected_classification,
         "draft": expected_draft,
