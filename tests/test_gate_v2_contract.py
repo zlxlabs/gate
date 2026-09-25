@@ -718,6 +718,35 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     )
 
 
+def test_aggregate_passes_skip_reason_facts_from_the_review_expected_atoms():
+    raw, _ = _load_workflow()
+    gate = raw["jobs"]["gate"]
+    aggregate = next(s for s in gate["steps"] if s.get("name") == "Aggregate required verdict")
+    env = aggregate["env"]
+    assert CLASSIFY_JOB_ID in gate["needs"]
+    assert raw["jobs"]["primary"]["if"] == REVIEW_EXPECTED_IF
+    assert env["REVIEW_EXPECTED"] == REVIEW_EXPECTED_IF
+    assert env["IS_DRAFT"] == "${{ github.event.pull_request.draft }}"
+    assert env["IS_FORK"] == "${{ github.event.pull_request.head.repo.full_name != github.repository }}"
+    assert env["RUNNER_MODE"] == "${{ inputs.runner }}"
+    assert env["CLASSIFY_REVIEW_EXPECTED"] == "${{ needs.classify_pr_paths.outputs.review_expected }}"
+    atom_positions = [
+        REVIEW_EXPECTED_IF.index(DRAFT_GUARD),
+        REVIEW_EXPECTED_IF.index(FORK_GUARD),
+        REVIEW_EXPECTED_IF.index(RUNNER_GUARD),
+        REVIEW_EXPECTED_IF.index(CLASSIFY_GUARD),
+    ]
+    assert atom_positions == sorted(atom_positions)
+    for flag, variable in (
+        ("--is-draft", "IS_DRAFT"),
+        ("--is-fork", "IS_FORK"),
+        ("--runner", "RUNNER_MODE"),
+        ("--classify-review-expected", "CLASSIFY_REVIEW_EXPECTED"),
+        ("--review-expected", "REVIEW_EXPECTED"),
+    ):
+        assert f'{flag} "${variable}"' in aggregate["run"]
+
+
 def test_observed_abandoned_primary_is_normalized_and_raw_value_is_preserved():
     fixture = json.loads(ABANDONED_FIXTURE.read_text(encoding="utf-8"))
     assert fixture["observed_env"]["PRIMARY_RESULT"] == "abandoned"
@@ -3019,7 +3048,8 @@ def test_real_preflight_payload_reaches_workflow_and_aggregator_cli(
     aggregator = subprocess.run(
         [sys.executable, str(AGGREGATOR_SCRIPT), "--quality-result", "failure", "--caller-checks", "passed",
          "--preflight-result", workflow_lines["preflight_result"], "--primary-result", "success", "--runner", "self",
-         "--is-draft", "false", "--review-expected", "true", "--repository-id", "123", "--repository", "zlxlabs/gate",
+         "--is-draft", "false", "--is-fork", "false", "--classify-review-expected", "true",
+         "--review-expected", "true", "--repository-id", "123", "--repository", "zlxlabs/gate",
          "--head-sha", "a" * 40, "--run-id", "999", "--run-attempt", "1", "--pr-number", "42",
          "--audit-source-attempt", "1", "--audit-artifact-name", "primary-audit-v2-1", "--audit-dir", str(audit_dir),
          "--summary-path", str(aggregator_summary), "--terminal-path", str(tmp_path / "gate-terminal.json")],

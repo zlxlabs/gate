@@ -59,10 +59,9 @@ tests/test_gate_aggregator.py for the full decision matrix):
   - primary's job `result` must itself be a recognized value (`success`,
     `failure`, `cancelled`, `skipped`); an unrecognized string fails closed
     rather than being treated as any particular case.
-  - primary `skipped` is only accepted when the PR is a draft, or when review
-    was not expected at all (fork PR / `runner: hosted` / any future
-    non-review policy) — an unexplained skip on a non-draft, same-repo,
-    `runner: self` PR is never treated as a pass.
+  - primary `skipped` is accepted only when a reason is identified in this
+    order: draft, fork, hosted runner, review-exempt paths. An unexplained
+    skip is never accepted as a passing primary review.
   - primary `cancelled` always fails closed and produces a synthetic audit
     (status `job_timed_out`).
   - primary `success`/`failure` must have a valid, identity-matched canonical
@@ -153,6 +152,7 @@ PREFLIGHT_RESULT_DOMAIN = ("", "success", "blocked", "unavailable", "skipped", "
 TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
 TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "disposition_resolved", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip", "review_expected_stale", "pr_state_unverifiable")
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
+PRIMARY_SKIP_REASON_DOMAIN = ("draft", "review_exempt", "fork", "hosted_runner")
 PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
 CONVERGENCE_ENVELOPE_SCHEMA_VERSION = 1
@@ -286,6 +286,7 @@ class Outcome:
     classification: Optional[str] = None
     reason_code: Optional[str] = None
     gate_result: Optional[str] = None
+    skip_reason: Optional[str] = None
     audit_available: bool = False
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
@@ -760,12 +761,15 @@ def build_terminal_envelope(
     """Build the versioned machine-readable gate terminal envelope."""
     if outcome.classification not in TERMINAL_CLASSIFICATION_DOMAIN or outcome.reason_code not in TERMINAL_REASON_DOMAIN or outcome.gate_result not in GATE_RESULT_DOMAIN:
         raise ValueError("terminal field is outside the finite domain")
+    if outcome.skip_reason not in (None,) + PRIMARY_SKIP_REASON_DOMAIN:
+        raise ValueError("primary skip reason is outside the finite domain")
     envelope = {
         "schema_version": 1, "kind": "gate_terminal", "repository": repository,
         "repository_id": identity.repository_id, "pr_number": identity.pr, "run_id": identity.run_id,
         "run_attempt": identity.run_attempt, "head_sha": identity.head_sha,
         "quality_result": quality_result,
         "primary_result": primary_result,
+        "skip_reason": outcome.skip_reason,
         "review_expected": review_expected,
         "is_draft": is_draft,
         "runner": runner,
@@ -973,6 +977,8 @@ def evaluate(
     audit: Any,
     audit_error: Optional[str],
     identity: Identity,
+    is_fork: bool = False,
+    classify_review_expected: str = "",
     audit_source_attempt: Optional[int] = None,
     audit_artifact_name: Optional[str] = None,
     scope: Optional[Any] = None,
@@ -1009,6 +1015,10 @@ def evaluate(
         invalid_inputs.append(f"primary job result {primary_result!r} is not a recognized value (expected one of {PRIMARY_RESULT_DOMAIN!r}) — fail-closed")
     if type(is_draft) is not bool or type(review_expected) is not bool:
         invalid_inputs.append("draft/review_expected must be genuine booleans — fail-closed")
+    if type(is_fork) is not bool:
+        invalid_inputs.append("is_fork must be a genuine boolean — fail-closed")
+    if not isinstance(classify_review_expected, str):
+        invalid_inputs.append("classify_review_expected must be a string — fail-closed")
     caller_checks = (caller_checks or "").strip()
     if caller_checks not in ("",) + CALLER_CHECKS_DOMAIN:
         invalid_inputs.append(f"caller_checks input {caller_checks!r} is not a recognized value (expected one of {CALLER_CHECKS_DOMAIN!r} or empty when the evidence step never ran) — fail-closed")
@@ -1030,6 +1040,7 @@ def evaluate(
     audit_available = False
     convergence_eligible = False
     audit_source = artifact_name = None
+    skip_reason = None
 
     if quality_result == "success":
         notes.append("quality: success")
@@ -1040,6 +1051,7 @@ def evaluate(
 
     if primary_result == "skipped":
         if is_draft:
+            skip_reason = "draft"
             # gate#110: the payload's draft flag can be stale — a synchronize
             # run cancels the same-head ready_for_review run and survives with
             # draft=true. `main` re-fetches the PR's current draft state and
@@ -1062,13 +1074,22 @@ def evaluate(
                 notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
                 notes.append("pr draft state re-verified: still draft")
                 primary_classification, primary_reason = "expected_skip", "review_not_expected"
-        elif not review_expected:
+        elif is_fork:
+            skip_reason = "fork"
+            notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
+            primary_classification, primary_reason = "expected_skip", "review_not_expected"
+        elif runner != "self":
+            skip_reason = "hosted_runner"
+            notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
+            primary_classification, primary_reason = "expected_skip", "review_not_expected"
+        elif classify_review_expected == "false":
+            skip_reason = "review_exempt"
             notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
             primary_classification, primary_reason = "expected_skip", "review_not_expected"
         else:
             problems.append(
-                "primary job was skipped but review was expected (non-draft PR, same-repo head, "
-                "runner: self) — an unexplained skip is never accepted as a passing primary review"
+                "primary job was skipped but no skip reason could be derived from draft, fork, runner, "
+                "or classify output — an unexplained skip is never accepted as a passing primary review"
             )
             primary_classification, primary_reason = "integration_error", "unexpected_primary_skip"
     elif primary_result == "cancelled":
@@ -1214,6 +1235,7 @@ def evaluate(
     outcome = Outcome(
         ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,
         classification=classification, reason_code=reason_code, gate_result=gate_result,
+        skip_reason=skip_reason,
         audit_available=audit_available, audit_source_attempt=audit_source, audit_artifact_name=artifact_name,
     )
     # This is deliberately the only convergence hand-off in the single-round
@@ -2872,6 +2894,19 @@ def _finish(
         runtime_values=runtime_values_from_environment(),
     )
     summary += convergence_note
+    classification = outcome.classification if outcome.classification in TERMINAL_CLASSIFICATION_DOMAIN else "integration_error"
+    reason_code = outcome.reason_code if outcome.reason_code in TERMINAL_REASON_DOMAIN else "audit_invalid"
+    gate_result = outcome.gate_result if outcome.gate_result in GATE_RESULT_DOMAIN else ("pass" if outcome.ok else "fail")
+    verdict = {
+        "v": 1,
+        "gate_result": gate_result,
+        "classification": classification,
+        "reason_code": reason_code,
+        "primary": "skipped" if primary_result == "skipped" else "executed",
+        "skip_reason": outcome.skip_reason,
+        "draft": is_draft is True,
+    }
+    summary += "AGENT-GATE-VERDICT-V1 " + json.dumps(verdict, sort_keys=True, separators=(",", ":")) + "\n"
     print(summary)
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as handle:
@@ -2915,6 +2950,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--primary-result", required=True, help="needs.primary.result")
     parser.add_argument("--runner", required=True, help="inputs.runner ('self'/'hosted') — validated strictly")
     parser.add_argument("--is-draft", required=True, help="github.event.pull_request.draft ('true'/'false')")
+    parser.add_argument("--is-fork", default="false", help="whether pull_request.head.repo.full_name differs from github.repository")
+    parser.add_argument("--classify-review-expected", default="", help="needs.classify_pr_paths.outputs.review_expected; absent means no review-exempt reason can be identified")
     parser.add_argument(
         "--review-expected",
         required=True,
@@ -3001,6 +3038,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         is_draft = as_bool(args.is_draft)
+        is_fork = as_bool(args.is_fork)
         review_expected = as_bool(args.review_expected)
     except BoolParseError as exc:
         return _finish(
@@ -3063,6 +3101,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         primary_result=args.primary_result,
         runner=args.runner,
         is_draft=is_draft,
+        is_fork=is_fork,
+        classify_review_expected=args.classify_review_expected,
         review_expected=review_expected,
         audit=audit,
         audit_error=audit_error,

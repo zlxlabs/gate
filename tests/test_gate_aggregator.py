@@ -16,7 +16,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -57,6 +59,8 @@ def test_single_round_gate_outcome_is_not_convergence_state():
         preflight_result="success",
         runner="self",
         is_draft=False,
+        is_fork=False,
+        classify_review_expected="true",
         review_expected=True,
         audit={
             **_valid_primary_record(),
@@ -350,7 +354,7 @@ def test_non_draft_non_fork_self_runner_skipped_primary_fails():
 def test_non_draft_fork_or_hosted_skipped_primary_is_accepted():
     # review_expected False due to fork/hosted (not draft) — still accepted.
     outcome = AGG.evaluate(
-        **_base_kwargs(primary_result="skipped", is_draft=False, review_expected=False, audit=None, audit_error=None)
+        **_base_kwargs(primary_result="skipped", is_draft=False, is_fork=True, review_expected=False, audit=None, audit_error=None)
     )
     assert outcome.ok is True
 
@@ -501,6 +505,8 @@ def _cli_args(audit_dir, summary_path, **overrides):
         preflight_result="success",
         runner="self",
         is_draft="false",
+        is_fork="false",
+        classify_review_expected="true",
         review_expected="true",
         repository_id=str(identity.repository_id),
         head_sha=identity.head_sha,
@@ -515,6 +521,8 @@ def _cli_args(audit_dir, summary_path, **overrides):
         "--primary-result", values["primary_result"],
         "--runner", values["runner"],
         "--is-draft", values["is_draft"],
+        "--is-fork", values["is_fork"],
+        "--classify-review-expected", values["classify_review_expected"],
         "--review-expected", values["review_expected"],
         "--repository-id", values["repository_id"], "--repository", values["repository"],
         "--head-sha", values["head_sha"],
@@ -784,7 +792,7 @@ def test_cli_non_draft_skip_never_calls_pr_draft_fetch(tmp_path, monkeypatch):
     rc = AGG.main(
         _cli_args(
             tmp_path / "missing-audit", summary_path,
-            primary_result="skipped", is_draft="false", review_expected="false",
+            primary_result="skipped", is_draft="false", runner="hosted", review_expected="false",
         )
     )
 
@@ -863,7 +871,7 @@ def _assert_terminal_classification(outcome, expected):
     ({"quality_result": "skipped"}, ("ci_failure", "quality_skipped", "fail")), ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": True}, ("expected_skip", "review_not_expected", "skipped")),
     ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": False}, ("review_unavailable", "review_expected_stale", "unavailable")),
     ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": None}, ("review_unavailable", "pr_state_unverifiable", "unavailable")),
-    ({"primary_result": "skipped", "is_draft": False, "review_expected": False, "audit": None, "pr_draft_now": None}, ("expected_skip", "review_not_expected", "skipped")),
+    ({"primary_result": "skipped", "is_draft": False, "is_fork": False, "classify_review_expected": "false", "review_expected": False, "audit": None, "pr_draft_now": None}, ("expected_skip", "review_not_expected", "skipped")),
     ({}, ("code_pass", "primary_pass", "pass")), ({"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")}, ("code_fail", "primary_findings", "fail")),
     # gate#105 方案 A: quality short-circuited (skipped) by a failed primary
     # lands on the SAME classification/reason as (quality=success, primary=
@@ -878,6 +886,102 @@ def _assert_terminal_classification(outcome, expected):
 ])
 def test_terminal_classification_matrix(kwargs, expected):
     _assert_terminal_classification(AGG.evaluate(**_base_kwargs(**kwargs)), expected)
+
+
+@pytest.mark.parametrize(
+    "facts,expected_reason,expected_draft",
+    [
+        ({"is_draft": True, "is_fork": True, "runner": "hosted", "classify_review_expected": "false"}, "draft", True),
+        ({"is_draft": False, "is_fork": True, "runner": "hosted", "classify_review_expected": "false"}, "fork", False),
+        ({"is_draft": False, "is_fork": False, "runner": "hosted", "classify_review_expected": "false"}, "hosted_runner", False),
+        ({"is_draft": False, "is_fork": False, "runner": "self", "classify_review_expected": "false"}, "review_exempt", False),
+    ],
+)
+def test_primary_skip_reason_uses_locked_precedence(facts, expected_reason, expected_draft):
+    outcome = AGG.evaluate(**_base_kwargs(
+        primary_result="skipped", review_expected=False, audit=None, pr_draft_now=True, **facts,
+    ))
+    assert outcome.skip_reason == expected_reason
+    assert facts["is_draft"] is expected_draft
+    if expected_reason == "review_exempt":
+        assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
+            "expected_skip", "review_not_expected", "skipped",
+        )
+
+
+def test_primary_skip_without_a_matching_reason_fails_closed():
+    outcome = AGG.evaluate(**_base_kwargs(
+        primary_result="skipped", is_draft=False, is_fork=False, runner="self",
+        classify_review_expected="true", review_expected=False, audit=None,
+    ))
+    assert outcome.ok is False
+    assert outcome.skip_reason is None
+    assert (outcome.classification, outcome.reason_code) == (
+        "integration_error", "unexpected_primary_skip",
+    )
+    assert outcome.gate_result != "skipped"
+
+
+def test_primary_skip_with_missing_classify_fact_fails_closed():
+    kwargs = _base_kwargs(
+        primary_result="skipped", is_draft=False, review_expected=False, audit=None,
+    )
+    outcome = AGG.evaluate(**kwargs)
+    assert outcome.ok is False
+    assert outcome.skip_reason is None
+    assert outcome.gate_result != "skipped"
+
+
+@pytest.mark.parametrize(
+    "case,expected_primary,expected_reason,expected_draft,expected_gate_result,expected_classification,expected_reason_code",
+    [
+        ({"primary_result": "skipped", "is_draft": "false", "is_fork": "false", "runner": "self", "classify_review_expected": "false", "review_expected": "false"}, "skipped", "review_exempt", False, "skipped", "expected_skip", "review_not_expected"),
+        ({"primary_result": "skipped", "is_draft": "true", "is_fork": "true", "runner": "hosted", "classify_review_expected": "false", "review_expected": "false"}, "skipped", "draft", True, "unavailable", "review_unavailable", "pr_state_unverifiable"),
+        ({"primary_result": "skipped", "is_draft": "false", "is_fork": "true", "runner": "self", "classify_review_expected": "true", "review_expected": "false"}, "skipped", "fork", False, "skipped", "expected_skip", "review_not_expected"),
+        ({"primary_result": "skipped", "is_draft": "false", "is_fork": "false", "runner": "hosted", "classify_review_expected": "true", "review_expected": "false"}, "skipped", "hosted_runner", False, "skipped", "expected_skip", "review_not_expected"),
+        ({"primary_result": "success", "is_draft": "false", "is_fork": "false", "runner": "self", "classify_review_expected": "true", "review_expected": "true"}, "executed", None, False, "pass", "code_pass", "primary_pass"),
+        ({"primary_result": "failure", "is_draft": "false", "is_fork": "false", "runner": "self", "classify_review_expected": "true", "review_expected": "true"}, "executed", None, False, "fail", "code_fail", "primary_findings"),
+        ({"primary_result": "skipped", "is_draft": "false", "is_fork": "false", "runner": "self", "classify_review_expected": "true", "review_expected": "false"}, "skipped", None, False, "unavailable", "integration_error", "unexpected_primary_skip"),
+    ],
+)
+def test_real_aggregator_subprocess_publishes_one_verdict_line(
+    tmp_path, case, expected_primary, expected_reason, expected_draft, expected_gate_result,
+    expected_classification, expected_reason_code,
+):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    if case["primary_result"] in ("success", "failure"):
+        (audit_dir / "primary-review-audit.json").write_text(
+            json.dumps(_valid_primary_record(verdict="fail" if case["primary_result"] == "failure" else "pass")),
+            encoding="utf-8",
+        )
+    summary_path = tmp_path / "summary.md"
+    args = _cli_args(audit_dir, summary_path, **case)
+    env = {**os.environ, "GH_TOKEN": "", "GITHUB_TOKEN": ""}
+    result = subprocess.run(
+        [sys.executable, str(MODULE_PATH), *args],
+        cwd=ROOT, env=env, capture_output=True, check=False,
+    )
+    assert result.returncode == (0 if expected_gate_result in ("pass", "skipped") else 1)
+    prefix = b"AGENT-GATE-VERDICT-V1 "
+    verdict_lines = [line for line in result.stdout.splitlines() if line.startswith(prefix)]
+    assert len(verdict_lines) == 1
+    verdict = json.loads(verdict_lines[0][len(prefix):])
+    assert verdict_lines[0] == prefix + json.dumps(
+        verdict, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    assert verdict == {
+        "classification": expected_classification,
+        "draft": expected_draft,
+        "gate_result": expected_gate_result,
+        "primary": expected_primary,
+        "reason_code": expected_reason_code,
+        "skip_reason": expected_reason,
+        "v": 1,
+    }
+    assert verdict_lines[0].decode("utf-8") in summary_path.read_text(encoding="utf-8")
+    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text(encoding="utf-8"))
+    assert terminal["skip_reason"] == expected_reason
 
 
 def test_quality_skipped_by_primary_failure_reports_short_circuit_not_quality_problem():
@@ -928,6 +1032,10 @@ def test_terminal_reason_domain_lock():
         "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip",
         "review_expected_stale", "pr_state_unverifiable",
     )
+
+
+def test_primary_skip_reason_domain_lock():
+    assert AGG.PRIMARY_SKIP_REASON_DOMAIN == ("draft", "review_exempt", "fork", "hosted_runner")
 
 
 def test_stale_draft_payload_problem_carries_the_retrigger_command_verbatim():
@@ -1123,6 +1231,7 @@ _TERMINAL_GOLDEN = """{
   "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "quality_result": "success",
   "primary_result": "success",
+  "skip_reason": null,
   "review_expected": true,
   "is_draft": false,
   "runner": "self",
@@ -3520,7 +3629,7 @@ def test_issue199_draft_skipped_primary_with_quality_failure_stays_code_problem(
 
 def test_issue199_hosted_skipped_primary_with_quality_failure_stays_code_problem():
     outcome = AGG.evaluate(
-        **_base_kwargs(quality_result="failure", caller_checks="failed", primary_result="skipped", is_draft=False, review_expected=False, audit=None, audit_error=None)
+        **_base_kwargs(quality_result="failure", caller_checks="failed", primary_result="skipped", is_draft=False, runner="hosted", review_expected=False, audit=None, audit_error=None)
     )
     assert outcome.ok is False
     assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("ci_failure", "quality_failure", "fail")

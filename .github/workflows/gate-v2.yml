@@ -1575,6 +1575,8 @@ jobs:
           # fall through whichever branch it happens to resemble.
           RUNNER_MODE: ${{ inputs.runner }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          CLASSIFY_REVIEW_EXPECTED: ${{ needs.classify_pr_paths.outputs.review_expected }}
           # The SAME expression the `primary` job's own `if:` uses (see that
           # job's comment) — recomputed here because a skipped job's `if:`
           # condition is not itself exposed via `needs.*`, only its `result`.
@@ -1601,6 +1603,8 @@ jobs:
             --primary-result "$PRIMARY_RESULT" \
             --runner "$RUNNER_MODE" \
             --is-draft "$IS_DRAFT" \
+            --is-fork "$IS_FORK" \
+            --classify-review-expected "$CLASSIFY_REVIEW_EXPECTED" \
             --review-expected "$REVIEW_EXPECTED" \
             --repository-id "$REPOSITORY_ID" \
             --repository "$REPOSITORY" \
