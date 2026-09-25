@@ -92,7 +92,7 @@ def evaluate_round(
 | INV-B1 | source attempt、artifact id、audit digest、epoch 必须成组校验 | `aggregate.py` artifact resolver + `convergence.py:validate_receipt` | `tests/test_gate_convergence_artifact.py::test_producer_payload_preserves_all_attempt_guards` |
 | INV-C1 | `triggering_actor` / `actor_id` 只标识 GitHub 账号，不能证明人工操作；owner 接受该限制，使用证据和留痕约束回执，不增加身份控制 | `convergence.py:validate_disposition_receipt` | `tests/test_gate_convergence.py` counterevidence/tier 矩阵 |
 | INV-C2 | 有效、active 回执只移除精确匹配的当前 P1；全覆盖按无 P1 计入本轮，部分覆盖保留剩余 P1；无效回执不改变 gate | `convergence.py:record_dispositions/evaluate_round` | `tests/test_gate_convergence.py` disposition 矩阵；`tests/test_gate_aggregator.py::test_main_fail_primary_plus_matching_receipt_resolves_p1` |
-| INV-C3 | `head_sha + audit_digest + epoch + finding_id/finding_key` 绑定当前审计目标；false-positive 还需反证，deferred 需同仓 issue 且受 tier 限制 | `convergence.py:validate_disposition_receipt` | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
+| INV-C3 | `head_sha + audit_digest + epoch + finding_id/finding_key` 绑定当前审计目标；false-positive 还需反证，deferred 需同仓 issue 且所有 tier 均拒绝 | `convergence.py:validate_disposition_receipt` | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
 | INV-D1 | 三个降层问题在 receipt 写入前回答；保护的是写入和 gate 行为两层 | `aggregate.py` + `gate-v2.yml` wiring | `tests/test_gate_convergence_artifact.py::test_terminal_publish_has_verified_receipt_before_exit` |
 | INV-E1 | convergence receipt 是 immutable replay source；ledger 只是观测；评论没有机器 state | `gate-v2.yml` artifact steps + `build_ledger.py` projection | `tests/test_gate_v2_contract.py::test_convergence_state_never_lives_in_pr_comment` |
 
@@ -110,7 +110,7 @@ def evaluate_round(
 | `M` | 旧 epoch 不再收新轮，保持 M；`test_manual_required_is_terminal_for_epoch` | 保持 M；不能用后来的 clean 证据偷偷复活；`test_manual_required_rejects_late_clean_round` | 保持 M；disposition 不能绕过人工恢复或重置该 terminal state；`test_manual_required_rejects_waiver_shortcut` | 保持 M；拒绝仅记诊断；`test_manual_required_is_terminal_for_epoch` | 同 processing/round key 仍 no-op；其它 rerun 也保持 M；`test_manual_required_is_idempotent` | 只有可信的新 epoch 初始化才离开 M；当前旧 state 不可信则 F；`test_manual_reinitialize_is_explicit_and_zero_based` |
 | `F` | 保持 F，禁止用新 primary 掩盖 state 损坏；`test_fail_closed_never_consumes_primary` | 保持 F；`test_fail_closed_never_treats_missing_as_clean` | 保持 F；无法验证 waiver 不能修复 state；`test_fail_closed_rejects_waiver` | 保持 F；`test_fail_closed_is_sticky_until_reinitialize` | 同 key no-op 只记录诊断，不改变 F；`test_fail_closed_replay_is_deterministic` | head 变化也不能自动信任旧 state；必须受保护人工 reinitialize，且新起点为零；`test_untrusted_state_cannot_auto_reset_on_new_head` |
 
-补充规则：有效回执不单独生成 round；它只在当前 round 中覆盖精确绑定的 P1。`false-positive` 需要完整反证且限 inferred P1；`deferred` 需要合法同仓 issue 引用，`saas` tier 拒绝 deferred。全部 P1 被覆盖时按“无 P1”进入现有 streak 规则；拒绝、stale、畸形回执只留下诊断，未覆盖 P1 继续阻断，不把回执错误升级为 state fail-closed。
+补充规则：有效回执不单独生成 round；它只在当前 round 中覆盖精确绑定的 P1。`false-positive` 需要完整反证且限 inferred P1；`deferred` 需要合法同仓 issue 引用，且所有 tier 均拒绝 deferred。全部 P1 被覆盖时按“无 P1”进入现有 streak 规则；拒绝、stale、畸形回执只留下诊断，未覆盖 P1 继续阻断，不把回执错误升级为 state fail-closed。
 
 ### 2.2 轴 B：部署形态与唯一性
 
@@ -133,7 +133,7 @@ def evaluate_round(
 
 | 阶段 | 必须发生的事 | 记录语义 | 失败与失效 | 检测点 |
 |---|---|---|---|---|
-| 签发申请 | producer 读取 canonical audit 并定位唯一 P1；`false-positive` 要求非空 `command/output/pointer` 与 `result=refuted`，`deferred` 要求同仓 issue 格式。producer 不调用 GitHub API 查询 issue 状态 | v3 immutable receipt 上传至 Silo `d30/<repo_id>/<artifact_name>/` | 缺证据、无效 issue 或 saas deferred 在上传前拒签；缺省/非法 tier 按 internal | `tests/test_gate_disposition_issue_receipt.py` producer 拒签矩阵 |
+| 签发申请 | producer 读取 canonical audit 并定位唯一 P1；`false-positive` 要求非空 `command/output/pointer` 与 `result=refuted`，`deferred` 要求同仓 issue 格式。producer 不调用 GitHub API 查询 issue 状态 | v3 immutable receipt 上传至 Silo `d30/<repo_id>/<artifact_name>/` | 缺证据、无效 issue 或任意 tier 的 deferred 在上传前拒签；缺省/非法 tier 按 internal | `tests/test_gate_disposition_issue_receipt.py` producer 拒签矩阵 |
 | 绑定 | receipt 校验 `repository_id/pr_number`、`head_sha`、`epoch`、完整 `audit_digest` 与唯一 `finding_id/finding_key` | binding 将证据锁到当前审计的单条 finding | 旧 head、旧 digest、旧 epoch、finding 歧义均拒收；不允许 wildcard/category-only | `tests/test_gate_convergence.py::test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch` |
 | 消费 | 通过证据、tier、绑定校验的 active receipt 写入 terminal / ledger | 逐条输出 disposition、finding、pointer 和有界证据字段；不声称人工审批 | 一张回执只解除一条 P1；全覆盖时本轮按无 P1 计，部分覆盖仍阻断 | `tests/test_review_ledger.py::test_real_disposition_producer_receipt_flows_through_ledger` |
 | 非法 / 重复 / stale | consumer 保留可诊断的校验状态 | 错误只影响 receipt 记录，不参与 P1 扣减 | invalid / duplicate / stale / read error 都不能使原本 pass 变 fail，也不能使原本 fail 变 pass | `tests/test_gate_convergence.py` disposition 状态矩阵；`tests/test_gate_aggregator.py` receipt read-error test |
@@ -144,7 +144,7 @@ def evaluate_round(
 |---|---|---|---|---|
 | primary audit producer | reviewer chain 执行和上传 audit 不可逆；producer 先写临时文件、fsync/close 后以唯一 artifact name 上传；上传失败不产生 eligible receipt | `repo/pr/epoch/run_id/run_attempt/audit_digest/source_attempt` 全量进入 payload 和 artifact name；同组合异文 F | 保护写入：只接受实际上传字节；保护行为：aggregator 不接受 quality/OCR/shadow 代替 canonical primary | `tests/test_gate_convergence_artifact.py::test_primary_producer_payload_is_the_bytes_aggregator_verifies` |
 | convergence receipt | replay 完成前不发布 `gate/gate` green；receipt artifact upload 是不可逆发布，必须在 exit/terminal envelope 前成功 | `event_id`、epoch、round key、artifact id、source attempt 可重算；parallel writer 不靠 CAS | 同时保护写入（receipt 不可变、冲突停机）和行为（`gate_result=pass` 只来自重放后的 N）；不能只测文件写成功 | `tests/test_gate_convergence_artifact.py::test_terminal_publish_has_verified_receipt_before_exit` |
-| disposition receipt | workflow 读取 current canonical audit 并签发 `false-positive`/`deferred`；PR 评论不会作为 receipt 输入 | v3 schema、证据/跟踪引用及 `head_sha + audit_digest + epoch + finding_id/finding_key` 绑定目标；账号字段不证明人工身份 | 保护写入和行为：只消费每条有效回执指向的 P1；saas deferred 拒收 | `tests/test_review_ledger.py::test_real_disposition_producer_receipt_flows_through_ledger`；`test_saas_deferred_is_rejected_by_producer_and_aggregator` |
+| disposition receipt | workflow 读取 current canonical audit 并签发 `false-positive`/`deferred`；PR 评论不会作为 receipt 输入 | v3 schema、证据/跟踪引用及 `head_sha + audit_digest + epoch + finding_id/finding_key` 绑定目标；账号字段不证明人工身份 | 保护写入和行为：只消费每条有效回执指向的 P1；deferred 拒收（所有 tier） | `tests/test_review_ledger.py::test_real_disposition_producer_receipt_flows_through_ledger`；`test_saas_deferred_is_rejected_by_producer_and_aggregator` |
 | terminal / Required Check | 终态 envelope 和 check context 发布不可逆；发布前必须完成 replay、waiver validation、receipt upload；失败只可 red/manual | `gate/gate` job、run id/attempt、epoch 和 terminal envelope 同源；future artifact、旧 head、旧 source attempt 均拒绝 | 既保护写入也保护行为：`gate` job 必须真的退出对应 code 并发布名为 `gate/gate` 的 check；Step Summary 不能替代 check | `tests/test_gate_v2_contract.py::test_gate_consumes_convergence_before_publishing_required_result` |
 
 ### 2.5 轴 E：介质约束
@@ -214,7 +214,7 @@ hosted、primary skipped 或 audit 不可用等没有 canonical primary 的轮�
 
 2026-09-15，gate-hub#810 指出 `github.triggering_actor` / `github.actor_id` 只能标识账号，不能证明人工操作；当时 owner 裁决为 record-only。2026-09-25，owner 接受身份不可证并重开出口：不加签名、nonce、撤销、Environment 审批或人机区分，改以证据/跟踪 issue 约束，加 terminal/ledger 留痕。
 
-Receipt v3 绑定 `repository_id/pr_number`、`head_sha`、`audit_digest`、`epoch` 与 exact `finding_id/finding_key`。`false-positive` 需附 `command`、`output`、`result=refuted`、`pointer` 四个非空字段，且仍只允许 inferred P1；`deferred` 需同仓 `#N` 或 `/issues/N` 格式引用，仅 personal/internal 可用，saas 拒收。签发及消费都只做 tracking issue 格式/同仓校验，不查询 GitHub issue API。
+Receipt v3 绑定 `repository_id/pr_number`、`head_sha`、`audit_digest`、`epoch` 与 exact `finding_id/finding_key`。`false-positive` 需附 `command`、`output`、`result=refuted`、`pointer` 四个非空字段，且仍只允许 inferred P1；`deferred` 需同仓 `#N` 或 `/issues/N` 格式引用，所有 tier 均拒收。签发及消费都只做 tracking issue 格式/同仓校验，不查询 GitHub issue API。
 
 身份和时间字段仍不表示人工审批事实。有效 active receipt 只从当前 P1 集合移除其指向的一条；全覆盖则本轮按无 P1 进入 streak，部分覆盖仍由剩余 P1 阻断。无证据旧格式 v1/v2 receipt 拒收，不能解除阻断。精确 schema、optional workflow inputs 与矩阵见 `docs/sessions/260925-disposition-exit/design.md`。
 
@@ -254,8 +254,8 @@ canonical primary upload
 |---|---|---|
 | clean streak | personal `N=1` 一次无 P1；internal `N=2` 连续两次同 epoch 无 P1 | personal 首轮 `gate/gate=success`；internal 首轮非 pass、第二个 distinct round 才 success；OCR/shadow 不改变结果 |
 | active finding | 同 epoch 连续提交含 major 的 audit，finding id 可相同或变化 | 每个 eligible round `streak=0`；达到 max 后 `manual_required`/red，不能因 finding “重复”而放行 |
-| valid false positive / deferred | 先让 P1 使 gate red，签出带反证的 false-positive 或带同仓 issue 的 deferred，再重跑真实 gate | 仅 exact digest/finding 且 tier 允许的有效回执覆盖对应 finding；全覆盖后 gate 通过，部分覆盖仍阻断；summary/ledger 显示 kind、finding、pointer |
-| invalid/stale disposition | 修改 head/diff、错误 audit digest、unknown id、缺反证、错误 issue URL、saas deferred、普通评论或 label | 回执只留下诊断；不扣除未覆盖 P1；有效全覆盖以外不得把原本 fail 变 pass；普通评论和 label 永不改变 Required Check |
+| valid false positive | 先让 P1 使 gate red，签出带反证的 false-positive，再重跑真实 gate | 仅 exact digest/finding 的有效回执覆盖对应 finding；全覆盖后 gate 通过，部分覆盖仍阻断；summary/ledger 显示 kind、finding、pointer |
+| invalid/stale disposition | 修改 head/diff、错误 audit digest、unknown id、缺反证、错误 issue URL、deferred（任意 tier）、普通评论或 label | 回执只留下诊断；不扣除未覆盖 P1；有效全覆盖以外不得把原本 fail 变 pass；普通评论和 label 永不改变 Required Check |
 | unavailable/manual | 连续产生 `K=max_rounds` 个同 epoch reviewer/circuit unavailable receipt；穿插一次 eligible round 再重复 | unavailable 不增 eligible；连续 K 次进入 `manual_required`；eligible round 清空 unavailable streak；不返回 pass |
 | rerun / cross-attempt | 对同一 run 执行 `rerun --failed`，使 attempt 2 读取 attempt 1 audit；再产生不同 audit digest | 同 audit 不多一个 round；新 digest 只计一次；source attempt/selected artifact 都可在 payload 与 envelope 对上 |
 | force-push / parallel | 同时触发两个 attempt，再 push 新 head | receipt replay 与到达顺序无关；旧 epoch 全排除；新 epoch 从零开始；同 event 异文 fail-closed |

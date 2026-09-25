@@ -32,3 +32,14 @@
   `tracking_issue_ 不出现` 断言保住格式校验顺序覆盖；另补 false-positive×measured 负例，
   承接原用例里 deferred+measured 隐含的 trigger_kind 规则。
 - 下一步唯一动作：commit ③（README deferred 条目与 clean-streak-convergence.md 措辞同步）。
+
+## 段 3：文档同步（2026-09-26）
+
+- 当前阶段：implementing，文档已改完，待全量验证与红验。
+- 本段结论：README `deferred` 条目改为「所有 tier 均拒绝（保留入参仅为兼容；低于红线的
+  major 由 producer 归一化降为 minor，不再需要 deferred）」；
+  `clean-streak-convergence.md` 共 6 处提到 deferred tier 限制的行（:95、:113、:136、:147、
+  :217、:257-258）同步为全档拒绝措辞，其中 ：257 的「valid false positive / deferred」场景行
+  因有效 deferred 回执域已空而删去 deferred 半边。
+- 关键决策与已否决方案：无。
+- 下一步唯一动作：收尾提交后跑 Verify-Command 全量，然后做两侧红验注入。
