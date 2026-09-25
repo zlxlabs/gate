@@ -25,3 +25,10 @@
 - 本段结论：聚合器只从当前 P1 集合扣除有效回执覆盖项；全覆盖转 pass，部分覆盖保留未覆盖 P1 并继续 fail。真实 producer 子进程字节已贯通 aggregator、terminal 与 ledger；全覆盖、部分覆盖、SaaS deferred 拒收和旧绑定负例覆盖在 649 项受影响测试中。
 - 关键决策与已否决方案：head_sha 在 epoch 前校验，确保 force-push 旧回执给出 `head_sha_mismatch`；独立 epoch 不匹配仍报 `epoch_mismatch_stale`。SaaS deferred 在签发侧和消费侧均拒收。
 - 下一步唯一动作：更新 README、状态机设计与新契约设计文档，并完成最终全量验证。
+
+### 2026-09-25 / 修正 G4 结构守卫
+
+- 当前阶段：implementing
+- 本段结论：全量测试发现 G4 行构造器守卫仍匹配旧的 `receipt claim (` 文案，与新逐条留痕格式不符；更新为锁定当前唯一行构造器，定向测试通过。
+- 关键决策与已否决方案：不保留旧文案或兼容分支，测试直接约束新的 disposition/finding 行格式。
+- 下一步唯一动作：完成设计文档并重跑全量验证。

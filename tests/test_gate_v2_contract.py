@@ -323,10 +323,11 @@ def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
 
 def test_recorded_disposition_lines_is_the_only_g4_line_builder():
     hits = []
+    line_builder = 'f"disposition={receipt.disposition} finding='
     for path in (REPO_ROOT / ".github").rglob("*"):
         if not path.is_file() or path.suffix not in {".py", ".yml"}:
             continue
-        if "receipt claim (" in path.read_text(encoding="utf-8"):
+        if line_builder in path.read_text(encoding="utf-8"):
             hits.append(str(path.relative_to(REPO_ROOT)))
     assert hits == [".github/actions/gate-aggregator/convergence.py"]
 
