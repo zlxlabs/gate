@@ -404,6 +404,10 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
     if not isinstance(resolved, list):
         raise ValueError("disposition_receipt_consumption.resolved must be an array")
     projected: list[dict[str, Any]] = []
+    display_fields = (
+        "disposition", "disposition_claim", "evidence_pointer",
+        "counterevidence_command", "counterevidence_output",
+    )
     for item in resolved:
         if not isinstance(item, dict):
             raise ValueError("disposition_receipt_consumption.resolved item must be an object")
@@ -427,6 +431,15 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
             if not isinstance(item["finding_key"], str) or not item["finding_key"]:
                 raise ValueError("disposition_receipt_consumption.resolved item has an invalid finding_key")
             projected_item["finding_key"] = item["finding_key"]
+        for key in display_fields:
+            if key not in item:
+                continue
+            value = item[key]
+            if not isinstance(value, str) or not value or len(value) > 500:
+                raise ValueError(f"disposition_receipt_consumption.resolved item has invalid {key}")
+            if key in {"disposition", "disposition_claim"} and value not in {"false-positive", "deferred"}:
+                raise ValueError(f"disposition_receipt_consumption.resolved item has invalid {key}")
+            projected_item[key] = value
         projected.append(projected_item)
     consumed_count = block["consumed_count"]
     rejected_count = block["rejected_count"]
@@ -467,8 +480,17 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
             if not isinstance(item["finding_key"], str) or not item["finding_key"]:
                 raise ValueError("disposition_receipt_consumption.recorded has invalid finding_key")
             projected_claim["finding_key"] = item["finding_key"]
+        for key in display_fields:
+            if key not in item:
+                continue
+            value = item[key]
+            if not isinstance(value, str) or not value or len(value) > 500:
+                raise ValueError(f"disposition_receipt_consumption.recorded item has invalid {key}")
+            if key in {"disposition", "disposition_claim"} and value not in {"false-positive", "deferred"}:
+                raise ValueError(f"disposition_receipt_consumption.recorded item has invalid {key}")
+            projected_claim[key] = value
         projected_claims.append(projected_claim)
-    return {
+    result = {
         "recorded": projected_claims,
         "resolved": projected,
         "consumed_count": consumed_count,
@@ -476,6 +498,12 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
         "rejected_reasons": dict(sorted(reasons.items())),
         "fail_closed": fail_closed,
     }
+    if "remaining_p1_ids" in block:
+        remaining = block["remaining_p1_ids"]
+        if not isinstance(remaining, list) or any(not isinstance(item, str) or not item for item in remaining):
+            raise ValueError("disposition_receipt_consumption.remaining_p1_ids must be non-empty text values")
+        result["remaining_p1_ids"] = list(remaining)
+    return result
 
 
 def _validate_finding_relation(block: Any) -> dict[str, Any]:

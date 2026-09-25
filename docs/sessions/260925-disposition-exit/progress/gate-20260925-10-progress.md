@@ -18,3 +18,10 @@
 - 本段结论：disposition workflow 与 caller 模板新增三个 optional inputs；approver 与 approver_id 同取 `github.actor` 上下文；不改权限、不触发标签，v2 caller 模板明确无标签豁免。相关契约测试和 pin 检查通过。
 - 关键决策与已否决方案：保留老 caller 的 required-input/权限契约；旧 caller 可启动，但缺反证的 false-positive 会在上传前明确拒签。
 - 下一步唯一动作：接通 aggregator 的逐条终态投影与 summary/ledger 留痕，并做真实 producer 到 ledger E2E。
+
+### 2026-09-25 / aggregator 与 ledger 端到端
+
+- 当前阶段：implementing
+- 本段结论：聚合器只从当前 P1 集合扣除有效回执覆盖项；全覆盖转 pass，部分覆盖保留未覆盖 P1 并继续 fail。真实 producer 子进程字节已贯通 aggregator、terminal 与 ledger；全覆盖、部分覆盖、SaaS deferred 拒收和旧绑定负例覆盖在 649 项受影响测试中。
+- 关键决策与已否决方案：head_sha 在 epoch 前校验，确保 force-push 旧回执给出 `head_sha_mismatch`；独立 epoch 不匹配仍报 `epoch_mismatch_stale`。SaaS deferred 在签发侧和消费侧均拒收。
+- 下一步唯一动作：更新 README、状态机设计与新契约设计文档，并完成最终全量验证。

@@ -151,7 +151,7 @@ CALLER_CHECKS_DOMAIN = ("not_started", "passed", "failed")
 # callers whose evidence step never ran, and never imply a passing gate.
 PREFLIGHT_RESULT_DOMAIN = ("", "success", "blocked", "unavailable", "skipped", "cancelled")
 TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
-TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip", "review_expected_stale", "pr_state_unverifiable")
+TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "disposition_resolved", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip", "review_expected_stale", "pr_state_unverifiable")
 GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
 PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
@@ -178,7 +178,7 @@ HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
 MAX_REPO_WIDE_HISTORY_PAGES = 5
 MAX_TARGETED_HISTORY_RUNS = 50
 MAX_HISTORY_WARNING_CHARS = 500
-DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v2-"
+DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v3-"
 SILO_TERMINAL_TIER = "d30"
 SILO_DISPOSITION_TIER = "d30"
 PUBLISH_OPERATION_ORDER = (
@@ -382,7 +382,7 @@ _ACTIVE_PUBLISH_BUDGET: contextvars.ContextVar[Optional[_PublishBudget]] = conte
 
 
 def empty_disposition_receipt_audit() -> dict[str, Any]:
-    """Default schema-2 block for a run without recorded receipt claims."""
+    """Default receipt-consumption block for a run without current receipts."""
     return {
         "recorded": [],
         "resolved": [],
@@ -390,44 +390,70 @@ def empty_disposition_receipt_audit() -> dict[str, Any]:
         "rejected_count": 0,
         "rejected_reasons": {},
         "fail_closed": False,
+        "remaining_p1_ids": [],
     }
 
 
 def project_disposition_receipt_audit(audit: Any) -> dict[str, Any]:
-    """Project validated submitter claims into an audit-only schema-2 block.
-
-    Receipt disposition is a claim, and actor identity is not human approval.
-    The legacy resolved fields remain empty for schema-2 readers.
-    """
+    """Project active evidence-bound receipts and rejected receipt reasons."""
     if audit is None:
         return empty_disposition_receipt_audit()
     recorded_finding_ids = audit.recorded_finding_ids
     if len(recorded_finding_ids) != len(audit.recorded_receipts):
         raise ValueError("disposition audit has mismatched recorded finding ids")
     recorded = []
+    resolved = []
     for index, receipt in enumerate(audit.recorded_receipts):
+        target = recorded_finding_ids[index]
+        if receipt.disposition == "false-positive":
+            evidence = receipt.counterevidence or {}
+            evidence_pointer = _CONVERGENCE._bounded_disposition_text(evidence.get("pointer", ""))
+            command = _CONVERGENCE._bounded_disposition_text(evidence.get("command", ""))
+            output = _CONVERGENCE._bounded_disposition_text(evidence.get("output", ""))
+        else:
+            evidence_pointer = _CONVERGENCE._bounded_disposition_text(receipt.tracking_issue or "")
+            command = output = ""
         item = {
-            "finding_id": recorded_finding_ids[index],
+            "finding_id": target,
             "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
             "disposition_claim": receipt.disposition,
-            "triggering_actor": receipt.approver,
+            "triggering_actor": _CONVERGENCE._bounded_disposition_text(receipt.approver),
             "triggering_actor_id": receipt.approver_id,
             "recorded_at": receipt.approved_at,
-            "reason": receipt.reason,
+            "reason": _CONVERGENCE._bounded_disposition_text(receipt.reason),
+            "evidence_pointer": evidence_pointer,
         }
+        if command:
+            item["counterevidence_command"] = command
+        if output:
+            item["counterevidence_output"] = output
         if receipt.finding_key:
             item["finding_key"] = receipt.finding_key
         recorded.append(item)
+        resolved.append({
+            "finding_id": target,
+            "receipt": item["receipt"],
+            "approver": _CONVERGENCE._bounded_disposition_text(receipt.approver),
+            "approver_id": receipt.approver_id,
+            "approved_at": receipt.approved_at,
+            "reason": item["reason"],
+            "disposition": receipt.disposition,
+            "evidence_pointer": evidence_pointer,
+            **({"counterevidence_command": command} if command else {}),
+            **({"counterevidence_output": output} if output else {}),
+            **({"finding_key": receipt.finding_key} if receipt.finding_key else {}),
+        })
     rejected_reasons: dict[str, int] = {}
     for _receipt, reason in audit.rejected_receipts:
         rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
     return {
         "recorded": recorded,
-        "resolved": [],
-        "consumed_count": 0,
+        "resolved": resolved,
+        "consumed_count": len(resolved),
         "rejected_count": len(audit.rejected_receipts),
         "rejected_reasons": dict(sorted(rejected_reasons.items())),
         "fail_closed": False,
+        "remaining_p1_ids": list(audit.remaining_p1_ids),
     }
 
 
@@ -792,7 +818,7 @@ def _canonical_p1_findings(
 
 
 _CONVERGENCE_SCOPE_FIELDS = (
-    "base_sha", "diff_digest", "policy_version", "policy_digest", "tier",
+    "base_sha", "diff_digest", "policy_version", "policy_digest",
     "caller_sha", "reusable_workflow_sha",
 )
 
@@ -814,7 +840,7 @@ def _convergence_scope_from_audit(
         diff_digest=audit["diff_digest"],
         policy_version=audit["policy_version"],
         policy_digest=audit["policy_digest"],
-        tier=audit["tier"],
+        tier=audit.get("tier") if audit.get("tier") in _CONVERGENCE.SUPPORTED_TIERS else "internal",
         caller_sha=audit["caller_sha"],
         reusable_workflow_sha=audit["reusable_workflow_sha"],
     ), ()
@@ -957,6 +983,7 @@ def evaluate(
     pr_draft_now: Optional[bool] = None,
     caller_checks: str = "",
     preflight_result: str = "",
+    repository: str | None = None,
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -1223,9 +1250,8 @@ def evaluate(
             primary=primary,
             audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
+            repository=repository,
         )
-        # The receipt is a submitter claim, so it is recorded without changing
-        # the canonical P1 projection sent to convergence.
         outcome.disposition_audit = disposition_audit
         state = convergence_state or _CONVERGENCE.initial_state(scope)
         round_decision = _CONVERGENCE.evaluate_round(
@@ -1233,7 +1259,9 @@ def evaluate(
             scope=scope,
             primary=primary,
             audit_digest=audit_digest,
+            waiver_receipts=waiver_receipts,
             processing_key=processing_key,
+            repository=repository,
         )
         outcome.convergence_envelope = build_convergence_envelope(
             scope=scope,
@@ -1254,6 +1282,19 @@ def evaluate(
         recorded_claim_lines = list(_CONVERGENCE.recorded_disposition_lines(disposition_audit))
         if recorded_claim_lines:
             outcome.recorded_disposition_claims = recorded_claim_lines
+        if (
+            outcome.classification == "code_fail"
+            and outcome.reason_code == "primary_findings"
+            and audit["verdict"] == "fail"
+            and disposition_audit.recorded_receipts
+            and not disposition_audit.remaining_p1_ids
+        ):
+            outcome.ok = True
+            outcome.classification = "code_pass"
+            outcome.reason_code = "disposition_resolved"
+            outcome.gate_result = "pass"
+            outcome.problems = [problem for problem in outcome.problems if problem != "primary review verdict is 'fail'"]
+            outcome.notes.append("all current P1 findings are covered by active evidence-bound gate-disposition receipts")
     return outcome
 
 
@@ -1294,6 +1335,10 @@ def _write_convergence_receipt(path: str, receipt: Any) -> None:
 # the "could not be read" entries must never read as a reviewer rejection, and
 # unexpected_primary_skip must never read as the normal draft/fork skip.
 REASON_CODE_EXPLANATIONS = {
+    "disposition_resolved": (
+        "The primary audit reported findings, but every current P1 is covered by an active, "
+        "evidence-bound gate-disposition receipt for this exact head and audit."
+    ),
     "primary_findings": (
         "The primary reviewer REJECTED this change — the specific findings are in the primary "
         "review result for this run (linked above); the Problems list below only mirrors the verdict."
@@ -1343,6 +1388,8 @@ def _action_sentence(
         run_url = f"https://github.com/{repository}/actions/runs/{identity.run_id}"
     gate_result = outcome.gate_result
     if gate_result == "pass":
+        if outcome.reason_code == "disposition_resolved":
+            return "All current P1 findings are covered by active evidence-bound disposition receipts; the gate is green."
         if outcome.recorded_disposition_claims:
             return (
                 "A disposition receipt claim was recorded; the gate conclusion is unchanged and green."
@@ -1424,6 +1471,11 @@ def render_summary(
     if explanation:
         lines.append("")
         lines.append(explanation)
+    if outcome.reason_code == "disposition_resolved":
+        lines.extend([
+            "",
+            "当前主审 P1 已由绑定本轮审计的有效处置回执逐条覆盖；回执只覆盖列出的 finding。",
+        ])
     lines.append("")
     if outcome.notes:
         lines.append("Accepted:")
@@ -1431,7 +1483,7 @@ def render_summary(
             lines.append(f"- {note}")
         lines.append("")
     if outcome.recorded_disposition_claims:
-        lines.append("Receipt claims recorded:")
+        lines.append("Disposition receipts consumed:")
         for line in outcome.recorded_disposition_claims:
             lines.append(f"- {line}")
         lines.append("")
@@ -1580,7 +1632,7 @@ def render_status_panel(
         if isinstance(line, str) and line
     ]
     if recorded_claims:
-        lines.extend(["", "Receipt claims recorded:"])
+        lines.extend(["", "Disposition receipts consumed:"])
         for line in recorded_claims:
             lines.append(f"- {line}")
     resolved = [
@@ -3022,6 +3074,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         legacy_raw_audit_digest=legacy_raw_audit_digest,
         waiver_receipts=waiver_receipts,
         pr_draft_now=pr_draft_now,
+        repository=args.repository,
     )
     apply_finding_relation(outcome, findings, previous_round)
 

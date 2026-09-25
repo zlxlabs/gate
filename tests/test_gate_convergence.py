@@ -304,9 +304,14 @@ def test_disposition_binding_rejects_head_epoch_digest_and_finding_mismatch():
         receipt, scope=changed_scope, primary=replace(primary, head_sha=changed_scope.head_sha),
         audit_digest="a" * 64,
     )
-    assert stale.reason_code == "epoch_mismatch_stale"
+    assert stale.reason_code == "head_sha_mismatch"
     assert receipt.finding_id in stale.reason
     assert changed_scope.head_sha in stale.reason
+    stale_epoch = CONV.validate_disposition_receipt(
+        replace(receipt, epoch="stale-epoch"), scope=SCOPE, primary=primary,
+        audit_digest="a" * 64,
+    )
+    assert stale_epoch.reason_code == "epoch_mismatch_stale"
     mismatched_digest = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="b" * 64,
     )
@@ -501,7 +506,8 @@ def test_recorded_disposition_lines_label_claim_and_truncate_reason():
     name = CONV.disposition_receipt_artifact_name(receipt)
     expected_reason = " ".join(reason.split())[:CONV.DISPOSITION_REASON_DISPLAY_MAX]
     assert CONV.recorded_disposition_lines(audit) == (
-        f"finding p1 receipt claim (false-positive) submitted by octocat recorded as {name}: {expected_reason}",
+        "disposition=false-positive finding=p1 pointer=tests/test_example.py::test_regression; "
+        f"command=pytest -q tests/test_example.py; output=1 passed receipt={name} reason={expected_reason}",
     )
     assert "\n" not in CONV.recorded_disposition_lines(audit)[0]
     assert len(expected_reason) == CONV.DISPOSITION_REASON_DISPLAY_MAX

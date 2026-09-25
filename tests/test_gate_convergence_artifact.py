@@ -16,6 +16,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 AGGREGATE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 DISPOSITION_PRODUCER = ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py"
+COUNTEREVIDENCE = {
+    "command": "pytest -q tests/test_regression.py",
+    "output": "1 passed",
+    "result": "refuted",
+    "pointer": "tests/test_regression.py::test_regression",
+}
+COUNTEREVIDENCE_JSON = json.dumps(COUNTEREVIDENCE, sort_keys=True)
 
 
 def _aggregate():
@@ -292,6 +299,7 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
         "--finding-id", "p1",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
         "--reason", "locked upstream behavior",
+        "--counterevidence-json", COUNTEREVIDENCE_JSON,
         "--approver", "octocat",
         "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
@@ -305,10 +313,10 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     payload = json.loads(payload_bytes)
     stable_key = CONV.canonical_finding_key(audit["result"]["findings"][0])
     key_digest = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:12]
-    assert result["artifact"] == f"gate-disposition-receipt-v2-{epoch}-{digest[:12]}-{key_digest}"
+    assert result["artifact"] == f"gate-disposition-receipt-v3-{epoch}-{digest[:12]}-{key_digest}"
     assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     assert payload["kind"] == CONV.DISPOSITION_RECEIPT_KIND
-    assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__)
+    assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__) - {"tracking_issue"}
     assert payload["audit_digest"] == digest
     assert payload["finding_id"] == "p1" and payload["finding_key"] == stable_key
     assert payload["approver"] == "octocat"
@@ -316,16 +324,18 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     assert payload["approved_at"] == "2026-08-30T12:00:00Z"
     assert payload["triggering_actor"] == "octocat"
     assert payload["triggering_actor_source"] == "env"
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert b'"triggering_actor":"octocat"' in payload_bytes
     assert b'"triggering_actor_source":"env"' in payload_bytes
-    assert b'"schema_version":2' in payload_bytes
+    assert b'"schema_version":3' in payload_bytes
     receipt = CONV.DispositionReceipt(**{
         field: payload[field]
         for field in CONV.DispositionReceipt.__dataclass_fields__
         if field in payload
     })
-    assert receipt.as_dict() == {field: payload[field] for field in receipt.__dataclass_fields__}
+    assert receipt.as_dict() == {
+        field: payload[field] for field in receipt.__dataclass_fields__ if field in payload
+    }
     second = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
     assert json.loads(second.stdout)["written"] is False
     assert artifact_path.read_bytes() == payload_bytes
@@ -355,6 +365,7 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
         sys.executable, str(DISPOSITION_PRODUCER), "issue", "--output-dir", str(tmp_path),
         "--audit-path", str(audit_path), "--repository-id", "123", "--pr-number", "42",
         "--head-sha", SCOPE.head_sha, "--finding-id", "minor", "--reason", "reason",
+        "--counterevidence-json", COUNTEREVIDENCE_JSON,
         "--approver", "octocat", "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict()),
@@ -391,6 +402,7 @@ def test_disposition_producer_rejects_stable_key_collision(tmp_path):
         "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
         "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
         "--finding-id", "p1", "--reason", "reason", "--approver", "octocat",
+        "--counterevidence-json", COUNTEREVIDENCE_JSON,
         "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
     ]
@@ -431,6 +443,7 @@ def test_disposition_producer_rejects_id_and_different_key_collision(tmp_path):
         "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
         "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
         "--finding-id", target, "--reason", "reason", "--approver", "octocat",
+        "--counterevidence-json", COUNTEREVIDENCE_JSON,
         "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
     ]
@@ -474,6 +487,7 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path, monkeypat
         approver_id="7",
         approved_at="2026-08-30T12:00:00Z",
         triggering_actor="octocat",
+        counterevidence_json=COUNTEREVIDENCE_JSON,
         scope_json=json.dumps(SCOPE.as_dict(), sort_keys=True),
         input_stdin=False,
     )
@@ -502,14 +516,14 @@ def _assert_receipt_actor_bytes(path, *, actor, source):
     payload = json.loads(payload_bytes)
     assert payload["triggering_actor"] == actor
     assert payload["triggering_actor_source"] == source
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert f'"triggering_actor":"{actor}"'.encode("utf-8") in payload_bytes
     assert f'"triggering_actor_source":"{source}"'.encode("utf-8") in payload_bytes
-    assert b'"schema_version":2' in payload_bytes
+    assert b'"schema_version":3' in payload_bytes
     parsed = CONV.parse_disposition_receipt(payload)
     assert parsed.triggering_actor == actor
     assert parsed.triggering_actor_source == source
-    assert parsed.schema_version == 2
+    assert parsed.schema_version == 3
     return payload
 
 
@@ -604,6 +618,7 @@ def test_disposition_producer_rejects_malformed_auth_fields(tmp_path, override, 
         "--approver", "octocat", "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict()),
+        "--counterevidence-json", COUNTEREVIDENCE_JSON,
     ]
     flag, value = next(iter(override.items()))
     index = argv.index(flag)
@@ -645,6 +660,7 @@ def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="lock
         "--approver", "octocat",
         "--approver-id", "1",
         "--approved-at", approved_at,
+        "--counterevidence-json", COUNTEREVIDENCE_JSON,
     ]
     return argv, _producer_env()
 
@@ -739,6 +755,7 @@ def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path
         "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
         "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
         "--finding-id", "p1", "--reason", "locked upstream behavior",
+        "--counterevidence-json", COUNTEREVIDENCE_JSON,
         "--approver", "octocat", "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
@@ -783,7 +800,7 @@ def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path
     assert receipt.finding_key in mismatched.reason
 
 
-def test_legacy_raw_bytes_receipt_is_recorded_without_changing_gate_result():
+def test_legacy_raw_bytes_receipt_can_resolve_with_counterevidence():
     audit = _failing_runtime_audit(duration_ms=11, run_attempt=2)
     raw = json.dumps(audit, indent=2).encode() + b"\n"
     legacy = hashlib.sha256(raw).hexdigest()
@@ -795,6 +812,12 @@ def test_legacy_raw_bytes_receipt_is_recorded_without_changing_gate_result():
         repository_id=str(SCOPE.repository_id), pr_number=SCOPE.pr_number,
         epoch=CONV.derive_epoch(SCOPE), head_sha=SCOPE.head_sha,
         audit_digest=legacy, finding_id="p1", reason="locked upstream behavior",
+        counterevidence={
+            "command": "pytest -q tests/test_regression.py",
+            "output": "1 passed",
+            "result": "refuted",
+            "pointer": "tests/test_regression.py::test_regression",
+        },
         approver="octocat", approver_id=1, approved_at="2026-08-30T12:00:00Z",
     )
     identity = AGG.Identity(123, SCOPE.head_sha, 77, 2, 42)
@@ -807,9 +830,9 @@ def test_legacy_raw_bytes_receipt_is_recorded_without_changing_gate_result():
     without_legacy = AGG.evaluate(**kwargs)
     with_legacy = AGG.evaluate(**kwargs, legacy_raw_audit_digest=legacy)
     assert without_legacy.gate_result == "fail"
-    assert with_legacy.gate_result == "fail"
+    assert with_legacy.gate_result == "pass"
     assert with_legacy.disposition_audit.recorded_receipts == (receipt,)
-    assert without_legacy.gate_result == with_legacy.gate_result
+    assert with_legacy.reason_code == "disposition_resolved"
 
 
 def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():

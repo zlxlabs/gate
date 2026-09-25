@@ -892,6 +892,12 @@ def _producer_terminal(*, receipts=(), run_attempt=1):
             approver="octocat",
             approver_id=1,
             approved_at="2026-08-30T12:00:00Z",
+            counterevidence={
+                "command": "pytest -q tests/test_regression.py",
+                "output": "1 passed",
+                "result": "refuted",
+                "pointer": "tests/test_regression.py::test_regression",
+            },
         )
         fields.update(changes)
         typed_receipts.append(conv.DispositionReceipt(**fields))
@@ -922,7 +928,7 @@ def test_ledger_projects_real_producer_terminal_claim_record():
     module = _module()
     agg, conv, identity, receipts, outcome, terminal = _producer_terminal(receipts=[{}])
     assert outcome.disposition_audit is not None
-    assert terminal["disposition_receipt_consumption"]["consumed_count"] == 0
+    assert terminal["disposition_receipt_consumption"]["consumed_count"] == 1
     entry = module.build_entry(
         repository=terminal["repository"],
         pr_number=terminal["pr_number"],
@@ -934,19 +940,11 @@ def test_ledger_projects_real_producer_terminal_claim_record():
         terminal_envelope=terminal,
     )
     assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
-    assert entry["disposition_receipt_consumption"]["recorded"] == [
-        {
-            "finding_id": "p1",
-            "receipt": conv.disposition_receipt_artifact_name(receipts[0]),
-            "disposition_claim": "false-positive",
-            "triggering_actor": "octocat",
-            "triggering_actor_id": 1,
-            "recorded_at": "2026-08-30T12:00:00Z",
-            "reason": "locked upstream behavior",
-        }
-    ]
-    assert entry["disposition_receipt_consumption"]["resolved"] == []
-    assert "resolved by receipt" not in json.dumps(entry["disposition_receipt_consumption"])
+    resolved = entry["disposition_receipt_consumption"]["resolved"]
+    assert len(resolved) == 1
+    assert resolved[0]["finding_id"] == "p1"
+    assert resolved[0]["disposition"] == "false-positive"
+    assert resolved[0]["evidence_pointer"] == "tests/test_regression.py::test_regression"
 
 
 def test_ledger_preserves_recorded_human_id_and_stable_key():
@@ -986,8 +984,10 @@ def test_ledger_empty_audit_when_producer_had_no_receipts():
         terminal_envelope=terminal,
     )
     expected = module.empty_disposition_receipt_audit()
-    assert terminal["disposition_receipt_consumption"] == expected
-    assert entry["disposition_receipt_consumption"] == expected
+    assert terminal["disposition_receipt_consumption"] == {
+        **expected, "remaining_p1_ids": ["p1"],
+    }
+    assert entry["disposition_receipt_consumption"] == terminal["disposition_receipt_consumption"]
 
 
 def test_ledger_omits_consumption_when_terminal_is_absent():
@@ -1020,7 +1020,13 @@ def test_disposition_audit_stays_out_of_review_summary_and_compact_attempts():
     assert "disposition_receipt_consumption" not in inspect.getsource(module._compact_attempts)
 
 
-def test_real_disposition_producer_receipt_is_record_only_through_ledger(tmp_path):
+@pytest.mark.parametrize(
+    ("extra_p1", "expected_gate", "remaining_p1"),
+    [(False, "pass", []), (True, "fail", ["p2"])],
+)
+def test_real_disposition_producer_receipt_flows_through_ledger(
+    tmp_path, extra_p1, expected_gate, remaining_p1,
+):
     import os
     import subprocess
 
@@ -1058,10 +1064,16 @@ def test_real_disposition_producer_receipt_is_record_only_through_ledger(tmp_pat
         "result": {
             "verdict": "fail",
             "summary": "primary reviewer found a blocking issue",
-            "findings": [{
-                "id": "p1", "severity": "major", "trigger_kind": "inferred",
-                "file": "src/lock.py", "line": 12, "category": "correctness",
-            }],
+            "findings": [
+                {
+                    "id": "p1", "severity": "major", "trigger_kind": "inferred",
+                    "file": "src/lock.py", "line": 12, "category": "correctness",
+                },
+                *([{
+                    "id": "p2", "severity": "major", "trigger_kind": "inferred",
+                    "file": "src/other.py", "line": 30, "category": "correctness",
+                }] if extra_p1 else []),
+            ],
         },
     }
     scope, missing = agg._convergence_scope_from_audit(audit, identity)
@@ -1075,6 +1087,12 @@ def test_real_disposition_producer_receipt_is_record_only_through_ledger(tmp_pat
         "--repository-id", str(identity.repository_id), "--pr-number", str(identity.pr),
         "--head-sha", identity.head_sha, "--finding-id", "p1",
         "--reason", "locked upstream behavior",
+        "--counterevidence-json", json.dumps({
+            "command": "pytest -q tests/test_lock.py",
+            "output": "1 passed",
+            "result": "refuted",
+            "pointer": "tests/test_lock.py::test_lock_regression",
+        }, sort_keys=True),
         "--approver", "octocat", "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(scope.as_dict(), sort_keys=True),
@@ -1109,13 +1127,11 @@ def test_real_disposition_producer_receipt_is_record_only_through_ledger(tmp_pat
         scope=scope,
         audit_digest=audit_digest,
         waiver_receipts=(receipt,),
+        repository="zlxlabs/gate",
     )
-    assert outcome.gate_result == "fail", (
-        "expected a record-only receipt to leave the primary P1 blocking; "
-        f"actual gate_result={outcome.gate_result!r}"
-    )
-    assert outcome.ok is False
-    assert outcome.convergence_envelope["state"]["clean_streak"] == 0
+    assert outcome.gate_result == expected_gate
+    assert outcome.ok is (expected_gate == "pass")
+    assert outcome.convergence_envelope["state"]["clean_streak"] == (1 if expected_gate == "pass" else 0)
     assert outcome.convergence_envelope["state"]["eligible_rounds"] == 1
 
     terminal = agg.build_terminal_envelope(
@@ -1138,22 +1154,98 @@ def test_real_disposition_producer_receipt_is_record_only_through_ledger(tmp_pat
         audit=audit,
         terminal_envelope=terminal,
     )
-    assert terminal["gate_result"] == "fail"
-    assert ledger["disposition_receipt_consumption"]["recorded"] == [
-        {
-            "finding_id": "p1",
-            "receipt": producer_result["artifact"],
-            "triggering_actor": "octocat",
-            "triggering_actor_id": 1,
-            "recorded_at": "2026-08-30T12:00:00Z",
-            "disposition_claim": "false-positive",
-            "reason": "locked upstream behavior",
-            "finding_key": conv.canonical_finding_key(audit["result"]["findings"][0]),
-        }
+    assert terminal["gate_result"] == expected_gate
+    assert terminal["disposition_receipt_consumption"]["remaining_p1_ids"] == remaining_p1
+    resolved = ledger["disposition_receipt_consumption"]["resolved"]
+    assert len(resolved) == 1
+    assert resolved[0]["finding_id"] == "p1"
+    assert resolved[0]["disposition"] == "false-positive"
+    assert resolved[0]["evidence_pointer"] == "tests/test_lock.py::test_lock_regression"
+    assert resolved[0]["receipt"] == producer_result["artifact"]
+
+
+def test_saas_deferred_is_rejected_by_producer_and_aggregator(tmp_path):
+    import os
+    import subprocess
+
+    agg = _aggregator()
+    conv = agg._CONVERGENCE
+    identity = agg.Identity(
+        repository_id=123, head_sha="a" * 40, run_id=1001, run_attempt=1, pr=42,
+    )
+    finding = {
+        "id": "p1", "severity": "major", "trigger_kind": "inferred",
+        "file": "src/lock.py", "line": 12, "category": "correctness",
+    }
+    audit = {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": identity.repository_id, "repository": "zlxlabs/gate",
+        "head_sha": identity.head_sha, "run_id": identity.run_id,
+        "run_attempt": identity.run_attempt, "pr": identity.pr, "verdict": "fail",
+        "base_sha": "b" * 40, "diff_digest": "d" * 64,
+        "policy_version": "policy-v1", "policy_digest": "e" * 64, "tier": "saas",
+        "caller_sha": "c" * 40, "reusable_workflow_sha": "w" * 40,
+        "registry_commit": "r" * 40, "job_id": 100, "reviewer": "test-reviewer",
+        "shadow_mode": "detached", "expected_shadows": [], "attempts": [],
+        "cost": 0, "tokens": [], "runtime": None,
+        "result": {"verdict": "fail", "summary": "blocking issue", "findings": [finding]},
+    }
+    scope, missing = agg._convergence_scope_from_audit(audit, identity)
+    assert not missing and scope is not None
+    audit_path = tmp_path / "saas-audit.json"
+    audit_path.write_bytes(json.dumps(audit, indent=2).encode("utf-8") + b"\n")
+    output_dir = tmp_path / "saas-receipts"
+    command = [
+        sys.executable, str(ROOT / ".github/actions/gate-disposition/issue_receipt.py"), "issue",
+        "--output-dir", str(output_dir), "--audit-path", str(audit_path),
+        "--repository-id", str(identity.repository_id), "--pr-number", str(identity.pr),
+        "--head-sha", identity.head_sha, "--finding-id", "p1", "--reason", "tracked",
+        "--disposition", "deferred", "--tracking-issue", "#123",
+        "--approver", "octocat", "--approver-id", "1",
+        "--approved-at", "2026-08-30T12:00:00Z",
+        "--scope-json", json.dumps(scope.as_dict(), sort_keys=True),
     ]
-    projected = json.dumps(ledger["disposition_receipt_consumption"])
-    assert '"resolved": []' in projected
-    assert "approved" not in projected
+    producer = subprocess.run(
+        command, capture_output=True, text=True,
+        env={"PATH": os.environ["PATH"], "GITHUB_RUN_ID": "control-1001", "GITHUB_TRIGGERING_ACTOR": "octocat"},
+    )
+    assert producer.returncode != 0
+    assert "deferred_not_allowed_for_tier" in producer.stderr
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+    digest = conv.canonical_audit_digest(audit)
+    receipt = conv.DispositionReceipt(
+        schema_version=conv.DISPOSITION_RECEIPT_SCHEMA_VERSION,
+        disposition="deferred", repository_id=str(identity.repository_id),
+        pr_number=identity.pr, epoch=conv.derive_epoch(scope),
+        head_sha=identity.head_sha, audit_digest=digest, finding_id="p1",
+        finding_key=conv.canonical_finding_key(finding), reason="tracked",
+        tracking_issue="#123", approver="octocat", approver_id=1,
+        approved_at="2026-08-30T12:00:00Z", triggering_actor="octocat",
+        triggering_actor_source="workflow",
+    )
+    handwritten_path = tmp_path / "handwritten-saas-receipt.json"
+    handwritten_path.write_bytes(json.dumps(
+        receipt.as_dict(), sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8"))
+    consumer_receipt = conv.parse_disposition_receipt(json.loads(handwritten_path.read_bytes()))
+    outcome = agg.evaluate(
+        quality_result="success", primary_result="failure", runner="self",
+        is_draft=False, review_expected=True, audit=audit, audit_error=None,
+        identity=identity, audit_source_attempt=identity.run_attempt,
+        audit_artifact_name="primary-audit-v2-1", scope=scope, audit_digest=digest,
+        waiver_receipts=(consumer_receipt,), repository="zlxlabs/gate",
+    )
+    assert outcome.gate_result == "fail"
+    terminal = agg.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=identity, quality_result="success",
+        primary_result="failure", review_expected=True, is_draft=False, runner="self",
+        outcome=outcome,
+    )
+    assert terminal["gate_result"] == "fail"
+    assert terminal["disposition_receipt_consumption"]["rejected_reasons"] == {
+        "deferred_not_allowed_for_tier": 1,
+    }
 
 
 def _write_terminal(tmp_path, payload):

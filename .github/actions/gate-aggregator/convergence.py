@@ -567,6 +567,11 @@ def _actionable_disposition_reason(
     """Explain a stale target with the values needed for the next action."""
 
     target = receipt.finding_key or receipt.finding_id
+    if code == "head_sha_mismatch":
+        return (
+            f"{code}: finding key {target!r} was registered for head_sha {receipt.head_sha!r}, "
+            f"but the current head_sha is {scope.head_sha!r}; register this key again for the new head."
+        )
     current_keys = json.dumps(list(_current_p1_keys(primary)), ensure_ascii=False, separators=(",", ":"))
     if code == "epoch_mismatch_stale":
         return (
@@ -706,6 +711,14 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, reason="repository_mismatch")
     if receipt.pr_number != scope.pr_number:
         return _disposition_status(receipt, valid=False, active=False, reason="pr_mismatch")
+    if receipt.head_sha != scope.head_sha:
+        return _disposition_status(
+            receipt, valid=False, active=False, reason="head_sha_mismatch",
+            message=_actionable_disposition_reason(
+                "head_sha_mismatch", receipt, scope=scope, primary=primary,
+                audit_digest=audit_digest,
+            ),
+        )
     expected_epoch = derive_epoch(scope)
     if receipt.epoch != expected_epoch:
         return _disposition_status(
@@ -715,8 +728,6 @@ def validate_disposition_receipt(
                 audit_digest=audit_digest,
             ),
         )
-    if receipt.head_sha != scope.head_sha:
-        return _disposition_status(receipt, valid=False, active=False, reason="head_sha_mismatch")
     if not _receipt_audit_digest_matches(receipt.audit_digest, audit_digest, legacy_raw_audit_digest):
         return _disposition_status(
             receipt, valid=False, active=False, reason="audit_digest_mismatch",
@@ -907,19 +918,32 @@ def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
 
 
 def recorded_disposition_lines(audit: DispositionAudit) -> tuple[str, ...]:
-    """Human-visible lines label receipts as submitter claims, never approvals."""
+    """Render bounded, evidence-linked audit lines for consumed receipts."""
 
     lines: list[str] = []
     for receipt in audit.recorded_receipts:
-        collapsed = " ".join(receipt.reason.split())
-        if len(collapsed) > DISPOSITION_REASON_DISPLAY_MAX:
-            collapsed = collapsed[:DISPOSITION_REASON_DISPLAY_MAX]
         target = receipt.finding_key or receipt.finding_id
+        if receipt.disposition == "false-positive":
+            evidence = receipt.counterevidence or {}
+            pointer = _bounded_disposition_text(evidence.get("pointer", ""))
+            command = _bounded_disposition_text(evidence.get("command", ""))
+            output = _bounded_disposition_text(evidence.get("output", ""))
+            evidence_text = f"pointer={pointer}; command={command}; output={output}"
+        else:
+            evidence_text = f"pointer={_bounded_disposition_text(receipt.tracking_issue or '')}"
         lines.append(
-            f"finding {target} receipt claim ({receipt.disposition}) submitted by {receipt.approver} "
-            f"recorded as {disposition_receipt_artifact_name(receipt)}: {collapsed}"
+            f"disposition={receipt.disposition} finding={_bounded_disposition_text(target)} "
+            f"{evidence_text} receipt={disposition_receipt_artifact_name(receipt)} "
+            f"reason={_bounded_disposition_text(receipt.reason)}"
         )
     return tuple(lines)
+
+
+def _bounded_disposition_text(value: Any) -> str:
+    collapsed = " ".join(str(value).split())
+    if len(collapsed) > DISPOSITION_REASON_DISPLAY_MAX:
+        return collapsed[:DISPOSITION_REASON_DISPLAY_MAX]
+    return collapsed
 
 
 def parse_disposition_receipt(payload: Any) -> DispositionReceipt:
