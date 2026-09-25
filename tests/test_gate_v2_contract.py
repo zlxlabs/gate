@@ -195,7 +195,8 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     control = raw["jobs"]["control"]
     assert control["environment"] == {"name": "gate-disposition"}
     expected_inputs = {
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason", "gate_ref",
+        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
+        "disposition", "counterevidence_json", "tracking_issue", "gate_ref",
     }
     assert "operation" not in trigger["workflow_dispatch"]["inputs"]
     assert "repository_id" not in trigger["workflow_dispatch"]["inputs"]
@@ -206,10 +207,14 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
         gate_ref = trigger[kind]["inputs"]["gate_ref"]
         assert gate_ref["required"] is False
         assert gate_ref["type"] == "string"
+        for name in ("disposition", "counterevidence_json", "tracking_issue"):
+            assert trigger[kind]["inputs"][name]["required"] is False
+            assert trigger[kind]["inputs"][name]["type"] == "string"
     text = DISPOSITION_WORKFLOW.read_text()
     assert "issue_receipt.py issue" in text
     assert "issue_receipt.py revoke" not in text
-    assert "evidence" not in text.lower()
+    assert "counterevidence_json" in text
+    assert "tracking_issue" in text
     assert "GITHUB_ACTOR" not in text
     assert "pull-requests: write" not in text
     assert "checks: write" not in text
@@ -231,13 +236,16 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert "upload-artifact" not in text
     issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
     assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
-    assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.triggering_actor }}"
+    assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.actor }}"
     assert issue["env"]["DISPOSITION_APPROVER_ID"] == "${{ github.actor_id }}"
+    assert "github.actor" in issue["env"]["DISPOSITION_APPROVER"]
+    assert "github.triggering_actor" not in issue["env"]["DISPOSITION_APPROVER"]
     assert "--approver \"$DISPOSITION_APPROVER\"" in issue["run"]
     assert "--approver-id \"$DISPOSITION_APPROVER_ID\"" in issue["run"]
     assert "--approved-at \"$approved_at\"" in issue["run"]
     assert "inputs.approver" not in text
-    assert "${{ github.triggering_actor }}" in text
+    assert "${{ github.actor }}" in text
+    assert "${{ github.triggering_actor }}" not in text
     assert "${{ github.actor_id }}" in text
     assert "GITHUB_TRIGGERING_ACTOR" not in issue.get("env", {})
     assert "--triggering-actor" not in issue["run"]
@@ -315,10 +323,11 @@ def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
 
 def test_recorded_disposition_lines_is_the_only_g4_line_builder():
     hits = []
+    line_builder = 'f"disposition={receipt.disposition} finding='
     for path in (REPO_ROOT / ".github").rglob("*"):
         if not path.is_file() or path.suffix not in {".py", ".yml"}:
             continue
-        if "receipt claim (" in path.read_text(encoding="utf-8"):
+        if line_builder in path.read_text(encoding="utf-8"):
             hits.append(str(path.relative_to(REPO_ROOT)))
     assert hits == [".github/actions/gate-aggregator/convergence.py"]
 
@@ -2718,6 +2727,7 @@ def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
     assert raw["name"] == "gate-disposition"
     assert set(trigger["workflow_dispatch"]["inputs"]) == {
         "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
+        "disposition", "counterevidence_json", "tracking_issue",
     }
     assert "workflow_call" not in trigger
     # reusable-workflow token is caller ∩ callee; upload-artifact needs write, gh api pulls needs pull-requests: read.
@@ -2737,11 +2747,13 @@ def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
     assert uses == (
         "zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@" + DISPOSITION_CALLER_PIN
     )
-    for key in ("pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason"):
-        assert job["with"][key] == "${{ inputs." + key + " }}"
-    assert set(job["with"]) == {
+    forwarded = (
         "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
-    }
+        "disposition", "counterevidence_json", "tracking_issue",
+    )
+    for key in forwarded:
+        assert job["with"][key] == "${{ inputs." + key + " }}"
+    assert set(job["with"]) == set(forwarded)
     text = DISPOSITION_CALLER_TEMPLATE.read_text()
     non_comment_text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     assert "pull-requests: write" not in text

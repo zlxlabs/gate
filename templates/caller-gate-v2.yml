@@ -1,4 +1,7 @@
 # Required Gate v2 — canary caller template.
+# v2 has no label-based waiver: `codex-review-waived` does not exempt findings.
+# The only controlled exit is the separate `gate-disposition` workflow, which
+# accepts evidence-backed false-positive or tracked deferred receipts.
 #
 # Dropped into a business repo as .github/workflows/gate.yml (replacing the
 # legacy caller of .github/workflows/gate.yml@main) ONLY for repos explicitly

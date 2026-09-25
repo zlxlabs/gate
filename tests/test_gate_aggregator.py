@@ -105,9 +105,9 @@ def _valid_scoped_primary_record(**overrides):
     return record
 
 
-def test_convergence_scope_contract_has_seven_audit_fields():
+def test_convergence_scope_contract_has_six_required_audit_fields():
     assert AGG._CONVERGENCE_SCOPE_FIELDS == (
-        "base_sha", "diff_digest", "policy_version", "policy_digest", "tier",
+        "base_sha", "diff_digest", "policy_version", "policy_digest",
         "caller_sha", "reusable_workflow_sha",
     )
 
@@ -631,7 +631,7 @@ def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):
 
 def test_cli_missing_one_scope_field_names_it_without_receipt(tmp_path):
     audit = _valid_scoped_primary_record()
-    del audit["tier"]
+    del audit["caller_sha"]
 
     rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
 
@@ -640,13 +640,13 @@ def test_cli_missing_one_scope_field_names_it_without_receipt(tmp_path):
     summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
     assert (
         "Convergence receipt: not produced (reason: canonical primary audit is missing "
-        "scope field(s): `tier`)."
+        "scope field(s): `caller_sha`)."
     ) in summary
 
 
 def test_cli_missing_multiple_scope_fields_names_all_in_sorted_order(tmp_path):
     audit = _valid_scoped_primary_record()
-    for field in ("tier", "caller_sha"):
+    for field in ("caller_sha", "reusable_workflow_sha"):
         del audit[field]
 
     rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
@@ -656,8 +656,23 @@ def test_cli_missing_multiple_scope_fields_names_all_in_sorted_order(tmp_path):
     summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
     assert (
         "Convergence receipt: not produced (reason: canonical primary audit is missing "
-        "scope field(s): `caller_sha, tier`)."
+        "scope field(s): `caller_sha, reusable_workflow_sha`)."
     ) in summary
+
+
+@pytest.mark.parametrize("tier", [None, "unrecognized"])
+def test_cli_missing_or_invalid_tier_defaults_to_internal(tmp_path, tier):
+    audit = _valid_scoped_primary_record()
+    if tier is None:
+        del audit["tier"]
+    else:
+        audit["tier"] = tier
+
+    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
+
+    assert rc == 0
+    payload = json.loads(receipt_path.read_bytes())
+    assert payload["scope"]["tier"] == "internal"
 
 
 @pytest.mark.parametrize(
@@ -908,7 +923,7 @@ def _stale_draft_kwargs(pr_draft_now):
 
 def test_terminal_reason_domain_lock():
     assert AGG.TERMINAL_REASON_DOMAIN == (
-        "primary_pass", "primary_findings", "review_not_expected", "primary_unavailable", "primary_cancelled",
+        "primary_pass", "primary_findings", "disposition_resolved", "review_not_expected", "primary_unavailable", "primary_cancelled",
         "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid",
         "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip",
         "review_expected_stale", "pr_state_unverifiable",
@@ -1125,7 +1140,8 @@ _TERMINAL_GOLDEN = """{
     "consumed_count": 0,
     "rejected_count": 0,
     "rejected_reasons": {},
-    "fail_closed": false
+    "fail_closed": false,
+    "remaining_p1_ids": []
   }
 }
 """
@@ -2576,6 +2592,32 @@ def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", *
         audit_digest=audit_digest,
         finding_id=finding_id,
         reason="locked upstream behavior",
+        counterevidence={
+            "command": "pytest -q tests/test_regression.py",
+            "output": "1 passed",
+            "result": "refuted",
+            "pointer": "tests/test_regression.py::test_regression",
+        },
+        approver="octocat",
+        approver_id=1,
+        approved_at="2026-08-30T12:00:00Z",
+    )
+    fields.update(changes)
+    return CONV.DispositionReceipt(**fields)
+
+
+def _deferred_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", tracking_issue="#12", **changes):
+    fields = dict(
+        schema_version=CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION,
+        disposition="deferred",
+        repository_id=str(IDENTITY.repository_id),
+        pr_number=IDENTITY.pr,
+        epoch=CONV.derive_epoch(scope),
+        head_sha=IDENTITY.head_sha,
+        audit_digest=audit_digest,
+        finding_id=finding_id,
+        reason="tracked below the gate redline",
+        tracking_issue=tracking_issue,
         approver="octocat",
         approver_id=1,
         approved_at="2026-08-30T12:00:00Z",
@@ -2603,8 +2645,54 @@ def _evaluate_failing_primary(audit, *, audit_digest=_DIGEST_A, waiver_receipts=
             scope=_scope_for(audit),
             audit_digest=audit_digest,
             waiver_receipts=waiver_receipts,
+            repository="zlxlabs/gate",
         )
     )
+
+
+@pytest.mark.parametrize("tier", ["personal", "internal", "unrecognized"])
+def test_deferred_receipt_releases_one_p1_for_allowed_or_defaulted_tier(tier):
+    audit = _failing_scoped_audit()
+    audit["tier"] = tier
+    scope = _scope_for(audit)
+    receipt = _deferred_receipt(
+        scope, tracking_issue="https://github.com/zlxlabs/gate/issues/12",
+    )
+
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+
+    assert outcome.gate_result == "pass"
+    block = _terminal_for(outcome)["disposition_receipt_consumption"]
+    assert block["remaining_p1_ids"] == []
+    assert block["recorded"][0]["disposition_claim"] == "deferred"
+    assert block["recorded"][0]["evidence_pointer"] == "https://github.com/zlxlabs/gate/issues/12"
+
+
+def test_deferred_receipt_is_rejected_for_saas_at_consumption():
+    audit = _failing_scoped_audit()
+    audit["tier"] = "saas"
+    receipt = _deferred_receipt(_scope_for(audit))
+
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+
+    block = _terminal_for(outcome)["disposition_receipt_consumption"]
+    assert outcome.gate_result == "fail"
+    assert block["remaining_p1_ids"] == ["p1"]
+    assert block["rejected_reasons"] == {"deferred_not_allowed_for_tier": 1}
+
+
+def test_consumer_rejects_handcrafted_deferred_pull_or_cross_repository_url():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    for reference, reason in (
+        ("https://github.com/zlxlabs/gate/pull/12", "tracking_issue_invalid"),
+        ("https://github.com/other/repo/issues/12", "tracking_issue_repository_mismatch"),
+    ):
+        receipt = _deferred_receipt(scope, tracking_issue=reference)
+        outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+        block = _terminal_for(outcome)["disposition_receipt_consumption"]
+        assert outcome.gate_result == "fail"
+        assert block["rejected_reasons"] == {reason: 1}
 
 
 def _zip_receipt_bytes(payload):
@@ -2694,22 +2782,22 @@ def test_aggregate_projection_binds_stable_disposition_and_rejects_line_change()
 
 
 @pytest.mark.parametrize("severity", ["major", "blocker"])
-def test_valid_disposition_receipt_claim_does_not_change_required_gate_fail(severity):
+def test_valid_disposition_receipt_releases_the_matching_required_gate_finding(severity):
     audit = _failing_scoped_audit(severity=severity)
     scope = _scope_for(audit)
     receipt = _false_positive_receipt(scope)
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
     resolved = _resolved_line(receipt)
-    assert outcome.gate_result == "fail"
-    assert outcome.ok is False
-    assert outcome.classification == "code_fail"
-    assert outcome.reason_code == "primary_findings"
+    assert outcome.gate_result == "pass"
+    assert outcome.ok is True
+    assert outcome.classification == "code_pass"
+    assert outcome.reason_code == "disposition_resolved"
     assert outcome.recorded_disposition_claims == [resolved]
     assert "resolved_findings" not in outcome.convergence_envelope
     summary = AGG.render_summary(outcome)
     assert resolved in summary
-    assert "**Result: fail**" in summary
-    assert "receipt claim" in summary
+    assert "**Result: pass**" in summary
+    assert "Disposition receipts consumed:" in summary
     terminal = AGG.build_terminal_envelope(
         repository="zlxlabs/gate", identity=IDENTITY, quality_result="success",
         primary_result="failure", review_expected=True, is_draft=False, runner="self",
@@ -2722,7 +2810,7 @@ def test_valid_disposition_receipt_claim_does_not_change_required_gate_fail(seve
     panel = AGG.render_status_panel([panel_row])
     pr_panel_has_required_line = resolved in panel
     assert pr_panel_has_required_line is True
-    assert "Receipt claims recorded:" in panel
+    assert "Disposition receipts consumed:" in panel
 
 
 def _terminal_for(outcome, *, primary_result="failure"):
@@ -2739,26 +2827,16 @@ def test_terminal_projects_structured_audit_from_record_dispositions_objects():
     receipt = _false_positive_receipt(scope)
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
     block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert block == {
-        "recorded": [
-            {
-                "finding_id": "p1",
-                "receipt": CONV.disposition_receipt_artifact_name(receipt),
-                "disposition_claim": "false-positive",
-                "triggering_actor": "octocat",
-                "triggering_actor_id": 1,
-                "recorded_at": "2026-08-30T12:00:00Z",
-                "reason": "locked upstream behavior",
-            }
-        ],
-        "resolved": [],
-        "consumed_count": 0,
-        "rejected_count": 0,
-        "rejected_reasons": {},
-        "fail_closed": False,
-    }
+    assert block["recorded"][0]["finding_id"] == "p1"
+    assert block["recorded"][0]["disposition_claim"] == "false-positive"
+    assert block["recorded"][0]["evidence_pointer"] == "tests/test_regression.py::test_regression"
+    assert block["recorded"][0]["counterevidence_command"] == "pytest -q tests/test_regression.py"
+    assert block["recorded"][0]["counterevidence_output"] == "1 passed"
+    assert block["resolved"][0]["disposition"] == "false-positive"
+    assert block["resolved"][0]["evidence_pointer"] == "tests/test_regression.py::test_regression"
+    assert block["consumed_count"] == 1
+    assert block["remaining_p1_ids"] == []
     assert outcome.recorded_disposition_claims == [_resolved_line(receipt)]
-    assert "approved" not in json.dumps(block)
     assert "receipt claim" not in json.dumps(block)
 
 
@@ -2779,7 +2857,7 @@ def test_terminal_structured_block_does_not_parse_g4_display_strings():
         disposition_audit=consumption,
     )
     block = _terminal_for(outcome, primary_result="success")["disposition_receipt_consumption"]
-    assert block["resolved"] == []
+    assert block["resolved"][0]["evidence_pointer"] == "tests/test_regression.py::test_regression"
     assert block["recorded"][0]["finding_id"] == "p1"
     assert isinstance(block["recorded"][0], dict)
     assert block["recorded"][0]["triggering_actor"] == "octocat"
@@ -2803,7 +2881,8 @@ def test_terminal_empty_audit_when_evaluate_sees_no_receipts():
     audit = _failing_scoped_audit()
     outcome = _evaluate_failing_primary(audit, waiver_receipts=())
     block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert block == AGG.empty_disposition_receipt_audit()
+    assert {**block, "remaining_p1_ids": []} == AGG.empty_disposition_receipt_audit()
+    assert block["remaining_p1_ids"] == ["p1"]
     assert outcome.disposition_audit is not None
     assert outcome.disposition_audit.recorded_receipts == ()
 
@@ -2835,6 +2914,39 @@ def test_digest_mismatch_keeps_finding_active_and_gate_fail():
     assert outcome.reason_code == "primary_findings"
     assert outcome.recorded_disposition_claims == []
     assert "resolved_findings" not in (outcome.convergence_envelope or {})
+    assert _terminal_for(outcome)["disposition_receipt_consumption"]["rejected_reasons"] == {
+        "audit_digest_mismatch": 1,
+    }
+
+
+def test_old_head_receipt_keeps_finding_active_and_gate_fail():
+    from dataclasses import replace
+
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    old_scope = replace(scope, head_sha="f" * 40)
+    receipt = _false_positive_receipt(
+        old_scope, head_sha=old_scope.head_sha,
+    )
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    assert outcome.gate_result == "fail"
+    assert outcome.reason_code == "primary_findings"
+    assert _terminal_for(outcome)["disposition_receipt_consumption"]["rejected_reasons"] == {
+        "head_sha_mismatch": 1,
+    }
+
+
+def test_old_format_receipt_without_counterevidence_cannot_pass():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(
+        scope, schema_version=2, counterevidence=None,
+    )
+    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
+    assert outcome.gate_result == "fail"
+    assert _terminal_for(outcome)["disposition_receipt_consumption"]["rejected_reasons"] == {
+        "schema_version_mismatch": 1,
+    }
 
 
 def test_finding_id_mismatch_keeps_finding_active_and_gate_fail():
@@ -2857,12 +2969,13 @@ def test_missing_reason_keeps_finding_active_and_gate_fail():
     assert outcome.recorded_disposition_claims == []
 
 
-def test_duplicate_disposition_receipt_is_idempotent_and_keeps_failure():
+def test_duplicate_disposition_receipt_is_idempotent_and_releases_once():
     audit = _failing_scoped_audit()
     scope = _scope_for(audit)
     receipt = _false_positive_receipt(scope)
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt, receipt))
-    assert outcome.gate_result == "fail"
+    assert outcome.gate_result == "pass"
+    assert _terminal_for(outcome)["disposition_receipt_consumption"]["consumed_count"] == 1
     assert outcome.recorded_disposition_claims == [
         _resolved_line(receipt)
     ]
@@ -2902,7 +3015,7 @@ def test_p1_receipt_trigger_kind_controls_gate_and_terminal_payload(trigger_kind
     terminal = _terminal_for(outcome)
     block = terminal["disposition_receipt_consumption"]
     if trigger_kind == "inferred":
-        assert outcome.gate_result == "fail"
+        assert outcome.gate_result == "pass"
         assert len(block["recorded"]) == 1
     else:
         assert outcome.gate_result == "fail"
@@ -2919,7 +3032,7 @@ def test_malformed_receipt_stays_blocked_in_terminal_payload():
     assert block["fail_closed"] is False
 
 
-def test_partial_disposition_records_claim_and_keeps_all_findings_blocking():
+def test_partial_disposition_records_claim_and_keeps_only_uncovered_finding_blocking():
     audit = _valid_scoped_primary_record(
         verdict="fail",
         result={
@@ -2934,12 +3047,13 @@ def test_partial_disposition_records_claim_and_keeps_all_findings_blocking():
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
     assert outcome.gate_result == "fail"
     assert outcome.reason_code == "primary_findings"
+    assert _terminal_for(outcome)["disposition_receipt_consumption"]["remaining_p1_ids"] == ["keep"]
     assert outcome.recorded_disposition_claims == [
         _resolved_line(receipt)
     ]
 
 
-def test_main_fail_primary_plus_matching_receipt_records_claim_only(monkeypatch, tmp_path):
+def test_main_fail_primary_plus_matching_receipt_resolves_p1(monkeypatch, tmp_path):
     audit = _failing_scoped_audit()
     audit_dir = tmp_path / "audit"
     audit_dir.mkdir()
@@ -2974,14 +3088,14 @@ def test_main_fail_primary_plus_matching_receipt_records_claim_only(monkeypatch,
     )
     text = summary_path.read_text()
     resolved = _resolved_line(receipt)
-    assert rc == 1
-    assert "**Result: fail**" in text
-    assert "Receipt claims recorded:" in text
+    assert rc == 0
+    assert "**Result: pass**" in text
+    assert "Disposition receipts consumed:" in text
     assert resolved in text
-    assert "gate conclusion is unchanged" not in text
+    assert "All current P1 findings are covered" in text
     terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text())
-    assert terminal["gate_result"] == "fail"
-    assert terminal["reason_code"] == "primary_findings"
+    assert terminal["gate_result"] == "pass"
+    assert terminal["reason_code"] == "disposition_resolved"
 
 
 def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
