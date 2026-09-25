@@ -4010,14 +4010,12 @@ def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_
         lambda prefix: [(key, raw) for key, raw in silo_objects if key.startswith(prefix)],
     )
     output = tmp_path / "previous-findings.json"
-    context = tmp_path / "context.md"
     rc = AGG.main([
         "--render-previous-context",
         "--repository-id", str(ledger["primary_identity"]["repository_id"]),
         "--pr-number", str(ledger["pr_number"]),
         "--run-id", str(run_id),
         "--run-attempt", "1",
-        "--output", str(context),
         "--previous-json", str(output),
     ])
     return rc, json.loads(output.read_text(encoding="utf-8"))
