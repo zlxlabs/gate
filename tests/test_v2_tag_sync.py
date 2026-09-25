@@ -114,6 +114,37 @@ def test_disabled_switch_skips_entire_evidence_step():
     assert evidence["if"] == "steps.guard.outputs.advance == 'true'"
 
 
+def test_sync_workflow_reports_exactly_one_of_six_states():
+    raw, _ = _load()
+    steps = raw["jobs"]["sync"]["steps"]
+    move = next(step for step in steps if step.get("name") == "Move v2 to selected canary-verified main commit")
+    report = next(step for step in steps if step.get("name") == "Report v2 tag sync state")
+    run = report["run"]
+
+    assert move["id"] == "move"
+    assert report["if"] == "always()"
+    assert steps.index(move) < steps.index(report)
+    assert report["env"]["MOVE_OUTCOME"] == "${{ steps.move.outcome }}"
+    assert run.count("V2-TAG-SYNC-STATE:") == 1
+    assert sum(line.strip() == 'echo "${state_line}"' for line in run.splitlines()) == 1
+    assert sum(
+        line.strip() == 'echo "${state_line}" >> "${GITHUB_STEP_SUMMARY}"'
+        for line in run.splitlines()
+    ) == 1
+    assert 'state="promoted"' in run
+    assert '[[ "${MOVE_OUTCOME}" == "success" ]]' in run
+    assert 'state="already_current"' in run
+    assert '[[ "${MOVE}" == "false" ]]' in run
+    assert 'state="held"' in run
+    assert '[[ "${ENABLED}" != "true" ]]' in run
+    assert 'state="disabled"' in run
+    assert '[[ "${ADVANCE}" != "true" ]]' in run
+    assert 'state="no_eligible_candidate"' in run
+    assert '[[ -z "${TARGET_SHA}" ]]' in run
+    assert 'state="query_failed"' in run
+    assert '[[ "${GUARD_OUTCOME}" != "success" ]]' in run
+
+
 def test_breaker_marker_blocks_advancement(capsys):
     assert main(
         ["--enabled", "true", "--commit-message", f"fix caller {HOLD_MARKER}"]
