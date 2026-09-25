@@ -2777,11 +2777,11 @@ def test_evaluate_records_dispositions_once_for_active_p1():
             repository="zlxlabs/gate",
         ))
 
+    assert record_dispositions.call_count == 1
     assert outcome.convergence_envelope is not None
     assert outcome.disposition_audit.primary_p1_ids == ("p1",)
     assert outcome.disposition_audit.remaining_p1_ids == ()
     assert outcome.convergence_envelope["state"]["clean_streak"] == 1
-    assert record_dispositions.call_count == 1
 
 
 def test_evaluate_round_reuses_disposition_audit_with_legacy_digest():
