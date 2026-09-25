@@ -32,3 +32,10 @@
 - 本段结论：复核发现设计文档曾把 skip reason 值域的列举顺序误称为判定优先级；现已改为分别描述值域和 draft→fork→hosted_runner→review_exempt 的判定顺序。
 - 关键决策与已否决方案：无。
 - 下一步唯一动作：提交并推送文档勘误，更新最终交接与报告。
+
+## 收尾验收
+
+- 当前阶段：complete
+- 本段结论：全量测试 1196 项与相关文件复验 742 项通过；workflow pin 检查通过，actionlint 忽略基线已有 SC2129 后通过。分支已推送，producer 子进程断言 stdout 恰有一条排序紧凑的 V1 标记。
+- 关键决策与已否决方案：无原因的真实 skipped 继续报告 `primary=skipped, skip_reason=null` 并 fail closed；不伪报 primary 已执行。
+- 下一步唯一动作：主脑审查并合并 workflow PR，待 v2 canary 自动抬升后核实真实纯文档 PR 的 gate 日志。
