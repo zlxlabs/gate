@@ -693,6 +693,50 @@ def load_previous_round_findings(
     return {"available": True, "detail": "", "findings": findings}
 
 
+def _project_previous_dispositions(*, repository_id: int, pr_number: int) -> list[dict[str, Any]]:
+    projected: list[tuple[str, dict[str, Any]]] = []
+    dropped = 0
+    for receipt in _fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number):
+        counterevidence = None
+        tracking_issue = None
+        if receipt.disposition == "false-positive":
+            if _CONVERGENCE._counterevidence_reason(receipt) is not None:
+                dropped += 1
+                continue
+            evidence = receipt.counterevidence
+            counterevidence = {
+                field: _clip_text(evidence[field])
+                for field in ("command", "output", "result", "pointer")
+            }
+        elif receipt.disposition == "deferred":
+            if not isinstance(receipt.tracking_issue, str) or not receipt.tracking_issue.strip():
+                dropped += 1
+                continue
+            tracking_issue = _clip_text(receipt.tracking_issue)
+        else:
+            dropped += 1
+            continue
+
+        approved_at = receipt.approved_at if isinstance(receipt.approved_at, str) else ""
+        projected.append((approved_at, {
+            "finding_id": _clip_text(receipt.finding_id),
+            "disposition": _clip_text(receipt.disposition),
+            "head_sha": receipt.head_sha,
+            "approved_at": _clip_text(approved_at),
+            "reason": _clip_text(receipt.reason),
+            "counterevidence": counterevidence,
+            "tracking_issue": tracking_issue,
+        }))
+
+    projected.sort(key=lambda item: item[0], reverse=True)
+    if len(projected) > PREVIOUS_FINDING_LIMIT:
+        dropped += len(projected) - PREVIOUS_FINDING_LIMIT
+        projected = projected[:PREVIOUS_FINDING_LIMIT]
+    result = [item for _approved_at, item in projected]
+    print(f"GATE-PREVIOUS-DISPOSITIONS: kept={len(result)} dropped={dropped}")
+    return result
+
+
 def render_previous_findings_context(previous_round: dict[str, Any], original_design: str) -> str:
     findings = previous_round.get("findings") if isinstance(previous_round.get("findings"), list) else []
     blob = json.dumps(findings[:PREVIOUS_FINDING_LIMIT], ensure_ascii=False, separators=(",", ":"))
@@ -722,6 +766,12 @@ def _render_previous_context_cli(argv: list[str]) -> int:
         path=None, repository_id=args.repository_id, pr_number=args.pr_number,
         run_id=args.run_id, run_attempt=args.run_attempt,
     )
+    dispositions = []
+    if previous["available"]:
+        dispositions = _project_previous_dispositions(
+            repository_id=args.repository_id, pr_number=args.pr_number,
+        )
+    previous = {**previous, "dispositions": dispositions}
     Path(args.previous_json).write_text(json.dumps(previous, ensure_ascii=False) + "\n", encoding="utf-8")
     if previous["available"] and previous["findings"]:
         original = ""

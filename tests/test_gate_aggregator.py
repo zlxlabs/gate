@@ -3864,3 +3864,143 @@ def test_missing_previous_ledger_marks_new_and_job_succeeds(tmp_path, capsys):
     assert item["relation_to_previous"] == "new"
     assert "previous_finding_id" not in item
     assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=previous-findings-file-missing" in out
+
+
+def _previous_round_fixture_objects():
+    ledger_path = ROOT / "tests/fixtures/previous-round-pr1063-ledger.json"
+    receipt_path = ROOT / "tests/fixtures/previous-round-pr1063-disposition.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    repository_id = ledger["primary_identity"]["repository_id"]
+    ledger_name = (
+        f"codex-review-ledger-v2-{repository_id}-{ledger['head_sha']}-"
+        f"{ledger['run_id']}-{ledger['run_attempt']}"
+    )
+    ledger_key = f"d30/{repository_id}/{ledger_name}/ledger.json"
+    receipt_name = CONV.disposition_receipt_artifact_name(CONV.parse_disposition_receipt(receipt))
+    receipt_key = f"d30/{repository_id}/{receipt_name}/{receipt_name}.json"
+    return ledger, receipt, [(ledger_key, ledger_path.read_bytes()), (receipt_key, receipt_path.read_bytes())]
+
+
+def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_configured=True, run_id=35989919390):
+    ledger, _, _ = _previous_round_fixture_objects()
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: silo_configured)
+    monkeypatch.setattr(
+        AGG, "_silo_objects_under",
+        lambda prefix: [(key, raw) for key, raw in silo_objects if key.startswith(prefix)],
+    )
+    output = tmp_path / "previous-findings.json"
+    context = tmp_path / "context.md"
+    rc = AGG.main([
+        "--render-previous-context",
+        "--repository-id", str(ledger["primary_identity"]["repository_id"]),
+        "--pr-number", str(ledger["pr_number"]),
+        "--run-id", str(run_id),
+        "--run-attempt", "1",
+        "--output", str(context),
+        "--previous-json", str(output),
+    ])
+    return rc, json.loads(output.read_text(encoding="utf-8"))
+
+
+def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp_path, monkeypatch, capsys):
+    ledger, _, objects = _previous_round_fixture_objects()
+    rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, objects)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert set(payload) == {"available", "detail", "findings", "dispositions"}
+    assert payload["available"] is True
+    assert payload["findings"] and any(
+        finding.get("id") == "reliability_alternates_survive_hard_kill"
+        for finding in payload["findings"]
+    )
+    assert len(payload["dispositions"]) == 1
+    disposition = payload["dispositions"][0]
+    assert disposition["finding_id"] == "reliability_alternates_survive_hard_kill"
+    assert disposition["disposition"] == "false-positive"
+    assert disposition["counterevidence"]["result"] == "refuted"
+    assert all(disposition["counterevidence"][field] for field in ("command", "output", "result", "pointer"))
+    assert disposition["head_sha"] == ledger["head_sha"]
+    assert set(disposition) == {
+        "finding_id", "disposition", "head_sha", "approved_at", "reason", "counterevidence", "tracking_issue",
+    }
+    assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=0" in out
+
+
+def test_render_previous_context_drops_invalid_dispositions_and_reports_count(tmp_path, monkeypatch, capsys):
+    _, valid, objects = _previous_round_fixture_objects()
+    repo_objects = list(objects)
+    base_key, base_raw = repo_objects[-1]
+    base = json.loads(base_raw)
+    for suffix, mutate in (
+        ("missing-pointer", lambda item: item["counterevidence"].pop("pointer")),
+        ("confirmed", lambda item: item["counterevidence"].update(result="confirmed")),
+    ):
+        invalid = json.loads(json.dumps(base))
+        mutate(invalid)
+        repo_objects.append((f"{base_key}-{suffix}", json.dumps(invalid).encode("utf-8")))
+
+    _, payload = _render_previous_round_fixture(tmp_path, monkeypatch, repo_objects)
+    out = capsys.readouterr().out
+
+    assert len(payload["dispositions"]) == 1
+    assert payload["dispositions"][0]["finding_id"] == valid["finding_id"]
+    assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=2" in out
+
+
+def test_render_previous_context_limits_dispositions_and_projects_deferred(tmp_path, monkeypatch, capsys):
+    from datetime import datetime, timedelta, timezone
+
+    _, base, objects = _previous_round_fixture_objects()
+    _, receipt_raw = objects[-1]
+    template = json.loads(receipt_raw)
+    repo_id = template["repository_id"]
+    receipts = []
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(35):
+        item = json.loads(json.dumps(template))
+        item["finding_id"] = f"finding-{index:02}"
+        item["approved_at"] = (start + timedelta(minutes=index)).isoformat().replace("+00:00", "Z")
+        item["reason"] = "r" * 300
+        item["counterevidence"]["command"] = "c" * 300
+        item["counterevidence"]["output"] = "o" * 300
+        item["counterevidence"]["pointer"] = "p" * 300
+        if index == 34:
+            item["disposition"] = "deferred"
+            item.pop("counterevidence")
+            item["tracking_issue"] = "#123"
+        receipts.append((f"d30/{repo_id}/gate-disposition-receipt-v3-test-{index}/receipt.json", json.dumps(item).encode()))
+    ledger_objects = [pair for pair in objects if b"codex-review-ledger-v2-" in pair[0].encode()]
+
+    _, payload = _render_previous_round_fixture(tmp_path, monkeypatch, ledger_objects + receipts)
+    out = capsys.readouterr().out
+
+    assert len(payload["dispositions"]) == 30
+    assert [item["finding_id"] for item in payload["dispositions"]] == [f"finding-{i:02}" for i in range(34, 4, -1)]
+    assert payload["dispositions"][0]["counterevidence"] is None
+    assert payload["dispositions"][0]["tracking_issue"] == "#123"
+    assert all(len(value) <= 240 for item in payload["dispositions"] for value in _string_values(item))
+    assert "GATE-PREVIOUS-DISPOSITIONS: kept=30 dropped=5" in out
+
+
+def _string_values(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [part for nested in value.values() for part in _string_values(nested)]
+    if isinstance(value, list):
+        return [part for nested in value for part in _string_values(nested)]
+    return []
+
+
+def test_render_previous_context_silo_unconfigured_has_complete_empty_contract(tmp_path, monkeypatch, capsys):
+    _, _, objects = _previous_round_fixture_objects()
+    rc, payload = _render_previous_round_fixture(
+        tmp_path, monkeypatch, objects, silo_configured=False,
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert payload == {"available": False, "detail": "silo-not-configured", "findings": [], "dispositions": []}
+    assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-not-configured" in out

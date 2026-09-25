@@ -738,8 +738,13 @@ jobs:
           echo "DESIGN_DOC=${DESIGN_DOC_INPUT}" >> "$GITHUB_ENV"
           if [ "$inject_status" -ne 0 ]; then
             echo "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=inject-step-failed"
-          elif [ -s .gate-review-context.md ]; then
-            echo "DESIGN_DOC=.gate-review-context.md" >> "$GITHUB_ENV"
+          else
+            if [ -s "${RUNNER_TEMP}/previous-findings.json" ]; then
+              echo "REVIEW_PREVIOUS_ROUND_PATH=${RUNNER_TEMP}/previous-findings.json" >> "$GITHUB_ENV"
+            fi
+            if [ -s .gate-review-context.md ]; then
+              echo "DESIGN_DOC=.gate-review-context.md" >> "$GITHUB_ENV"
+            fi
           fi
 
       - name: Run review-primary
