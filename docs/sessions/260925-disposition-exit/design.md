@@ -21,7 +21,7 @@ Artifact name 前缀为 `gate-disposition-receipt-v3-`。producer 写入 canonic
 | `head_sha` | string | 必需 | 当前 PR head |
 | `audit_digest` | string | 必需 | 当前 canonical primary audit digest |
 | `finding_id` | string | 必需 | 当前 P1 finding 的人类可读 ID |
-| `finding_key` | string | 必需 | 当前 P1 finding 的稳定精确 key；匹配歧义拒绝 |
+| `finding_key` | string | 可选（缺失时取空字符串） | 当前 P1 finding 的稳定精确 key；匹配歧义拒绝；见 [单次处置计算设计记录](../260925-record-dispositions-once/design.md) |
 | `reason` | string | 必需 | 非空；展示时截断至 500 字符 |
 | `approver` | string | 必需 | producer 收到的 GitHub actor 名称，不代表已验证审批 |
 | `approver_id` | integer | 必需 | 正整数；与 `approver` 同取 `github.actor` / `github.actor_id` 上下文 |
