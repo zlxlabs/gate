@@ -24,7 +24,7 @@ The aggregator prints exactly one marker from its shared finalization path. `pri
 | `skip_reason` | `draft`, `review_exempt`, `fork`, `hosted_runner`, `null` | Why a skipped primary is accepted, or null when there is no identified reason. |
 | `draft` | JSON Boolean | Draft state from the pull request event, independent of `skip_reason`. |
 
-`PRIMARY_SKIP_REASON_DOMAIN` is ordered by precedence: `draft`, `fork`, `hosted_runner`, `review_exempt`. The rule selects the first matching fact:
+`PRIMARY_SKIP_REASON_DOMAIN` contains exactly `draft`, `review_exempt`, `fork`, and `hosted_runner`. The independent decision precedence selects the first matching fact:
 
 1. `draft`: event draft is true. The existing current-draft recheck still decides whether that skip can be accepted.
 2. `fork`: head repository full name differs from the current repository.

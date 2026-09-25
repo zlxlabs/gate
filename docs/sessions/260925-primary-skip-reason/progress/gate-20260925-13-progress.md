@@ -25,3 +25,10 @@
 - 本段结论：全量测试发现仓内另有聚合器子进程用例只覆盖 primary 执行路径，未传新增参数。CLI 现在对缺失的 fork/classify 输入使用不能生成 skip reason 的默认值；已执行 primary 仍可处理，缺事实的 skipped 仍 fail closed。
 - 关键决策与已否决方案：不扩写卡面未授权的 convergence 测试文件；通过 CLI 的 fail-closed 缺省值兼容只处理执行结果的调用方。
 - 下一步唯一动作：重跑全量测试及相关契约检查并生成交付报告。
+
+## 文档勘误：值域顺序与判定优先级
+
+- 当前阶段：implementing
+- 本段结论：复核发现设计文档曾把 skip reason 值域的列举顺序误称为判定优先级；现已改为分别描述值域和 draft→fork→hosted_runner→review_exempt 的判定顺序。
+- 关键决策与已否决方案：无。
+- 下一步唯一动作：提交并推送文档勘误，更新最终交接与报告。
