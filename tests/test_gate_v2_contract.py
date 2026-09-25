@@ -3079,13 +3079,13 @@ def test_primary_injects_previous_findings_and_names_the_degrade_line():
     failure_branch = lines.index('if [ "$inject_status" -ne 0 ]; then')
     outer_else = lines.index("else", failure_branch)
     outer_fi = lines.index("fi", outer_else)
-    output_nonempty = lines.index('  if [ -s "${RUNNER_TEMP}/previous-findings.json" ]; then', outer_else)
-    export_line = lines.index('    echo "REVIEW_PREVIOUS_ROUND_PATH=${RUNNER_TEMP}/previous-findings.json" >> "$GITHUB_ENV"')
+    output_check = '  if [ -s "${RUNNER_TEMP}/previous-findings.json" ]; then'
+    export = '    echo "REVIEW_PREVIOUS_ROUND_PATH=${RUNNER_TEMP}/previous-findings.json" >> "$GITHUB_ENV"'
+    assert output_check in lines[outer_else:outer_fi]
+    assert export in lines
+    output_nonempty = lines.index(output_check, outer_else)
+    export_line = lines.index(export)
     assert status_assignment < failure_branch < outer_else < output_nonempty < export_line < outer_fi
-    assert any(
-        '-s "${RUNNER_TEMP}/previous-findings.json"' in line
-        for line in lines[outer_else:outer_fi]
-    )
     run_step = steps[review]
     assert "DESIGN_DOC" not in run_step.get("env", {})
     assert "REVIEW_PREVIOUS_ROUND_PATH" not in run_step.get("env", {})

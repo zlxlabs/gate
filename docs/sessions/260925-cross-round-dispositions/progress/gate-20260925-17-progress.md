@@ -18,3 +18,10 @@
 - 本段结论：注入成功分支现在仅在 `${RUNNER_TEMP}/previous-findings.json` 非空时导出 `REVIEW_PREVIOUS_ROUND_PATH`；`Run review-primary` 不新增显式 env。workflow 契约测试通过：189 passed；pin 检查通过。
 - 关键决策与已否决方案：卡面写 `/previous-findings.json`，但现有 CLI 实际写 `${RUNNER_TEMP}/previous-findings.json`；导出实际产物的绝对路径，避免 env 指向不存在的文件。保留 `DESIGN_DOC` 拼接与 primary audit 注解行为。
 - 下一步唯一动作：完成红验与全量验收，写报告并推送分支。
+
+## 导出条件判据
+
+- 当前阶段：implementing
+- 本段结论：契约测试对 `inject_status` 的成功分支、非空文件判断、导出顺序和 review-primary env 缺席分别作直接断言；针对性测试通过。断言缺失时会以 AssertionError 报出。
+- 关键决策与已否决方案：不把路径写入 `Run review-primary` 的 `env:`；只通过 `$GITHUB_ENV` 在注入 step 内导出。
+- 下一步唯一动作：逐项执行导出条件反向红验，再跑全量测试和静态检查。
