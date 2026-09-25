@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -2757,6 +2758,83 @@ def _evaluate_failing_primary(audit, *, audit_digest=_DIGEST_A, waiver_receipts=
             repository="zlxlabs/gate",
         )
     )
+
+
+def test_evaluate_records_dispositions_once_for_active_p1():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    receipt = _false_positive_receipt(scope, audit_digest=_DIGEST_A)
+    original = CONV.record_dispositions
+
+    with patch.object(CONV, "record_dispositions", wraps=original) as record_dispositions:
+        outcome = AGG.evaluate(**_base_kwargs(
+            primary_result="failure",
+            audit=audit,
+            scope=scope,
+            audit_digest=_DIGEST_B,
+            legacy_raw_audit_digest=_DIGEST_A,
+            waiver_receipts=(receipt,),
+            repository="zlxlabs/gate",
+        ))
+
+    assert outcome.convergence_envelope is not None
+    assert outcome.disposition_audit.primary_p1_ids == ("p1",)
+    assert outcome.disposition_audit.remaining_p1_ids == ()
+    assert outcome.convergence_envelope["state"]["clean_streak"] == 1
+    assert record_dispositions.call_count == 1
+
+
+def test_evaluate_round_reuses_disposition_audit_with_legacy_digest():
+    audit = _failing_scoped_audit()
+    scope = _scope_for(audit)
+    p1_findings = AGG._canonical_p1_findings(audit)
+    primary = CONV.CanonicalPrimary(
+        schema_version=1,
+        repository_id=IDENTITY.repository_id,
+        pr_number=IDENTITY.pr,
+        head_sha=IDENTITY.head_sha,
+        run_id=IDENTITY.run_id,
+        run_attempt=IDENTITY.run_attempt,
+        verdict=audit["verdict"],
+        p1_ids=tuple(item[0] for item in p1_findings),
+        p1_findings=p1_findings,
+    )
+    receipt = _false_positive_receipt(scope, audit_digest=_DIGEST_A)
+    disposition_audit = CONV.record_dispositions(
+        primary.p1_ids,
+        (receipt,),
+        scope=scope,
+        primary=primary,
+        audit_digest=_DIGEST_B,
+        legacy_raw_audit_digest=_DIGEST_A,
+        repository="zlxlabs/gate",
+    )
+    without_legacy_digest = CONV.record_dispositions(
+        primary.p1_ids,
+        (receipt,),
+        scope=scope,
+        primary=primary,
+        audit_digest=_DIGEST_B,
+        repository="zlxlabs/gate",
+    )
+
+    decision = CONV.evaluate_round(
+        state=CONV.initial_state(scope),
+        scope=scope,
+        primary=primary,
+        audit_digest=_DIGEST_B,
+        waiver_receipts=(receipt,),
+        disposition_audit=disposition_audit,
+        processing_key=CONV.ProcessingKey(
+            IDENTITY.repository_id, IDENTITY.pr, IDENTITY.run_id, IDENTITY.run_attempt,
+        ),
+        repository="zlxlabs/gate",
+    )
+
+    assert disposition_audit.remaining_p1_ids == ()
+    assert without_legacy_digest.remaining_p1_ids == primary.p1_ids
+    assert decision.remaining_p1_ids == disposition_audit.remaining_p1_ids
+    assert decision.state.clean_streak == 1
 
 
 @pytest.mark.parametrize("tier", ["personal", "internal", "unrecognized"])

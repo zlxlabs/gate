@@ -1463,6 +1463,7 @@ def evaluate_round(
     primary: CanonicalPrimary,
     audit_digest: str,
     waiver_receipts: Sequence[DispositionReceipt] = (),
+    disposition_audit: DispositionAudit | None = None,
     processing_key: ProcessingKey,
     repository: str | None = None,
 ) -> RoundDecision:
@@ -1554,14 +1555,15 @@ def evaluate_round(
             accepted=False,
             no_op=False,
         )
-    disposition_audit = record_dispositions(
-        primary.p1_ids,
-        waiver_receipts,
-        scope=scope,
-        primary=primary,
-        audit_digest=audit_digest,
-        repository=repository,
-    )
+    if disposition_audit is None:
+        disposition_audit = record_dispositions(
+            primary.p1_ids,
+            waiver_receipts,
+            scope=scope,
+            primary=primary,
+            audit_digest=audit_digest,
+            repository=repository,
+        )
     remaining_p1_ids = disposition_audit.remaining_p1_ids
     # Epoch boundaries precede all idempotency checks. Old indexes cannot
     # consume a round in the new generation.
