@@ -3591,6 +3591,48 @@ def test_disposition_receipts_dual_read_table(monkeypatch, capsys, case):
         assert "RuntimeError" in warning
 
 
+def test_dual_read_merge_keeps_same_key_receipts_with_different_finding_ids(monkeypatch):
+    # gate#240: two same-key P1s (same file, line null) legitimately produce
+    # two receipts that differ only by finding_id; the name-keyed merge must
+    # keep both instead of letting one swallow the other.
+    scope = _scope_for(_failing_scoped_audit())
+    same_key = CONV.canonical_finding_key(
+        {"file": "src/lock.py", "line": None, "category": "correctness", "severity": "major"}
+    )
+    first = _false_positive_receipt(
+        scope, repository_id=str(_CANARY_REPO_ID), finding_id="p1", finding_key=same_key,
+    )
+    second = _false_positive_receipt(
+        scope, repository_id=str(_CANARY_REPO_ID), finding_id="p2", finding_key=same_key,
+    )
+    assert CONV.disposition_receipt_artifact_name(first) != CONV.disposition_receipt_artifact_name(second)
+
+    def github_artifact(receipt, index):
+        return {
+            "name": CONV.disposition_receipt_artifact_name(receipt),
+            "expired": False,
+            "archive_download_url": f"https://api.github.com/artifacts/{index}/zip",
+        }
+
+    _install_dual_read(
+        monkeypatch,
+        github_artifacts=[github_artifact(first, 1), github_artifact(second, 2)],
+        github_blobs={
+            "https://api.github.com/artifacts/1/zip": _zip_receipt_bytes(_receipt_payload(first)),
+            "https://api.github.com/artifacts/2/zip": _zip_receipt_bytes(_receipt_payload(second)),
+        },
+        silo_objects=[
+            (_receipt_key(first), json.dumps(_receipt_payload(first)).encode()),
+            (_receipt_key(second), json.dumps(_receipt_payload(second)).encode()),
+        ],
+    )
+    receipts = AGG._fetch_disposition_receipts(
+        token="tok", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert len(receipts) == 2
+    assert {receipt.finding_id for receipt in receipts} == {"p1", "p2"}
+
+
 def test_silo_objects_under_cli_path_contract(monkeypatch):
     import subprocess
 

@@ -662,11 +662,14 @@ def test_legacy_id_disposition_rejects_ambiguous_stable_primary_and_consumption_
 
 
 @pytest.mark.parametrize(
-    "primary, receipt, expected",
+    "primary, receipt, with_key_expected, without_key_expected",
     [
+        # gate#240: the exact finding_id resolves the collision for the
+        # stable-key path; the legacy no-key path keeps failing closed.
         (
             _stable_primary(ids=("p1", "p2"), line=None),
             _stable_disposition(primary=_stable_primary(ids=("p1", "p2"), line=None)),
+            (True, True),
             (False, False),
         ),
         (
@@ -676,15 +679,19 @@ def test_legacy_id_disposition_rejects_ambiguous_stable_primary_and_consumption_
                 finding_id="missing",
             ),
             (False, False),
+            (False, False),
         ),
         (
             _stable_primary(ids=("p1",), line=12),
             _stable_disposition(primary=_stable_primary(ids=("p1",), line=12)),
             (True, True),
+            (True, True),
         ),
     ],
 )
-def test_legacy_path_is_never_more_permissive_than_stable_key_path(primary, receipt, expected):
+def test_legacy_path_is_never_more_permissive_than_stable_key_path(
+    primary, receipt, with_key_expected, without_key_expected,
+):
     with_key = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
@@ -693,8 +700,9 @@ def test_legacy_path_is_never_more_permissive_than_stable_key_path(primary, rece
         scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
 
-    assert (with_key.valid, with_key.active) == expected
-    assert (without_key.valid, without_key.active) == expected
+    assert (with_key.valid, with_key.active) == with_key_expected
+    assert (without_key.valid, without_key.active) == without_key_expected
+    assert (without_key.valid and without_key.active) <= (with_key.valid and with_key.active)
 
 
 def test_primary_errors_describe_legacy_and_stable_finding_shapes():
@@ -712,13 +720,63 @@ def test_primary_errors_describe_legacy_and_stable_finding_shapes():
 
 def test_stable_disposition_rejects_ambiguous_current_key():
     primary = _stable_primary(ids=("p1", "p2"))
-    receipt = _stable_disposition(primary=primary)
+    receipt = _stable_disposition(primary=primary, finding_id="id-outside-collision-set")
     status = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
     assert status.reason_code == "finding_key_ambiguous"
     assert "2" in status.reason
     assert receipt.finding_key in status.reason
+
+
+def test_same_key_p1s_disambiguate_by_exact_receipt_finding_id():
+    primary = _stable_primary(ids=("p1", "p2"), line=None)
+    receipt = _stable_disposition(primary=primary)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason_code) == (True, True, "active_false_positive")
+    recorded = CONV.record_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert recorded.recorded_finding_ids == ("p1",)
+    assert recorded.remaining_p1_ids == ("p2",)
+
+
+def test_same_key_p1_deferred_disambiguates_to_active_deferred():
+    primary = _stable_primary(ids=("p1", "p2"), line=None)
+    receipt = _stable_disposition(
+        primary=primary, disposition="deferred", counterevidence=None, tracking_issue="#12",
+    )
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason_code) == (True, True, "active_deferred")
+
+
+def test_same_key_p1s_stay_fail_closed_when_receipt_id_hits_none_of_them():
+    primary = _stable_primary(ids=("p1", "p2"), line=None)
+    receipt = _stable_disposition(primary=primary, finding_id="id-outside-collision-set")
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason_code) == (False, False, "finding_key_ambiguous")
+    assert "finding_id does not resolve the collision" in status.reason
+    audit = CONV.record_dispositions(
+        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert audit.recorded_receipts == ()
+    assert [reason for _, reason in audit.rejected_receipts] == ["finding_key_ambiguous"]
+    assert audit.remaining_p1_ids == ("p1", "p2")
+
+
+def test_single_null_line_p1_survives_receipt_id_drift():
+    primary = _stable_primary(line=None)
+    receipt = _stable_disposition(primary=primary, finding_id="rerun-drifted-id")
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert (status.valid, status.active, status.reason_code) == (True, True, "active_false_positive")
 
 
 def test_legacy_raw_bytes_digest_still_consumes_current_file():

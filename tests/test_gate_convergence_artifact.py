@@ -312,8 +312,12 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     payload_bytes = artifact_path.read_bytes()
     payload = json.loads(payload_bytes)
     stable_key = CONV.canonical_finding_key(audit["result"]["findings"][0])
-    key_digest = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:12]
-    assert result["artifact"] == f"gate-disposition-receipt-v3-{epoch}-{digest[:12]}-{key_digest}"
+    # gate#240: the target component hashes the canonical JSON of
+    # [finding_key, finding_id] so same-key receipts cannot share a name.
+    target_digest = hashlib.sha256(
+        json.dumps([stable_key, "p1"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    assert result["artifact"] == f"gate-disposition-receipt-v3-{epoch}-{digest[:12]}-{target_digest}"
     assert payload_bytes == json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     assert payload["kind"] == CONV.DISPOSITION_RECEIPT_KIND
     assert set(payload) - {"kind"} == set(CONV.DispositionReceipt.__dataclass_fields__) - {"tracking_issue"}
@@ -375,7 +379,7 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
     assert "finding_id must identify a P1 finding" in failed.stderr
 
 
-def test_disposition_producer_rejects_stable_key_collision(tmp_path):
+def test_disposition_producer_resolves_stable_key_collision_by_exact_finding_id(tmp_path):
     findings = [
         {
             "id": "p1", "severity": "major", "trigger_kind": "inferred",
@@ -397,19 +401,35 @@ def test_disposition_producer_rejects_stable_key_collision(tmp_path):
     }
     audit_path = tmp_path / "audit.json"
     audit_path.write_text(json.dumps(audit), encoding="utf-8")
-    argv = [
-        sys.executable, str(DISPOSITION_PRODUCER), "issue",
-        "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
-        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
-        "--finding-id", "p1", "--reason", "reason", "--approver", "octocat",
-        "--counterevidence-json", COUNTEREVIDENCE_JSON,
-        "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
-        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
-    ]
-    failed = subprocess.run(argv, capture_output=True, text=True, env=_producer_env())
-    assert failed.returncode == 1
-    assert "2" in failed.stderr
-    assert "cannot determine" in failed.stderr
+
+    def issue(output_dir, finding_id):
+        argv = [
+            sys.executable, str(DISPOSITION_PRODUCER), "issue",
+            "--output-dir", str(output_dir), "--audit-path", str(audit_path),
+            "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+            "--finding-id", finding_id, "--reason", "reason", "--approver", "octocat",
+            "--counterevidence-json", COUNTEREVIDENCE_JSON,
+            "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
+            "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+        ]
+        return subprocess.run(argv, capture_output=True, text=True, env=_producer_env())
+
+    # gate#240: the exact finding_id singles out one of the same-key P1s.
+    issued = issue(tmp_path / "out", "p1")
+    assert issued.returncode == 0, issued.stderr
+    payload = json.loads(
+        (tmp_path / "out" / json.loads(issued.stdout)["artifact"]).read_bytes()
+    )
+    assert payload["finding_id"] == "p1"
+    assert payload["finding_key"] == CONV.canonical_finding_key(findings[0])
+
+    # An id outside the collision set never resolves a finding and still
+    # fails closed (the receipt-level zero-hit branch is covered in
+    # tests/test_gate_convergence.py).
+    rejected = issue(tmp_path / "out-rejected", "p3")
+    assert rejected.returncode == 1
+    assert "finding_id must identify exactly one canonical audit finding" in rejected.stderr
+    assert not (tmp_path / "out-rejected").exists()
 
 
 def test_disposition_producer_rejects_id_and_different_key_collision(tmp_path):
