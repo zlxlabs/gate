@@ -51,8 +51,15 @@ REVIEW_EXPECTED_IF = (
     "inputs.runner == 'self' && "
     "needs.classify_pr_paths.outputs.review_expected != 'false' }}"
 )
-PRIMARY_RESULT_EXPR = "${{ needs.primary.result == 'abandoned' && 'cancelled' || needs.primary.result }}"
+PRIMARY_RESULT_EXPR = (
+    "${{ needs.primary.result == 'success' && 'success' "
+    "|| needs.primary.result == 'failure' && 'failure' "
+    "|| needs.primary.result == 'cancelled' && 'cancelled' "
+    "|| needs.primary.result == 'skipped' && 'skipped' "
+    "|| 'cancelled' }}"
+)
 PRIMARY_RESULT_RAW_EXPR = "${{ needs.primary.result }}"
+PRIMARY_RESULT_DOMAIN = ("success", "failure", "cancelled", "skipped")
 ARTIFACT_NAME_EXPR = (
     "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
     "-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -94,6 +101,29 @@ def _load_workflow():
     raw = yaml.safe_load(WORKFLOW.read_text())
     trigger = raw.get("on", raw.get(True))
     return raw, trigger
+
+
+def _evaluate_primary_result_expr(expression: str, raw_result: str) -> str:
+    """Evaluate the small equality/and/or subset used by this GHA expression."""
+    body = expression.removeprefix("${{").removesuffix("}}").strip()
+    for disjunction in body.split("||"):
+        value = True
+        for operand in disjunction.split("&&"):
+            operand = operand.strip()
+            comparison = re.fullmatch(r"needs\.primary\.result == '([^']+)'", operand)
+            if comparison:
+                value = raw_result == comparison.group(1)
+            elif operand.startswith("'") and operand.endswith("'"):
+                value = operand[1:-1]
+            elif operand == "needs.primary.result":
+                value = raw_result
+            else:
+                raise AssertionError(f"unsupported PRIMARY_RESULT expression operand: {operand!r}")
+            if not value:
+                break
+        if value:
+            return value if isinstance(value, str) else "true"
+    return ""
 
 
 def _load_caller():
@@ -698,6 +728,45 @@ def test_observed_abandoned_primary_is_normalized_and_raw_value_is_preserved():
     for step in (aggregate, publish, resolver):
         assert step["env"]["PRIMARY_RESULT"] == PRIMARY_RESULT_EXPR
         assert step["env"]["PRIMARY_RESULT_RAW"] == PRIMARY_RESULT_RAW_EXPR
+        assert "::warning::PRIMARY_RESULT normalized from" in step["run"]
+
+
+@pytest.mark.parametrize(
+    "raw_result,expected",
+    [
+        *((result, result) for result in PRIMARY_RESULT_DOMAIN),
+        ("", "cancelled"),
+        ("abandoned", "cancelled"),
+        ("weird_future_value", "cancelled"),
+    ],
+)
+def test_primary_result_expression_preserves_domain_and_normalizes_everything_else(raw_result, expected):
+    assert _evaluate_primary_result_expr(PRIMARY_RESULT_EXPR, raw_result) == expected
+
+
+@pytest.mark.parametrize("raw_result", ["", "abandoned", "weird_future_value"])
+def test_ledger_resolver_records_out_of_domain_primary_as_cancelled(tmp_path, raw_result):
+    artifacts = [
+        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
+        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
+    ]
+    result, output = _run_ledger_resolver(
+        tmp_path,
+        artifacts=artifacts,
+        current=1,
+        review_expected="true",
+        extra_env={
+            "QUALITY_RESULT": "success",
+            "PRIMARY_RESULT": _evaluate_primary_result_expr(PRIMARY_RESULT_EXPR, raw_result),
+            "PRIMARY_RESULT_RAW": raw_result,
+        },
+    )
+    combined = result.stderr + result.stdout
+    assert result.returncode == 0, combined
+    assert "audit_artifact_id=\n" in output
+    assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
+    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
+    assert f"::warning::PRIMARY_RESULT normalized from {raw_result!r} to 'cancelled'" in combined
 
 
 def test_classify_listing_failure_does_not_output_false(tmp_path):
