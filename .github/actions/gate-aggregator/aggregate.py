@@ -1332,6 +1332,7 @@ def evaluate(
             primary=primary,
             audit_digest=audit_digest,
             waiver_receipts=waiver_receipts,
+            disposition_audit=disposition_audit,
             processing_key=processing_key,
             repository=repository,
         )
