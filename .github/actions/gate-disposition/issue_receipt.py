@@ -23,6 +23,9 @@ from typing import Any
 
 P1_SEVERITIES = frozenset({"major", "blocker"})
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TRACKING_ISSUE_URL = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)")
+COUNTEREVIDENCE_FIELDS = ("command", "output", "result", "pointer")
+DISPOSITIONS = frozenset({"false-positive", "deferred"})
 
 
 def _load_convergence():
@@ -169,10 +172,12 @@ def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repositor
     scope = json.loads(raw_scope) if isinstance(raw_scope, str) else raw_scope
     required = {
         "repository_id", "pr_number", "base_sha", "head_sha", "diff_digest",
-        "policy_version", "policy_digest", "tier", "caller_sha", "reusable_workflow_sha",
+        "policy_version", "policy_digest", "caller_sha", "reusable_workflow_sha",
     }
-    if not isinstance(scope, dict) or set(scope) != required:
+    if not isinstance(scope, dict) or set(scope) not in (required, required | {"tier"}):
         raise ValueError("scope_json must contain the complete canonical Scope fields")
+    tier = scope.get("tier")
+    scope["tier"] = tier if tier in _CONVERGENCE.SUPPORTED_TIERS else "internal"
     if scope["repository_id"] != int(repository_id) or scope["pr_number"] != pr_number:
         raise ValueError("scope repository/PR does not match current control target")
     if scope["head_sha"] != head_sha:
@@ -191,6 +196,12 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
     head_sha = str(_required(args, envelope, "head_sha", "DISPOSITION_HEAD_SHA"))
     finding_id = str(_required(args, envelope, "finding_id", "DISPOSITION_FINDING_ID"))
     reason = str(_required(args, envelope, "reason", "DISPOSITION_REASON"))
+    disposition = _value(args, envelope, "disposition", "DISPOSITION_KIND") or "false-positive"
+    if disposition not in DISPOSITIONS:
+        raise ValueError("disposition must be false-positive or deferred")
+    repository = _value(args, envelope, "repository", "GITHUB_REPOSITORY")
+    counterevidence_raw = _value(args, envelope, "counterevidence_json", "DISPOSITION_COUNTEREVIDENCE_JSON")
+    tracking_issue = _value(args, envelope, "tracking_issue", "DISPOSITION_TRACKING_ISSUE")
     approver = str(_required(args, envelope, "approver", "DISPOSITION_APPROVER"))
     approver_id = _positive_int(
         _required(args, envelope, "approver_id", "DISPOSITION_APPROVER_ID"), "approver_id",
@@ -221,11 +232,34 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         )
     if matching.get("severity") not in P1_SEVERITIES:
         raise ValueError("finding_id must identify a P1 finding")
-    if matching.get("trigger_kind") != "inferred":
+    if disposition == "false-positive" and matching.get("trigger_kind") != "inferred":
         raise ValueError("finding_id must identify an inferred P1 finding")
+    counterevidence = None
+    if disposition == "false-positive":
+        if counterevidence_raw is None or counterevidence_raw == "":
+            raise ValueError("counterevidence_required")
+        counterevidence = json.loads(counterevidence_raw) if isinstance(counterevidence_raw, str) else counterevidence_raw
+        if not isinstance(counterevidence, dict) or any(
+            not isinstance(counterevidence.get(field), str) or not counterevidence[field].strip()
+            for field in COUNTEREVIDENCE_FIELDS
+        ):
+            raise ValueError("counterevidence_required")
+        if counterevidence["result"] != "refuted":
+            raise ValueError("counterevidence_result_not_refuted")
+    else:
+        if not isinstance(tracking_issue, str):
+            raise ValueError("tracking_issue_invalid")
+        if re.fullmatch(r"#[1-9][0-9]*", tracking_issue) is None:
+            match = TRACKING_ISSUE_URL.fullmatch(tracking_issue)
+            if match is None:
+                raise ValueError("tracking_issue_invalid")
+            if not isinstance(repository, str) or f"{match.group(1)}/{match.group(2)}".casefold() != repository.casefold():
+                raise ValueError("tracking_issue_repository_mismatch")
+        if scope["tier"] == "saas":
+            raise ValueError("deferred_not_allowed_for_tier")
     fields = {
         "schema_version": SCHEMA_VERSION,
-        "disposition": "false-positive",
+        "disposition": disposition,
         "repository_id": repository_id,
         "pr_number": pr_number,
         "epoch": _derive_epoch(scope),
@@ -240,6 +274,10 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         "triggering_actor": triggering_actor,
         "triggering_actor_source": triggering_actor_source,
     }
+    if counterevidence is not None:
+        fields["counterevidence"] = counterevidence
+    if disposition == "deferred":
+        fields["tracking_issue"] = tracking_issue
     return fields
 
 
@@ -281,9 +319,7 @@ def issue(args: argparse.Namespace, envelope: dict[str, Any]) -> int:
         **fields,
         "kind": _CONVERGENCE.DISPOSITION_RECEIPT_KIND,
     }
-    receipt = _CONVERGENCE.DispositionReceipt(
-        **{key: fields[key] for key in _CONVERGENCE.DispositionReceipt.__dataclass_fields__}
-    )
+    receipt = _CONVERGENCE.parse_disposition_receipt(payload)
     _safe_component(fields["epoch"], "epoch")
     name = _CONVERGENCE.disposition_receipt_artifact_name(receipt)
     _safe_component(name, "artifact name")
@@ -303,6 +339,7 @@ def _parser() -> argparse.ArgumentParser:
     for name in (
         "repository-id", "pr-number", "head-sha", "finding-id", "scope-json",
         "approver", "approver-id", "approved-at", "triggering-actor",
+        "repository", "disposition", "counterevidence-json", "tracking-issue",
     ):
         sub.add_argument(f"--{name}", dest=name.replace("-", "_"))
     return parser
