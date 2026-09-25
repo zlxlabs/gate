@@ -8,6 +8,9 @@ on:
       primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      disposition: { description: "false-positive or deferred; omitted legacy calls are rejected without evidence", required: false, type: string }
+      counterevidence_json: { description: "JSON object with command, output, result=refuted, and pointer for false-positive", required: false, type: string }
+      tracking_issue: { description: "same-repository issue number (#N) or issues URL for deferred", required: false, type: string }
       gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
   workflow_call:
     inputs:
@@ -16,6 +19,9 @@ on:
       primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      disposition: { description: "false-positive or deferred; omitted legacy calls are rejected without evidence", required: false, type: string }
+      counterevidence_json: { description: "JSON object with command, output, result=refuted, and pointer for false-positive", required: false, type: string }
+      tracking_issue: { description: "same-repository issue number (#N) or issues URL for deferred", required: false, type: string }
       gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
 
 permissions:
@@ -148,7 +154,7 @@ jobs:
           repository_id = int(sys.argv[3])
           pr_number = int(sys.argv[4])
           required = (
-              "diff_digest", "policy_version", "policy_digest", "tier",
+              "diff_digest", "policy_version", "policy_digest",
               "caller_sha", "reusable_workflow_sha", "base_sha", "head_sha",
           )
           missing = [field for field in required if field not in audit]
@@ -173,7 +179,7 @@ jobs:
               diff_digest=audit["diff_digest"],
               policy_version=audit["policy_version"],
               policy_digest=audit["policy_digest"],
-              tier=audit["tier"],
+              tier=audit.get("tier") if audit.get("tier") in module.SUPPORTED_TIERS else "internal",
               caller_sha=audit["caller_sha"],
               reusable_workflow_sha=audit["reusable_workflow_sha"],
           )
@@ -193,8 +199,12 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           FINDING_ID: ${{ inputs.finding_id }}
           DISPOSITION_REASON: ${{ inputs.reason }}
-          DISPOSITION_APPROVER: ${{ github.triggering_actor }}
+          DISPOSITION_KIND: ${{ inputs.disposition }}
+          DISPOSITION_COUNTEREVIDENCE_JSON: ${{ inputs.counterevidence_json }}
+          DISPOSITION_TRACKING_ISSUE: ${{ inputs.tracking_issue }}
+          DISPOSITION_APPROVER: ${{ github.actor }}
           DISPOSITION_APPROVER_ID: ${{ github.actor_id }}
+          DISPOSITION_REPOSITORY: ${{ github.repository }}
           OUTPUT_DIR: ${{ runner.temp }}/gate-disposition-artifact
         run: |
           set -euo pipefail
@@ -211,6 +221,9 @@ jobs:
             --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
             --head-sha "$CURRENT_HEAD_SHA" --finding-id "$FINDING_ID" \
             --reason "$DISPOSITION_REASON" --scope-json "$CURRENT_SCOPE_JSON" \
+            --repository "$DISPOSITION_REPOSITORY" --disposition "$DISPOSITION_KIND" \
+            --counterevidence-json "$DISPOSITION_COUNTEREVIDENCE_JSON" \
+            --tracking-issue "$DISPOSITION_TRACKING_ISSUE" \
             --approver "$DISPOSITION_APPROVER" \
             --approver-id "$DISPOSITION_APPROVER_ID" \
             --approved-at "$approved_at")"
