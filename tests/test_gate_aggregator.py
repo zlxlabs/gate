@@ -922,6 +922,16 @@ def test_primary_skip_without_a_matching_reason_fails_closed():
     assert outcome.gate_result != "skipped"
 
 
+def test_primary_skip_with_missing_classify_fact_fails_closed():
+    kwargs = _base_kwargs(
+        primary_result="skipped", is_draft=False, review_expected=False, audit=None,
+    )
+    outcome = AGG.evaluate(**kwargs)
+    assert outcome.ok is False
+    assert outcome.skip_reason is None
+    assert outcome.gate_result != "skipped"
+
+
 @pytest.mark.parametrize(
     "case,expected_primary,expected_reason,expected_draft,expected_gate_result,expected_classification,expected_reason_code",
     [
@@ -930,6 +940,7 @@ def test_primary_skip_without_a_matching_reason_fails_closed():
         ({"primary_result": "skipped", "is_draft": "false", "is_fork": "true", "runner": "self", "classify_review_expected": "true", "review_expected": "false"}, "skipped", "fork", False, "skipped", "expected_skip", "review_not_expected"),
         ({"primary_result": "skipped", "is_draft": "false", "is_fork": "false", "runner": "hosted", "classify_review_expected": "true", "review_expected": "false"}, "skipped", "hosted_runner", False, "skipped", "expected_skip", "review_not_expected"),
         ({"primary_result": "success", "is_draft": "false", "is_fork": "false", "runner": "self", "classify_review_expected": "true", "review_expected": "true"}, "executed", None, False, "pass", "code_pass", "primary_pass"),
+        ({"primary_result": "failure", "is_draft": "false", "is_fork": "false", "runner": "self", "classify_review_expected": "true", "review_expected": "true"}, "executed", None, False, "fail", "code_fail", "primary_findings"),
         ({"primary_result": "skipped", "is_draft": "false", "is_fork": "false", "runner": "self", "classify_review_expected": "true", "review_expected": "false"}, "skipped", None, False, "unavailable", "integration_error", "unexpected_primary_skip"),
     ],
 )
@@ -939,9 +950,10 @@ def test_real_aggregator_subprocess_publishes_one_verdict_line(
 ):
     audit_dir = tmp_path / "audit"
     audit_dir.mkdir()
-    if case["primary_result"] == "success":
+    if case["primary_result"] in ("success", "failure"):
         (audit_dir / "primary-review-audit.json").write_text(
-            json.dumps(_valid_primary_record()), encoding="utf-8",
+            json.dumps(_valid_primary_record(verdict="fail" if case["primary_result"] == "failure" else "pass")),
+            encoding="utf-8",
         )
     summary_path = tmp_path / "summary.md"
     args = _cli_args(audit_dir, summary_path, **case)

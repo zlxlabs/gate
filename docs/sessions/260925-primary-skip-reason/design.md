@@ -33,9 +33,10 @@ The aggregator prints exactly one marker from its shared finalization path. `pri
 
 `gate-v2.yml` passes these facts into `Aggregate required verdict`. It does not alter the primary job's `if:` or the `REVIEW_EXPECTED` expression, and the aggregator does not call GitHub to reconstruct them.
 
+The CLI defaults a missing fork input to false and a missing classify output to empty so callers that only aggregate an executed primary can continue to run. These defaults never establish a skip reason: fork and review-exempt require their explicit facts, and any skipped primary with no identified reason fails closed.
+
 If primary is skipped and none of the four facts supplies a reason, the aggregator fails closed with `integration_error / unexpected_primary_skip`; its existing mapping yields `gate_result=unavailable`, never `skipped`. It emits `primary=skipped, skip_reason=null` to preserve the actual job conclusion. This fail-closed case is the necessary exception to a broad `primary=executed` iff `skip_reason=null` assertion: reporting `primary=executed` would falsify the observed skipped job.
 
 ## Consumer rule
 
 The first consumer, agent-config `ci-watch`, may treat the primary skip as the review-exempt case only when `skip_reason` is `review_exempt` **and** `draft` is false. Other skip reasons do not relax that consumer's primary-skip handling. Missing or duplicate markers remain a consumer error; the producer test runs this script in a subprocess and checks the bytes written to stdout.
-

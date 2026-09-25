@@ -18,3 +18,10 @@
 - 本段结论：设计文档记录了标记字段、有限值域、判定顺序和消费规则，也明确说明了 fail-closed 负例中 `primary=skipped, skip_reason=null` 的必要例外。实现与契约测试已提交，正在跑最终全量验证。
 - 关键决策与已否决方案：不伪报未执行的 primary 为 `executed`；负例保持真实执行状态并以非零退出和非 `skipped` 的 gate_result 失败。
 - 下一步唯一动作：跑卡面要求的全量测试、相关文件测试、pin 检查并保存完整报告。
+
+## 补充里程碑：保持无跳过调用方可用
+
+- 当前阶段：implementing
+- 本段结论：全量测试发现仓内另有聚合器子进程用例只覆盖 primary 执行路径，未传新增参数。CLI 现在对缺失的 fork/classify 输入使用不能生成 skip reason 的默认值；已执行 primary 仍可处理，缺事实的 skipped 仍 fail closed。
+- 关键决策与已否决方案：不扩写卡面未授权的 convergence 测试文件；通过 CLI 的 fail-closed 缺省值兼容只处理执行结果的调用方。
+- 下一步唯一动作：重跑全量测试及相关契约检查并生成交付报告。

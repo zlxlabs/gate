@@ -978,7 +978,7 @@ def evaluate(
     audit_error: Optional[str],
     identity: Identity,
     is_fork: bool = False,
-    classify_review_expected: str = "true",
+    classify_review_expected: str = "",
     audit_source_attempt: Optional[int] = None,
     audit_artifact_name: Optional[str] = None,
     scope: Optional[Any] = None,
@@ -2950,8 +2950,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--primary-result", required=True, help="needs.primary.result")
     parser.add_argument("--runner", required=True, help="inputs.runner ('self'/'hosted') — validated strictly")
     parser.add_argument("--is-draft", required=True, help="github.event.pull_request.draft ('true'/'false')")
-    parser.add_argument("--is-fork", required=True, help="whether pull_request.head.repo.full_name differs from github.repository")
-    parser.add_argument("--classify-review-expected", required=True, help="needs.classify_pr_paths.outputs.review_expected")
+    parser.add_argument("--is-fork", default="false", help="whether pull_request.head.repo.full_name differs from github.repository")
+    parser.add_argument("--classify-review-expected", default="", help="needs.classify_pr_paths.outputs.review_expected; absent means no review-exempt reason can be identified")
     parser.add_argument(
         "--review-expected",
         required=True,
