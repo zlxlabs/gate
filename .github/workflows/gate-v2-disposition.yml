@@ -23,6 +23,13 @@ on:
       counterevidence_json: { description: "JSON object with command, output, result=refuted, and pointer for false-positive", required: false, type: string }
       tracking_issue: { description: "same-repository issue number (#N) or issues URL for deferred", required: false, type: string }
       gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
+    secrets:
+      SILO_ACCESS_KEY:
+        description: "Silo 访问密钥 ID；缺省时 S3 步骤以「SILO_ACCESS_KEY 未传入」显式失败"
+        required: false
+      SILO_SECRET_KEY:
+        description: "Silo 访问密钥 Secret；与 SILO_ACCESS_KEY 配对注入 control 作业"
+        required: false
 
 permissions:
   actions: write

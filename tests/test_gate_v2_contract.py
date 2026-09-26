@@ -463,6 +463,27 @@ def test_disposition_workflow_call_accepts_legacy_gate_ref_both_ways():
     assert legacy_caller_inputs <= set(callee_declared)
 
 
+def test_disposition_workflow_call_declares_optional_silo_secret_pair():
+    # Public callers map the Silo pair by name; legacy callers keep
+    # secrets: inherit. The callee must declare exactly the pair its control
+    # job consumes, both optional, so both call shapes pass schema validation.
+    raw, trigger = _load_disposition_workflow()
+    control_env = raw["jobs"]["control"]["env"]
+    assert control_env["AWS_ACCESS_KEY_ID"] == "${{ secrets.SILO_ACCESS_KEY }}"
+    assert control_env["AWS_SECRET_ACCESS_KEY"] == "${{ secrets.SILO_SECRET_KEY }}"
+    consumed = set()
+    for value in control_env.values():
+        match = re.fullmatch(r"\$\{\{ secrets\.([A-Z0-9_]+) }}", str(value))
+        if match:
+            consumed.add(match.group(1))
+    assert consumed == {"SILO_ACCESS_KEY", "SILO_SECRET_KEY"}
+    declared = trigger["workflow_call"].get("secrets", {})
+    assert set(declared) == consumed
+    for name in consumed:
+        assert declared[name]["required"] is False
+    assert "secrets" not in trigger["workflow_dispatch"]
+
+
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
     raw, _ = _load_workflow()
