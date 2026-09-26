@@ -11,7 +11,7 @@
 self-hosted-runner:
   # Every custom self-hosted runner label used anywhere in this repo's own workflow
   # files (`self-hosted`/`linux` are actionlint built-ins already; these are the
-  # repo-specific labels layered on top — see gate.yml/gate-v2.yml/gate-shadow-v2.yml's
+  # repo-specific labels layered on top — see gate-v2.yml/gate-shadow-v2.yml's
   # own `runs-on:` ternaries and templates/caller-*.yml for where each is used):
   labels:
     - codex         # the shared self-hosted review-runner pool — since the control plane

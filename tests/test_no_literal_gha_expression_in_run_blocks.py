@@ -44,7 +44,7 @@ def test_workflow_files_glob_finds_the_known_files():
     # Sanity check on the glob itself: if a future rename/move silently emptied this
     # list, every test below would vacuously "pass" without checking anything at all.
     names = {p.name for p in WORKFLOW_FILES}
-    assert {"ci.yml", "gate.yml", "gate-v2.yml", "gate-shadow-v2.yml"} <= names
+    assert {"ci.yml", "gate-v2.yml", "gate-shadow-v2.yml"} <= names
     assert TEMPLATE_FILES  # non-empty
 
 

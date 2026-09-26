@@ -105,7 +105,7 @@ def test_install_metrics_flow_through_when_present_and_default_to_none():
 
 
 def test_missing_install_result_file_yields_null_install_field(tmp_path):
-    # canary ring:tier != personal 时 gate.yml 的 Install 步骤整体不跑,
+    # tier != personal 时 Install 步骤整体不跑,
     # install-result.json *不存在*(不是一份 skipped JSON)。_load_json 必须
     # 对缺文件(以及空文件)容错为 None,进而 ledger 条目 install 字段为 null,
     # 不能报错 —— 否则非 personal tier 的每次 run 都会在 ledger 步骤炸掉。
