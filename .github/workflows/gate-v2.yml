@@ -120,17 +120,23 @@ env:
   GATE_CHECKOUT_MIRROR_SCRIPT: |
     set -euo pipefail
     result_emitted=0
+    lock_held=0
+    consumer_step=startup
     emit_result() {
       printf 'GATE-CHECKOUT-MIRROR-V1 {"hit":%s,"reason":"%s"%s}\n' "$1" "$2" "${3:-}"
       result_emitted=1
     }
+    fail_prefetch() {
+      trap - EXIT; set +e
+      [ "$lock_held" -eq 0 ] || flock --unlock "$mirror_lock_fd"
+      rm -rf -- "$workspace/.git"
+      emit_result 0 "$1"
+      exit 0
+    }
     finish_result() {
-      status=$?
       trap - EXIT
-      if [ "$result_emitted" -eq 0 ]; then
-        printf 'GATE-CHECKOUT-MIRROR-V1 {"hit":0,"reason":"consumer-error"}\n'
-      fi
-      exit "$status"
+      [ "$result_emitted" -eq 0 ] && fail_prefetch "consumer-error:$consumer_step"
+      exit 0
     }
     trap finish_result EXIT
     mirror_miss() { emit_result 0 "$1"; exit 0; }
@@ -155,6 +161,8 @@ env:
     [[ -f "$lock_file" && -r "$lock_file" ]] || mirror_miss lock-unreadable
     exec {mirror_lock_fd}<"$lock_file" || mirror_miss lock-open-failed
     flock --shared "$mirror_lock_fd" || mirror_miss lock-failed
+    lock_held=1
+    consumer_step=mirror-refs
     mirror_refs=$(git --git-dir="$mirror_repo" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/demand) || mirror_miss mirror-read-failed
     mirror_hit=1
     reason=ok
@@ -162,49 +170,45 @@ env:
       mirror_hit=0
       reason=sha-missing
     fi
-    git init --quiet "$workspace"
-    git -C "$workspace" remote add origin "$origin_url"
+    consumer_step=init; git init --quiet "$workspace"
+    consumer_step=remote; git -C "$workspace" remote add origin "$origin_url"
     alternates="$workspace/.git/objects/info/alternates"
     mirror_objects="$mirror_repo/objects"
-    printf '%s\n' "$mirror_objects" > "$alternates"
-    while read -r source_ref object_id; do
+    consumer_step=alternates; printf '%s\n' "$mirror_objects" > "$alternates"
+    consumer_step=update-ref; while read -r source_ref object_id; do
       [ -n "$source_ref" ] || continue
       git -C "$workspace" update-ref "refs/remotes/mirror/${source_ref#refs/}" "$object_id"
     done <<< "$mirror_refs"
-    mkdir -p "$workspace/.git/objects/pack"
+    consumer_step=fetch; mkdir -p "$workspace/.git/objects/pack"
     pack_bytes() {
       find "$workspace/.git/objects/pack" -maxdepth 1 -type f -name '*.pack' -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }'
     }
     bytes_before=$(pack_bytes)
-    fetch_status=0
+    fetch_status=0; consumer_step=fetch
     if [[ "$origin_url" == https://* || "$origin_url" == http://* ]]; then
       auth=$(printf 'x-access-token:%s' "${GATE_GITHUB_TOKEN:?}" | base64 | tr -d '\n')
       GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server_url/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" git -C "$workspace" -c protocol.version=2 fetch --no-tags --keep --depth=1 origin "$sha" || fetch_status=$?
     else
       git -C "$workspace" -c protocol.version=2 fetch --no-tags --keep --depth=1 origin "$sha" || fetch_status=$?
     fi
-    if [ "$fetch_status" -ne 0 ]; then
-      rm -f -- "$alternates"
-      flock --unlock "$mirror_lock_fd"
-      emit_result "$mirror_hit" origin-fetch-failed
-      exit "$fetch_status"
-    fi
+    [ "$fetch_status" -eq 0 ] || fail_prefetch origin-fetch-failed
     bytes_after=$(pack_bytes)
     fetch_pack_bytes=$((bytes_after - bytes_before))
-    git -C "$workspace" update-ref refs/internal/gate-checkout-target "$sha"
-    installed_refs=$(git -C "$workspace" for-each-ref --format='%(refname)' refs/remotes/mirror)
+    consumer_step=target-ref; git -C "$workspace" update-ref refs/internal/gate-checkout-target "$sha"
+    consumer_step=delete-ref; installed_refs=$(git -C "$workspace" for-each-ref --format='%(refname)' refs/remotes/mirror)
     if [[ -n "$installed_refs" ]]; then
       while read -r installed_ref; do
         [ -n "$installed_ref" ] || continue
         git -C "$workspace" update-ref -d "$installed_ref"
       done <<< "$installed_refs"
     fi
-    git -C "$workspace" repack --no-local -a -d
+    consumer_step=repack; git -C "$workspace" repack --no-local -a -d
     rm -f -- "$alternates"
     flock --unlock "$mirror_lock_fd"
+    lock_held=0
     exec {mirror_lock_fd}<&-
-    object_type=$(git -C "$workspace" cat-file -t "$sha")
-    git -C "$workspace" checkout --force --detach "$sha"
+    consumer_step=cat-file; object_type=$(git -C "$workspace" cat-file -t "$sha")
+    consumer_step=checkout; git -C "$workspace" checkout --force --detach "$sha"
     emit_result "$mirror_hit" "$reason" ",\"origin_fetch_pack_bytes\":$fetch_pack_bytes,\"object_type\":\"$object_type\""
 
   SILO_ENDPOINT: https://zlx-vm-work-i5-infra.taile9071.ts.net:9000

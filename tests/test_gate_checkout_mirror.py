@@ -45,20 +45,8 @@ def _run_action_checkout(workspace, origin_url, sha):
         _git("init", "--quiet", cwd=workspace, env=env)
         _git("remote", "add", "origin", origin_url, cwd=workspace, env=env)
     _git("config", "--local", "gc.auto", "0", cwd=workspace, env=env)
-    _git(
-        "-c",
-        "protocol.version=2",
-        "fetch",
-        "--no-tags",
-        "--keep",
-        "--prune",
-        "--no-recurse-submodules",
-        "--depth=1",
-        "origin",
-        f"+{sha}:refs/remotes/pull/1/merge",
-        cwd=workspace,
-        env=env,
-    )
+    refspec = f"+{sha}:refs/remotes/pull/1/merge"
+    _git("-c", "protocol.version=2", "fetch", "--no-tags", "--keep", "--prune", "--no-recurse-submodules", "--depth=1", "origin", refspec, cwd=workspace, env=env)
     _git("checkout", "--force", "refs/remotes/pull/1/merge", cwd=workspace, env=env)
 
 
@@ -142,12 +130,12 @@ def _fixture(tmp_path, *, advance_mirror=False):
     }
 
 
-def _run_mirror_script(script, fixture, workspace, mirror_root=None):
+def _run_mirror_script(script, fixture, workspace, mirror_root=None, server_url=None):
     env = os.environ.copy()
     env.update(
         GITHUB_WORKSPACE=str(workspace),
         GITHUB_REPOSITORY="zlxlabs/repo",
-        GITHUB_SERVER_URL=fixture["server_url"],
+        GITHUB_SERVER_URL=fixture["server_url"] if server_url is None else server_url,
         GITHUB_SHA=fixture["sha"],
         GITHUB_REF="refs/pull/1/merge",
         GATE_GITHUB_TOKEN="fixture-token",
@@ -188,6 +176,10 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
     assert "flock --shared" in script
     assert "refs/heads refs/demand" in script
     assert 'exec {mirror_lock_fd}<"$lock_file"' in script
+    assert script.count('rm -rf -- "$workspace/.git"') == 1
+    assert "fail_prefetch origin-fetch-failed" in script
+    assert 'consumer-error:$consumer_step' in script
+    assert 'exit "$fetch_status"' not in script
     assert script.index("printf '%s\\n' \"$mirror_objects\" > \"$alternates\"") < script.index("fetch --no-tags --keep --depth=1 origin \"$sha\"")
     assert script.index("fetch --no-tags --keep --depth=1 origin \"$sha\"") < script.index("repack --no-local -a -d")
     assert script.index("repack --no-local -a -d") < script.rindex('rm -f -- "$alternates"') < script.rindex('flock --unlock "$mirror_lock_fd"')
@@ -277,3 +269,29 @@ def test_mirror_misses_report_reason_and_origin_checkout_succeeds(tmp_path, requ
     _run_action_checkout(baseline, fixture["origin_url"], fixture["sha"])
     assert _tree_state(missing_sha_workspace) == _tree_state(baseline)
     assert _pack_bytes(baseline) > result["origin_fetch_pack_bytes"]
+
+
+def _assert_failed_prefetch_then_plain_fetch(run, workspace, fixture, reason):
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    assert _result_line(run) == {"hit": 0, "reason": reason}
+    assert not (workspace / ".git").exists(), "partial .git left behind"
+    _git("init", "--quiet", cwd=workspace)
+    _git("remote", "add", "origin", fixture["origin_url"], cwd=workspace)
+    _git("fetch", "--no-tags", "--depth=1", "origin", fixture["sha"], cwd=workspace)
+    assert _git("cat-file", "-t", fixture["sha"], cwd=workspace) == "commit"
+
+
+def test_prefetch_failures_clear_partial_git_and_exit_zero(tmp_path, request):
+    fixture = _fixture(tmp_path)
+    request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
+    script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        dead_port = sock.getsockname()[1]
+    dead_workspace = tmp_path / "dead-origin"
+    dead = _run_mirror_script(script, fixture, dead_workspace, server_url=f"git://127.0.0.1:{dead_port}")
+    _assert_failed_prefetch_then_plain_fetch(dead, dead_workspace, fixture, "origin-fetch-failed")
+    (fixture["mirror_repo"] / "refs/heads/dangling").write_text("b" * 40 + "\n")
+    broken_workspace = tmp_path / "dangling-ref"
+    broken = _run_mirror_script(script, fixture, broken_workspace)
+    _assert_failed_prefetch_then_plain_fetch(broken, broken_workspace, fixture, "consumer-error:update-ref")
