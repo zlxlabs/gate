@@ -117,6 +117,100 @@ on:
         required: false
 
 env:
+  GATE_CHECKOUT_MIRROR_SCRIPT: |
+    set -euo pipefail
+    result_emitted=0
+    lock_held=0
+    consumer_step=startup
+    emit_result() {
+      printf 'GATE-CHECKOUT-MIRROR-V1 {"hit":%s,"reason":"%s"%s}\n' "$1" "$2" "${3:-}"
+      result_emitted=1
+    }
+    fail_prefetch() {
+      trap - EXIT; set +e
+      [ "$lock_held" -eq 0 ] || flock --unlock "$mirror_lock_fd"
+      rm -rf -- "$workspace/.git"
+      emit_result 0 "$1"
+      exit 0
+    }
+    finish_result() {
+      trap - EXIT
+      [ "$result_emitted" -eq 0 ] && fail_prefetch "consumer-error:$consumer_step"
+      exit 0
+    }
+    trap finish_result EXIT
+    mirror_miss() { emit_result 0 "$1"; exit 0; }
+    workspace=${GITHUB_WORKSPACE:?}
+    repository=${GITHUB_REPOSITORY:?}
+    sha=${GITHUB_SHA:?}
+    server_url=${GITHUB_SERVER_URL%/}
+    origin_url="$server_url/$repository"
+    mirror_root=${GATE_HUB_GIT_MIRROR_DIR:-}
+    [[ -n "$mirror_root" ]] || mirror_miss env-missing
+    [[ "$repository" =~ ^[[:alnum:]_.-]+/[[:alnum:]_.-]+$ ]] || mirror_miss repository-invalid
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || mirror_miss sha-invalid
+    [[ ! -e "$workspace/.git" ]] || mirror_miss workspace-existing
+    [[ -d "$mirror_root" ]] || mirror_miss mirror-dir-missing
+    mirror_root=$(realpath -e "$mirror_root") || mirror_miss mirror-dir-unreadable
+    mirror_repo=$(realpath -e "$mirror_root/$repository.git") || mirror_miss mirror-repo-missing
+    case "$mirror_repo" in "$mirror_root"/*) ;; *) mirror_miss mirror-outside-root ;; esac
+    [[ -d "$mirror_repo/objects" && -r "$mirror_repo/objects" ]] || mirror_miss mirror-objects-unreadable
+    mirror_bare=$(git --git-dir="$mirror_repo" rev-parse --is-bare-repository) || mirror_miss mirror-read-failed
+    [[ "$mirror_bare" == true ]] || mirror_miss mirror-not-bare
+    lock_file="$mirror_repo/consume.lock"
+    [[ -f "$lock_file" && -r "$lock_file" ]] || mirror_miss lock-unreadable
+    exec {mirror_lock_fd}<"$lock_file" || mirror_miss lock-open-failed
+    flock --shared "$mirror_lock_fd" || mirror_miss lock-failed
+    lock_held=1
+    consumer_step=mirror-refs
+    mirror_refs=$(git --git-dir="$mirror_repo" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/demand) || mirror_miss mirror-read-failed
+    mirror_hit=1
+    reason=ok
+    if ! git --git-dir="$mirror_repo" cat-file -e "$sha^{commit}" 2>/dev/null; then
+      mirror_hit=0
+      reason=sha-missing
+    fi
+    consumer_step=init; git init --quiet "$workspace"
+    consumer_step=remote; git -C "$workspace" remote add origin "$origin_url"
+    alternates="$workspace/.git/objects/info/alternates"
+    mirror_objects="$mirror_repo/objects"
+    consumer_step=alternates; printf '%s\n' "$mirror_objects" > "$alternates"
+    consumer_step=update-ref; while read -r source_ref object_id; do
+      [ -n "$source_ref" ] || continue
+      git -C "$workspace" update-ref "refs/remotes/mirror/${source_ref#refs/}" "$object_id"
+    done <<< "$mirror_refs"
+    consumer_step=fetch; mkdir -p "$workspace/.git/objects/pack"
+    pack_bytes() {
+      find "$workspace/.git/objects/pack" -maxdepth 1 -type f -name '*.pack' -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }'
+    }
+    bytes_before=$(pack_bytes)
+    fetch_status=0; consumer_step=fetch
+    if [[ "$origin_url" == https://* || "$origin_url" == http://* ]]; then
+      auth=$(printf 'x-access-token:%s' "${GATE_GITHUB_TOKEN:?}" | base64 | tr -d '\n')
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server_url/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" git -C "$workspace" -c protocol.version=2 fetch --no-tags --keep --depth=1 origin "$sha" || fetch_status=$?
+    else
+      git -C "$workspace" -c protocol.version=2 fetch --no-tags --keep --depth=1 origin "$sha" || fetch_status=$?
+    fi
+    [ "$fetch_status" -eq 0 ] || fail_prefetch origin-fetch-failed
+    bytes_after=$(pack_bytes)
+    fetch_pack_bytes=$((bytes_after - bytes_before))
+    consumer_step=target-ref; git -C "$workspace" update-ref refs/internal/gate-checkout-target "$sha"
+    consumer_step=delete-ref; installed_refs=$(git -C "$workspace" for-each-ref --format='%(refname)' refs/remotes/mirror)
+    if [[ -n "$installed_refs" ]]; then
+      while read -r installed_ref; do
+        [ -n "$installed_ref" ] || continue
+        git -C "$workspace" update-ref -d "$installed_ref"
+      done <<< "$installed_refs"
+    fi
+    consumer_step=repack; git -C "$workspace" repack --no-local -a -d
+    rm -f -- "$alternates"
+    flock --unlock "$mirror_lock_fd"
+    lock_held=0
+    exec {mirror_lock_fd}<&-
+    consumer_step=cat-file; object_type=$(git -C "$workspace" cat-file -t "$sha")
+    consumer_step=checkout; git -C "$workspace" checkout --force --detach "$sha"
+    emit_result "$mirror_hit" "$reason" ",\"origin_fetch_pack_bytes\":$fetch_pack_bytes,\"object_type\":\"$object_type\""
+
   SILO_ENDPOINT: https://zlx-vm-work-i5-infra.taile9071.ts.net:9000
   SILO_BUCKET: ci-artifacts
   # gate#190: 25s * 3 attempts + 5s + 15s backoff = 95s worst case.
@@ -240,6 +334,10 @@ jobs:
           for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] && continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value" in ''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ] || total=$((total + 10#$value)); done
           printf 'GATE_CHECKOUT_RX_BYTES_%s=%s\n' "$GATE_CHECKOUT_SEQUENCE" "$total" >> "$GITHUB_ENV"
           exit 0
+      - name: Prime checkout from host Git mirror
+        env:
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 1 }
       - name: Record network bytes after checkout (quality-1)
@@ -256,6 +354,7 @@ jobs:
           variable=GATE_CHECKOUT_RX_BYTES_${GATE_CHECKOUT_SEQUENCE}; before=$(printenv "$variable" 2>/dev/null)
           case "$before" in ''|unavailable) total=unavailable;; *) [ "$total" = unavailable ] || total=$((total - 10#$before));; esac
           printf 'GATE-CHECKOUT-BYTES-V1 %s rx_bytes=%s\n' "$GATE_CHECKOUT_CONTEXT" "$total"
+          [ ! -d "$GITHUB_WORKSPACE/.git" ] || git -C "$GITHUB_WORKSPACE" update-ref -d refs/internal/gate-checkout-target >/dev/null 2>&1
           exit 0
 
       - name: Remove stale gate source directories
@@ -591,6 +690,10 @@ jobs:
           for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] && continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value" in ''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ] || total=$((total + 10#$value)); done
           printf 'GATE_CHECKOUT_RX_BYTES_%s=%s\n' "$GATE_CHECKOUT_SEQUENCE" "$total" >> "$GITHUB_ENV"
           exit 0
+      - name: Prime checkout from host Git mirror
+        env:
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 1 }
       - name: Record network bytes after checkout (primary-1)
@@ -607,6 +710,7 @@ jobs:
           variable=GATE_CHECKOUT_RX_BYTES_${GATE_CHECKOUT_SEQUENCE}; before=$(printenv "$variable" 2>/dev/null)
           case "$before" in ''|unavailable) total=unavailable;; *) [ "$total" = unavailable ] || total=$((total - 10#$before));; esac
           printf 'GATE-CHECKOUT-BYTES-V1 %s rx_bytes=%s\n' "$GATE_CHECKOUT_CONTEXT" "$total"
+          [ ! -d "$GITHUB_WORKSPACE/.git" ] || git -C "$GITHUB_WORKSPACE" update-ref -d refs/internal/gate-checkout-target >/dev/null 2>&1
           exit 0
 
       - name: Compute and validate review-primary's internal timeout budget
@@ -1034,6 +1138,11 @@ jobs:
           for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] && continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value" in ''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ] || total=$((total + 10#$value)); done
           printf 'GATE_CHECKOUT_RX_BYTES_%s=%s\n' "$GATE_CHECKOUT_SEQUENCE" "$total" >> "$GITHUB_ENV"
           exit 0
+      - name: Prime checkout from host Git mirror
+        if: matrix.reviewer != '__none__'
+        env:
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: matrix.reviewer != '__none__'
         with: { fetch-depth: 1 }
@@ -1051,6 +1160,7 @@ jobs:
           variable=GATE_CHECKOUT_RX_BYTES_${GATE_CHECKOUT_SEQUENCE}; before=$(printenv "$variable" 2>/dev/null)
           case "$before" in ''|unavailable) total=unavailable;; *) [ "$total" = unavailable ] || total=$((total - 10#$before));; esac
           printf 'GATE-CHECKOUT-BYTES-V1 %s rx_bytes=%s\n' "$GATE_CHECKOUT_CONTEXT" "$total"
+          [ ! -d "$GITHUB_WORKSPACE/.git" ] || git -C "$GITHUB_WORKSPACE" update-ref -d refs/internal/gate-checkout-target >/dev/null 2>&1
           exit 0
 
       - name: Resolve numeric job id for REVIEW_JOB_ID
