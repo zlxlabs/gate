@@ -37,7 +37,14 @@ def test_every_checkout_is_bracketed_by_fail_open_measurements():
     for workflow_name, job_id, steps, index, checkout in checkouts:
         key = (workflow_name, job_id)
         sequences[key] = sequences.get(key, 0) + 1
-        before = steps[index - 1]
+        if workflow_name == "gate-v2":
+            before = steps[index - 2]
+            prime = steps[index - 1]
+            assert prime.get("name") == "Prime checkout from host Git mirror"
+            assert prime.get("if") == checkout.get("if")
+            assert prime.get("env", {}).get("GATE_GITHUB_TOKEN") == "${{ github.token }}"
+        else:
+            before = steps[index - 1]
         after = steps[index + 1]
         assert before.get("name", "").startswith(BEFORE_STEP)
         assert after.get("name", "").startswith(AFTER_STEP)
@@ -61,7 +68,11 @@ def test_every_checkout_is_bracketed_by_fail_open_measurements():
 def _measurement_steps(workflow_name, job_id):
     for name, candidate_job, steps, index, _checkout in _checkouts():
         if name == workflow_name and candidate_job == job_id:
-            return steps[index - 1], steps[index + 1]
+            before = next(
+                step for step in reversed(steps[:index])
+                if step.get("name", "").startswith(BEFORE_STEP)
+            )
+            return before, steps[index + 1]
     raise AssertionError(f"no checkout found for {workflow_name}/{job_id}")
 
 
