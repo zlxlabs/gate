@@ -23,7 +23,7 @@ failure-visibility: clean
 5. legacy caller 兼容：caller 模板 `secrets: inherit`（caller-gate-disposition.yml:29）未动；optional 声明不约束 inherit。
 6. 新测试约束真实 producer：`_load_disposition_workflow()` 读仓内真实 yml；先精确钉死两条 env 映射，再反解消费集断言「声明==消费==pair 且均 optional」，并断言 workflow_dispatch 无 secrets。红验：base(08a3baa) 临时 worktree 仅拷入新测试文件运行如期失败（declared=∅≠pair），HEAD 上同用例通过——非恒真、无假绿。
 7. progress 文档未声称本 PR 已合并/v2 已推广/公共 caller 已启用（写明推广前不得启用、主脑验收）。
-8. PR251 单次例外（超 200 行预算偏差）未沿用：本 PR +47 行在预算内，且未做 PR251 已否决的 step 级迁 secret。
+8. PR251 单次授权为「缺 primary 下跳过未配置 gate/primary 检查合并」，仅限该次、不沿用 PR252：本次仍需自身 CI 与独立审查，缺 primary 须另获单次批准。
 9. 无密钥生成/写入、无手动 tag；无新增抽象/状态/配置项。
 
 ## 发现与真实风险
