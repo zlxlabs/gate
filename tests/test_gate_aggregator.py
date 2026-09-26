@@ -2838,7 +2838,7 @@ def test_evaluate_round_reuses_disposition_audit_with_legacy_digest():
 
 
 @pytest.mark.parametrize("tier", ["personal", "internal", "unrecognized"])
-def test_deferred_receipt_releases_one_p1_for_allowed_or_defaulted_tier(tier):
+def test_deferred_receipt_rejected_for_every_tier_or_defaulted_tier_at_consumption(tier):
     audit = _failing_scoped_audit()
     audit["tier"] = tier
     scope = _scope_for(audit)
@@ -2848,11 +2848,10 @@ def test_deferred_receipt_releases_one_p1_for_allowed_or_defaulted_tier(tier):
 
     outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
 
-    assert outcome.gate_result == "pass"
     block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert block["remaining_p1_ids"] == []
-    assert block["recorded"][0]["disposition_claim"] == "deferred"
-    assert block["recorded"][0]["evidence_pointer"] == "https://github.com/zlxlabs/gate/issues/12"
+    assert outcome.gate_result == "fail"
+    assert block["remaining_p1_ids"] == ["p1"]
+    assert block["rejected_reasons"] == {"deferred_not_allowed_for_tier": 1}
 
 
 def test_deferred_receipt_is_rejected_for_saas_at_consumption():

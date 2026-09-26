@@ -218,7 +218,8 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
 - `false-positive` 仅针对当前审计中的 inferred P1，必须提供 JSON 反证对象，包含非空 `command`、
   `output`、`pointer`，且 `result` 必须为 `refuted`。
 - `deferred` 必须提供同仓跟踪 issue：`#<正整数>` 或本仓 GitHub `/issues/<正整数>` URL；只校验格式与仓库，
-  不查询 issue 是否存在或仍为 open。仅 `personal`、`internal` tier 可用，`saas` 拒绝。
+  不查询 issue 是否存在或仍为 open。所有 tier 均拒绝（保留入参仅为兼容；低于红线的 major
+  由 producer 归一化降为 minor，不再需要 deferred）。
 - 两种回执都绑定 `head_sha`、`audit_digest`、`epoch` 和唯一 finding。每张回执只覆盖指向的一条 P1；
   全部 P1 都被有效回执覆盖时，本轮按无 P1 进入 clean-streak 计算；部分覆盖时，未覆盖 P1 仍阻断。
 - 同一稳定键（同 `file`/`line`/`category`/`severity`，典型是同文件 `line: null`）命中多条当前 P1 时，
