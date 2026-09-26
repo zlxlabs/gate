@@ -220,13 +220,9 @@ jobs:
     # quality 走无凭据 ci 池（spec：gate-hub docs/designs/runner-ci-pool-split.md）。
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
-      SILO_STORE: ${{ github.workspace }}/_gate-silo-src/scripts/silo_store.py
-      SILO_EXEC: ${{ github.workspace }}/_gate-silo-src/scripts/silo_exec.sh
     outputs:
       ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
+      ledger_input_bundle: ${{ steps.ledger-input-upload.outputs.bundle }}
       caller_checks: ${{ steps.caller-checks-outcome.outputs.caller_checks }}
       preflight_result: ${{ steps.caller-checks-outcome.outputs.preflight_result }}
     # Per-PR cancel of stale quality only. Group is independent of `primary`
@@ -468,91 +464,44 @@ jobs:
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.runner == 'hosted' && hashFiles('uv.lock') != '' }}
         run: uv cache prune --ci || true
 
-      - name: Checkout silo store at this workflow's own commit
-        if: always()
-        env:
-          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
-          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
-          GATE_CHECKOUT_PATH: _gate-silo-src
-          GATE_CHECKOUT_SPARSE: |
-            scripts/silo_store.py
-            scripts/silo_exec.sh
-          GATE_GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
-          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
-          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
-
-      - name: Resolve Silo hostname via MagicDNS
-        if: always() && env.AWS_ACCESS_KEY_ID != ''
-        run: |
-          set -euo pipefail
-          SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
-            echo "::error::Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
-            exit 1
-          }
-          SILO_IP="${SILO_RESOLUTION%% *}"; SILO_HOST="${SILO_RESOLUTION#* }"
-          if [ -z "$SILO_IP" ] || [ -z "$SILO_HOST" ] || [ "$SILO_IP" = "$SILO_RESOLUTION" ]; then
-            echo "::error::Silo MagicDNS lookup failed; see the preceding MagicDNS attempt N/M failed: line for the underlying cause. SILO_ENDPOINT=${SILO_ENDPOINT}" >&2
-            exit 1
-          fi
-          if grep -qF "$SILO_HOST" /etc/hosts; then printf 'Silo host %s already in /etc/hosts\n' "$SILO_HOST"
-          elif [ "$(id -u)" -eq 0 ]; then printf '%s %s\n' "$SILO_IP" "$SILO_HOST" >> /etc/hosts
-          else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
-          fi
-
-      - name: Upload v2 review ledger inputs
+      - name: Publish v2 review ledger inputs
         id: ledger-input-upload
         if: always()
         continue-on-error: true
-        timeout-minutes: 5
         env:
-          ARTIFACT_NAME: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           PREFLIGHT: ${{ runner.temp }}/pr-size-preflight.json
           INSTALL: ${{ runner.temp }}/install-result.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
-            --tier d1 \
-            --repo-id "${{ github.repository_id }}" \
-            --name "$ARTIFACT_NAME" \
-            --file "$PREFLIGHT" \
-            --file "$INSTALL"
-
-      - name: Retry upload v2 review ledger inputs
-        id: ledger-input-upload-retry
-        if: always() && steps.ledger-input-upload.outcome == 'failure'
-        continue-on-error: true
-        timeout-minutes: 5
-        env:
-          ARTIFACT_NAME: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          PREFLIGHT: ${{ runner.temp }}/pr-size-preflight.json
-          INSTALL: ${{ runner.temp }}/install-result.json
-        run: |
-          set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
-            --tier d1 \
-            --repo-id "${{ github.repository_id }}" \
-            --name "$ARTIFACT_NAME" \
-            --file "$PREFLIGHT" \
-            --file "$INSTALL"
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          bundle = {}
+          for key, env_name in (("preflight", "PREFLIGHT"), ("install", "INSTALL")):
+              path = Path(os.environ[env_name])
+              if path.is_file():
+                  bundle[key] = path.read_text(encoding="utf-8")
+          if not bundle:
+              print("::error::review ledger input files missing", file=sys.stderr)
+              raise SystemExit(1)
+          payload = json.dumps(bundle, ensure_ascii=False, separators=(",", ":"))
+          delim = "GATE_LEDGER_BUNDLE_EOF"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as fh:
+              fh.write(f"bundle<<{delim}\n{payload}\n{delim}\n")
+          PY
 
       - name: Record ledger input upload outcome
         id: ledger-input-upload-outcome
         if: always()
         env:
           LEDGER_INPUT_UPLOAD: ${{ steps.ledger-input-upload.outcome }}
-          LEDGER_INPUT_UPLOAD_RETRY: ${{ steps.ledger-input-upload-retry.outcome }}
         run: |
           set -euo pipefail
-          if [ "$LEDGER_INPUT_UPLOAD" = "success" ] || [ "$LEDGER_INPUT_UPLOAD_RETRY" = "success" ]; then
+          if [ "$LEDGER_INPUT_UPLOAD" = "success" ]; then
             echo "ledger_input_upload=success" >> "$GITHUB_OUTPUT"
           else
             echo "ledger_input_upload=failure" >> "$GITHUB_OUTPUT"
-            echo "::error::review ledger input upload failed after one retry (network); gate / ledger will report the input missing"
+            echo "::error::review ledger input publish failed; gate / ledger will report the input missing"
           fi
 
       # gate#199 根治：业务检查证据记录步。只读各业务步骤的原生 outcome，
@@ -596,27 +545,6 @@ jobs:
           else
             echo "caller_checks=not_started" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Diagnose silo network after job failure
-        if: failure()
-        env:
-          GATE_NET_DIAG_JOB: ${{ github.job }}
-        run: |
-          endpoint=${SILO_ENDPOINT:-}
-          authority=${endpoint#*://}; authority=${authority%%/*}
-          silo_host=${authority%%:*}; silo_port=${authority##*:}
-          dns_host=${GATE_NET_DIAG_TAILNET_DNS_HOST:-100.100.100.100}
-          dns_port=${GATE_NET_DIAG_TAILNET_DNS_PORT:-53}
-          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$dns_host" "$dns_port" 2>/dev/null; then dns=ok; else dns=fail:connect; fi
-          if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
-          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
-          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
-          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
-          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
-          result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
-          printf '%s\n' "$result"
-          printf '::warning::%s\n' "$result"
-          exit 0
 
   # ── primary ──────────────────────────────────────────────────────────────
   # Runs review-primary (gate-hub, already merged) and writes+uploads the ONE
@@ -2001,7 +1929,7 @@ jobs:
             fi
             printf '%s' "$out"
           }
-          INPUT_RESOLVE="$(resolve_or_empty d1 "$INPUT_PREFIX")"
+          INPUT_RESOLVE=""
           AUDIT_RESOLVE="$(resolve_or_empty d14 "$AUDIT_PREFIX")"
           TERMINAL_RESOLVE="$(resolve_or_empty d30 "$TERMINAL_PREFIX")"
           export INPUT_RESOLVE AUDIT_RESOLVE TERMINAL_RESOLVE
@@ -2036,6 +1964,25 @@ jobs:
           quality_short_circuited = quality_result == "skipped" and primary_result == "failure"
           quality_upload = (os.environ.get("QUALITY_LEDGER_INPUT_UPLOAD") or "").strip() or "unknown"
 
+          def github_fact_input_artifact():
+              prefix = (os.environ.get("INPUT_PREFIX") or "").strip()
+              repo_id = (os.environ.get("REPO_ID") or "").strip()
+              if not prefix or not repo_id:
+                  raise SystemExit("INPUT_PREFIX and REPO_ID are required to bind ledger input identity")
+              name = f"{prefix}{current}"
+              return current, f"d1/{repo_id}/{name}", name
+
+          if quality_upload == "success":
+              input_artifact = github_fact_input_artifact()
+          elif quality_short_circuited:
+              input_artifact = None
+          else:
+              raise SystemExit(
+                  f"No matching required ledger input artifact found (quality upload outcome: {quality_upload})"
+              )
+          if quality_short_circuited and input_artifact is None:
+              print("::notice::ledger input skipped: quality was short-circuited by primary failure (gate#105 A); preflight/install fields will be null")
+
           def parse_resolve(raw, missing_message, required):
               text = (raw or "").strip()
               if not text:
@@ -2056,13 +2003,6 @@ jobs:
                   return None
               return attempt, prefix, _name
 
-          input_artifact = parse_resolve(
-              os.environ.get("INPUT_RESOLVE"),
-              f"No matching required ledger input artifact found (quality upload outcome: {quality_upload})",
-              not quality_short_circuited,
-          )
-          if quality_short_circuited and input_artifact is None:
-              print("::notice::ledger input skipped: quality was short-circuited by primary failure (gate#105 A); preflight/install fields will be null")
           audit_artifact = parse_resolve(
               os.environ.get("AUDIT_RESOLVE"),
               "No matching canonical primary audit artifact found",
@@ -2200,18 +2140,82 @@ jobs:
         # Empty only when quality was short-circuited by a primary failure
         # (gate#105 A): nothing to download; build_ledger._load_json maps the
         # missing files to null preflight/install fields and the row is
-        # still written.
+        # still written. Identity for later Silo persist is GitHub facts
+        # (repository_id / head.sha / run_id / attempt), never payload fields.
         if: steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''
         env:
-          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.input_artifact_id }}
+          LEDGER_INPUT_BUNDLE: ${{ needs.quality.outputs.ledger_input_bundle }}
           DEST: ${{ runner.temp }}/review-ledger-input
         run: |
           echo "::notice::step-start: Download v2 review ledger inputs"
           set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          raw = os.environ.get("LEDGER_INPUT_BUNDLE") or ""
+          if not raw.strip():
+              print("::error::review ledger input bundle missing", file=sys.stderr)
+              raise SystemExit(1)
+          bundle = json.loads(raw)
+          if not isinstance(bundle, dict) or not bundle:
+              print("::error::review ledger input bundle has invalid shape", file=sys.stderr)
+              raise SystemExit(1)
+          dest = Path(os.environ["DEST"])
+          dest.mkdir(parents=True, exist_ok=True)
+          mapping = {
+              "preflight": dest / "pr-size-preflight.json",
+              "install": dest / "install-result.json",
+          }
+          wrote = False
+          for key, path in mapping.items():
+              payload = bundle.get(key)
+              if isinstance(payload, str) and payload:
+                  path.write_text(payload, encoding="utf-8")
+                  wrote = True
+          if not wrote:
+              print("::error::review ledger input bundle contained no files", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Upload v2 review ledger inputs
+        id: persist-ledger-input
+        if: always() && steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          ARTIFACT_NAME: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PREFLIGHT: ${{ runner.temp }}/review-ledger-input/pr-size-preflight.json
+          INSTALL: ${{ runner.temp }}/review-ledger-input/install-result.json
+        run: |
+          echo "::notice::step-start: Upload v2 review ledger inputs"
+          set -euo pipefail
           [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" get \
-            --prefix "$ARTIFACT_PREFIX" \
-            --dest "$DEST"
+          "$SILO_EXEC" put \
+            --tier d1 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$PREFLIGHT" \
+            --file "$INSTALL"
+
+      - name: Retry upload v2 review ledger inputs
+        id: persist-ledger-input-retry
+        if: always() && steps.persist-ledger-input.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          ARTIFACT_NAME: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PREFLIGHT: ${{ runner.temp }}/review-ledger-input/pr-size-preflight.json
+          INSTALL: ${{ runner.temp }}/review-ledger-input/install-result.json
+        run: |
+          echo "::notice::step-start: Retry upload v2 review ledger inputs"
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          "$SILO_EXEC" put \
+            --tier d1 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$PREFLIGHT" \
+            --file "$INSTALL"
 
       - name: Download canonical primary audit for ledger
         if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
