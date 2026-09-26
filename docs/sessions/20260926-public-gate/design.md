@@ -16,7 +16,7 @@ quality 删除 job 级 `AWS_*`/`SILO_*`、Silo checkout、MagicDNS、Silo put/re
 
 ## 通道选择
 
-实测两份 JSON 远小于 job output 1MB 上限（fixture bundle < 1KB），因此走 **job outputs**，不启用 `actions/upload-artifact`。原禁令（`test_gate_v2_has_no_github_artifact_actions` 与 260916-silo-migration）是为了禁止 Silo 迁完后的双通道 fallback，不是禁止文件传递。本次不删该断言。
+走 **job outputs**，不启用 `actions/upload-artifact`。原禁令（`test_gate_v2_has_no_github_artifact_actions` 与 260916-silo-migration）禁止双通道 fallback。当前真实 producer fixture 约 1KB；`excluded_files` 无条数上限，consumer 单 env `LEDGER_INPUT_BUNDLE` 受 Linux `MAX_ARG_STRLEN`（先于 Actions 1MB UTF-16）约束。只覆盖小规模 advisory persist，空 bundle 消费 fail-loud。不宣称任意 PR 容量，不新增大 artifact 通道。
 
 ## 否决
 
@@ -34,10 +34,10 @@ quality 删除 job 级 `AWS_*`/`SILO_*`、Silo checkout、MagicDNS、Silo put/re
 ## 不变式（代码位置 / 测试）
 
 1. quality 无私有存储 secret、无 Silo 调用：`.github/workflows/gate-v2.yml` quality job；`test_quality_job_has_no_private_storage_secrets_or_silo_calls`。
-2. 必需 ledger-input 经 job outputs 到达 ledger：quality `ledger_input_bundle`、ledger Download 步；`test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes`（fixture 在 `tests/fixtures/quality-ledger-input/`）。
-3. 身份来自 GitHub 事实，Silo listing / payload 内 spoof 字段不参与命名：resolver `github_fact_input_artifact`、persist `ARTIFACT_NAME`；`test_ledger_resolver_ignores_silo_listing_and_spoofed_prefix_for_input`。
-4. 存储失败保持 advisory：ledger persist `continue-on-error` + 一次 retry + `::error::`；quality 必需检查不依赖 Silo。`test_review_ledger_input_uploads_declare_one_day_retention`。
-5. 预置 helper 不能指挥 ledger：ledger checkout `job.workflow_sha`；publish 步不跑 `gate_bounded_retry.py`。`test_ledger_helper_checkout_is_independent_of_quality_runner_temp`。
+2. 必需 ledger-input 经 job outputs 到达 ledger：quality `ledger_input_bundle`、ledger Download 步；`test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes` 用真实 `preflight.py` 与 workflow `printf` 产物，字节经发布/消费不变。
+3. 身份来自 GitHub 事实，Silo listing / payload 内 spoof 字段不参与命名：resolver `github_fact_input_artifact`、persist `ARTIFACT_NAME`；`test_review_ledger_input_uploads_declare_one_day_retention` 锁 identity，`test_ledger_resolver_ignores_silo_listing_and_spoofed_prefix_for_input` 锁 listing。
+4. 存储失败保持 advisory：ledger persist `continue-on-error` + 一次 retry + `::error::`；quality 必需检查不依赖 Silo。
+5. 预置 helper 不能指挥 ledger：ledger checkout `job.workflow_sha`（`test_silo_store_env_aligns_with_job_checkout_path`）；publish 步不跑 `gate_bounded_retry.py`（`test_quality_job_has_no_private_storage_secrets_or_silo_calls`）。
 6. 空 bundle 失败可见：`test_empty_bundle_download_fails_loud`。
 
 ## 待证

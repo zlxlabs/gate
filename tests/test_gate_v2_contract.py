@@ -1497,16 +1497,10 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "uses" not in input_publish
     assert "pr-size-preflight.json" in input_publish["env"]["PREFLIGHT"]
     assert "install-result.json" in input_publish["env"]["INSTALL"]
-    assert "SILO_ACCESS_KEY" not in input_publish["run"]
-    assert "$SILO_EXEC" not in input_publish["run"]
     assert persist["continue-on-error"] is True
     assert persist_retry["continue-on-error"] is True
     assert persist_retry["if"] == "always() && steps.persist-ledger-input.outcome == 'failure'"
     assert persist["env"]["ARTIFACT_NAME"] == persist_retry["env"]["ARTIFACT_NAME"]
-    assert persist["env"]["ARTIFACT_NAME"] == (
-        "review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
-        "-${{ github.run_id }}-${{ github.run_attempt }}"
-    )
     assert "--tier d1" in persist["run"] and "--tier d1" in persist_retry["run"]
     assert persist["env"]["PREFLIGHT"] == "${{ runner.temp }}/review-ledger-input/pr-size-preflight.json"
     assert "needs.quality.outputs.ledger_input_bundle" in input_download["env"]["LEDGER_INPUT_BUNDLE"]
@@ -1621,9 +1615,13 @@ def test_review_ledger_input_uploads_declare_one_day_retention():
     assert "--tier d1" in upload["run"]
     assert "--tier d1" in retry["run"]
     assert "$SILO_EXEC" in upload["run"]
-    assert upload["env"]["ARTIFACT_NAME"].startswith("review-ledger-input-v2-${{ github.repository_id }}")
+    assert upload["env"]["ARTIFACT_NAME"] == retry["env"]["ARTIFACT_NAME"]
+    assert upload["env"]["ARTIFACT_NAME"] == (
+        "review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+        "-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
     assert "needs.quality" not in upload["env"]["ARTIFACT_NAME"]
-    assert "head.sha" in upload["env"]["ARTIFACT_NAME"]
+    assert "--repo-id \"${{ github.repository_id }}\"" in upload["run"]
 
 
 def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
@@ -3253,31 +3251,63 @@ def test_quality_job_has_no_private_storage_secrets_or_silo_calls():
     assert "Resolve Silo hostname via MagicDNS" not in names
     assert "Diagnose silo network after job failure" not in names
     assert "Publish v2 review ledger inputs" in names
+    publish = next(s for s in quality["steps"] if s.get("name") == "Publish v2 review ledger inputs")
+    assert "gate_bounded_retry.py" not in publish["run"]
+    assert "RUNNER_TEMP" not in publish["run"]
 
 
 def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     raw, _ = _load_workflow()
-    publish = next(
-        step for step in raw["jobs"]["quality"]["steps"]
-        if step.get("name") == "Publish v2 review ledger inputs"
+    quality = raw["jobs"]["quality"]
+    publish = next(s for s in quality["steps"] if s.get("name") == "Publish v2 review ledger inputs")
+    download = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Download v2 review ledger inputs")
+    install_step = next(s for s in quality["steps"] if s.get("id") == "install")
+    printf = "printf '{\"ecosystem\":\"%s\",\"status\":\"%s\",\"duration_s\":%s,\"cache_hit\":%s}\\n'"
+    assert printf in install_step["run"]
+
+    repo, base, head = _repo(tmp_path, 1)
+    (repo / "资料").mkdir()
+    (repo / "资料" / "数据.bin").write_bytes(bytes(range(256)))
+    (repo / "资料" / "说明.pdf").write_text("pdf-shaped text\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "excluded"], cwd=repo, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    live_preflight = tmp_path / "live-preflight.json"
+    producer_env = {**os.environ, "GITHUB_OUTPUT": str(tmp_path / "preflight-github-output"),
+                    "GITHUB_REPOSITORY": "spoof/from-pr-payload", "PR_NUMBER": "0"}
+    producer_env.pop("GH_TOKEN", None)
+    subprocess.run(
+        [sys.executable, str(PREFLIGHT_SCRIPT), "--base-sha", base, "--head-sha", head,
+         "--max-diff-lines", "8000", "--warn-lines", "12000", "--max-review-shards", "8",
+         "--output", str(live_preflight)],
+        cwd=repo, env=producer_env, check=True,
     )
-    download = next(
-        step for step in raw["jobs"]["ledger"]["steps"]
-        if step.get("name") == "Download v2 review ledger inputs"
+    preflight = live_preflight.read_text(encoding="utf-8")
+    payload = json.loads(preflight)
+    excluded = {(item["path"], item["rule"]) for item in payload["excluded_files"]}
+    assert ("资料/数据.bin", "R1") in excluded
+    assert ("资料/说明.pdf", "R2") in excluded
+    assert payload["repository"] == "spoof/from-pr-payload"
+    snap = json.loads((LEDGER_INPUT_FIXTURE / "pr-size-preflight.json").read_text(encoding="utf-8"))
+    assert {(item["path"], item["rule"]) for item in snap["excluded_files"]} == excluded
+
+    live_install = tmp_path / "live-install.json"
+    subprocess.run(
+        ["bash", "-c", f"ecosystem=uv; status=ok; start=0; end=1; cache_hit=true; {printf} "
+         '"$ecosystem" "$status" "$((end - start))" "$cache_hit" | tee "$INSTALL_RESULT_PATH"'],
+        env={**os.environ, "INSTALL_RESULT_PATH": str(live_install)},
+        check=True,
     )
-    preflight = (LEDGER_INPUT_FIXTURE / "pr-size-preflight.json").read_text(encoding="utf-8")
-    install = (LEDGER_INPUT_FIXTURE / "install-result.json").read_text(encoding="utf-8")
+    install = live_install.read_text(encoding="utf-8")
+    assert install == (LEDGER_INPUT_FIXTURE / "install-result.json").read_text(encoding="utf-8")
+
     src = tmp_path / "producer"
     src.mkdir()
     (src / "pr-size-preflight.json").write_text(preflight, encoding="utf-8")
     (src / "install-result.json").write_text(install, encoding="utf-8")
     github_output = tmp_path / "github_output"
-    env = os.environ.copy()
-    env.update({
-        "PREFLIGHT": str(src / "pr-size-preflight.json"),
-        "INSTALL": str(src / "install-result.json"),
-        "GITHUB_OUTPUT": str(github_output),
-    })
+    env = {**os.environ, "PREFLIGHT": str(src / "pr-size-preflight.json"),
+           "INSTALL": str(src / "install-result.json"), "GITHUB_OUTPUT": str(github_output)}
     subprocess.run(["bash", "-c", publish["run"]], env=env, check=True)
     text = github_output.read_text(encoding="utf-8")
     start = text.index("bundle<<GATE_LEDGER_BUNDLE_EOF\n") + len("bundle<<GATE_LEDGER_BUNDLE_EOF\n")
@@ -3285,27 +3315,13 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     bundle = json.loads(text[start:end])
     assert bundle["preflight"] == preflight
     assert bundle["install"] == install
-    assert len(json.dumps(bundle, ensure_ascii=False, separators=(",", ":")).encode()) < 1024 * 1024
 
     dest = tmp_path / "review-ledger-input"
     consume_env = os.environ.copy()
     consume_env.update({"LEDGER_INPUT_BUNDLE": json.dumps(bundle), "DEST": str(dest)})
     subprocess.run(["bash", "-c", download["run"]], env=consume_env, check=True)
-    assert (dest / "pr-size-preflight.json").read_text(encoding="utf-8") == preflight
-    assert (dest / "install-result.json").read_text(encoding="utf-8") == install
-
-    persist = next(
-        step for step in raw["jobs"]["ledger"]["steps"]
-        if step.get("name") == "Upload v2 review ledger inputs"
-    )
-    assert persist["env"]["ARTIFACT_NAME"] == (
-        "review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
-        "-${{ github.run_id }}-${{ github.run_attempt }}"
-    )
-    assert "--repo-id \"${{ github.repository_id }}\"" in persist["run"]
-    assert "spoof_repository_id" not in persist["run"]
-    assert "spoof_head_sha" not in persist["run"]
-    assert "spoof_run_id" not in persist["run"]
+    assert (dest / "pr-size-preflight.json").read_bytes() == live_preflight.read_bytes()
+    assert (dest / "install-result.json").read_bytes() == live_install.read_bytes()
 
 
 def test_ledger_resolver_ignores_silo_listing_and_spoofed_prefix_for_input(tmp_path):
@@ -3324,24 +3340,6 @@ def test_ledger_resolver_ignores_silo_listing_and_spoofed_prefix_for_input(tmp_p
     )[0]
     assert missing.returncode != 0
     assert "INPUT_PREFIX and REPO_ID are required to bind ledger input identity" in missing.stderr + missing.stdout
-
-
-def test_ledger_helper_checkout_is_independent_of_quality_runner_temp():
-    raw, _ = _load_workflow()
-    ledger_checkout = next(
-        step for step in raw["jobs"]["ledger"]["steps"]
-        if (step.get("env") or {}).get("GATE_CHECKOUT_PATH") == "_gate-aggregator-src"
-    )
-    assert_workflow_sha_checkout(ledger_checkout, path="_gate-aggregator-src")
-    quality_blob = yaml.dump(raw["jobs"]["quality"])
-    assert "gate_bounded_retry.py" in quality_blob
-    assert "silo_store.py" not in quality_blob
-    publish = next(
-        step for step in raw["jobs"]["quality"]["steps"]
-        if step.get("name") == "Publish v2 review ledger inputs"
-    )
-    assert "gate_bounded_retry.py" not in publish["run"]
-    assert "RUNNER_TEMP" not in publish["run"]
 
 
 def test_empty_bundle_download_fails_loud(tmp_path):

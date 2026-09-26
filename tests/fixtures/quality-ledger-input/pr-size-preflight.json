@@ -1,1 +1,38 @@
-{"preflight_result":"success","reviewable_lines":4,"spoof_repository_id":"999","spoof_head_sha":"0deadbeef0deadbeef0deadbeef0deadbeef0dea"}
+{
+  "schema_version": 1,
+  "size_filter_contract": "v1",
+  "base_sha": "b9555703eb03445eb5edbb0625b63a7d5602e6b4",
+  "head_sha": "78080bd15c63c28d76f34c08ae5d3b45b578d3c8",
+  "diff_lines": 7,
+  "reviewable_lines": 7,
+  "raw_patch_lines": 24,
+  "changed_lines": 3,
+  "additions": 2,
+  "deletions": 1,
+  "changed_files": 3,
+  "excluded_files": [
+    {
+      "path": "资料/数据.bin",
+      "rule": "R1",
+      "raw_lines": 10
+    },
+    {
+      "path": "资料/说明.pdf",
+      "rule": "R2",
+      "raw_lines": 7
+    }
+  ],
+  "classification": "single",
+  "reviewable": true,
+  "review_plan": "single",
+  "preflight_result": "success",
+  "thresholds": {
+    "single_turn_lines": 8000,
+    "warn_lines": 12000,
+    "hard_lines": 64000,
+    "max_review_shards": 8
+  },
+  "repository": "spoof/from-pr-payload",
+  "pr_number": 0,
+  "measured_at": "2026-09-26T10:26:42.180041+00:00"
+}
