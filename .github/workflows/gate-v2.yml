@@ -570,6 +570,27 @@ jobs:
             echo "caller_checks=not_started" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Diagnose silo network after job failure
+        if: failure()
+        env:
+          GATE_NET_DIAG_JOB: ${{ github.job }}
+        run: |
+          endpoint=${SILO_ENDPOINT:-}
+          authority=${endpoint#*://}; authority=${authority%%/*}
+          silo_host=${authority%%:*}; silo_port=${authority##*:}
+          dns_host=${GATE_NET_DIAG_TAILNET_DNS_HOST:-100.100.100.100}
+          dns_port=${GATE_NET_DIAG_TAILNET_DNS_PORT:-53}
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$dns_host" "$dns_port" 2>/dev/null; then dns=ok; else dns=fail:connect; fi
+          if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
+          printf '%s\n' "$result"
+          printf '::warning::%s\n' "$result"
+          exit 0
+
   # ── primary ──────────────────────────────────────────────────────────────
   # Runs review-primary (gate-hub, already merged) and writes+uploads the ONE
   # canonical primary audit the `gate` aggregator consumes. Deliberately does
@@ -931,6 +952,27 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --dir "$DIAGNOSTICS_DIR" \
             --empty skip
+
+      - name: Diagnose silo network after job failure
+        if: failure()
+        env:
+          GATE_NET_DIAG_JOB: ${{ github.job }}
+        run: |
+          endpoint=${SILO_ENDPOINT:-}
+          authority=${endpoint#*://}; authority=${authority%%/*}
+          silo_host=${authority%%:*}; silo_port=${authority##*:}
+          dns_host=${GATE_NET_DIAG_TAILNET_DNS_HOST:-100.100.100.100}
+          dns_port=${GATE_NET_DIAG_TAILNET_DNS_PORT:-53}
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$dns_host" "$dns_port" 2>/dev/null; then dns=ok; else dns=fail:connect; fi
+          if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
+          printf '%s\n' "$result"
+          printf '::warning::%s\n' "$result"
+          exit 0
 
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
   resolve_advisory:
@@ -1438,6 +1480,27 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --dir "$ADVISORY_DIR"
 
+      - name: Diagnose silo network after job failure
+        if: failure()
+        env:
+          GATE_NET_DIAG_JOB: ${{ github.job }}
+        run: |
+          endpoint=${SILO_ENDPOINT:-}
+          authority=${endpoint#*://}; authority=${authority%%/*}
+          silo_host=${authority%%:*}; silo_port=${authority##*:}
+          dns_host=${GATE_NET_DIAG_TAILNET_DNS_HOST:-100.100.100.100}
+          dns_port=${GATE_NET_DIAG_TAILNET_DNS_PORT:-53}
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$dns_host" "$dns_port" 2>/dev/null; then dns=ok; else dns=fail:connect; fi
+          if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
+          printf '%s\n' "$result"
+          printf '::warning::%s\n' "$result"
+          exit 0
+
   # ── gate (final aggregator — required check) ────────────────────────────
   gate:
     needs: [quality, primary, classify_pr_paths]
@@ -1746,6 +1809,27 @@ jobs:
           if [ "$TERMINAL_UPLOAD_OUTCOME" = "failure" ] && [ "$TERMINAL_RETRY_OUTCOME" = "failure" ]; then
             echo "::warning::Gate terminal envelope upload failed after retry; ledger may lack terminal input"
           fi
+
+      - name: Diagnose silo network after job failure
+        if: failure()
+        env:
+          GATE_NET_DIAG_JOB: ${{ github.job }}
+        run: |
+          endpoint=${SILO_ENDPOINT:-}
+          authority=${endpoint#*://}; authority=${authority%%/*}
+          silo_host=${authority%%:*}; silo_port=${authority##*:}
+          dns_host=${GATE_NET_DIAG_TAILNET_DNS_HOST:-100.100.100.100}
+          dns_port=${GATE_NET_DIAG_TAILNET_DNS_PORT:-53}
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$dns_host" "$dns_port" 2>/dev/null; then dns=ok; else dns=fail:connect; fi
+          if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
+          printf '%s\n' "$result"
+          printf '::warning::%s\n' "$result"
+          exit 0
 
   # ── ledger (independent persistence health check) ───────────────────────
   ledger:
@@ -2105,6 +2189,27 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$LEDGER_PATH"
+
+      - name: Diagnose silo network after job failure
+        if: failure()
+        env:
+          GATE_NET_DIAG_JOB: ${{ github.job }}
+        run: |
+          endpoint=${SILO_ENDPOINT:-}
+          authority=${endpoint#*://}; authority=${authority%%/*}
+          silo_host=${authority%%:*}; silo_port=${authority##*:}
+          dns_host=${GATE_NET_DIAG_TAILNET_DNS_HOST:-100.100.100.100}
+          dns_port=${GATE_NET_DIAG_TAILNET_DNS_PORT:-53}
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$dns_host" "$dns_port" 2>/dev/null; then dns=ok; else dns=fail:connect; fi
+          if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
+          if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
+          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
+          printf '%s\n' "$result"
+          printf '::warning::%s\n' "$result"
+          exit 0
 
   # ── notify (registry-routed, required-gate-failure only) ────────────────
   # Same fail-only semantics as legacy gate.yml's notify job (see that file
