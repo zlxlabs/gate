@@ -910,6 +910,7 @@ def _producer_terminal(*, receipts=(), run_attempt=1):
         audit=audit,
         audit_error=None,
         identity=identity,
+        pr_author="zj1123581321",
         audit_source_attempt=identity.run_attempt,
         audit_artifact_name="primary-audit-v2-1",
         scope=scope,
@@ -1122,6 +1123,7 @@ def test_real_disposition_producer_receipt_flows_through_ledger(
         audit=audit,
         audit_error=None,
         identity=identity,
+        pr_author="zj1123581321",
         audit_source_attempt=identity.run_attempt,
         audit_artifact_name="primary-audit-v2-1",
         scope=scope,
@@ -1232,7 +1234,7 @@ def test_saas_deferred_is_rejected_by_producer_and_aggregator(tmp_path):
     outcome = agg.evaluate(
         quality_result="success", primary_result="failure", runner="self",
         is_draft=False, review_expected=True, audit=audit, audit_error=None,
-        identity=identity, audit_source_attempt=identity.run_attempt,
+        identity=identity, pr_author="zj1123581321", audit_source_attempt=identity.run_attempt,
         audit_artifact_name="primary-audit-v2-1", scope=scope, audit_digest=digest,
         waiver_receipts=(consumer_receipt,), repository="zlxlabs/gate",
     )

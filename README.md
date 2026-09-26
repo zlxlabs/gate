@@ -165,6 +165,7 @@ org 设置。
   `primary` job 目前是**整个 job 跳过**(`if:` 条件判断 draft/fork/runner)，`gate`
   聚合器靠重算同一份表达式来接受这个 `skipped` 结论，而不是去读一份真正写入的
   `not_expected` canonical audit。
+  人工作者的 fork/hosted 路径保留该兼容；Dependabot 已 ready 的 PR 和缺失/非法作者由聚合器标记为 `unavailable`，不接受为主审 no-op，详见下方作者矩阵。
 - **聚合器现在无条件拒绝 `not_expected`/`waived` 两个 verdict**——`aggregate.py` 的
   `PRIMARY_VERDICT_DOMAIN` 里保留了这两个值的位置，但当前实现把它们当成不合法输入
   直接拒绝（canary 阶段的 `primary` job 从不会合法产出这两个 verdict，出现即视为
@@ -233,28 +234,36 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
 
 ## 公开仓安全模型（四层）
 
-1. **fork-PR 防护写死在 reusable workflow 本体**：fork PR（`head.repo` ≠ 本仓）一律
-   强制降级 GitHub-hosted 一次性沙箱并跳过 codex review；只有本仓分支的 PR 才上
-   self-hosted。`pull_request` 事件下 caller 文件是 PR 作者的版本（拦不住人），可复用
-   workflow 本体执行门禁（拦得住）。三处防护由 `tests/test_gate_v2_contract.py` 钉死。
+1. **PR 作者与 fork 防护写在 reusable workflow 本体**：只有同仓、合法非空人类作者的
+   ready PR 才进入可信评审池；fork、Dependabot 和缺失/非法作者走 hosted quality 并跳过
+   可信评审。聚合器单独拒绝 Dependabot ready 和无效作者。路由由
+   `tests/test_gate_v2_contract.py` 钉死。
 2. **GitHub 外部贡献者人工批准**：5 个公开仓——`llm-compat`、`MediaResolverAPI`、
    `obsidian-clip-api`、`VideoTranscriptAPI`、`youtube_download_api`——全部设为
    `approval_policy: all_external_contributors`（最严一档；org 默认只是
    `first_time_contributors`）。任何外部贡献者的 workflow 运行都需人工点同意。查法：
    `gh api repos/zlxlabs/<repo>/actions/permissions/fork-pr-contributor-approval`
-3. **org runner group 分池 + 白名单（白名单仅评审池）**：自建 runner 分两个 group
-   （spec 见 gate-hub `docs/designs/runner-ci-pool-split.md`）——**评审池**（Default，
-   id=1，挂 LLM 凭据，`restricted_to_workflows=true`，只放行本仓 workflow 的钉定 SHA /
-   `@refs/heads/main`）与**无凭据 CI 池**（`ci`，id=4，`restricted_to_workflows=false`，
-   `allows_public_repositories=true`；2026-08-05 翻转，分池理由见上述 spec）。因此公开
-   仓的自有测试 CI 可以上 self-hosted 的 ci 池；绕过本文件的任意 job（包括 fork PR 里
-   改写 caller 硬点名 self-hosted）仍派不进评审池。
+3. **runner 标签是调度选择器，不是隔离证明**：本工作流为同仓人类 PR 选择现有 `ci`
+   标签，为可信评审选择现有评审标签。runner group ACL、凭据边界、实际镜像和 launcher
+   在仓库外管理；本次静态契约不证明这些配置已部署或具有预期隔离。
+4. **容器隔离与依赖由平台实测**：runner 镜像和生命周期不由 reusable workflow 定义。
+   hosted 路由只说明作业目标，不保证应用工具链齐全；本次没有真实 Dependabot Actions
+   run，也没有验证所有 runner 镜像的应用依赖。
 
-   评审池白名单是隔离承重墙，任何时候不放开。ci 池刻意不设 workflow 白名单，不是遗漏：
-   它只承载各仓自己的 CI，池内没有凭据；白名单是资源边界而非安全边界，救不了 fork
-   guard 失效，而且每次 bump SHA 多维护一处，漏同步就会无限排队且零告警。
-4. **ephemeral 容器**：runner 容器跑完即销毁，不在 self-hosted 机器上留下可被下一个
-   job 读到的状态。
+### Pull request 作者与门禁终态
+
+作者取 GitHub pull request 事件的 `pull_request.user.login`，不取可因人工重跑变化的 `github.actor`。合法作者只要求是非空字符串；缺失或非字符串时走 hosted quality、不调度可信评审，并由聚合器标记 `unavailable`。
+
+| PR 情形 | Quality | 主审及 advisory/OCR | Required Gate |
+|---|---|---|---|
+| 私仓或公开仓、同仓人工作者、ready | 现有 runner 路由 | 完整执行 | 按质量与主审结果裁决 |
+| 合法作者、仍为 draft | 现有 draft 路由 | draft 状态复核后跳过 | 保留既有 draft accepted skip；ready 事件重新运行 |
+| 人工作者的 fork PR | `ubuntu-latest` | 跳过 | 保留既有 fork accepted skip，明确尚未主审 |
+| Dependabot 作者的 ready PR（包括人工 actor 重跑） | `ubuntu-latest` | 跳过可信评审 | `unavailable`，不得按 hosted/fork skip 接受 |
+| 缺失、空或非字符串作者 | `ubuntu-latest` | 跳过可信评审 | `unavailable`，不得回退到 `github.actor` 或 classifier 豁免 |
+| 合法人工作者命中 classifier 豁免 | 现有 runner 路由 | 按现有豁免跳过 | 保留既有 accepted skip；不改变 Dependabot 规则 |
+
+矩阵描述静态策略，不代表真实 Dependabot Actions 验收或 runner 隔离已验证；hosted 只表示调度目标，也不保证应用依赖齐全。当前未找到该组织的真实 Dependabot PR；完整作者序列化和负向输入证据见对应进度记录。
 
 已知残余风险：L1 依赖缓存卷在两池之间共享（gate-hub spec D3 明写「两池共享是有意的」）。
 这是唯一一条从 ci 池通往评审池的路径；触发它需先穿过上面四层，故当前接受该风险，暂不处理。

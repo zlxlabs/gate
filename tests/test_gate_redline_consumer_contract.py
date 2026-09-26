@@ -112,6 +112,7 @@ def _evaluate_overlaid(audit):
         audit=overlaid,
         audit_error=None,
         identity=identity,
+        pr_author="zj1123581321",  # REST PR #252 user.login fixture
         audit_source_attempt=overlay["run_attempt"],
         audit_artifact_name="primary-audit-v2-1",
         scope=scope,

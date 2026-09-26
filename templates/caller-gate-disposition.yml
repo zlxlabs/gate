@@ -26,8 +26,11 @@ jobs:
       actions: write
       contents: read
       pull-requests: read
-    secrets: inherit
+    secrets:
+      SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
+      SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}
     uses: zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@__PINNED_GATE_SHA__
+    # 公开仓仅映射专属仓级 Silo 密钥，不继承其他仓库秘密。
     with:
       pr_number: ${{ inputs.pr_number }}
       primary_run_id: ${{ inputs.primary_run_id }}

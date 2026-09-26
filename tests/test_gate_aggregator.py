@@ -51,6 +51,9 @@ def _module():
 AGG = _module()
 
 IDENTITY = AGG.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=1, pr=42)
+# Captured from REST PR #252's real `user.login` field; this is a PR object
+# fixture, not an Actions event or Dependabot run.
+PR_AUTHOR_REST_FIXTURE = {"user": {"login": "zj1123581321"}}
 
 
 def test_single_round_gate_outcome_is_not_convergence_state():
@@ -69,6 +72,7 @@ def test_single_round_gate_outcome_is_not_convergence_state():
         },
         audit_error=None,
         identity=IDENTITY,
+        pr_author=PR_AUTHOR_REST_FIXTURE["user"]["login"],
         audit_source_attempt=1,
         audit_artifact_name="primary-audit-v2-1",
     )
@@ -127,7 +131,8 @@ def _base_kwargs(**overrides):
         review_expected=True,
         audit=_valid_primary_record(),
         audit_error=None,
-        identity=IDENTITY, audit_source_attempt=IDENTITY.run_attempt, audit_artifact_name="primary-audit-v2-1",
+        identity=IDENTITY, pr_author=PR_AUTHOR_REST_FIXTURE["user"]["login"],
+        audit_source_attempt=IDENTITY.run_attempt, audit_artifact_name="primary-audit-v2-1",
     )
     kwargs.update(overrides)
     return kwargs
@@ -514,6 +519,7 @@ def _cli_args(audit_dir, summary_path, **overrides):
         run_id=str(identity.run_id),
         run_attempt=str(identity.run_attempt),
         pr_number=str(identity.pr), repository="zlxlabs/gate",
+        pr_author_json=json.dumps(PR_AUTHOR_REST_FIXTURE["user"]["login"]),
         audit_source_attempt=str(identity.run_attempt), audit_artifact_name="primary-audit-v2-1", terminal_path=str(Path(summary_path).with_name("gate-terminal.json")),
     )
     values.update(overrides)
@@ -533,6 +539,8 @@ def _cli_args(audit_dir, summary_path, **overrides):
         "--audit-dir", str(audit_dir),
         "--summary-path", str(summary_path),
     ]
+    if values.get("pr_author_json") is not None:
+        args.extend(["--pr-author-json", values["pr_author_json"]])
     if values.get("pr_number") is not None:
         args.extend(["--pr-number", values["pr_number"]])
     if "audit_source_attempt" in values:
@@ -555,6 +563,23 @@ def test_main_exit_code_zero_on_pass(tmp_path):
     rc = AGG.main(_cli_args(audit_dir, summary_path))
     assert rc == 0
     assert "pass" in summary_path.read_text() and json.loads(summary_path.with_name("gate-terminal.json").read_text())["kind"] == "gate_terminal"
+
+
+@pytest.mark.parametrize("author_json,expected", [
+    (json.dumps(PR_AUTHOR_REST_FIXTURE["user"]["login"]), "skipped"),
+    (json.dumps("dependabot[bot]"), "unavailable"), (None, "unavailable"),
+    ("not-json", "unavailable"),
+])
+def test_cli_consumes_pr_author_json_instead_of_human_rerun_actor(tmp_path, monkeypatch, author_json, expected):
+    monkeypatch.setenv("GITHUB_ACTOR", "zj1123581321")
+    summary = tmp_path / "summary.md"
+    rc = AGG.main(_cli_args(
+        tmp_path / "missing-audit", summary, primary_result="skipped", runner="hosted",
+        review_expected="false", classify_review_expected="false", pr_author_json=author_json,
+    ))
+    terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
+    assert terminal["gate_result"] == expected
+    assert rc == (0 if expected == "skipped" else 1)
 
 
 def test_observed_abandoned_fixture_produces_fail_terminal_and_unreviewed_ledger_row(tmp_path, monkeypatch):
@@ -873,6 +898,8 @@ def _assert_terminal_classification(outcome, expected):
     ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": False}, ("review_unavailable", "review_expected_stale", "unavailable")),
     ({"primary_result": "skipped", "is_draft": True, "review_expected": False, "audit": None, "pr_draft_now": None}, ("review_unavailable", "pr_state_unverifiable", "unavailable")),
     ({"primary_result": "skipped", "is_draft": False, "is_fork": False, "classify_review_expected": "false", "review_expected": False, "audit": None, "pr_draft_now": None}, ("expected_skip", "review_not_expected", "skipped")),
+    ({"pr_author": "dependabot[bot]", "primary_result": "skipped", "review_expected": False, "classify_review_expected": "false", "audit": None}, ("review_unavailable", "primary_unavailable", "unavailable")),
+    ({"pr_author": "dependabot[bot]", "primary_result": "success", "review_expected": False, "classify_review_expected": "false", "audit": _valid_primary_record()}, ("review_unavailable", "primary_unavailable", "unavailable")),
     ({}, ("code_pass", "primary_pass", "pass")), ({"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")}, ("code_fail", "primary_findings", "fail")),
     # gate#105 方案 A: quality short-circuited (skipped) by a failed primary
     # lands on the SAME classification/reason as (quality=success, primary=
@@ -887,6 +914,30 @@ def _assert_terminal_classification(outcome, expected):
 ])
 def test_terminal_classification_matrix(kwargs, expected):
     _assert_terminal_classification(AGG.evaluate(**_base_kwargs(**kwargs)), expected)
+
+
+@pytest.mark.parametrize("author", [None, "", 17, True, [], {}])
+def test_missing_or_invalid_pr_author_is_unavailable_before_skip_acceptance(author):
+    outcome = AGG.evaluate(**_base_kwargs(
+        pr_author=author, primary_result="skipped", is_draft=False, is_fork=True,
+        runner="hosted", classify_review_expected="false", review_expected=False, audit=None,
+    ))
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
+        "review_unavailable", "primary_unavailable", "unavailable",
+    )
+    assert outcome.skip_reason is None
+    assert any("PR author" in problem for problem in outcome.problems)
+
+@pytest.mark.parametrize("now_draft,expected", [
+    (True, ("expected_skip", "review_not_expected", "skipped")),
+    (False, ("review_unavailable", "primary_unavailable", "unavailable")),
+])
+def test_dependabot_draft_uses_reverified_state(now_draft, expected):
+    outcome = AGG.evaluate(**_base_kwargs(
+        pr_author="dependabot[bot]", primary_result="skipped", is_draft=True,
+        review_expected=False, audit=None, pr_draft_now=now_draft,
+    ))
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == expected
 
 
 @pytest.mark.parametrize(

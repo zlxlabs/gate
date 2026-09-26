@@ -36,6 +36,7 @@ FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository
 DRAFT_GUARD = "github.event.pull_request.draft != true"
 RUNNER_GUARD = "inputs.runner == 'self'"
 CLASSIFY_GUARD = "needs.classify_pr_paths.outputs.review_expected != 'false'"
+PR_AUTHOR_GUARD = "toJSON(github.event.pull_request.user.login)"
 CLASSIFY_JOB_ID = "classify_pr_paths"
 CLASSIFY_SCRIPT = "_gate-classify-src/scripts/classify_pr_reviewable_paths.py"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -137,7 +138,7 @@ def test_resolve_if_is_byte_identical_to_gate_v2_primary_if():
     required_raw = _load_required_workflow()
     resolve_if = str(raw["jobs"]["resolve"].get("if", ""))
     primary_if = str(required_raw["jobs"]["primary"].get("if", ""))
-    for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD, CLASSIFY_GUARD):
+    for guard in (DRAFT_GUARD, FORK_GUARD, RUNNER_GUARD, CLASSIFY_GUARD, PR_AUTHOR_GUARD):
         assert guard in resolve_if, f"resolve job if is missing {guard!r}"
     assert resolve_if == primary_if, (
         "gate-shadow-v2.yml's `resolve` job if: must be byte-for-byte identical to "

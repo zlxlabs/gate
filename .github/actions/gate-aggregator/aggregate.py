@@ -1004,6 +1004,7 @@ def evaluate(
     audit: Any,
     audit_error: Optional[str],
     identity: Identity,
+    pr_author: Any,
     is_fork: bool = False,
     classify_review_expected: str = "",
     audit_source_attempt: Optional[int] = None,
@@ -1033,6 +1034,12 @@ def evaluate(
     notes: list[str] = []
     problems: list[str] = []
     synthetic: Optional[dict[str, Any]] = None
+    if not isinstance(pr_author, str) or not pr_author:
+        return Outcome(ok=False, problems=["PR author missing or is not a non-empty string — fail-closed"], classification="review_unavailable", reason_code="primary_unavailable", gate_result="unavailable")
+    if pr_author == "dependabot[bot]" and not (
+        is_draft is True and primary_result == "skipped" and pr_draft_now is True
+    ):
+        return Outcome(ok=False, problems=["Dependabot PR author has no trusted primary review — fail-closed"], classification="review_unavailable", reason_code="primary_unavailable", gate_result="unavailable")
     invalid_inputs = []
     if runner not in RUNNER_DOMAIN:
         invalid_inputs.append(f"runner input {runner!r} is not a recognized value (expected one of {RUNNER_DOMAIN!r}) — fail-closed")
@@ -2978,6 +2985,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--primary-result", required=True, help="needs.primary.result")
     parser.add_argument("--runner", required=True, help="inputs.runner ('self'/'hosted') — validated strictly")
     parser.add_argument("--is-draft", required=True, help="github.event.pull_request.draft ('true'/'false')")
+    parser.add_argument("--pr-author-json", default=None, help="JSON-serialized github.event.pull_request.user.login; no actor fallback")
     parser.add_argument("--is-fork", default="false", help="whether pull_request.head.repo.full_name differs from github.repository")
     parser.add_argument("--classify-review-expected", default="", help="needs.classify_pr_paths.outputs.review_expected; absent means no review-exempt reason can be identified")
     parser.add_argument(
@@ -3078,6 +3086,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     audit, audit_error, audit_bytes = _read_audit_file(args.audit_dir)
+    try:
+        pr_author = json.loads(args.pr_author_json) if args.pr_author_json is not None else None
+    except json.JSONDecodeError:
+        pr_author = None
     scope, missing_scope_fields = _convergence_scope_from_audit(audit, identity)
     legacy_raw_audit_digest = hashlib.sha256(audit_bytes).hexdigest() if audit_bytes is not None else None
     if isinstance(audit, dict):
@@ -3135,6 +3147,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit=audit,
         audit_error=audit_error,
         identity=identity,
+        pr_author=pr_author,
         audit_source_attempt=audit_source_attempt,
         audit_artifact_name=args.audit_artifact_name or None,
         scope=scope,
