@@ -3,9 +3,8 @@ templates/caller-gate-v2.yml, .github/actions/gate-aggregator/aggregate.py).
 
 Scope: this is the D1 "Required Gate" half of the shadow-review-independence
 rollout (see the private gate-hub repo's
-ceo-plans/2026-07-24-shadow-review-independence.md). Legacy
-.github/workflows/gate.yml and its own tests/test_gate_contract.py are
-kept behaviorally aligned with this file.
+ceo-plans/2026-07-24-shadow-review-independence.md). These tests cover the
+supported v2 workflow.
 """
 import ast
 import json
@@ -2777,24 +2776,6 @@ def test_quality_entry_contract_covers_missing_non_executable_and_executable_sta
     assert legacy_steps
     for step in legacy_steps:
         assert f"{QUALITY_ENTRY_MODE} == 'legacy'" in str(step.get("if", ""))
-
-
-def test_v2_quality_entry_detection_and_legacy_python_selection_match_v1():
-    legacy_raw = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "gate.yml").read_text())
-    legacy_steps = legacy_raw["jobs"]["gate"]["steps"]
-    raw, _ = _load_workflow()
-    quality_steps = raw["jobs"]["quality"]["steps"]
-    for name in ("Detect repository quality entry", "Run scripts/gate-quality"):
-        legacy_step = next(step for step in legacy_steps if step.get("name") == name)
-        v2_step = next(step for step in quality_steps if step.get("name") == name)
-        assert v2_step.get("run") == legacy_step.get("run")
-        assert v2_step.get("env") == legacy_step.get("env")
-
-    legacy_tests = next(step for step in legacy_steps if step.get("name") == "Tests")
-    v2_tests = next(step for step in quality_steps if step.get("name") == "Tests")
-    assert "uv run --frozen pytest -q || uv run pytest -q" not in v2_tests["run"]
-    assert "if [ -f uv.lock ]; then" in v2_tests["run"]
-    assert v2_tests["run"] == legacy_tests["run"]
 
 
 # ── notify job ────────────────────────────────────────────────────────────
