@@ -144,12 +144,39 @@ jobs:
     outputs:
       review_expected: ${{ steps.classify.outputs.review_expected }}
     steps:
+      - name: Record network bytes before checkout (classify_pr_paths-1)
+        env:
+          GATE_CHECKOUT_CONTEXT: workflow=gate-shadow-v2 job=classify_pr_paths step=classify_pr_paths-1 repo=${{ job.workflow_repository }}
+          GATE_CHECKOUT_SEQUENCE: "1"
+          NET_SYSFS_ROOT: ${{ vars.NET_SYSFS_ROOT }}
+        run: |
+          set +e
+          root=${NET_SYSFS_ROOT:-/sys/class/net}; total=0
+          [ -r "$root" ] || total=unavailable
+          for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] && continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value" in ''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ] || total=$((total + 10#$value)); done
+          printf 'GATE_CHECKOUT_RX_BYTES_%s=%s\n' "$GATE_CHECKOUT_SEQUENCE" "$total" >> "$GITHUB_ENV"
+          exit 0
       - name: Checkout classify script at this workflow's own commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: _gate-classify-src
+      - name: Record network bytes after checkout (classify_pr_paths-1)
+        if: always()
+        env:
+          GATE_CHECKOUT_CONTEXT: workflow=gate-shadow-v2 job=classify_pr_paths step=classify_pr_paths-1 repo=${{ job.workflow_repository }}
+          GATE_CHECKOUT_SEQUENCE: "1"
+          NET_SYSFS_ROOT: ${{ vars.NET_SYSFS_ROOT }}
+        run: |
+          set +e
+          root=${NET_SYSFS_ROOT:-/sys/class/net}; total=0
+          [ -r "$root" ] || total=unavailable
+          for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] && continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value" in ''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ] || total=$((total + 10#$value)); done
+          variable=GATE_CHECKOUT_RX_BYTES_${GATE_CHECKOUT_SEQUENCE}; before=$(printenv "$variable" 2>/dev/null)
+          case "$before" in ''|unavailable) total=unavailable;; *) [ "$total" = unavailable ] || total=$((total - 10#$before));; esac
+          printf 'GATE-CHECKOUT-BYTES-V1 %s rx_bytes=%s\n' "$GATE_CHECKOUT_CONTEXT" "$total"
+          exit 0
 
       - name: Classify whether model review is expected
         id: classify
@@ -435,9 +462,37 @@ jobs:
       # `success` (a job with zero executed steps is not the same as a job whose OWN
       # `if:` was false, which reports `skipped` instead — either outcome is harmless
       # here, since normal operation never reaches this branch at all).
+      - name: Record network bytes before checkout (shadow-1)
+        if: matrix.reviewer != '__none__'
+        env:
+          GATE_CHECKOUT_CONTEXT: workflow=gate-shadow-v2 job=shadow step=shadow-1 repo=${{ github.repository }}
+          GATE_CHECKOUT_SEQUENCE: "1"
+          NET_SYSFS_ROOT: ${{ vars.NET_SYSFS_ROOT }}
+        run: |
+          set +e
+          root=${NET_SYSFS_ROOT:-/sys/class/net}; total=0
+          [ -r "$root" ] || total=unavailable
+          for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] && continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value" in ''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ] || total=$((total + 10#$value)); done
+          printf 'GATE_CHECKOUT_RX_BYTES_%s=%s\n' "$GATE_CHECKOUT_SEQUENCE" "$total" >> "$GITHUB_ENV"
+          exit 0
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: matrix.reviewer != '__none__'
         with: { fetch-depth: 1 }
+      - name: Record network bytes after checkout (shadow-1)
+        if: always() && matrix.reviewer != '__none__'
+        env:
+          GATE_CHECKOUT_CONTEXT: workflow=gate-shadow-v2 job=shadow step=shadow-1 repo=${{ github.repository }}
+          GATE_CHECKOUT_SEQUENCE: "1"
+          NET_SYSFS_ROOT: ${{ vars.NET_SYSFS_ROOT }}
+        run: |
+          set +e
+          root=${NET_SYSFS_ROOT:-/sys/class/net}; total=0
+          [ -r "$root" ] || total=unavailable
+          for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] && continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value" in ''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ] || total=$((total + 10#$value)); done
+          variable=GATE_CHECKOUT_RX_BYTES_${GATE_CHECKOUT_SEQUENCE}; before=$(printenv "$variable" 2>/dev/null)
+          case "$before" in ''|unavailable) total=unavailable;; *) [ "$total" = unavailable ] || total=$((total - 10#$before));; esac
+          printf 'GATE-CHECKOUT-BYTES-V1 %s rx_bytes=%s\n' "$GATE_CHECKOUT_CONTEXT" "$total"
+          exit 0
 
       # Extends gate-v2.yml's `primary` job's own "Resolve numeric job id" step to a
       # matrix context: GitHub's Jobs API renders a matrix leg's job `name` as
