@@ -142,6 +142,7 @@ def test_aggregate_cli_receipt_bytes_validate_and_replay(capfd, tmp_path):
         "--quality-result", "success", "--primary-result", "success",
         "--preflight-result", "success",
         "--runner", "self", "--is-draft", "false", "--review-expected", "true",
+        "--pr-author-json", json.dumps("zj1123581321"),
         "--repository-id", str(SCOPE.repository_id), "--repository", "zlxlabs/gate",
         "--head-sha", SCOPE.head_sha, "--run-id", "77", "--run-attempt", "1",
         "--pr-number", str(SCOPE.pr_number), "--audit-source-attempt", "1",
@@ -199,6 +200,7 @@ def test_aggregate_cli_p1_receipt_bytes_validate_and_replay(tmp_path):
         [
             sys.executable, str(AGGREGATE_PATH), "--quality-result", "success",
             "--primary-result", "failure", "--runner", "self", "--is-draft", "false",
+            "--pr-author-json", json.dumps("zj1123581321"),
             "--review-expected", "true", "--repository-id", "123", "--repository", "zlxlabs/gate",
             "--head-sha", SCOPE.head_sha, "--run-id", "77", "--run-attempt", "1",
             "--pr-number", "42", "--audit-source-attempt", "1",
@@ -242,7 +244,7 @@ def test_producer_payload_preserves_all_attempt_guards(tmp_path):
         "raw=Path(sys.argv[2]).read_bytes(); audit=json.loads(raw)\n"
         "scope=mod._CONVERGENCE.Scope(**json.loads(os.environ['GATE_SCOPE']))\n"
         "identity=mod.Identity(123, scope.head_sha, 77, 2, 42)\n"
-        "out=mod.evaluate(quality_result='success', primary_result='success', runner='self', is_draft=False, review_expected=True, audit=audit, audit_error=None, identity=identity, audit_source_attempt=1, audit_artifact_name=os.environ['GATE_ARTIFACT'], scope=scope, audit_digest=hashlib.sha256(raw).hexdigest())\n"
+        "out=mod.evaluate(quality_result='success', primary_result='success', runner='self', is_draft=False, review_expected=True, audit=audit, audit_error=None, identity=identity, pr_author='zj1123581321', audit_source_attempt=1, audit_artifact_name=os.environ['GATE_ARTIFACT'], scope=scope, audit_digest=hashlib.sha256(raw).hexdigest())\n"
         "Path(sys.argv[3]).write_bytes(json.dumps(out.convergence_envelope, sort_keys=True, separators=(',', ':')).encode() + b'\\n')\n"
     )
     argv = [
@@ -727,7 +729,8 @@ def test_convergence_receipt_bytes_preserve_trigger_kind_for_replay():
     outcome = AGG.evaluate(
         quality_result="success", primary_result="failure", runner="self",
         is_draft=False, review_expected=True, audit=audit, audit_error=None,
-        identity=identity, audit_source_attempt=1, audit_artifact_name="primary-audit-v2-1",
+        identity=identity, pr_author="zj1123581321", audit_source_attempt=1,
+        audit_artifact_name="primary-audit-v2-1",
         scope=SCOPE, audit_digest=digest,
     )
     payload = outcome.convergence_receipt.as_dict()
@@ -844,7 +847,8 @@ def test_legacy_raw_bytes_receipt_can_resolve_with_counterevidence():
     kwargs = dict(
         quality_result="success", primary_result="failure", runner="self",
         is_draft=False, review_expected=True, audit=audit, audit_error=None,
-        identity=identity, audit_source_attempt=2, audit_artifact_name="primary-audit-v2-2",
+        identity=identity, pr_author="zj1123581321", audit_source_attempt=2,
+        audit_artifact_name="primary-audit-v2-2",
         scope=SCOPE, audit_digest=canonical, waiver_receipts=(receipt,),
     )
     without_legacy = AGG.evaluate(**kwargs)
@@ -871,7 +875,7 @@ def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():
     outcome = AGG.evaluate(
         quality_result="success", primary_result="success", runner="self",
         is_draft=False, review_expected=True, audit=audit, audit_error=None,
-        identity=identity, audit_source_attempt=1,
+        identity=identity, pr_author="zj1123581321", audit_source_attempt=1,
         audit_artifact_name="primary-audit-v1-1", scope=SCOPE, audit_digest=digest,
     )
     envelope = outcome.convergence_envelope
@@ -889,7 +893,8 @@ def _aggregate_case(audit, *, primary_result="success", identity=None):
     return AGG.evaluate(
         quality_result="success", primary_result=primary_result, runner="self",
         is_draft=False, review_expected=True, audit=audit, audit_error=None,
-        identity=identity, audit_source_attempt=1, audit_artifact_name="primary-audit-v1-1",
+        identity=identity, pr_author="zj1123581321", audit_source_attempt=1,
+        audit_artifact_name="primary-audit-v1-1",
         scope=SCOPE, audit_digest=hashlib.sha256(raw).hexdigest(),
     )
 

@@ -45,11 +45,17 @@ CONTROL_RUNNER_GUARD = "inputs.control_runner != 'github-hosted'"
 CLASSIFY_GUARD = "needs.classify_pr_paths.outputs.review_expected != 'false'"
 CLASSIFY_JOB_ID = "classify_pr_paths"
 CLASSIFY_SCRIPT = "_gate-classify-src/scripts/classify_pr_reviewable_paths.py"
+PR_AUTHOR_JSON = "toJSON(github.event.pull_request.user.login)"
+PR_AUTHOR_HUMAN_GUARD = (
+    f"startsWith({PR_AUTHOR_JSON}, '\"') && endsWith({PR_AUTHOR_JSON}, '\"') && "
+    f"{PR_AUTHOR_JSON} != '\"\"' && {PR_AUTHOR_JSON} != '\"dependabot[bot]\"'"
+)
 REVIEW_EXPECTED_IF = (
     "${{ github.event.pull_request.draft != true && "
     "github.event.pull_request.head.repo.full_name == github.repository && "
     "inputs.runner == 'self' && "
-    "needs.classify_pr_paths.outputs.review_expected != 'false' }}"
+    "needs.classify_pr_paths.outputs.review_expected != 'false' && "
+    f"{PR_AUTHOR_HUMAN_GUARD} }}}}"
 )
 PRIMARY_RESULT_EXPR = (
     "${{ needs.primary.result == 'success' && 'success' "
@@ -2489,6 +2495,18 @@ def test_primary_job_if_gates_draft_fork_and_runner():
     assert primary_if == REVIEW_EXPECTED_IF
 
 
+def test_pr_author_source_guards_review_and_reaches_aggregator_as_json():
+    raw, _ = _load_workflow()
+    assert PR_AUTHOR_HUMAN_GUARD in str(raw["jobs"]["quality"]["runs-on"])
+    assert raw["jobs"]["resolve_advisory"]["if"] == REVIEW_EXPECTED_IF
+    assert PR_AUTHOR_HUMAN_GUARD in str(raw["jobs"]["ocr"]["if"])
+    steps = raw["jobs"]["gate"]["steps"]
+    aggregate = next(step for step in steps if step.get("name") == "Aggregate required verdict")
+    assert aggregate["env"]["PR_AUTHOR_JSON"] == "${{ " + PR_AUTHOR_JSON + " }}"
+    assert '--pr-author-json "$PR_AUTHOR_JSON"' in aggregate["run"]
+    assert "github.actor" not in aggregate["run"]
+
+
 def test_primary_runs_on_has_fork_guard_and_hosted_fallback():
     raw, _ = _load_workflow()
     runs_on = str(raw["jobs"]["primary"]["runs-on"])
@@ -2912,7 +2930,7 @@ def test_caller_forwards_silo_secrets():
     assert secrets["SILO_SECRET_KEY"] == "${{ secrets.SILO_SECRET_KEY }}"
     text = CALLER_TEMPLATE.read_text(encoding="utf-8")
     assert "SILO_ACCESS_KEY 未传入" in text
-    assert "Fleet callers are updated" in text
+    assert "公开仓应配置专属仓级密钥" in text
 
 
 def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error():
@@ -2977,7 +2995,10 @@ def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
     assert set(raw["jobs"]) == {"disposition"}
     job = raw["jobs"]["disposition"]
     assert job["permissions"] == expected_permissions
-    assert job.get("secrets") == "inherit"
+    assert job["secrets"] == {
+        "SILO_ACCESS_KEY": "${{ secrets.SILO_ACCESS_KEY }}",
+        "SILO_SECRET_KEY": "${{ secrets.SILO_SECRET_KEY }}",
+    }
     assert "environment" not in job
     uses = job["uses"]
     assert uses == (
@@ -2991,9 +3012,7 @@ def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
         assert job["with"][key] == "${{ inputs." + key + " }}"
     assert set(job["with"]) == set(forwarded)
     text = DISPOSITION_CALLER_TEMPLATE.read_text()
-    non_comment_text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     assert "pull-requests: write" not in text
-    assert "secrets." not in non_comment_text
     assert "environment:" not in text
 
 
@@ -3187,7 +3206,8 @@ def test_real_preflight_payload_reaches_workflow_and_aggregator_cli(
         [sys.executable, str(AGGREGATOR_SCRIPT), "--quality-result", "failure", "--caller-checks", "passed",
          "--preflight-result", workflow_lines["preflight_result"], "--primary-result", "success", "--runner", "self",
          "--is-draft", "false", "--is-fork", "false", "--classify-review-expected", "true",
-         "--review-expected", "true", "--repository-id", "123", "--repository", "zlxlabs/gate",
+         "--review-expected", "true", "--pr-author-json", json.dumps("test-human"),
+         "--repository-id", "123", "--repository", "zlxlabs/gate",
          "--head-sha", "a" * 40, "--run-id", "999", "--run-attempt", "1", "--pr-number", "42",
          "--audit-source-attempt", "1", "--audit-artifact-name", "primary-audit-v2-1", "--audit-dir", str(audit_dir),
          "--summary-path", str(aggregator_summary), "--terminal-path", str(tmp_path / "gate-terminal.json")],

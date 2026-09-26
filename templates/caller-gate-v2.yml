@@ -106,10 +106,7 @@ jobs:
       # secrets); private repos may omit it and rely on the same-name repo
       # VARIABLE fallback inside gate-v2.yml's notify job instead.
       FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
-      # Silo object-store credentials (org-level). Required at runtime for
-      # gate-v2 artifact put/get; omitting them fails the S3 step with
-      # "SILO_ACCESS_KEY 未传入". Fleet callers are updated one repo at a
-      # time before the v2 moving tag advances; do not bump @v2 until the
-      # caller in that repo forwards both secrets.
+      # Silo 对象存储凭据。公开仓应配置专属仓级密钥；私有仓可按同名映射
+      # 组织现有密钥。漏配会使 artifact 传输失败（SILO_ACCESS_KEY 未传入）。
       SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
       SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}

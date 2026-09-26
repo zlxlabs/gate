@@ -47,6 +47,19 @@ PERMISSION_SCOPES = (
 )
 
 
+def test_caller_templates_forward_only_named_silo_secrets():
+    expected = {
+        "SILO_ACCESS_KEY": "${{ secrets.SILO_ACCESS_KEY }}",
+        "SILO_SECRET_KEY": "${{ secrets.SILO_SECRET_KEY }}",
+    }
+    for filename in ("caller-gate-v2.yml", "caller-gate-disposition.yml"):
+        document = yaml.safe_load((REPO_ROOT / "templates" / filename).read_text())
+        for job in document["jobs"].values():
+            if job.get("uses", "").startswith("zlxlabs/gate/"):
+                assert job.get("secrets", {}) != "inherit"
+                assert {name: job["secrets"][name] for name in expected} == expected
+
+
 def _workflow_call(document):
     trigger = document.get("on", document.get(True, {}))
     return trigger.get("workflow_call", {})
