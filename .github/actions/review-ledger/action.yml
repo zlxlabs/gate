@@ -12,8 +12,8 @@ inputs:
   # scripts/review-ledger-report.py,按 key 取值、不会因未知/缺失字段报错)
   # 都是纯新增、向后兼容。
   install-path: { required: true }
-  # Optional: omitted by legacy gate.yml. When set (gate-v2), fail-loud G3
-  # projection. Empty/absent must not error and must not add the field.
+  # Optional: callers that omit it keep the older ledger shape. When set
+  # (gate-v2), fail-loud G3 projection. Empty/absent must not add the field.
   terminal-path: { required: false, default: "" }
   codex-expected: { required: true }
   codex-waived: { required: true }

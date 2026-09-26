@@ -596,7 +596,7 @@ def build_entry(
         "disposition_status": disposition_status,
         "preflight": preflight or None,
         # D5(ci-cache-strategy.md 阶段 A):Install dependencies 步骤的度量信号 —
-        # {ecosystem, status, duration_s, cache_hit}(见 gate.yml Install 步骤),
+        # {ecosystem, status, duration_s, cache_hit}(见 gate-v2.yml Install 步骤),
         # 缺失时为 None。纯新增字段,不影响任何读取 "review"/"preflight"/
         # "comparison" 等既有 key 的消费者。
         "install": install,

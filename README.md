@@ -2,7 +2,7 @@
 
 全部 zlxlabs / 个人仓库共用的**复用 pre-merge 门禁**（lint / tests /
 Codex review）。这是私有 `zlxlabs/gate-hub` 的
-"纯逻辑公开半"——本仓只有这一份 reusable workflow 和它的契约测试；仓库清单
+"纯逻辑公开半"——本仓提供 reusable workflows 和契约测试；仓库清单
 （registry）、Codex review 的 prompt/策略（烧在 self-hosted runner 镜像里）、
 runner 基建、onboard 工具全部留在私有 gate-hub。
 
@@ -23,7 +23,7 @@ permissions:
   pull-requests: write        # codex review 要发 PR 评论
 jobs:
   gate:
-    uses: zlxlabs/gate/.github/workflows/gate.yml@main   # @main 故意不钉:改一处全仓库生效
+    uses: zlxlabs/gate/.github/workflows/gate-v2.yml@v2
     with:
       tier: personal          # personal | internal | saas
       runner: self            # self(自建两台, 有 codex review) | hosted(免费分钟)
@@ -50,19 +50,18 @@ gate checkout 后从仓库根目录以独立进程执行 `./scripts/gate-quality
 执行会立即失败且不会回退。入口可执行后，legacy 的 install/lint/duplicate/test 猜测
 步骤全部跳过。未迁移仓库应尽快补上入口，避免依赖兼容路径。
 
-## Required Gate v2 + Shadow Calibration v2（canary，2026-07-26 起）
+## Required Gate v2 + Shadow Calibration v2
 
-上面的 `gate.yml`（legacy）仍是未迁移仓库的默认路径，原样继续服务。`shadow-review-
-independence` 计划（2026-07-24 定稿，私有 `zlxlabs/gate-hub` 仓
-`ceo-plans/2026-07-24-shadow-review-independence.md`）把执行面拆成两个独立 reusable
-workflow，**目前只有 `zlxlabs/gate-hub` 自己（personal canary）接入**，其余已注册仓库
-不受影响，继续走 legacy caller。
+当前 Required Gate caller 使用 `gate-v2.yml@v2`。`shadow-review-independence` 计划
+（2026-07-24 定稿，私有 `zlxlabs/gate-hub` 仓
+`ceo-plans/2026-07-24-shadow-review-independence.md`）将 Required Gate 与 Shadow
+Calibration 拆成两个独立 reusable workflow；旧版 `gate.yml` 已删除。
 
 ### 两个 reusable workflow
 
 | workflow(`name:`) | job 拓扑 | 说明 |
 |---|---|---|
-| `.github/workflows/gate-v2.yml`(`gate`) | `quality` ∥ `primary` → `gate`(`needs: [quality, primary]`,`if: always()`) | Required Gate。`gate` job id 与 `name:` 都字面等于 `gate`，与 legacy 一致——required status check context 保持 `gate / gate` 不变，branch protection 零迁移。 |
+| `.github/workflows/gate-v2.yml`(`gate`) | `quality` ∥ `primary` → `gate`(`needs: [quality, primary]`,`if: always()`) | Required Gate。`gate` job id 与 `name:` 都字面等于 `gate`，required status check context 为 `gate / gate`。 |
 | `.github/workflows/gate-shadow-v2.yml`(`gate-shadow`) | `resolve` → `shadow`(matrix，每 reviewer 一个 job)→ `summary` | Shadow Calibration。**不产生任何 required status check**，只用于校准；失败/取消/超时不影响 Required Gate。 |
 
 PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式固定为
@@ -75,8 +74,8 @@ PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式�
 |---|---|---|
 | `tier` | `personal` | `personal` / `internal` / `saas` |
 | `runner` | `self` | `self`（自建，跑 `primary` review）/ `hosted`（免费分钟，`primary` 整个 job 跳过） |
-| `has_ui` | `false` | 同 legacy |
-| `design_doc` | `""` | 同 legacy |
+| `has_ui` | `false` | 兼容输入，当前 workflow 未消费 |
+| `design_doc` | `""` | 设计文档路径 |
 | `max_diff_lines` | `4000` | 单轮 review diff 预算 |
 | `max_review_shards` | `8` | 大 PR 完整覆盖预算 |
 | `pr_size_warn_lines` | `8000` | 强警告线 |
@@ -110,23 +109,14 @@ webhook，也从不发 PR 评论（发校准收据是计划 T6 的范围，尚�
 ### caller 模板位置
 
 `templates/caller-gate-v2.yml` / `templates/caller-gate-shadow-v2.yml` 是两份独立的
-canary caller 模板，与上面 legacy 的 `templates/caller-ci.yml` **并列**，不是替换。两份
-模板里 `uses:` 的 SHA 都是占位符 `__PINNED_GATE_SHA__`——接入一个仓库前必须替换成本仓
-当时 `zlxlabs/gate` `main` 的真实 commit SHA，不能照抄占位符，也不能用 `@main` 移动引用
-（见下面「钉 SHA 纪律」）。两份文件对应两个独立 workflow(`.github/workflows/gate.yml` +
-`.github/workflows/gate-shadow.yml`)，只装一份就只有 Required Gate 或只有 Shadow
-Calibration，不是「装一份就两者都有」。
+caller 模板，分别调用 Required Gate 与 Shadow Calibration。两个 workflow 分开接入；
+只配置 Required Gate 不会自动启用 Shadow Calibration。
 
-### 钉 SHA 纪律
+### 调用版本
 
-v2 阶段（canary 期间及以后，直到 fleet migration 完成）两个 caller 都**必须**钉死具体
-commit SHA，不用 `@main`——这样 `zlxlabs/gate` 主分支继续推进，不会让已经通过 canary
-验证的仓库行为跟着漂移，升级是一次显式、可审查的「改 SHA」提交，不是自动生效。**两个
-caller 的 SHA 通常保持一致**（同一次评审、同一批推广），但设计上允许独立演进（例如只
-bump 了 `gate-shadow-v2.yml` 的一个修复，`gate-v2.yml` 暂不动）——这不是强制要求，只是
-治理上更简单的默认做法。`gate-hub` 自己当前两个 caller 都钉在同一 commit
-(`9b673035aad284eb4dedaf2fd7554a9581c7decd`，即本次 Stage 2 canary 切换时的
-`zlxlabs/gate` `main`)。
+调用方使用移动标签 `@v2`，例如
+`zlxlabs/gate/.github/workflows/gate-v2.yml@v2`。`.github/workflows/v2-tag-sync.yml`
+会在 canary 验证通过后自动推进 `v2`；caller 无需随本仓每次合并更新 SHA。
 
 ### Silo 产物存储（gate-v2.yml）
 
@@ -146,50 +136,26 @@ MagicDNS `100.100.100.100` 解析 Silo 主机名失败即红，没有 GitHub art
 Silo 推广已完成，`.github/v2-tag-sync.hold` 熔断文件已移除，`v2` 移动 tag 随主干前移。
 下游 caller 仍必须透传 `SILO_ACCESS_KEY` 与 `SILO_SECRET_KEY`（不传则 S3 步骤红）。
 
-### org runner group 白名单运维要点（bump SHA 时最容易漏的一步）
+### org runner group 白名单运维要点（新仓接入）
 
-上面「公开仓安全模型」小节讲的 `restricted_to_workflows` 白名单，在 v2 caller 存在后
-**必须同时放行 legacy 与 v2 两条 workflow 的 SHA**——只在 caller 里改 `uses: …@<new-
-sha>` 是不够的，org runner group 的白名单是另一道独立的闸，不会自动跟着 caller 走。
-2026-07-26 canary 切换时这一步漏做过一次，导致 self-hosted job **无限排队且没有任何
-告警**（现有容量告警都不覆盖「job 排队卡在白名单外」这种失效模式），排了约 4 小时才被
-人工发现。
+org runner group 的 `restricted_to_workflows` 白名单只在新仓接入时检查。升级 `@v2`
+不需要改白名单；若列表仍有旧版 `gate.yml@refs/heads/main`，管理员可以移除该条目。
 
-（2026-08 起 org 有两个 runner group：白名单只存在于**评审池** Default（id=1）；
-CI 池 `ci`（id=4）`restricted_to_workflows=false`，bump 不涉及它——PATCH 别打错组。
-首选入口是 gate-hub `scripts/bump_caller_pins.py`，它固定先同步白名单再改 caller。）
+白名单只存在于**评审池** Default（id=1）；CI 池 `ci`（id=4）
+`restricted_to_workflows=false`，不需要改动。
 
-正确顺序（三步缺一不可）：
+新仓接入时，先读完整白名单，再按仓库实际启用的 workflow 放行：
 
-1. 改 caller 的 `uses: zlxlabs/gate/.github/workflows/gate-v2.yml@<new-sha>`（以及
-   `gate-shadow-v2.yml` 那一份，如果也要 bump）；
-2. 用 `gh api` **PATCH** 该 org 的 runner group，把 `selected_workflows` 数组里对应
-   旧 SHA 的条目换成新 SHA——这是整个数组的**全量覆盖**，不是增量 append，务必先读出
-   当前完整列表再改：
    ```bash
    # 先看当前白名单(group id 因 org 而异,这里以 zlxlabs 的 id=1 为例)
    gh api orgs/zlxlabs/actions/runner-groups/1 --jq .selected_workflows
-
-   # 确认后整份数组一起回写(legacy 条目原样保留,只替换 v2 的 SHA):
-   gh api --method PATCH orgs/zlxlabs/actions/runner-groups/1 \
-     -f 'selected_workflows[]=zlxlabs/gate/.github/workflows/gate.yml@refs/heads/main' \
-     -f 'selected_workflows[]=zlxlabs/gate/.github/workflows/gate-v2.yml@<new-sha>' \
-     -f 'selected_workflows[]=zlxlabs/gate/.github/workflows/gate-shadow-v2.yml@<new-sha>'
    ```
-3. 验证：新 SHA 触发的 run 能正常从 `queued` 转 `in_progress`，而不是卡在 `queued`
-   不动。
 
-这一步目前**没有自动化**，纯人工操作，漏做的后果（无限排队 + 零告警）比大多数 CI 故障
-更隐蔽——bump 任何一个 v2 reusable workflow 的钉 SHA 时，请把同步这份白名单当成清单里
-跟改 caller 同等优先级的一步，不是「回头再说」的收尾动作。
+### 旧版工作流已删除
 
-### 与 legacy `gate.yml@main` 的共存关系
-
-v2 两个 caller 目前只在 `zlxlabs/gate-hub` 一个仓库（personal canary）生效。其余全部
-已接入仓库（私有 `gate-hub` 仓 `registry.yaml` 台账里的仓库）继续用上面「caller」小节
-描述的单一 legacy `gate.yml@main` caller，行为不受本节内容影响，直到按分层灰度顺序
-（personal canary → internal → saas）显式切换。两条路径长期共存，不是「v2 上线 legacy
-立刻退役」——legacy 退役是 fleet migration 完成之后的事，当前尚未开工。
+旧版 `.github/workflows/gate.yml` 已删除，当前统一使用 `gate-v2.yml@v2`。runner group
+白名单若仍保留旧版 `gate.yml@refs/heads/main` 条目，可由管理员移除；本仓库 PR 不修改
+org 设置。
 
 ### 已知边界（fleet 推广前必须补齐）
 
@@ -266,9 +232,8 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
 
 1. **fork-PR 防护写死在 reusable workflow 本体**：fork PR（`head.repo` ≠ 本仓）一律
    强制降级 GitHub-hosted 一次性沙箱并跳过 codex review；只有本仓分支的 PR 才上
-   self-hosted。`pull_request` 事件下 caller 文件是 PR 作者的版本（拦不住人），本文件
-   永远取 pin 的 SHA（拦得住）。三处防护由 `tests/test_gate_contract.py` /
-   `tests/test_gate_v2_contract.py` 钉死。
+   self-hosted。`pull_request` 事件下 caller 文件是 PR 作者的版本（拦不住人），可复用
+   workflow 本体执行门禁（拦得住）。三处防护由 `tests/test_gate_v2_contract.py` 钉死。
 2. **GitHub 外部贡献者人工批准**：5 个公开仓——`llm-compat`、`MediaResolverAPI`、
    `obsidian-clip-api`、`VideoTranscriptAPI`、`youtube_download_api`——全部设为
    `approval_policy: all_external_contributors`（最严一档；org 默认只是
@@ -291,12 +256,11 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
 已知残余风险：L1 依赖缓存卷在两池之间共享（gate-hub spec D3 明写「两池共享是有意的」）。
 这是唯一一条从 ci 池通往评审池的路径；触发它需先穿过上面四层，故当前接受该风险，暂不处理。
 
-## 改 gate.yml 注意
+## 改 Gate v2 注意
 
-- 白名单钉在 `@refs/heads/main`：分支上的 gate.yml 无法派 self-hosted 任务。要真机
-  验证未合并的改动，临时把分支 ref 加进 runner group 白名单，或先用 `runner: hosted`
-  验证四项门禁，codex 步骤合并后再看。
-- 本仓 PR 会自动跑契约测试（hosted，免费）。
+- 分支上的改动不会通过 `@v2` 被下游调用；本仓 PR 会自动运行契约测试，`v2` 由 canary
+  验证通过后自动推进。
+- 本仓 PR 的契约测试运行在 GitHub-hosted runner 上。
 - **L1 本机缓存卷的 env 切换（`runner == 'self' && tier == 'personal'`）依赖私有
   `zlxlabs/gate-hub` 仓 `run-ephemeral-runner.sh` 挂载的
   `/opt/gate-hub-cache/{uv,npm,pnpm,go}`（`docs/designs/ci-cache-strategy.md` §0
