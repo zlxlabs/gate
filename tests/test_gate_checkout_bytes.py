@@ -37,14 +37,11 @@ def test_every_checkout_is_bracketed_by_fail_open_measurements():
     for workflow_name, job_id, steps, index, checkout in checkouts:
         key = (workflow_name, job_id)
         sequences[key] = sequences.get(key, 0) + 1
-        if workflow_name == "gate-v2":
-            before = steps[index - 2]
-            prime = steps[index - 1]
-            assert prime.get("name") == "Prime checkout from host Git mirror"
-            assert prime.get("if") == checkout.get("if")
-            assert prime.get("env", {}).get("GATE_GITHUB_TOKEN") == "${{ github.token }}"
-        else:
-            before = steps[index - 1]
+        before = steps[index - 2]
+        prime = steps[index - 1]
+        assert prime.get("name") == "Prime checkout from host Git mirror"
+        assert prime.get("if") == checkout.get("if")
+        assert prime.get("env", {}).get("GATE_GITHUB_TOKEN") == "${{ github.token }}"
         after = steps[index + 1]
         assert before.get("name", "").startswith(BEFORE_STEP)
         assert after.get("name", "").startswith(AFTER_STEP)
