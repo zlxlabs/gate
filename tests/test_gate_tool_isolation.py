@@ -70,7 +70,7 @@ def test_diff_coverage_uses_no_project_mode():
     assert "uv run --no-project --with diff-cover python3" in diff_cover_run
 
 
-def _run_with_uv_stub(tmp_path: Path, exit_code: int = 0):
+def _run_with_python_stub(tmp_path: Path, exit_code: int = 0):
     poisoned = tmp_path / "poisoned"
     poisoned.mkdir()
     (poisoned / "pyproject.toml").write_text(
@@ -81,9 +81,9 @@ def _run_with_uv_stub(tmp_path: Path, exit_code: int = 0):
     runner_temp.mkdir()
     stub_bin = tmp_path / "stub-bin"
     stub_bin.mkdir()
-    stub_output = tmp_path / "uv-call.txt"
-    uv_stub = stub_bin / "uv"
-    uv_stub.write_text(
+    stub_output = tmp_path / "python-call.txt"
+    python_stub = stub_bin / "python3"
+    python_stub.write_text(
         "#!/bin/sh\n"
         "set -eu\n"
         "printf 'PWD=%s\\n' \"$PWD\" > \"$STUB_OUTPUT\"\n"
@@ -91,9 +91,9 @@ def _run_with_uv_stub(tmp_path: Path, exit_code: int = 0):
         "exit \"${STUB_EXIT:-0}\"\n",
         encoding="utf-8",
     )
-    uv_stub.chmod(0o755)
+    python_stub.chmod(0o755)
     silo_store = tmp_path / "silo_store.py"
-    silo_store.write_text("# The uv stub records the invocation before this file is used.\n", encoding="utf-8")
+    silo_store.write_text("# The python stub records the invocation before this file is used.\n", encoding="utf-8")
     env = os.environ.copy()
     env.update(
         {
@@ -116,31 +116,24 @@ def _run_with_uv_stub(tmp_path: Path, exit_code: int = 0):
 
 
 def test_silo_wrapper_emits_isolated_cwd_and_argv(tmp_path):
-    result, runner_temp, poisoned, silo_store, stub_output = _run_with_uv_stub(tmp_path)
+    result, runner_temp, poisoned, silo_store, stub_output = _run_with_python_stub(tmp_path)
     assert result.returncode == 0, result.stderr
     records = stub_output.read_text(encoding="utf-8").splitlines()
     assert Path(records[0].removeprefix("PWD=")).resolve() == runner_temp.resolve()
     assert Path(records[0].removeprefix("PWD=")).resolve() != poisoned.resolve()
     argv = [line.removeprefix("ARG=") for line in records[1:]]
-    assert argv == [
-        "run",
-        "--no-project",
-        "--python",
-        "3.12",
-        "--with",
-        "boto3",
-        "--",
-        "python3",
-        str(silo_store),
-        "get",
-        "--key",
-        "example",
-    ]
+    # stdlib client: plain python3, no package manager in the argv.
+    assert argv == [str(silo_store), "get", "--key", "example"]
 
 
 def test_silo_wrapper_transparent_exit_code(tmp_path):
-    result, *_ = _run_with_uv_stub(tmp_path, exit_code=2)
+    result, *_ = _run_with_python_stub(tmp_path, exit_code=2)
     assert result.returncode == 2
+
+
+def test_silo_wrapper_needs_no_package_manager():
+    text = SILO_EXEC.read_text(encoding="utf-8")
+    assert "uv run" not in text and "boto3" not in text
 
 
 def test_silo_wrapper_fails_loud_when_store_env_is_missing(tmp_path):
