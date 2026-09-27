@@ -360,3 +360,181 @@ def test_get_non_structured_client_error_fails_loud(monkeypatch, capsys, tmp_pat
         store.main(["get", "--key", target_key, "--dest", str(tmp_path / "out.json")])
     assert caught.value.code == store.EXIT_ERROR
     assert caught.value.code != store.EXIT_NOT_FOUND
+
+
+# SigV4 KAT. Expected signatures cross-checked against botocore 1.34.46
+# SigV4Auth (frozen 20150830T123600Z, AKIDEXAMPLE / wJalr...EXAMPLEKEY).
+_KAT_ACCESS = "AKIDEXAMPLE"
+_KAT_SECRET = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+_KAT_DATE = "20150830T123600Z"
+_KAT_STAMP = "20150830"
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _kat_auth(method, uri, qs, headers, payload_hash, region, service):
+    return store.sigv4_authorization(
+        method=method, canonical_uri=uri, canonical_query_string=qs,
+        signed_headers=headers, payload_hash=payload_hash, access_key=_KAT_ACCESS,
+        secret_key=_KAT_SECRET, region=region, service=service,
+        amz_date=_KAT_DATE, date_stamp=_KAT_STAMP,
+    )
+
+
+def test_sigv4_get_matches_cross_checked_vector():
+    assert _kat_auth("GET", "/", "Action=ListUsers&Version=2010-05-08",
+                     [("host", "iam.amazonaws.com"), ("x-amz-date", _KAT_DATE)],
+                     _EMPTY_SHA256, "us-east-1", "iam") == (
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, "
+        "SignedHeaders=host;x-amz-date, "
+        "Signature=b2e4af44cfad96d9ffa3c5653674a927b9b0995c33de22e1f843745ce37c1d5e"
+    )
+
+
+def test_sigv4_put_canonical_request_and_signature():
+    payload_hash = store.sha256_hex(b"hello world")
+    assert payload_hash == "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    headers = [("host", "silo.example.test:9000"), ("x-amz-date", _KAT_DATE)]
+    canonical_request, signed_names = store.build_canonical_request(
+        "PUT", "/ci-artifacts/d1/7/n/f.json", "", headers, payload_hash)
+    assert canonical_request == (
+        "PUT\n/ci-artifacts/d1/7/n/f.json\n\n"
+        "host:silo.example.test:9000\nx-amz-date:20150830T123600Z\n\n"
+        "host;x-amz-date\n"
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    )
+    assert signed_names == "host;x-amz-date"
+    assert _kat_auth("PUT", "/ci-artifacts/d1/7/n/f.json", "", headers,
+                     payload_hash, "us-east-1", "s3") == (
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, "
+        "SignedHeaders=host;x-amz-date, "
+        "Signature=c1b27c3fb1304c88aefa3e40ccc7b84d5ea8c5d836afe90fecb5eb4e49521d3f"
+    )
+
+
+def test_sigv4_list_query_vector():
+    assert _kat_auth("GET", "/ci-artifacts/", "list-type=2&prefix=d14%2F5%2F",
+                     [("host", "silo.example.test:9000"), ("x-amz-date", _KAT_DATE)],
+                     _EMPTY_SHA256, "us-east-1", "s3") == (
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, "
+        "SignedHeaders=host;x-amz-date, "
+        "Signature=0c63b10a42106ba5cc619f256141ca5f5734d6b5bdb363fb719203aa03a8768e"
+    )
+
+
+def test_encode_s3_path_is_path_style():
+    assert store.encode_s3_path("ci-artifacts", "d1/7/n/f.json") == "/ci-artifacts/d1/7/n/f.json"
+    assert store.encode_s3_path("ci-artifacts", "d1/7/n/a b.json") == "/ci-artifacts/d1/7/n/a%20b.json"
+
+
+def test_s3_client_rejects_non_http_endpoint():
+    with pytest.raises(SystemExit) as caught:
+        store.S3Client("ftp://silo.example.test:9000", "ak", "sk")
+    assert caught.value.code == store.EXIT_ERROR
+
+
+# Fake in-process S3 over stdlib http.server: proves path-style SigV4-signed
+# requests, real XML list parsing with ContinuationToken pagination, and the
+# 404-maps-to-miss / other-status-is-loud contract. No production Silo.
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+
+class _FakeS3Handler(BaseHTTPRequestHandler):
+    def _send(self, status, body, content_type="application/xml"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _route(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        self.server.requests.append({
+            "method": self.command, "path": self.path,
+            "authorization": self.headers.get("Authorization") or "",
+            "amz_date": self.headers.get("x-amz-date") or "",
+            "payload_hash": self.headers.get("x-amz-content-sha256") or "",
+        })
+        parts = urlparse(self.path).path.strip("/").split("/", 1)
+        bucket, key = (parts + [""])[:2]
+        if bucket != self.server.bucket:
+            self._send(404, b"<Error><Code>NoSuchBucket</Code><Message>no bucket</Message></Error>")
+        elif self.command == "PUT" and key:
+            self.server.objects[key] = body
+            self._send(200, b"", content_type="text/plain")
+        elif self.command == "GET" and not key:
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            assert query.get("list-type") == ["2"], self.path
+            names = sorted(k for k in self.server.objects if k.startswith((query.get("prefix") or [""])[0]))
+            page = names[1:] if "continuation-token" in query else names[:1]
+            truncated = "continuation-token" not in query and len(names) > 1
+            items = "".join(f"<Contents><Key>{k}</Key><Size>1</Size></Contents>" for k in page)
+            token = "<NextContinuationToken>tok1</NextContinuationToken>" if truncated else ""
+            self._send(200, (f'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                             f"<IsTruncated>{str(truncated).lower()}</IsTruncated>{items}{token}"
+                             "</ListBucketResult>").encode())
+        elif self.command == "GET" and key == "d1/7/n/boom.json":
+            self._send(500, b"<Error><Code>InternalError</Code><Message>boom</Message></Error>")
+        elif self.command == "GET" and key in self.server.objects:
+            self._send(200, self.server.objects[key], content_type="application/octet-stream")
+        elif self.command == "GET":
+            self._send(404, b"<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>")
+        else:
+            self._send(400, b"<Error><Code>BadRequest</Code><Message>bad</Message></Error>")
+
+    do_GET = _route
+    do_PUT = _route
+
+    def log_message(self, *args):
+        pass
+
+
+def _live_client(monkeypatch, objects=None):
+    server = HTTPServer(("127.0.0.1", 0), _FakeS3Handler)
+    server.bucket = "ci-artifacts"
+    server.objects = dict(objects or {})
+    server.requests = []
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.daemon = True
+    thread.start()
+    return server, store.S3Client(f"http://127.0.0.1:{server.server_port}", "test-access", "sk")
+
+
+def test_live_fake_s3_put_get_list_pagination_and_errors(monkeypatch, tmp_path):
+    server, client = _live_client(monkeypatch)
+    try:
+        _env(monkeypatch)
+        monkeypatch.setattr(store, "connect", lambda: client)
+        (tmp_path / "a.json").write_bytes(b'{"n":1}')
+        (tmp_path / "b.json").write_bytes(b'{"n":2}')
+        put_args = ["put", "--tier", "d14", "--repo-id", "42",
+                    "--name", "primary-audit-v2-42-deadbeef-99-1"]
+        assert store.main(put_args + ["--file", str(tmp_path / "a.json")]) == 0
+        assert store.main(put_args + ["--file", str(tmp_path / "b.json")]) == 0
+        dest = tmp_path / "out"
+        assert store.main(["get", "--prefix", "d14/42/primary-audit-v2-42-deadbeef-99-1",
+                           "--dest", str(dest)]) == 0
+        assert (dest / "a.json").read_bytes() == b'{"n":1}'
+        assert (dest / "b.json").read_bytes() == b'{"n":2}'
+        # fake S3 pages one key at a time; client must follow tok1
+        assert store.list_keys(client, "ci-artifacts", "d14/42/") == [
+            "d14/42/primary-audit-v2-42-deadbeef-99-1/a.json",
+            "d14/42/primary-audit-v2-42-deadbeef-99-1/b.json",
+        ]
+        assert any("continuation-token=tok1" in r["path"] for r in server.requests)
+        for record in server.requests:
+            assert record["path"].startswith("/ci-artifacts/"), record["path"]
+            assert record["authorization"].startswith("AWS4-HMAC-SHA256 Credential="), record
+            assert "/us-east-1/s3/aws4_request" in record["authorization"], record
+            assert record["amz_date"] and record["payload_hash"], record
+        with pytest.raises(SystemExit) as missed:
+            store.main(["get", "--key", "d1/7/n/missing.json", "--dest", str(tmp_path / "o.json")])
+        assert missed.value.code == store.EXIT_NOT_FOUND
+        with pytest.raises(SystemExit) as failed:
+            store.main(["get", "--key", "d1/7/n/boom.json", "--dest", str(tmp_path / "o.json")])
+        assert failed.value.code == store.EXIT_ERROR
+    finally:
+        server.shutdown()
+        server.server_close()
