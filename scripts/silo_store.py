@@ -10,16 +10,25 @@ Exit: 0 ok; 2 miss; 1 any other failure (distinct from miss).
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
+import http.client
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 TIERS = frozenset({"d1", "d3", "d14", "d30"})
 DEFAULT_BUCKET = "ci-artifacts"
+S3_REGION = "us-east-1"
+S3_SERVICE = "s3"
+S3_TIMEOUT_SECONDS = 60
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_FOUND = 2
@@ -73,7 +82,11 @@ def artifact_prefix(tier: str, repo_id: str, artifact_name: str) -> str:
 
 
 def connect():
-    """Build a path-style S3 client against SILO_ENDPOINT. No network until used."""
+    """Build a path-style S3 client against SILO_ENDPOINT. No network until used.
+
+    The client signs with SigV4 from the standard library only, so review jobs
+    never download S3 SDK packages from PyPI at runtime.
+    """
 
     access = (os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
     secret = (os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
@@ -84,22 +97,234 @@ def connect():
         fail(MISSING_SECRET_KEY)
     if not endpoint:
         fail("SILO_ENDPOINT 未设置")
-    try:
-        import boto3
-        from botocore.config import Config
-    except ImportError:
-        fail("boto3 is not installed")
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=access,
-        aws_secret_access_key=secret,
-        region_name="us-east-1",
-        config=Config(
-            signature_version="s3v4",
-            s3={"addressing_style": "path"},
-        ),
+    return S3Client(endpoint, access, secret, region=S3_REGION)
+
+
+class S3Error(Exception):
+    """S3 HTTP failure; ``response`` keeps the old SDK ClientError shape so the
+    NoSuchKey/404/NoSuchBucket miss-mapping in cmd_get/cmd_list keeps working."""
+
+    def __init__(self, code: str, message: str = "", status: int = 0):
+        super().__init__(f"{code}: {message}" if message else code)
+        self.response = {"Error": {"Code": code, "Message": message}}
+        self.status = status
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def build_canonical_request(
+    method: str,
+    canonical_uri: str,
+    canonical_query_string: str,
+    signed_headers: list[tuple[str, str]],
+    payload_hash: str,
+) -> tuple[str, str]:
+    """Return (canonical_request, signed_headers_names); names lowercased+sorted."""
+
+    normalized = sorted((name.strip().lower(), value.strip()) for name, value in signed_headers)
+    canonical_headers = "".join(f"{name}:{value}\n" for name, value in normalized)
+    signed_names = ";".join(name for name, _ in normalized)
+    # canonical_headers ends with "\n"; the extra one is the blank line the spec
+    # requires between headers and SignedHeaders.
+    canonical_request = (
+        f"{method.upper()}\n{canonical_uri}\n{canonical_query_string}\n"
+        f"{canonical_headers}\n{signed_names}\n{payload_hash}"
     )
+    return canonical_request, signed_names
+
+
+def _hmac(key: bytes, data: str) -> bytes:
+    return hmac.new(key, data.encode("utf-8"), hashlib.sha256).digest()
+
+
+def derive_signing_key(secret_key: str, date_stamp: str, region: str, service: str) -> bytes:
+    key = ("AWS4" + secret_key).encode("utf-8")
+    for scope_part in (date_stamp, region, service, "aws4_request"):
+        key = _hmac(key, scope_part)
+    return key
+
+
+def sigv4_authorization(
+    *,
+    method: str,
+    canonical_uri: str,
+    canonical_query_string: str,
+    signed_headers: list[tuple[str, str]],
+    payload_hash: str,
+    access_key: str,
+    secret_key: str,
+    region: str,
+    service: str,
+    amz_date: str,
+    date_stamp: str,
+) -> str:
+    """Compute the SigV4 ``Authorization`` header value for one request."""
+
+    canonical_request, signed_names = build_canonical_request(
+        method, canonical_uri, canonical_query_string, signed_headers, payload_hash
+    )
+    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    hashed_request = sha256_hex(canonical_request.encode("utf-8"))
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_request}"
+    signing_key = derive_signing_key(secret_key, date_stamp, region, service)
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_names}, Signature={signature}"
+    )
+
+
+def encode_s3_path(bucket: str, key: str) -> str:
+    """Path-style canonical URI: /<bucket>/<key>, segments percent-encoded."""
+
+    return f"/{quote(bucket, safe='-_.~')}/{quote(key, safe='/-_.~')}"
+
+
+def encode_query_string(params: list[tuple[str, str]]) -> str:
+    return "&".join(
+        f"{quote(name, safe='-_.~')}={quote(value, safe='-_.~')}"
+        for name, value in sorted(params)
+    )
+
+
+def _xml_local_texts(root: ET.Element, local_name: str) -> list[str]:
+    """Text of every descendant named ``local_name``, any XML namespace."""
+
+    texts: list[str] = []
+    for element in root.iter():
+        tag = element.tag
+        name = tag.rsplit("}", 1)[-1] if "}" in tag else tag
+        if name == local_name:
+            texts.append(element.text or "")
+    return texts
+
+
+class S3Client:
+    """Minimal path-style S3 client over stdlib http.client with SigV4."""
+
+    def __init__(self, endpoint: str, access_key: str, secret_key: str, region: str = S3_REGION):
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in ("http", "https"):
+            authority = parsed.netloc.rsplit("@", 1)[-1]
+            fail(f"SILO_ENDPOINT scheme must be http or https: {parsed.scheme}://{authority}")
+        if not parsed.hostname:
+            fail("SILO_ENDPOINT must contain a hostname")
+        self.tls = parsed.scheme == "https"
+        self.host = parsed.hostname
+        default_port = 443 if self.tls else 80
+        self.port = parsed.port or default_port
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.region = region
+        if self.port == default_port:
+            self.host_header = self.host
+        else:
+            self.host_header = f"{self.host}:{self.port}"
+
+    def _request(
+        self, method: str, path: str, query_params: list[tuple[str, str]], body: bytes
+    ) -> tuple[int, bytes]:
+        payload_hash = sha256_hex(body)
+        now = datetime.now(timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        canonical_qs = encode_query_string(query_params)
+        signed_headers = [
+            ("host", self.host_header),
+            ("x-amz-content-sha256", payload_hash),
+            ("x-amz-date", amz_date),
+        ]
+        authorization = sigv4_authorization(
+            method=method,
+            canonical_uri=path,
+            canonical_query_string=canonical_qs,
+            signed_headers=signed_headers,
+            payload_hash=payload_hash,
+            access_key=self.access_key,
+            secret_key=self.secret_key,
+            region=self.region,
+            service=S3_SERVICE,
+            amz_date=amz_date,
+            date_stamp=date_stamp,
+        )
+        target = path if not canonical_qs else f"{path}?{canonical_qs}"
+        headers = {
+            "Host": self.host_header,
+            "x-amz-date": amz_date,
+            "x-amz-content-sha256": payload_hash,
+            "Authorization": authorization,
+        }
+        if body:
+            headers["Content-Length"] = str(len(body))  # explicit; MinIO closes keep-alive otherwise
+        connection = (http.client.HTTPSConnection if self.tls else http.client.HTTPConnection)(
+            self.host, self.port, timeout=S3_TIMEOUT_SECONDS)
+        try:
+            connection.request(method, target, body=body or None, headers=headers)
+            response = connection.getresponse()
+            return response.status, response.read()
+        except Exception as err:  # noqa: BLE001 — surfaced as exit 1 by callers
+            fail(f"Silo request failed: {type(err).__name__}: {err}")
+            raise AssertionError("unreachable")
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _raise_for_status(status: int, data: bytes) -> S3Error:
+        code = ""
+        message = ""
+        try:
+            root = ET.fromstring(data)
+            codes = _xml_local_texts(root, "Code")
+            messages = _xml_local_texts(root, "Message")
+            if codes:
+                code = codes[0].strip()
+            if messages:
+                message = messages[0].strip()
+        except ET.ParseError:
+            pass
+        code = code or str(status)
+        if not message:
+            message = data[:200].decode("utf-8", "replace").strip()
+        return S3Error(code, message, status=status)
+
+    def put_object(self, *, Bucket: str, Key: str, Body) -> dict:
+        data = _body_bytes(Body)
+        status, payload = self._request("PUT", encode_s3_path(Bucket, Key), [], data)
+        if status != 200:
+            raise self._raise_for_status(status, payload)
+        return {}
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict:
+        status, payload = self._request("GET", encode_s3_path(Bucket, Key), [], b"")
+        if status != 200:
+            raise self._raise_for_status(status, payload)
+        return {"Body": BytesIO(payload)}
+
+    def list_objects_v2(self, *, Bucket: str, Prefix: str = "", ContinuationToken=None, **_: object) -> dict:
+        query = [("encoding-type", "url"), ("list-type", "2"), ("prefix", Prefix)]
+        if ContinuationToken:
+            query.append(("continuation-token", str(ContinuationToken)))
+        status, payload = self._request("GET", f"/{quote(Bucket, safe='-_.~')}/", query, b"")
+        if status != 200:
+            raise self._raise_for_status(status, payload)
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError as err:
+            raise S3Error("MalformedXML", f"invalid ListBucketResult: {err}", status=status)
+        keys = [text for text in _xml_local_texts(root, "Key") if text]
+        truncated = _xml_local_texts(root, "IsTruncated")
+        is_truncated = bool(truncated) and truncated[0].strip().lower() == "true"
+        tokens = _xml_local_texts(root, "NextContinuationToken")
+        result: dict = {
+            "Contents": [{"Key": unquote(key)} for key in keys],
+            "IsTruncated": is_truncated,
+            "KeyCount": len(keys),
+        }
+        if is_truncated and tokens and tokens[0]:
+            result["NextContinuationToken"] = tokens[0]
+        return result
 
 
 def _body_bytes(body: object) -> bytes:
