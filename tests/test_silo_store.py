@@ -437,7 +437,7 @@ def test_s3_client_rejects_non_http_endpoint():
 # 404-maps-to-miss / other-status-is-loud contract. No production Silo.
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 class _FakeS3Handler(BaseHTTPRequestHandler):
@@ -462,18 +462,22 @@ class _FakeS3Handler(BaseHTTPRequestHandler):
         if bucket != self.server.bucket:
             self._send(404, b"<Error><Code>NoSuchBucket</Code><Message>no bucket</Message></Error>")
         elif self.command == "PUT" and key:
-            self.server.objects[key] = body
+            self.server.objects[unquote(key)] = body
             self._send(200, b"", content_type="text/plain")
         elif self.command == "GET" and not key:
             query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
             assert query.get("list-type") == ["2"], self.path
+            encoding_type = (query.get("encoding-type") or [""])[0]
             names = sorted(k for k in self.server.objects if k.startswith((query.get("prefix") or [""])[0]))
             page = names[1:] if "continuation-token" in query else names[:1]
             truncated = "continuation-token" not in query and len(names) > 1
+            if encoding_type == "url":
+                page = [quote(k, safe="/-_.~") for k in page]
             items = "".join(f"<Contents><Key>{k}</Key><Size>1</Size></Contents>" for k in page)
             token = "<NextContinuationToken>tok1</NextContinuationToken>" if truncated else ""
+            encoding = "<EncodingType>url</EncodingType>" if encoding_type == "url" else ""
             self._send(200, (f'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-                             f"<IsTruncated>{str(truncated).lower()}</IsTruncated>{items}{token}"
+                             f"{encoding}<IsTruncated>{str(truncated).lower()}</IsTruncated>{items}{token}"
                              "</ListBucketResult>").encode())
         elif self.command == "GET" and key == "d1/7/n/boom.json":
             self._send(500, b"<Error><Code>InternalError</Code><Message>boom</Message></Error>")
@@ -535,6 +539,31 @@ def test_live_fake_s3_put_get_list_pagination_and_errors(monkeypatch, tmp_path):
         with pytest.raises(SystemExit) as failed:
             store.main(["get", "--key", "d1/7/n/boom.json", "--dest", str(tmp_path / "o.json")])
         assert failed.value.code == store.EXIT_ERROR
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_live_fake_s3_put_list_round_trips_literal_percent_escape(monkeypatch, tmp_path, capsys):
+    server, client = _live_client(monkeypatch)
+    try:
+        _env(monkeypatch)
+        monkeypatch.setattr(store, "connect", lambda: client)
+        source = tmp_path / "100%2Fdone.json"
+        source.write_bytes(b'{"done":true}')
+        name = "primary-audit-v2-42-deadbeef-99-1"
+        expected_key = f"d14/42/{name}/100%2Fdone.json"
+
+        assert store.main([
+            "put", "--tier", "d14", "--repo-id", "42", "--name", name, "--file", str(source),
+        ]) == store.EXIT_OK
+        assert capsys.readouterr().out.splitlines() == [expected_key]
+
+        assert store.main(["list", "--prefix", f"d14/42/{name}/"]) == store.EXIT_OK
+        assert capsys.readouterr().out.splitlines() == [expected_key]
+        list_requests = [r["path"] for r in server.requests if r["method"] == "GET" and "list-type=2" in r["path"]]
+        assert list_requests
+        assert all("encoding-type=url" in request for request in list_requests)
     finally:
         server.shutdown()
         server.server_close()

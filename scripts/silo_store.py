@@ -302,7 +302,7 @@ class S3Client:
         return {"Body": BytesIO(payload)}
 
     def list_objects_v2(self, *, Bucket: str, Prefix: str = "", ContinuationToken=None, **_: object) -> dict:
-        query = [("list-type", "2"), ("prefix", Prefix)]
+        query = [("encoding-type", "url"), ("list-type", "2"), ("prefix", Prefix)]
         if ContinuationToken:
             query.append(("continuation-token", str(ContinuationToken)))
         status, payload = self._request("GET", f"/{quote(Bucket, safe='-_.~')}/", query, b"")
