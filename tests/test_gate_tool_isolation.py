@@ -63,11 +63,15 @@ def test_silo_store_jobs_have_absolute_store_and_wrapper_paths():
             )
 
 
-def test_diff_coverage_uses_no_project_mode():
+def test_diff_coverage_runs_on_plain_interpreter_without_runtime_install():
     action = _load(DIFF_COVERAGE_ACTION)
     runs = [step["run"] for step in action["runs"]["steps"] if "run" in step]
-    diff_cover_run = next(run for run in runs if "diff-cover" in run)
-    assert "uv run --no-project --with diff-cover python3" in diff_cover_run
+    advisory_run = next(run for run in runs if "advisory.py" in run)
+    for token in ("uv run", "uvx", "uv tool", "pip install", "python -m pip", "npx"):
+        assert token not in advisory_run, (
+            f"diff-coverage advisory must not fetch packages at runtime: {token!r}"
+        )
+    assert 'python3 "$GITHUB_ACTION_PATH/advisory.py"' in advisory_run
 
 
 def _run_with_python_stub(tmp_path: Path, exit_code: int = 0):
@@ -133,7 +137,8 @@ def test_silo_wrapper_transparent_exit_code(tmp_path):
 
 def test_silo_wrapper_needs_no_package_manager():
     text = SILO_EXEC.read_text(encoding="utf-8")
-    assert "uv run" not in text and "boto3" not in text
+    for token in ("uv run", "uvx", "uv tool", "pip install", "python -m pip"):
+        assert token not in text
 
 
 def test_silo_wrapper_fails_loud_when_store_env_is_missing(tmp_path):

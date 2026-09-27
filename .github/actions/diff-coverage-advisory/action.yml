@@ -22,12 +22,11 @@ runs:
         GITHUB_REPOSITORY: ${{ github.repository }}
       run: |
         set -euo pipefail
-        if command -v uv >/dev/null 2>&1; then
-          runner=(uv run --no-project --with diff-cover python3)
-        else
-          runner=(python3)
-        fi
-        "${runner[@]}" "$GITHUB_ACTION_PATH/advisory.py" \
+        # advisory 本身是非门禁、可降级的（缺 diff-cover 时退化为 missing
+        # note 并返回 0）。本步骤禁用运行期装包：quality 槽与 Silo 密钥同机，
+        # 每次从包索引拉取既计费又不可审计；diff-cover 需要预装进 runner
+        # 镜像，而不是每次取包。
+        python3 "$GITHUB_ACTION_PATH/advisory.py" \
           --base-sha "${{ inputs.base-sha }}" \
           --head-sha "${{ inputs.head-sha }}" \
           --lcov-path "${{ inputs.lcov-path }}"
