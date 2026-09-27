@@ -13,6 +13,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github/workflows/gate-v2.yml"
+SHADOW_WORKFLOW = REPO_ROOT / ".github/workflows/gate-shadow-v2.yml"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 BYTE_STEP = "Record network bytes"
 MIRROR_STEP = "Prime checkout from host Git mirror"
@@ -206,6 +207,45 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
         assert "GATE-CHECKOUT-BYTES-V1" in after["run"]
         assert "refs/internal/gate-checkout-target" in after["run"]
     assert checkout_count == 3
+
+
+def test_shadow_checkouts_prime_from_the_same_script_and_keep_checkout_fallback():
+    gate_workflow = _workflow()
+    shadow_workflow = yaml.safe_load(SHADOW_WORKFLOW.read_text())
+    script = gate_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
+    assert shadow_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"] == script
+    assert "GATE-CHECKOUT-MIRROR-V1" in script
+
+    jobs = shadow_workflow["jobs"]
+    for job_name in ("classify_pr_paths", "shadow"):
+        steps = jobs[job_name]["steps"]
+        checkout_indexes = [i for i, step in enumerate(steps) if step.get("uses", "").startswith(CHECKOUT_ACTION)]
+        assert len(checkout_indexes) == 1
+        index = checkout_indexes[0]
+        before, prime, checkout, after = steps[index - 2 : index + 2]
+        assert before.get("name", "").startswith(BYTE_STEP)
+        assert prime["name"] == MIRROR_STEP
+        assert prime["run"] == 'bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"'
+        assert prime["env"]["GATE_GITHUB_TOKEN"] == "${{ github.token }}"
+        assert prime.get("if") == checkout.get("if")
+        assert checkout["uses"] == CHECKOUT_ACTION
+        assert after.get("name", "").startswith(BYTE_STEP)
+        assert "GATE-CHECKOUT-BYTES-V1" in after["run"]
+
+        if job_name == "classify_pr_paths":
+            assert checkout["with"] == {
+                "repository": "${{ job.workflow_repository }}",
+                "ref": "${{ job.workflow_sha }}",
+                "path": "_gate-classify-src",
+            }
+            assert prime["env"]["GATE_CHECKOUT_REPOSITORY"] == "${{ job.workflow_repository }}"
+            assert prime["env"]["GATE_CHECKOUT_REF"] == "${{ job.workflow_sha }}"
+            assert prime["env"]["GATE_CHECKOUT_PATH"] == "_gate-classify-src"
+        else:
+            assert checkout["with"] == {"fetch-depth": 1}
+            assert "GATE_CHECKOUT_REPOSITORY" not in prime["env"]
+            assert "GATE_CHECKOUT_REF" not in prime["env"]
+            assert "GATE_CHECKOUT_PATH" not in prime["env"]
 
 
 def test_mirror_hit_localizes_checkout_and_sends_no_origin_pack(tmp_path, request):
