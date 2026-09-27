@@ -133,7 +133,7 @@ artifact。Caller 必须透传两个 org 级 secret（`workflow_call.secrets` �
 
 下游 caller 不传时，S3 步骤明确报错（文案含「SILO_ACCESS_KEY 未传入」），禁止静默跳过。
 fleet 正常拓扑是全 self-hosted；`runner: hosted` 或控制面落到 GitHub-hosted 时，
-MagicDNS `100.100.100.100` 解析 Silo 主机名失败即红，没有 GitHub artifact 兜底。
+fleet 正常拓扑是全 self-hosted；Silo hostname 解析依赖 tailnet DNS。直接运行 `scripts/gate_bounded_retry.py magicdns` 时，必须从环境变量 `SILO_NAMESERVER` 提供 nameserver；缺失时命令 fail-loud。当前 reusable workflows 通过显式参数传入 resolver；若要移除共享 workflow 中的内嵌值，应由主脑统一决定使用 org 级 Variable 还是 caller input。GitHub-hosted 没有 tailnet DNS，Silo 步骤会失败，不做 artifact fallback。
 
 Silo 推广已完成，`.github/v2-tag-sync.hold` 熔断文件已移除，`v2` 移动 tag 随主干前移。
 下游 caller 仍必须透传 `SILO_ACCESS_KEY` 与 `SILO_SECRET_KEY`（不传则 S3 步骤红）。

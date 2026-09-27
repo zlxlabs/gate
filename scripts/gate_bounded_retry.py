@@ -222,7 +222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args[0] == "magicdns":
         silo_store = os.environ.get("SILO_STORE", "")
         endpoint = os.environ.get("SILO_ENDPOINT", "")
-        nameserver = "100.100.100.100"
+        nameserver: str | None = None
         rest = args[1:]
         while rest:
             if rest[0] == "--silo-store" and len(rest) > 1:
@@ -233,6 +233,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 nameserver, rest = rest[1], rest[2:]
             else:
                 raise SystemExit(f"unknown magicdns arg {rest[0]}")
+        if nameserver is None:
+            nameserver = os.environ["SILO_NAMESERVER"]
         return cmd_magicdns(silo_store, endpoint, nameserver)
     raise SystemExit(f"unknown command {args[0]}")
 

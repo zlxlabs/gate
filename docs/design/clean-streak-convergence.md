@@ -7,7 +7,7 @@
 >
 > 实现归属：`zlxlabs/gate` 的 reusable workflow / aggregator 路径。gate-hub 只提供 canonical primary policy、audit 数据和受保护控制面的输入，不另造 evaluator。
 
-输入依据：gate#35（`https://github.com/zlxlabs/gate/issues/35`）、gate-hub#335（`https://github.com/zlxlabs/gate-hub/issues/335`）、gate-hub 既有方案 `/home/zlx/projects/personal/gate-hub/docs/design/gate-convergence-criterion.md`，以及本仓当前 `aggregate.py`、`build_ledger.py` 和 v2 workflow/contract tests。
+输入依据：gate#35（`https://github.com/zlxlabs/gate/issues/35`）、gate-hub#335（`https://github.com/zlxlabs/gate-hub/issues/335`）、gate-hub 既有方案 `/path/to/proposal`，以及本仓当前 `aggregate.py`、`build_ledger.py` 和 v2 workflow/contract tests。
 
 ## 1. 结论与边界
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -107,8 +108,12 @@ def test_checkout_retries_then_materializes_sha(tmp_path):
 
 def test_magicdns_cli_absorbs_then_fail_loud(tmp_path):
     store = tmp_path / "silo_store.py"
+    args_log = tmp_path / "magicdns-argv.jsonl"
     store.write_text(
-        "#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\n"
+        "#!/usr/bin/env python3\nimport json, sys\nfrom pathlib import Path\n"
+        f"args_log=Path({str(args_log)!r})\n"
+        "with args_log.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
         f"p=Path({str(tmp_path / 'n')!r})\n"
         "n=int(p.read_text()) if p.exists() else 0\nn+=1\np.write_text(str(n))\n"
         "if n==1:\n"
@@ -116,9 +121,17 @@ def test_magicdns_cli_absorbs_then_fail_loud(tmp_path):
         "    raise SystemExit(1)\nprint('100.64.0.8 silo.example')\n",
         encoding="utf-8",
     )
-    env = {retry.RETRY_ATTEMPTS_ENV: "3", retry.RETRY_BACKOFF_ENV: "0 0", retry.ATTEMPT_TIMEOUT_ENV: "5"}
+    env = {
+        retry.RETRY_ATTEMPTS_ENV: "3", retry.RETRY_BACKOFF_ENV: "0 0",
+        retry.ATTEMPT_TIMEOUT_ENV: "5", "SILO_NAMESERVER": "192.0.2.53",
+    }
     ok = _run(["magicdns", "--silo-store", str(store), "--endpoint", "https://silo.example"], env, tmp_path)
     assert ok.returncode == 0, ok.stderr
+    child_argv = [json.loads(line) for line in args_log.read_text(encoding="utf-8").splitlines()]
+    assert child_argv == [
+        ["magicdns", "--endpoint", "https://silo.example", "--nameserver", "192.0.2.53"],
+        ["magicdns", "--endpoint", "https://silo.example", "--nameserver", "192.0.2.53"],
+    ]
     assert ok.stdout.strip() == "100.64.0.8 silo.example"
     store.write_text(
         "#!/usr/bin/env python3\nimport sys\n"
@@ -131,3 +144,13 @@ def test_magicdns_cli_absorbs_then_fail_loud(tmp_path):
     assert "SILO_ENDPOINT=https://silo.example" in bad.stderr
     assert "tailnet" not in bad.stderr
     assert all(f"MagicDNS attempt {attempt}/3 failed:" in bad.stderr for attempt in range(1, 4))
+
+
+def test_magicdns_cli_requires_nameserver_environment(monkeypatch):
+    monkeypatch.delenv("SILO_NAMESERVER", raising=False)
+    try:
+        retry.main(["magicdns", "--silo-store", "unused", "--endpoint", "https://silo.example"])
+    except KeyError as exc:
+        assert exc.args == ("SILO_NAMESERVER",)
+    else:
+        raise AssertionError("expected missing SILO_NAMESERVER to fail")
