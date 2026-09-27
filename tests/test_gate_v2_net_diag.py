@@ -43,6 +43,21 @@ def _silo_jobs(workflow):
     return jobs
 
 
+def test_all_github_https_probes_use_the_same_unmetered_head_target():
+    workflow = _workflow()
+    runs = [
+        step.get("run", "")
+        for steps in _diagnostics(workflow).values()
+        for step in steps
+    ]
+    assert len(runs) == 4
+    for run in runs:
+        assert "https://api.github.com/zen" not in run
+        assert "github_url=${GATE_NET_DIAG_GITHUB_URL:-https://github.com}" in run
+        assert 'curl -sS -I -o /dev/null -w \'%{http_code}\' --max-time 5 "$github_url"' in run
+    assert len(set(runs)) == 1
+
+
 def test_each_silo_job_has_one_failure_only_diagnostic_as_its_last_step():
     workflow = _workflow()
     silo_jobs = _silo_jobs(workflow)
@@ -61,6 +76,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200 if self.path in {"/minio/health/live", "/zen"} else 404)
         self.end_headers()
+
+    do_HEAD = do_GET
 
     def log_message(self, *_args):
         pass

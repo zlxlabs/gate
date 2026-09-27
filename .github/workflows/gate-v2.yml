@@ -1037,8 +1037,8 @@ jobs:
           if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
           if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
           if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
-          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
-          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://github.com}
+          if code=$(curl -sS -I -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
           result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
           printf '%s\n' "$result"
           printf '::warning::%s\n' "$result"
@@ -1593,8 +1593,8 @@ jobs:
           if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
           if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
           if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
-          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
-          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://github.com}
+          if code=$(curl -sS -I -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
           result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
           printf '%s\n' "$result"
           printf '::warning::%s\n' "$result"
@@ -1925,8 +1925,8 @@ jobs:
           if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
           if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
           if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
-          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
-          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://github.com}
+          if code=$(curl -sS -I -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
           result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
           printf '%s\n' "$result"
           printf '::warning::%s\n' "$result"
@@ -2381,8 +2381,8 @@ jobs:
           if timeout 5 getent hosts "$silo_host" >/dev/null 2>&1; then resolved=ok; else resolved=fail:lookup; fi
           if timeout 5 bash -c ':</dev/tcp/$1/$2' _ "$silo_host" "$silo_port" 2>/dev/null; then tcp=ok; else tcp=fail:connect; fi
           if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${endpoint%/}/minio/health/live" 2>/dev/null); then silo_http=http_${code}; else rc=$?; silo_http=fail:curl_${rc}; fi
-          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://api.github.com/zen}
-          if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
+          github_url=${GATE_NET_DIAG_GITHUB_URL:-https://github.com}
+          if code=$(curl -sS -I -o /dev/null -w '%{http_code}' --max-time 5 "$github_url" 2>/dev/null); then github_https=http_${code}; else rc=$?; github_https=fail:curl_${rc}; fi
           result="GATE-NET-DIAG-V1 job=${GATE_NET_DIAG_JOB} tailnet_dns_tcp=${dns} silo_resolve=${resolved} silo_tcp=${tcp} silo_http=${silo_http} github_https=${github_https}"
           printf '%s\n' "$result"
           printf '::warning::%s\n' "$result"
