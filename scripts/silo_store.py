@@ -207,7 +207,8 @@ class S3Client:
     def __init__(self, endpoint: str, access_key: str, secret_key: str, region: str = S3_REGION):
         parsed = urlparse(endpoint)
         if parsed.scheme not in ("http", "https"):
-            fail(f"SILO_ENDPOINT scheme must be http or https: {endpoint!r}")
+            authority = parsed.netloc.rsplit("@", 1)[-1]
+            fail(f"SILO_ENDPOINT scheme must be http or https: {parsed.scheme}://{authority}")
         if not parsed.hostname:
             fail("SILO_ENDPOINT must contain a hostname")
         self.tls = parsed.scheme == "https"

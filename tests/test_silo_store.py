@@ -432,6 +432,16 @@ def test_s3_client_rejects_non_http_endpoint():
     assert caught.value.code == store.EXIT_ERROR
 
 
+def test_s3_client_endpoint_error_hides_userinfo(capsys):
+    with pytest.raises(SystemExit) as caught:
+        store.S3Client("ftp://USER_MARKER:PASS_MARKER@minio.invalid:9000", "ak", "sk")
+    assert caught.value.code == store.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "USER_MARKER" not in err
+    assert "PASS_MARKER" not in err
+    assert "ftp://minio.invalid:9000" in err
+
+
 # Fake in-process S3 over stdlib http.server: proves path-style SigV4-signed
 # requests, real XML list parsing with ContinuationToken pagination, and the
 # 404-maps-to-miss / other-status-is-loud contract. No production Silo.
