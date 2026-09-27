@@ -8,11 +8,13 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github/workflows/gate-v2.yml"
+SHADOW_WORKFLOW = REPO_ROOT / ".github/workflows/gate-shadow-v2.yml"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 BYTE_STEP = "Record network bytes"
 MIRROR_STEP = "Prime checkout from host Git mirror"
@@ -130,8 +132,10 @@ def _fixture(tmp_path, *, advance_mirror=False):
     }
 
 
-def _run_mirror_script(script, fixture, workspace, mirror_root=None, server_url=None):
+def _run_mirror_script(script, fixture, workspace, mirror_root=None, server_url=None, script_env=None):
     env = os.environ.copy()
+    for name in ("GATE_CHECKOUT_REPOSITORY", "GATE_CHECKOUT_REF", "GATE_CHECKOUT_PATH"):
+        env.pop(name, None)
     env.update(
         GITHUB_WORKSPACE=str(workspace),
         GITHUB_REPOSITORY="zlxlabs/repo",
@@ -144,6 +148,7 @@ def _run_mirror_script(script, fixture, workspace, mirror_root=None, server_url=
         GIT_CONFIG_KEY_0="fetch.unpackLimit",
         GIT_CONFIG_VALUE_0="0",
     )
+    env.update(script_env or {})
     return subprocess.run(
         ["bash", "-euo", "pipefail", "-c", script],
         env=env,
@@ -206,6 +211,129 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
         assert "GATE-CHECKOUT-BYTES-V1" in after["run"]
         assert "refs/internal/gate-checkout-target" in after["run"]
     assert checkout_count == 3
+
+
+def test_shadow_checkouts_prime_from_the_same_script_and_keep_checkout_fallback():
+    gate_workflow = _workflow()
+    shadow_workflow = yaml.safe_load(SHADOW_WORKFLOW.read_text())
+    script = gate_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
+    assert shadow_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"] == script
+    assert "GATE-CHECKOUT-MIRROR-V1" in script
+
+    jobs = shadow_workflow["jobs"]
+    for job_name in ("classify_pr_paths", "shadow"):
+        steps = jobs[job_name]["steps"]
+        checkout_indexes = [i for i, step in enumerate(steps) if step.get("uses", "").startswith(CHECKOUT_ACTION)]
+        assert len(checkout_indexes) == 1
+        index = checkout_indexes[0]
+        before, prime, checkout, after = steps[index - 2 : index + 2]
+        assert before.get("name", "").startswith(BYTE_STEP)
+        assert prime["name"] == MIRROR_STEP
+        assert prime["run"] == 'bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"'
+        assert prime["env"]["GATE_GITHUB_TOKEN"] == "${{ github.token }}"
+        assert prime.get("if") == checkout.get("if")
+        assert checkout["uses"] == CHECKOUT_ACTION
+        assert after.get("name", "").startswith(BYTE_STEP)
+        assert "GATE-CHECKOUT-BYTES-V1" in after["run"]
+
+        if job_name == "classify_pr_paths":
+            assert checkout["with"] == {
+                "repository": "${{ job.workflow_repository }}",
+                "ref": "${{ job.workflow_sha }}",
+                "path": "_gate-classify-src",
+            }
+            assert prime["env"]["GATE_CHECKOUT_REPOSITORY"] == "${{ job.workflow_repository }}"
+            assert prime["env"]["GATE_CHECKOUT_REF"] == "${{ job.workflow_sha }}"
+            assert prime["env"]["GATE_CHECKOUT_PATH"] == "_gate-classify-src"
+        else:
+            assert checkout["with"] == {"fetch-depth": 1}
+            assert "GATE_CHECKOUT_REPOSITORY" not in prime["env"]
+            assert "GATE_CHECKOUT_REF" not in prime["env"]
+            assert "GATE_CHECKOUT_PATH" not in prime["env"]
+
+
+def test_gate_v2_mirror_defaults_keep_the_original_checkout_context(tmp_path, request):
+    fixture = _fixture(tmp_path)
+    request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
+    workspace = tmp_path / "gate-v2-workspace"
+    script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
+
+    prime = _run_mirror_script(script, fixture, workspace)
+
+    assert prime.returncode == 0, f"{prime.stderr}\n{prime.stdout}"
+    assert _result_line(prime)["hit"] == 1
+    assert _git("rev-parse", "HEAD", cwd=workspace) == fixture["sha"]
+    assert _git("remote", "get-url", "origin", cwd=workspace) == fixture["origin_url"]
+    assert not (workspace / "_gate-classify-src" / ".git").exists()
+    assert not (workspace / ".git" / "objects" / "info" / "alternates").exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "target_path"),
+    (("shadow", None), ("classify_pr_paths", "_gate-classify-src")),
+)
+@pytest.mark.parametrize("mode", ("hit", "miss", "failure"))
+def test_shadow_checkout_targets_hit_miss_and_failure_cleanup(tmp_path, request, target, target_path, mode):
+    fixture = _fixture(tmp_path, advance_mirror=(mode == "miss"))
+    request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
+    shadow_workflow = yaml.safe_load(SHADOW_WORKFLOW.read_text())
+    script = shadow_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
+    steps = shadow_workflow["jobs"][target]["steps"]
+    prime = next(step for step in steps if step.get("name") == MIRROR_STEP)
+    checkout = next(step for step in steps if step.get("uses", "").startswith(CHECKOUT_ACTION))
+    workspace_root = tmp_path / f"{target}-{mode}-workspace"
+    workspace_root.mkdir()
+    workspace = workspace_root / target_path if target_path else workspace_root
+    script_env = {}
+    if target == "classify_pr_paths":
+        assert prime["env"]["GATE_CHECKOUT_REPOSITORY"] == "${{ job.workflow_repository }}"
+        assert prime["env"]["GATE_CHECKOUT_REF"] == "${{ job.workflow_sha }}"
+        assert prime["env"]["GATE_CHECKOUT_PATH"] == target_path
+        assert checkout["with"]["repository"] == "${{ job.workflow_repository }}"
+        assert checkout["with"]["ref"] == "${{ job.workflow_sha }}"
+        script_env.update(
+            GATE_CHECKOUT_REPOSITORY="zlxlabs/repo",
+            GATE_CHECKOUT_REF=fixture["sha"],
+            GATE_CHECKOUT_PATH=target_path,
+        )
+    else:
+        assert "GATE_CHECKOUT_REPOSITORY" not in prime["env"]
+        assert "GATE_CHECKOUT_REF" not in prime["env"]
+        assert "GATE_CHECKOUT_PATH" not in prime["env"]
+
+    server_url = None
+    if mode == "failure":
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            dead_port = sock.getsockname()[1]
+        server_url = f"git://127.0.0.1:{dead_port}"
+    run = _run_mirror_script(
+        script,
+        fixture,
+        workspace_root,
+        server_url=server_url,
+        script_env=script_env,
+    )
+
+    if mode == "failure":
+        _assert_failed_prefetch_then_plain_fetch(run, workspace, fixture, "origin-fetch-failed")
+        return
+
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    result = _result_line(run)
+    if mode == "hit":
+        assert result["hit"] == 1
+        assert result["reason"] == "ok"
+        assert result["origin_fetch_pack_bytes"] <= 64
+    else:
+        assert result["hit"] == 0
+        assert result["reason"] == "sha-missing"
+        assert result["origin_fetch_pack_bytes"] > 0
+    assert not (workspace / ".git/objects/info/alternates").exists()
+    _run_action_checkout(workspace, fixture["origin_url"], fixture["sha"])
+    _git("update-ref", "-d", TEMP_REF, cwd=workspace)
+    assert _git("rev-parse", "HEAD", cwd=workspace) == fixture["sha"]
+    assert not _git("status", "--porcelain=v1", cwd=workspace)
 
 
 def test_mirror_hit_localizes_checkout_and_sends_no_origin_pack(tmp_path, request):

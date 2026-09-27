@@ -141,8 +141,11 @@ env:
     trap finish_result EXIT
     mirror_miss() { emit_result 0 "$1"; exit 0; }
     workspace=${GITHUB_WORKSPACE:?}
-    repository=${GITHUB_REPOSITORY:?}
-    sha=${GITHUB_SHA:?}
+    repository=${GATE_CHECKOUT_REPOSITORY:-${GITHUB_REPOSITORY:?}}
+    sha=${GATE_CHECKOUT_REF:-${GITHUB_SHA:?}}
+    if [[ -n ${GATE_CHECKOUT_PATH:-} ]]; then
+      workspace="$workspace/$GATE_CHECKOUT_PATH"
+    fi
     server_url=${GITHUB_SERVER_URL%/}
     origin_url="$server_url/$repository"
     mirror_root=${GATE_HUB_GIT_MIRROR_DIR:-}
