@@ -9,7 +9,7 @@ if [ -z "${SILO_STORE:-}" ]; then
   echo "::error::SILO_STORE 未传入，无法启动 Silo 客户端" >&2
   exit 1
 fi
-command -v uv >/dev/null || { echo "::error::uv 不可用，无法临时安装 boto3（Silo 客户端）" >&2; exit 1; }
 
+# Silo 客户端是纯标准库 Python（SigV4 自签），无需 uv、无需 PyPI。
 cd "$RUNNER_TEMP"
-exec uv run --no-project --python 3.12 --with boto3 -- python3 "$SILO_STORE" "$@"
+exec python3 "$SILO_STORE" "$@"
