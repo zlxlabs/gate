@@ -3686,7 +3686,6 @@ def test_dual_read_merge_keeps_same_key_receipts_with_different_finding_ids(monk
 def test_silo_objects_under_cli_path_contract(monkeypatch):
     import subprocess
 
-    monkeypatch.setitem(sys.modules, "boto3", None)
     prefix = f"d30/{_CANARY_REPO_ID}/"
     canonical_key = f"d30/{_CANARY_REPO_ID}/artifact-abc/receipt.json"
     payload = b'{"receipt": true}'
@@ -3739,30 +3738,59 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
     assert "silo key is not tier/repo_id/artifact_name/path" in str(exc.value)
 
 
-def test_silo_objects_under_narrows_import_error(monkeypatch):
-    import types
+def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
+    # Silo 控制路径零运行期装包：旧的进程内直连分支（含第三方 SDK 探测）已
+    # 删除，模块不再提供 _silo_store_mod；唯一出口是纯标准库 CLI（打桩断言）。
+    import subprocess
 
-    monkeypatch.setitem(sys.modules, "boto3", types.ModuleType("boto3"))
-    fake_store = AGG._silo_store_mod()
+    assert not hasattr(AGG, "_silo_store_mod")
+    prefix = f"d30/{_CANARY_REPO_ID}/"
+    canonical_key = f"d30/{_CANARY_REPO_ID}/artifact-abc/receipt.json"
+    payload = b'{"receipt": true}'
+    recorded_calls = []
 
-    class BrokenClient:
-        pass
+    def fake_cli(argv):
+        recorded_calls.append(list(argv))
+        assert "--dest" in argv
+        dest_dir = Path(argv[argv.index("--dest") + 1])
+        parts = canonical_key.split("/", 3)
+        file_path = dest_dir / parts[2] / parts[3]
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(payload)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{canonical_key}\n", stderr="")
 
-    monkeypatch.setattr(fake_store, "connect", lambda: BrokenClient())
-    monkeypatch.setattr(fake_store, "bucket_name", lambda: "ci-artifacts")
+    monkeypatch.setattr(AGG, "_silo_cli", fake_cli)
+    objects = AGG._silo_objects_under(prefix)
+    assert objects == [(canonical_key, payload)]
+    assert len(recorded_calls) == 1
+    assert recorded_calls[0][0:3] == ["list", "--prefix", prefix]
 
-    def raise_import_error(*args, **kwargs):
-        raise ImportError("dependency missing during listing")
 
-    monkeypatch.setattr(fake_store, "list_keys", raise_import_error)
+def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
+    # 跨进程边界断言：聚合器实际发出的 argv 必须是 [解释器, 仓内脚本, ...]，
+    # 不得出现 uv/uvx/pip/npx。捕获真实 argv（不执行），本机有无 uv 结果一致。
+    recorded = []
 
-    cli_called = []
-    monkeypatch.setattr(AGG, "_silo_cli", lambda argv: cli_called.append(argv))
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
 
-    with pytest.raises(ImportError) as exc:
-        AGG._silo_objects_under("d30/1/")
-    assert "dependency missing during listing" in str(exc.value)
-    assert not cli_called, "CLI fallback must not be triggered when store operations raise ImportError"
+    def fake_run(argv, **kwargs):
+        recorded.append(list(argv))
+        return _Proc()
+
+    monkeypatch.setattr(AGG.subprocess, "run", fake_run)
+    monkeypatch.setenv("SILO_STORE", "/tmp/fake-silo-store.py")
+    AGG._silo_cli(["list", "--prefix", "d30/1/"])
+    assert len(recorded) == 1
+    argv = recorded[0]
+    assert argv[0] == sys.executable
+    assert argv[1] == "/tmp/fake-silo-store.py"
+    assert argv[2:] == ["list", "--prefix", "d30/1/"]
+    joined = " ".join(argv)
+    for banned in ("uv run", "uvx", "pip install", "npx", "--with"):
+        assert banned not in joined
 
 
 # ── gate#199 止血：主审未产出结论时 quality 不得定罪 ──────────────────────

@@ -1,4 +1,4 @@
-"""Stubbed-boto3 contracts for scripts/silo_store.py. No disk network, no real S3."""
+"""Fake-S3 contracts for the stdlib client in scripts/silo_store.py. No network, no real S3."""
 
 from __future__ import annotations
 

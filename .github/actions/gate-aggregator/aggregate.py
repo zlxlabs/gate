@@ -2151,16 +2151,14 @@ def _silo_configured() -> bool:
     return bool((os.environ.get("SILO_ENDPOINT") or "").strip())
 
 
-def _silo_store_mod():
-    from scripts import silo_store as store
-
-    return store
-
-
 def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
+    # Silo 客户端是纯标准库（scripts/silo_store.py 自签 SigV4）：直接用当前
+    # 解释器执行，禁止经由 uv/pip 在运行期取包。SILO_STORE 允许覆盖是为了
+    # 让测试打桩与 job 稀疏检出能指向同一份仓内脚本，不接受仓外路径以外的
+    # 任何包管理器入口。
     store_path = os.environ.get("SILO_STORE") or str(GATE_ROOT / "scripts" / "silo_store.py")
     return subprocess.run(
-        ["uv", "run", "--python", "3.12", "--with", "boto3", "--", "python3", store_path, *argv],
+        [sys.executable, store_path, *argv],
         capture_output=True,
         text=True,
         check=False,
@@ -2169,28 +2167,6 @@ def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
 
 def _silo_objects_under(prefix: str) -> list[tuple[str, bytes]]:
     """Return (key, body) pairs under a Silo prefix. Raises on listing/get failure."""
-
-    store = _silo_store_mod()
-    has_boto3 = True
-    try:
-        import boto3  # noqa: F401
-    except ImportError:
-        has_boto3 = False
-
-    if has_boto3:
-        try:
-            client = store.connect()
-            bucket = store.bucket_name()
-            keys = store.list_keys(client, bucket, prefix)
-            objects: list[tuple[str, bytes]] = []
-            for key in keys:
-                response = client.get_object(Bucket=bucket, Key=key)
-                objects.append(
-                    (key, store._body_bytes(response.get("Body") if isinstance(response, dict) else response))
-                )
-            return objects
-        except SystemExit as exc:
-            raise RuntimeError(f"silo scan failed with exit {exc.code}") from exc
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="silo-scan-") as dest:
