@@ -36,7 +36,6 @@ EXIT_NOT_FOUND = 2
 MISSING_ACCESS_KEY = "SILO_ACCESS_KEY 未传入"
 MISSING_SECRET_KEY = "SILO_SECRET_KEY 未传入"
 MANAGED_PROFILE_PATH = Path("/opt/review-auth/silo.json")
-INVALID_MANAGED_PROFILE = "SILO managed credential profile is missing or invalid"
 ATTEMPT_SUFFIX = re.compile(r"[0-9]+$")
 
 
@@ -88,19 +87,9 @@ def connect(*, managed_profile: bool = False):
     """Build an S3 client; managed profile mode reads only the fixed credential file."""
 
     if managed_profile:
-        try:
-            profile = json.loads(MANAGED_PROFILE_PATH.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            fail(INVALID_MANAGED_PROFILE)
-        if not isinstance(profile, dict):
-            fail(INVALID_MANAGED_PROFILE)
-        access_value = profile.get("access_key_id")
-        secret_value = profile.get("secret_access_key")
-        if not isinstance(access_value, str) or not isinstance(secret_value, str):
-            fail(INVALID_MANAGED_PROFILE)
-        access, secret = access_value.strip(), secret_value.strip()
-        if not access or not secret:
-            fail(INVALID_MANAGED_PROFILE)
+        profile = json.loads(MANAGED_PROFILE_PATH.read_text(encoding="utf-8"))
+        access = profile["access_key_id"].strip()
+        secret = profile["secret_access_key"].strip()
     else:
         access = (os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
         secret = (os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()

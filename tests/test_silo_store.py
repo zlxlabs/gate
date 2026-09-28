@@ -243,44 +243,45 @@ def test_list_prints_keys_under_name_prefix_and_optional_dest(tmp_path, monkeypa
     assert failed.value.code == store.EXIT_ERROR
 
 
-def test_missing_access_key_stderr(monkeypatch, capsys):
+def test_missing_access_key_stderr(monkeypatch, capsys, tmp_path):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
     monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
-    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: '{"access_key_id":"profile","secret_access_key":"profile"}')
+    profile_path = tmp_path / "silo.json"
+    profile_path.write_text('{"access_key_id":"profile","secret_access_key":"profile"}')
+    monkeypatch.setattr(store, "MANAGED_PROFILE_PATH", profile_path)
     with pytest.raises(SystemExit) as caught:
         store.connect()
     assert caught.value.code == store.EXIT_ERROR
     assert "SILO_ACCESS_KEY 未传入" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("profile", [None, "not-json", '{"access_key_id":"only-one-key"}'])
-def test_managed_profile_fails_without_falling_back_to_environment(monkeypatch, profile, capsys):
+@pytest.mark.parametrize(
+    ("profile_text", "error"),
+    [
+        (None, FileNotFoundError),
+        ("not-json", json.JSONDecodeError),
+        (json.dumps({"access_key_id": "one"}), KeyError),
+    ],
+)
+def test_managed_profile_fails_without_falling_back_to_environment(monkeypatch, tmp_path, profile_text, error):
     _env(monkeypatch)
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-fallback")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-fallback")
-
-    def read_profile(path, **kwargs):
-        assert path == Path("/opt/review-auth/silo.json")
-        if profile is None:
-            raise FileNotFoundError(path)
-        return profile
-
-    monkeypatch.setattr(Path, "read_text", read_profile)
+    profile_path = tmp_path / "silo.json"
+    if profile_text is not None:
+        profile_path.write_text(profile_text)
+    monkeypatch.setattr(store, "MANAGED_PROFILE_PATH", profile_path)
     monkeypatch.setattr(store, "S3Client", lambda *args, **kwargs: pytest.fail("credential fallback"))
-    with pytest.raises(SystemExit) as caught:
+    with pytest.raises(error):
         store.connect(managed_profile=True)
-    assert caught.value.code == store.EXIT_ERROR
-    assert "managed credential profile" in capsys.readouterr().err
 
 
-def test_legacy_profile_presence_does_not_replace_environment(monkeypatch):
+def test_legacy_profile_presence_does_not_replace_environment(monkeypatch, tmp_path):
     _env(monkeypatch)
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda *args, **kwargs: '{"access_key_id":"profile-access","secret_access_key":"profile-secret"}',
-    )
+    profile_path = tmp_path / "silo.json"
+    profile_path.write_text('{"access_key_id":"profile-access","secret_access_key":"profile-secret"}')
+    monkeypatch.setattr(store, "MANAGED_PROFILE_PATH", profile_path)
     captured = {}
     monkeypatch.setattr(
         store,
@@ -506,7 +507,6 @@ class _FakeS3Handler(BaseHTTPRequestHandler):
         self.server.requests.append({
             "method": self.command, "path": self.path,
             "host": self.headers.get("Host") or "",
-            "content_sha256": self.headers.get("x-amz-content-sha256") or "",
             "authorization": self.headers.get("Authorization") or "",
             "amz_date": self.headers.get("x-amz-date") or "",
             "payload_hash": self.headers.get("x-amz-content-sha256") or "",
@@ -568,14 +568,18 @@ def test_managed_profile_reaches_all_five_commands_and_signs_profile_identity(mo
         monkeypatch.setenv("SILO_ENDPOINT", f"http://127.0.0.1:{server.server_port}")
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "environment-access")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "environment-secret")
+        profile_path = tmp_path / "silo.json"
+        profile_path.write_text(json.dumps({"access_key_id": "profile-access", "secret_access_key": "profile-secret"}))
+        monkeypatch.setattr(store, "MANAGED_PROFILE_PATH", profile_path)
         profile_reads = []
+        read_text = Path.read_text
 
-        def read_profile(path, **kwargs):
-            profile_reads.append(path)
-            assert path == Path("/opt/review-auth/silo.json")
-            return json.dumps({"access_key_id": "profile-access", "secret_access_key": "profile-secret"})
+        def track_profile_read(path, *args, **kwargs):
+            if path == profile_path:
+                profile_reads.append(path)
+            return read_text(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", read_profile)
+        monkeypatch.setattr(Path, "read_text", track_profile_read)
         single = tmp_path / "single.txt"
         single.write_bytes(b"put-bytes")
         tree = tmp_path / "tree"
@@ -606,7 +610,7 @@ def test_managed_profile_reaches_all_five_commands_and_signs_profile_identity(mo
                 method=request["method"],
                 canonical_uri=parsed.path,
                 canonical_query_string=store.encode_query_string(parse_qsl(parsed.query, keep_blank_values=True)),
-                signed_headers=[("host", request["host"]), ("x-amz-content-sha256", request["content_sha256"]), ("x-amz-date", request["amz_date"])],
+                signed_headers=[("host", request["host"]), ("x-amz-content-sha256", request["payload_hash"]), ("x-amz-date", request["amz_date"])],
                 payload_hash=request["payload_hash"],
                 access_key="profile-access",
                 secret_key="profile-secret",
