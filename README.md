@@ -29,10 +29,16 @@ jobs:
       runner: self            # self(自建两台, 有 codex review) | hosted(免费分钟)
       # 可选覆盖: max_diff_lines: 4000, max_review_shards: 8, pr_size_warn_lines: 8000
     secrets:
-      SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
-      SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}
       FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}   # 公开仓必须 secret;私有仓可用同名 variable 兜底
 ```
+
+Required Gate 公共 caller 模板不映射 Silo key。只有可信仓库 `zlxlabs/gate`
+（`github.repository_id == 1295374164`）的 gate jobs 使用 runner 管理的固定档案
+`/opt/review-auth/silo.json`；既有 private callers 仍可用 optional secrets 走 legacy AWS
+env，缺少凭据时 fail-fast。其他 public caller 不获新的 managed profile；使用无 key 模板时，
+其 Silo 操作仍不可用。quality job 的 workflow 源码不映射 Silo keys，也不调用 Silo；这不
+证明 runner 对固定档案文件物理不可见，实际文件权限/可见性仍待生产 quality consumer 验证。
+代码合并、生产 runner 安装档案、真实事件矩阵验收是三个独立状态，合并源码不代表已部署。
 
 ### 仓库自有质量入口（推荐）
 
@@ -124,19 +130,27 @@ caller 模板，分别调用 Required Gate 与 Shadow Calibration。两个 workf
 
 `gate-v2.yml` 的八类 run 内产物（review-ledger-input / primary-audit / diagnostics /
 advisory-event / convergence-receipt / gate-terminal / status-panel-delivery /
-codex-review-ledger）改走 Silo bucket `ci-artifacts`，不再上传 GitHub Actions
-artifact。Caller 必须透传两个 org 级 secret（`workflow_call.secrets` 声明为
-`required: false`，与 `FEISHU_CI_WEBHOOK` 同模式）：
+codex-review-ledger）存入 Silo bucket `ci-artifacts`，不使用 GitHub Actions artifact。
+Required Gate 公共模板不传 Silo key；`workflow_call.secrets.SILO_ACCESS_KEY` 与
+`SILO_SECRET_KEY` 仍声明为 optional。仅 Gate 仓库 ID `1295374164` 的 jobs 不消费这两项，
+而使用固定 runner 档案；档案缺失时操作失败，不回退到 caller key。既有 non-Gate private
+callers 可继续传入 optional secrets 并由 jobs 映射到 legacy AWS env，缺凭据时 fail-fast。
+其他 public caller 没有旧 keys 时，其 Silo 操作仍 unavailable；C2 不为其他仓增加 managed
+keys、namespace 或 ACL。
+quality 相关测试只锁定源码不映射 Silo keys、不调用 Silo；生产 consumer 的 profile 文件权限
+与可见性仍待实际 runner 验证。
 
-- `SILO_ACCESS_KEY`
-- `SILO_SECRET_KEY`
+disposition 是独立 workflow，仍使用 legacy caller-key 环境契约；部署
+`caller-gate-disposition.yml` 时继续映射这两项。GitHub-hosted 没有 runner 档案或
+tailnet DNS，Silo 操作会失败，不做 artifact fallback。直接运行
+`scripts/gate_bounded_retry.py magicdns` 时需从 `SILO_NAMESERVER` 提供 nameserver；
+缺失时 fail-loud。
 
-下游 caller 不传时，S3 步骤明确报错（文案含「SILO_ACCESS_KEY 未传入」），禁止静默跳过。
-fleet 正常拓扑是全 self-hosted；`runner: hosted` 或控制面落到 GitHub-hosted 时，
-fleet 正常拓扑是全 self-hosted；Silo hostname 解析依赖 tailnet DNS。直接运行 `scripts/gate_bounded_retry.py magicdns` 时，必须从环境变量 `SILO_NAMESERVER` 提供 nameserver；缺失时命令 fail-loud。当前 reusable workflows 通过显式参数传入 resolver；若要移除共享 workflow 中的内嵌值，应由主脑统一决定使用 org 级 Variable 还是 caller input。GitHub-hosted 没有 tailnet DNS，Silo 步骤会失败，不做 artifact fallback。
-
-Silo 推广已完成，`.github/v2-tag-sync.hold` 熔断文件已移除，`v2` 移动 tag 随主干前移。
-下游 caller 仍必须透传 `SILO_ACCESS_KEY` 与 `SILO_SECRET_KEY`（不传则 S3 步骤红）。
+状态须分别核验：C1 只为 Gate 仓库 ID `1295374164` 实现 managed-profile source；源码合并不代表生产 runner
+已安装并验证档案，真实事件矩阵目前也未完成。`zlxlabs/gate-hub#1183` 共享缓存隔离源码已合入
+gate-hub，但生产 host 推广仍待执行。现有缓存隔离和 rootless/DinD 约束不证明整个
+host state 对 review 工具不可见。部署后还须实际验收 private、public 同仓、fork、
+Dependabot 与 draft→ready 事件；模板测试不代替真实矩阵。
 
 ### org runner group 白名单运维要点（新仓接入）
 

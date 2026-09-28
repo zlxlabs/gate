@@ -47,17 +47,31 @@ PERMISSION_SCOPES = (
 )
 
 
-def test_caller_templates_forward_only_named_silo_secrets():
-    expected = {
+def test_gate_caller_templates_preserve_silo_source_boundaries():
+    silo_secrets = {
         "SILO_ACCESS_KEY": "${{ secrets.SILO_ACCESS_KEY }}",
         "SILO_SECRET_KEY": "${{ secrets.SILO_SECRET_KEY }}",
     }
-    for filename in ("caller-gate-v2.yml", "caller-gate-disposition.yml"):
-        document = yaml.safe_load((REPO_ROOT / "templates" / filename).read_text())
-        for job in document["jobs"].values():
-            if job.get("uses", "").startswith("zlxlabs/gate/"):
-                assert job.get("secrets", {}) != "inherit"
-                assert {name: job["secrets"][name] for name in expected} == expected
+    public = yaml.safe_load((REPO_ROOT / "templates/caller-gate-v2.yml").read_text())
+    assert public["jobs"]["gate"]["secrets"] == {
+        "FEISHU_CI_WEBHOOK": "${{ secrets.FEISHU_CI_WEBHOOK }}"
+    }
+    disposition = yaml.safe_load((REPO_ROOT / "templates/caller-gate-disposition.yml").read_text())
+    assert disposition["jobs"]["disposition"]["secrets"] == silo_secrets
+
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
+    workflow_call = _workflow_call(workflow)
+    for name in silo_secrets:
+        assert workflow_call["secrets"][name]["required"] is False
+    assert workflow["env"]["SILO_CREDENTIAL_SOURCE"] == (
+        "${{ github.repository_id == '1295374164' && 'managed-profile' || 'legacy-env' }}"
+    )
+    access_key = "${{ github.repository_id != '1295374164' && secrets.SILO_ACCESS_KEY || '' }}"
+    secret_key = "${{ github.repository_id != '1295374164' && secrets.SILO_SECRET_KEY || '' }}"
+    for job_name in ("primary", "ocr", "gate", "ledger"):
+        env = workflow["jobs"][job_name]["env"]
+        assert env["AWS_ACCESS_KEY_ID"] == access_key
+        assert env["AWS_SECRET_ACCESS_KEY"] == secret_key
 
 
 def _workflow_call(document):
