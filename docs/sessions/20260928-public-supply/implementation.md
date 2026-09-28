@@ -9,7 +9,7 @@ Refs #262 / #249；PR #263 保持 draft。
 
 ## 验证
 
-- TDD：修复前四种 managed profile 负例失败；修复后 `tests/test_silo_store.py` 为 35 passed。
+- TDD：修复前 `tests/test_silo_store.py` 的相关筛选为 5 failed、1 passed；修复后整文件为 35 passed。
 - 冻结代码全量：`pytest` 1270 passed，exit 0；`scripts/check_pinned_uses.py` 与 `git diff --check` 均通过。
-- 固定路径/签名/argv 及五个 store consumer 的验证沿用 C1 H1 证据；H1 代码与最终实现相同，本次只增加两行预检及相应断言。
+- H1 已有固定路径/签名/argv 及五个 store consumer 证据；最终 head 新增两行预检和相应断言，已专项复核。
 - 未构建或部署生产 profile，未切换生产 slot，也未测真实生产 quality job 的依赖源计费。
