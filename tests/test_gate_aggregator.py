@@ -3787,7 +3787,7 @@ def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
     argv = recorded[0]
     assert argv[0] == sys.executable
     assert argv[1] == "/tmp/fake-silo-store.py"
-    assert argv[2:] == ["list", "--prefix", "d30/1/"]
+    assert argv[2:] == ["--managed-profile", "list", "--prefix", "d30/1/"]
     joined = " ".join(argv)
     for banned in ("uv run", "uvx", "pip install", "npx", "--with"):
         assert banned not in joined

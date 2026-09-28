@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import socket
 import struct
 from pathlib import Path
@@ -59,7 +60,7 @@ def _env(monkeypatch):
 
 def _use(monkeypatch, fake: FakeS3):
     _env(monkeypatch)
-    monkeypatch.setattr(store, "connect", lambda: fake)
+    monkeypatch.setattr(store, "connect", lambda *, managed_profile=False: fake)
 
 
 def test_build_key_joins_tier_repo_name_and_relative_path():
@@ -246,10 +247,51 @@ def test_missing_access_key_stderr(monkeypatch, capsys):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
     monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
+    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: '{"access_key_id":"profile","secret_access_key":"profile"}')
     with pytest.raises(SystemExit) as caught:
         store.connect()
     assert caught.value.code == store.EXIT_ERROR
     assert "SILO_ACCESS_KEY 未传入" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("profile", [None, "not-json", '{"access_key_id":"only-one-key"}'])
+def test_managed_profile_fails_without_falling_back_to_environment(monkeypatch, profile, capsys):
+    _env(monkeypatch)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-fallback")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-fallback")
+
+    def read_profile(path, **kwargs):
+        assert path == Path("/opt/review-auth/silo.json")
+        if profile is None:
+            raise FileNotFoundError(path)
+        return profile
+
+    monkeypatch.setattr(Path, "read_text", read_profile)
+    monkeypatch.setattr(store, "S3Client", lambda *args, **kwargs: pytest.fail("credential fallback"))
+    with pytest.raises(SystemExit) as caught:
+        store.connect(managed_profile=True)
+    assert caught.value.code == store.EXIT_ERROR
+    assert "managed credential profile" in capsys.readouterr().err
+
+
+def test_legacy_profile_presence_does_not_replace_environment(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *args, **kwargs: '{"access_key_id":"profile-access","secret_access_key":"profile-secret"}',
+    )
+    captured = {}
+    monkeypatch.setattr(
+        store,
+        "S3Client",
+        lambda endpoint, access, secret, **kwargs: captured.update(
+            endpoint=endpoint, access=access, secret=secret, **kwargs
+        ),
+    )
+    store.connect()
+    assert captured["access"] == "test-access"
+    assert captured["secret"] == "test-secret"
 
 
 class _FakeDNS:
@@ -447,7 +489,7 @@ def test_s3_client_endpoint_error_hides_userinfo(capsys):
 # 404-maps-to-miss / other-status-is-loud contract. No production Silo.
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlparse, urlsplit
 
 
 class _FakeS3Handler(BaseHTTPRequestHandler):
@@ -463,6 +505,8 @@ class _FakeS3Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         self.server.requests.append({
             "method": self.command, "path": self.path,
+            "host": self.headers.get("Host") or "",
+            "content_sha256": self.headers.get("x-amz-content-sha256") or "",
             "authorization": self.headers.get("Authorization") or "",
             "amz_date": self.headers.get("x-amz-date") or "",
             "payload_hash": self.headers.get("x-amz-content-sha256") or "",
@@ -516,11 +560,72 @@ def _live_client(monkeypatch, objects=None):
     return server, store.S3Client(f"http://127.0.0.1:{server.server_port}", "test-access", "sk")
 
 
+def test_managed_profile_reaches_all_five_commands_and_signs_profile_identity(monkeypatch, tmp_path):
+    seed = "d1/7/seed/file.txt"
+    server, _ = _live_client(monkeypatch, {seed: b"seed-bytes"})
+    try:
+        _env(monkeypatch)
+        monkeypatch.setenv("SILO_ENDPOINT", f"http://127.0.0.1:{server.server_port}")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "environment-access")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "environment-secret")
+        profile_reads = []
+
+        def read_profile(path, **kwargs):
+            profile_reads.append(path)
+            assert path == Path("/opt/review-auth/silo.json")
+            return json.dumps({"access_key_id": "profile-access", "secret_access_key": "profile-secret"})
+
+        monkeypatch.setattr(Path, "read_text", read_profile)
+        single = tmp_path / "single.txt"
+        single.write_bytes(b"put-bytes")
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        (tree / "nested.txt").write_bytes(b"dir-bytes")
+
+        commands = [
+            ["put", "--tier", "d1", "--repo-id", "7", "--name", "new", "--file", str(single)],
+            ["put-dir", "--tier", "d1", "--repo-id", "7", "--name", "tree", "--dir", str(tree)],
+            ["get", "--key", seed, "--dest", str(tmp_path / "get.txt")],
+            ["list", "--prefix", "d1/7/seed/", "--dest", str(tmp_path / "listed")],
+            ["resolve", "--tier", "d1", "--repo-id", "7", "--name-prefix", "artifact-run-", "--attempt", "1"],
+        ]
+        server.objects["d1/7/artifact-run-1/file.txt"] = b"resolve-bytes"
+        for command in commands:
+            assert store.main(["--managed-profile", *command]) == store.EXIT_OK
+
+        assert server.objects["d1/7/new/single.txt"] == b"put-bytes"
+        assert server.objects["d1/7/tree/nested.txt"] == b"dir-bytes"
+        assert (tmp_path / "get.txt").read_bytes() == b"seed-bytes"
+        assert (tmp_path / "listed/seed/file.txt").read_bytes() == b"seed-bytes"
+        assert len(profile_reads) == len(commands)
+        assert server.requests
+        for request in server.requests:
+            auth = request["authorization"]
+            parsed = urlsplit(request["path"])
+            expected = store.sigv4_authorization(
+                method=request["method"],
+                canonical_uri=parsed.path,
+                canonical_query_string=store.encode_query_string(parse_qsl(parsed.query, keep_blank_values=True)),
+                signed_headers=[("host", request["host"]), ("x-amz-content-sha256", request["content_sha256"]), ("x-amz-date", request["amz_date"])],
+                payload_hash=request["payload_hash"],
+                access_key="profile-access",
+                secret_key="profile-secret",
+                region=store.S3_REGION,
+                service=store.S3_SERVICE,
+                amz_date=request["amz_date"],
+                date_stamp=request["amz_date"][:8],
+            )
+            assert auth == expected
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_live_fake_s3_put_get_list_pagination_and_errors(monkeypatch, tmp_path):
     server, client = _live_client(monkeypatch)
     try:
         _env(monkeypatch)
-        monkeypatch.setattr(store, "connect", lambda: client)
+        monkeypatch.setattr(store, "connect", lambda *, managed_profile=False: client)
         (tmp_path / "a.json").write_bytes(b'{"n":1}')
         (tmp_path / "b.json").write_bytes(b'{"n":2}')
         put_args = ["put", "--tier", "d14", "--repo-id", "42",
@@ -558,7 +663,7 @@ def test_live_fake_s3_put_list_round_trips_literal_percent_escape(monkeypatch, t
     server, client = _live_client(monkeypatch)
     try:
         _env(monkeypatch)
-        monkeypatch.setattr(store, "connect", lambda: client)
+        monkeypatch.setattr(store, "connect", lambda *, managed_profile=False: client)
         source = tmp_path / "100%2Fdone.json"
         source.write_bytes(b'{"done":true}')
         name = "primary-audit-v2-42-deadbeef-99-1"

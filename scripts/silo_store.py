@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import hmac
 import http.client
+import json
 import os
 import re
 import sys
@@ -34,6 +35,8 @@ EXIT_ERROR = 1
 EXIT_NOT_FOUND = 2
 MISSING_ACCESS_KEY = "SILO_ACCESS_KEY 未传入"
 MISSING_SECRET_KEY = "SILO_SECRET_KEY 未传入"
+MANAGED_PROFILE_PATH = Path("/opt/review-auth/silo.json")
+INVALID_MANAGED_PROFILE = "SILO managed credential profile is missing or invalid"
 ATTEMPT_SUFFIX = re.compile(r"[0-9]+$")
 
 
@@ -81,15 +84,26 @@ def artifact_prefix(tier: str, repo_id: str, artifact_name: str) -> str:
     return f"{tier}/{repo_id}/{artifact_name}"
 
 
-def connect():
-    """Build a path-style S3 client against SILO_ENDPOINT. No network until used.
+def connect(*, managed_profile: bool = False):
+    """Build an S3 client; managed profile mode reads only the fixed credential file."""
 
-    The client signs with SigV4 from the standard library only, so review jobs
-    never download S3 SDK packages from PyPI at runtime.
-    """
-
-    access = (os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
-    secret = (os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
+    if managed_profile:
+        try:
+            profile = json.loads(MANAGED_PROFILE_PATH.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            fail(INVALID_MANAGED_PROFILE)
+        if not isinstance(profile, dict):
+            fail(INVALID_MANAGED_PROFILE)
+        access_value = profile.get("access_key_id")
+        secret_value = profile.get("secret_access_key")
+        if not isinstance(access_value, str) or not isinstance(secret_value, str):
+            fail(INVALID_MANAGED_PROFILE)
+        access, secret = access_value.strip(), secret_value.strip()
+        if not access or not secret:
+            fail(INVALID_MANAGED_PROFILE)
+    else:
+        access = (os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
+        secret = (os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
     endpoint = (os.environ.get("SILO_ENDPOINT") or "").strip()
     if not access:
         fail(MISSING_ACCESS_KEY)
@@ -477,7 +491,7 @@ def cmd_put(args: argparse.Namespace) -> int:
             files.append((path, path.name))
         if not files:
             fail("put requires at least one existing --file: all sources missing")
-    client = connect()
+    client = connect(managed_profile=args.managed_profile)
     bucket = bucket_name()
     try:
         for path, relative in files:
@@ -501,7 +515,7 @@ def cmd_put_dir(args: argparse.Namespace) -> int:
             )
             return EXIT_OK
         fail(f"put-dir source is empty or missing: {directory}")
-    client = connect()
+    client = connect(managed_profile=args.managed_profile)
     bucket = bucket_name()
     try:
         for path, relative in files:
@@ -517,7 +531,7 @@ def cmd_put_dir(args: argparse.Namespace) -> int:
 
 def cmd_get(args: argparse.Namespace) -> int:
     dest = Path(args.dest)
-    client = connect()
+    client = connect(managed_profile=args.managed_profile)
     bucket = bucket_name()
     if args.key:
         keys = [args.key]
@@ -618,7 +632,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         name_prefix = (args.name_prefix or "").strip()
         if name_prefix:
             listing_prefix = f"{args.tier}/{args.repo_id}/{name_prefix}"
-    client = connect()
+    client = connect(managed_profile=args.managed_profile)
     bucket = bucket_name()
     keys = list_keys(client, bucket, listing_prefix)
     dest = Path(args.dest) if args.dest else None
@@ -656,7 +670,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.attempt < 1:
         fail("attempt must be >= 1")
     listing_prefix = f"{args.tier}/{args.repo_id}/{args.name_prefix}"
-    client = connect()
+    client = connect(managed_profile=args.managed_profile)
     bucket = bucket_name()
     keys = list_keys(client, bucket, listing_prefix)
     names = artifact_names_from_keys(keys, args.tier, args.repo_id)
@@ -675,6 +689,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--managed-profile", action="store_true", help="read credentials from the fixed managed profile")
     sub = parser.add_subparsers(dest="command", required=True)
 
     magicdns = sub.add_parser("magicdns", help="resolve SILO_ENDPOINT via MagicDNS (100.100.100.100)")

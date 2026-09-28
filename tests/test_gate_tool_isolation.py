@@ -74,7 +74,7 @@ def test_diff_coverage_runs_on_plain_interpreter_without_runtime_install():
     assert 'python3 "$GITHUB_ACTION_PATH/advisory.py"' in advisory_run
 
 
-def _run_with_python_stub(tmp_path: Path, exit_code: int = 0):
+def _run_with_python_stub(tmp_path: Path, exit_code: int = 0, managed_profile: bool = False):
     poisoned = tmp_path / "poisoned"
     poisoned.mkdir()
     (poisoned / "pyproject.toml").write_text(
@@ -108,8 +108,12 @@ def _run_with_python_stub(tmp_path: Path, exit_code: int = 0):
             "STUB_EXIT": str(exit_code),
         }
     )
+    command = [str(SILO_EXEC)]
+    if managed_profile:
+        command.append("--managed-profile")
+    command.extend(["get", "--key", "example"])
     result = subprocess.run(
-        [str(SILO_EXEC), "get", "--key", "example"],
+        command,
         cwd=poisoned,
         env=env,
         capture_output=True,
@@ -128,6 +132,13 @@ def test_silo_wrapper_emits_isolated_cwd_and_argv(tmp_path):
     argv = [line.removeprefix("ARG=") for line in records[1:]]
     # stdlib client: plain python3, no package manager in the argv.
     assert argv == [str(silo_store), "get", "--key", "example"]
+
+
+def test_silo_wrapper_passes_managed_profile_as_store_argv(tmp_path):
+    result, _, _, silo_store, stub_output = _run_with_python_stub(tmp_path, managed_profile=True)
+    assert result.returncode == 0, result.stderr
+    argv = [line.removeprefix("ARG=") for line in stub_output.read_text(encoding="utf-8").splitlines()[1:]]
+    assert argv == [str(silo_store), "--managed-profile", "get", "--key", "example"]
 
 
 def test_silo_wrapper_transparent_exit_code(tmp_path):

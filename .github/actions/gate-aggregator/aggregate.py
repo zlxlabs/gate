@@ -2158,7 +2158,7 @@ def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
     # 任何包管理器入口。
     store_path = os.environ.get("SILO_STORE") or str(GATE_ROOT / "scripts" / "silo_store.py")
     return subprocess.run(
-        [sys.executable, store_path, *argv],
+        [sys.executable, store_path, "--managed-profile", *argv],
         capture_output=True,
         text=True,
         check=False,

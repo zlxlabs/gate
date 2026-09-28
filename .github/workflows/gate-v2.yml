@@ -110,8 +110,8 @@ on:
         required: false
       SILO_ACCESS_KEY:
         # Optional at the workflow_call schema so existing callers keep
-        # starting; S3 steps fail loud with "SILO_ACCESS_KEY 未传入" when
-        # the caller omits it. Fleet callers are updated one repo at a time.
+        # starting; retained for caller compatibility. Managed Silo commands
+        # read the fixed runner credential profile.
         required: false
       SILO_SECRET_KEY:
         required: false
@@ -671,8 +671,6 @@ jobs:
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
       SILO_STORE: ${{ github.workspace }}/_gate-silo-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-silo-src/scripts/silo_exec.sh
     # Per-PR cancel of stale primary only. Own group (not shared with
@@ -1001,8 +999,7 @@ jobs:
           AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          "$SILO_EXEC" --managed-profile put \
             --tier d14 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1018,8 +1015,7 @@ jobs:
           DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put-dir \
+          "$SILO_EXEC" --managed-profile put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1123,8 +1119,6 @@ jobs:
     # not finish a single such file.
     timeout-minutes: 20
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
       SILO_STORE: ${{ github.workspace }}/_gate-silo-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-silo-src/scripts/silo_exec.sh
     steps:
@@ -1575,8 +1569,7 @@ jobs:
           ADVISORY_DIR: ${{ runner.temp }}/shadow-events/advisory
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put-dir \
+          "$SILO_EXEC" --managed-profile put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1624,8 +1617,6 @@ jobs:
     # and the remaining time covers artifact download/upload and runner jitter.
     timeout-minutes: 8
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
       SILO_STORE: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_exec.sh
     steps:
@@ -1689,9 +1680,8 @@ jobs:
             echo "source_attempt="
             echo "artifact_name="
           } >> "$GITHUB_OUTPUT"
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           set +e
-          selected="$("$SILO_EXEC" resolve \
+          selected="$("$SILO_EXEC" --managed-profile resolve \
             --tier d14 \
             --repo-id "$REPO_ID" \
             --name-prefix "$AUDIT_PREFIX" \
@@ -1723,8 +1713,7 @@ jobs:
           DEST: ${{ runner.temp }}/primary-audit
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" get \
+          "$SILO_EXEC" --managed-profile get \
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
 
@@ -1802,8 +1791,7 @@ jobs:
           RECEIPT_DIR: ${{ runner.temp }}/convergence-receipt
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put-dir \
+          "$SILO_EXEC" --managed-profile put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1818,8 +1806,7 @@ jobs:
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          "$SILO_EXEC" --managed-profile put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1834,8 +1821,7 @@ jobs:
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          "$SILO_EXEC" --managed-profile put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1892,8 +1878,7 @@ jobs:
           PANEL_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          "$SILO_EXEC" --managed-profile put \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1943,8 +1928,6 @@ jobs:
     runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 10
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
       SILO_STORE: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_exec.sh
     steps:
@@ -2000,10 +1983,9 @@ jobs:
         run: |
           echo "::notice::step-start: Resolve v2 ledger artifacts"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           silo_resolve() {
             local tier="$1" prefix="$2"
-            "$SILO_EXEC" resolve \
+            "$SILO_EXEC" --managed-profile resolve \
               --tier "$tier" --repo-id "$REPO_ID" --name-prefix "$prefix" --attempt "$CURRENT_ATTEMPT"
           }
           resolve_or_empty() {
@@ -2283,8 +2265,7 @@ jobs:
         run: |
           echo "::notice::step-start: Upload v2 review ledger inputs"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          "$SILO_EXEC" --managed-profile put \
             --tier d1 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -2303,8 +2284,7 @@ jobs:
         run: |
           echo "::notice::step-start: Retry upload v2 review ledger inputs"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          "$SILO_EXEC" --managed-profile put \
             --tier d1 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -2319,8 +2299,7 @@ jobs:
         run: |
           echo "::notice::step-start: Download canonical primary audit for ledger"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" get \
+          "$SILO_EXEC" --managed-profile get \
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
 
@@ -2332,8 +2311,7 @@ jobs:
         run: |
           echo "::notice::step-start: Download gate terminal envelope for ledger"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" get \
+          "$SILO_EXEC" --managed-profile get \
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
 
@@ -2363,8 +2341,7 @@ jobs:
         run: |
           echo "::notice::step-start: Upload v2 review effectiveness ledger"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          "$SILO_EXEC" --managed-profile put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \

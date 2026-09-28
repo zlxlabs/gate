@@ -595,6 +595,21 @@ def test_silo_store_env_aligns_with_job_checkout_path():
         assert_workflow_sha_checkout(checkout_step, path=checkout_dir)
 
 
+def test_gate_silo_calls_select_managed_profile_without_job_secrets():
+    raw, _ = _load_workflow()
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    assert raw.get("env", {}).get("SILO_ENDPOINT")
+    for job_name in ("primary", "ocr", "gate", "ledger"):
+        env = raw["jobs"][job_name].get("env", {})
+        assert "AWS_ACCESS_KEY_ID" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+    calls = [line for line in workflow_text.splitlines() if '"$SILO_EXEC"' in line]
+    assert calls
+    assert all('"$SILO_EXEC" --managed-profile ' in line for line in calls)
+    assert "${AWS_ACCESS_KEY_ID:-}" not in workflow_text
+    assert "${AWS_SECRET_ACCESS_KEY:-}" not in workflow_text
+
+
 def test_secrets_explicit_and_feishu_optional():
     code = "\n".join(ln for ln in WORKFLOW.read_text().splitlines() if not ln.lstrip().startswith("#"))
     assert "inherit" not in code
@@ -1400,7 +1415,7 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert "--tier d14" in upload["run"]
     assert upload["env"]["AUDIT_PATH"] == "${{ runner.temp }}/primary-review-audit.json"
     assert "|| true" not in upload["run"]
-    assert "SILO_ACCESS_KEY 未传入" in upload["run"]
+    assert '"$SILO_EXEC" --managed-profile' in upload["run"]
 
 
 def test_primary_uploads_review_diagnostics_after_canonical_audit():
@@ -1485,7 +1500,7 @@ def test_artifact_listing_resolvers_retry_with_bounded_timeout(job_name, step_na
     assert "$SILO_EXEC" in run
     assert " resolve" in run
     assert "--attempt" in run
-    assert "SILO_ACCESS_KEY 未传入" in run
+    assert '"$SILO_EXEC" --managed-profile' in run
     assert "while true" not in run
     assert "until true" not in run
 
