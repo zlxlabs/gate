@@ -22,8 +22,8 @@
 | 阶段 | 内容 / 锁定判据 |
 |---|---|
 | C1 前置（先于部署/合并） | Gate 现有 Silo key 供给按已获授权的固定路径候选 `/opt/review-auth/silo.json` 管理：host-managed、root-owned、0600、runner 内只读；quality runner 不可见。all28 与真实 adapter 前置通过前不实施供给、不标 ready/merge/@v2。 |
-| C1 runtime PR（≤160 行代码/测试） | 可信 `github.repository_id` 只在 Gate `1295374164` 选择 `managed-profile`，其他 caller 选择 `legacy-env`；wrapper 在 managed 模式添加固定 flag 并清除 AWS env，legacy 保留旧 env，空/未知 selector fail-fast。四个 job 的 source 与 AWS env 一致，15 个操作和 aggregate 都走同一 `SILO_EXEC`；aggregate 保留源码路径默认值与 standalone 兼容。保留两个 optional secrets 声明；无改 schema/path/namespace/ACL/终态。 |
-| C2 caller/终态验收 | 在 C1 runtime 与供给就绪后，更新 public caller 模板/README/契约测试，移除 public template 的 Silo key mapping；callee optional secret 声明保留为旧 private caller 兼容 API，但 gate-v2 jobs 不消费/不注入它们。disposition 的 caller key contract 原样保留，另卡裁决迁移。运行 private、public 同仓、external fork、Dependabot、draft→ready 矩阵，读取测试结论、主审 audit 身份与 `SUCCESS`/`SKIPPED`/unavailable 原因；真实矩阵需用户授权平台部署/运行。 |
+| C1 兼容修订卡（≤160 行代码/测试） | 可信 `github.repository_id` 只在 Gate `1295374164` 选择 `managed-profile`，其他 caller 选择 `legacy-env`；wrapper 在 managed 模式添加固定 flag 并清除 AWS env，legacy 保留旧 env，空/未知 selector fail-fast。四个 job 的 source 与 AWS env 一致，15 个操作和 aggregate 都走同一 `SILO_EXEC`；aggregate 保留源码路径默认值与 standalone 兼容。保留两个 optional secrets 声明；无改 schema/path/namespace/ACL/终态。 |
+| C2 caller/终态验收 | 在 C1 runtime 与供给就绪后，更新 public caller 模板/README/契约测试，移除 public template 的 Silo key mapping；callee optional secret 声明保留为旧 private caller 兼容 API；仅 Gate ID 的四个 job 不消费/不注入，其他 private caller 仍经 legacy env 使用它们。disposition 的 caller key contract 原样保留，另卡裁决迁移。运行 private、public 同仓、external fork、Dependabot、draft→ready 矩阵，读取测试结论、主审 audit 身份与 `SUCCESS`/`SKIPPED`/unavailable 原因；真实矩阵需用户授权平台部署/运行。 |
 
 ## 不变式与未知
 

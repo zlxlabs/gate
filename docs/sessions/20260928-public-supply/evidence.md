@@ -21,7 +21,7 @@
 - H0 基线红验：`/run/user/1000/gate-c1-red-H0.log`，4 项新契约失败、pytest exit 1；覆盖 wrapper selector、四 job source 与 aggregate subprocess producer。
 - 定点绿验：`/run/user/1000/gate-c1-green-target.log`，9 passed、exit 0；真实 wrapper 子进程记录 argv/env，managed 清除 AWS keys、legacy 保留 keys。
 - 受影响五文件+store/no-runtime：`/run/user/1000/gate-c1-focused-files.log`，597 passed in 86.52s、exit 0；包含 managed profile 缺文件时有 env key 也 fail-fast。
-- `python3 scripts/check_pinned_uses.py` exit 0。全量、actionlint 与冻结 SHA 的独立 review 尚未完成；此处不代表完整验收。
+- `python3 scripts/check_pinned_uses.py` exit 0；CI lint `SHELLCHECK_OPTS=--severity=warning actionlint -color .github/workflows/*.yml templates/*.yml` exit 0；全量 `uv run --python 3.12 --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` 在冻结代码 SHA `5cfcb043` 上 1272 passed in 117.42s。OCR预扫仍在运行，独立完整review待主脑另派；此处不代表完整验收。
 
 ## 尚未验收
 
