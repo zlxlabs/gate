@@ -47,7 +47,7 @@ PERMISSION_SCOPES = (
 )
 
 
-def test_public_gate_uses_managed_profile_and_disposition_keeps_legacy_secrets():
+def test_gate_caller_templates_preserve_silo_source_boundaries():
     silo_secrets = {
         "SILO_ACCESS_KEY": "${{ secrets.SILO_ACCESS_KEY }}",
         "SILO_SECRET_KEY": "${{ secrets.SILO_SECRET_KEY }}",
@@ -60,8 +60,18 @@ def test_public_gate_uses_managed_profile_and_disposition_keeps_legacy_secrets()
     assert disposition["jobs"]["disposition"]["secrets"] == silo_secrets
 
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
-    jobs = yaml.safe_dump(workflow["jobs"])
-    assert all(name not in jobs for name in silo_secrets)
+    workflow_call = _workflow_call(workflow)
+    for name in silo_secrets:
+        assert workflow_call["secrets"][name]["required"] is False
+    assert workflow["env"]["SILO_CREDENTIAL_SOURCE"] == (
+        "${{ github.repository_id == '1295374164' && 'managed-profile' || 'legacy-env' }}"
+    )
+    access_key = "${{ github.repository_id != '1295374164' && secrets.SILO_ACCESS_KEY || '' }}"
+    secret_key = "${{ github.repository_id != '1295374164' && secrets.SILO_SECRET_KEY || '' }}"
+    for job_name in ("primary", "ocr", "gate", "ledger"):
+        env = workflow["jobs"][job_name]["env"]
+        assert env["AWS_ACCESS_KEY_ID"] == access_key
+        assert env["AWS_SECRET_ACCESS_KEY"] == secret_key
 
 
 def _workflow_call(document):

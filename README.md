@@ -32,9 +32,12 @@ jobs:
       FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}   # 公开仓必须 secret;私有仓可用同名 variable 兜底
 ```
 
-Required Gate caller 不传 Silo key。可信 gate job 从 runner 管理的固定档案
-`/opt/review-auth/silo.json` 读取凭据；quality job 不接收 key，也不可见该档案。
-代码合并、生产 runner 安装档案、真实事件矩阵验收是三个独立状态，合并源码不代表已部署。
+Required Gate 公共 caller 模板不映射 Silo key。只有可信仓库 `zlxlabs/gate`
+（`github.repository_id == 1295374164`）的 gate jobs 使用 runner 管理的固定档案
+`/opt/review-auth/silo.json`；既有 private callers 仍可用 optional secrets 走 legacy AWS
+env，缺少凭据时 fail-fast。其他 public caller 不获新的 managed profile；使用无 key 模板时，
+其 Silo 操作仍不可用。quality job 不接收 key，也不可见该档案。代码合并、生产 runner
+安装档案、真实事件矩阵验收是三个独立状态，合并源码不代表已部署。
 
 ### 仓库自有质量入口（推荐）
 
@@ -127,9 +130,12 @@ caller 模板，分别调用 Required Gate 与 Shadow Calibration。两个 workf
 `gate-v2.yml` 的八类 run 内产物（review-ledger-input / primary-audit / diagnostics /
 advisory-event / convergence-receipt / gate-terminal / status-panel-delivery /
 codex-review-ledger）存入 Silo bucket `ci-artifacts`，不使用 GitHub Actions artifact。
-caller 不传 Silo key；`workflow_call.secrets.SILO_ACCESS_KEY` 与
-`SILO_SECRET_KEY` 仍声明为 optional，只为旧 caller 保持 schema 兼容，gate-v2 jobs
-不消费这两项。可信 job 使用固定 runner 档案；档案缺失时操作失败，不回退到 caller key。
+Required Gate 公共模板不传 Silo key；`workflow_call.secrets.SILO_ACCESS_KEY` 与
+`SILO_SECRET_KEY` 仍声明为 optional。仅 Gate 仓库 ID `1295374164` 的 jobs 不消费这两项，
+而使用固定 runner 档案；档案缺失时操作失败，不回退到 caller key。既有 non-Gate private
+callers 可继续传入 optional secrets 并由 jobs 映射到 legacy AWS env，缺凭据时 fail-fast。
+其他 public caller 没有旧 keys 时，其 Silo 操作仍 unavailable；C2 不为其他仓增加 managed
+keys、namespace 或 ACL。
 
 disposition 是独立 workflow，仍使用 legacy caller-key 环境契约；部署
 `caller-gate-disposition.yml` 时继续映射这两项。GitHub-hosted 没有 runner 档案或
@@ -137,7 +143,7 @@ tailnet DNS，Silo 操作会失败，不做 artifact fallback。直接运行
 `scripts/gate_bounded_retry.py magicdns` 时需从 `SILO_NAMESERVER` 提供 nameserver；
 缺失时 fail-loud。
 
-状态须分别核验：C1 managed-profile 支持由本仓源码实现；源码合并不代表生产 runner
+状态须分别核验：C1 只为 Gate 仓库 ID `1295374164` 实现 managed-profile source；源码合并不代表生产 runner
 已安装并验证档案，真实事件矩阵目前也未完成。`zlxlabs/gate-hub#1183` 共享缓存隔离源码已合入
 gate-hub，但生产 host 推广仍待执行。现有缓存隔离和 rootless/DinD 约束不证明整个
 host state 对 review 工具不可见。部署后还须实际验收 private、public 同仓、fork、
