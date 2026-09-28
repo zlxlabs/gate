@@ -262,12 +262,11 @@ def test_missing_access_key_stderr(monkeypatch, capsys, tmp_path):
         (None, FileNotFoundError),
         ("not-json", json.JSONDecodeError),
         (json.dumps({"access_key_id": "one"}), KeyError),
+        (json.dumps({"access_key_id": "", "secret_access_key": "secret"}), SystemExit),
     ],
 )
 def test_managed_profile_fails_without_falling_back_to_environment(monkeypatch, tmp_path, profile_text, error):
     _env(monkeypatch)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-fallback")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-fallback")
     profile_path = tmp_path / "silo.json"
     if profile_text is not None:
         profile_path.write_text(profile_text)
@@ -275,6 +274,8 @@ def test_managed_profile_fails_without_falling_back_to_environment(monkeypatch, 
     monkeypatch.setattr(store, "S3Client", lambda *args, **kwargs: pytest.fail("credential fallback"))
     with pytest.raises(error):
         store.connect(managed_profile=True)
+    with pytest.raises(error):
+        store.main(["--managed-profile", "put-dir", "--tier", "d3", "--repo-id", "8", "--name", "diagnostics", "--dir", str(tmp_path / "empty"), "--empty", "skip"])
 
 
 def test_legacy_profile_presence_does_not_replace_environment(monkeypatch, tmp_path):
@@ -598,11 +599,16 @@ def test_managed_profile_reaches_all_five_commands_and_signs_profile_identity(mo
         for command in commands:
             assert store.main(["--managed-profile", *command]) == store.EXIT_OK
 
+        empty_skip = ["put-dir", "--tier", "d3", "--repo-id", "8", "--name", "empty", "--dir", str(tmp_path / "empty"), "--empty", "skip"]
+        requests_before_skip = len(server.requests)
+        assert store.main(["--managed-profile", *empty_skip]) == store.EXIT_OK
+        assert len(profile_reads) == len(commands) + 1
+        assert len(server.requests) == requests_before_skip
+
         assert server.objects["d1/7/new/single.txt"] == b"put-bytes"
         assert server.objects["d1/7/tree/nested.txt"] == b"dir-bytes"
         assert (tmp_path / "get.txt").read_bytes() == b"seed-bytes"
         assert (tmp_path / "listed/seed/file.txt").read_bytes() == b"seed-bytes"
-        assert len(profile_reads) == len(commands)
         assert server.requests
         for request in server.requests:
             auth = request["authorization"]

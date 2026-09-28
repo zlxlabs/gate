@@ -499,6 +499,8 @@ def cmd_put_dir(args: argparse.Namespace) -> int:
     files = list(iter_dir_files(directory))
     if not files:
         if args.empty == "skip":
+            if args.managed_profile:
+                connect(managed_profile=True)
             print(
                 f"::notice::silo put-dir skipped: directory empty or missing ({directory})"
             )
