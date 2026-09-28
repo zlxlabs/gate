@@ -6,7 +6,7 @@
 
 - 公共 caller 不持有/转发能访问 Silo 的长期 key；quality job 持续执行业务测试，但拿不到该 profile 或 key。
 - gate-v2 可信 Silo subprocess 通过显式 managed mode 读 host-managed profile；disposition 继续走显式 legacy env mode。两个入口互斥，managed mode 缺 profile 就失败，不回落 env；不加 broker、policy knob 或重试。
-- 本卡只设计 gate#249；runner profile 的生产创建/部署未授权。#1183 只证明共享缓存隔离，不证明所有 host state 隔离。
+- Gate 现有 Silo key 的 runner-managed 供给已获分阶段授权；但 all28 与真实 adapter 前置尚未通过，因此本卡未创建/部署 profile。#1183 只证明共享缓存隔离，不证明所有 host state 隔离。
 - 设计/证据合计新增预算 ≤120 行；后续 runtime C1 ≤200 行代码与测试。只写当前 docs 目录两文件。
 
 ## 当前真实消费者（固定 SHA）
@@ -21,8 +21,8 @@
 
 | 阶段 | 内容 / 锁定判据 |
 |---|---|
-| C1 前置（先于实现合并） | 经用户授权后，runner owner 在每个 gate-v2 self-hosted `linux/codex` Silo 消费环境提供固定路径候选 `/opt/review-auth/silo.json`：host-managed、root-owned、0600、runner 内只读；`ci` quality runner 不可见。实际 active adapter 必须逐个通过工具路径隔离验收。C1 可开 draft PR；在 profile 供给和所有 active adapter 验收前禁止 ready/merge/@v2 自动推广。 |
-| C1 runtime PR（≤200 行代码/测试） | `silo_exec.sh --managed-profile <operation>` 明确选择固定 managed file 模式，flag 后不接受 PR 提供路径；`connect()` 在该模式只读 profile，缺失即 fail。`gate-v2.yml` 所有 15 个 Silo wrapper 调用显式传 flag；`aggregate.py::_silo_cli()` 也显式传 flag。endpoint 仍是非秘密 workflow 配置。无 flag 的 legacy env 模式供 disposition 保持原行为；绝不自动 fallback。保留 gate-v2 `workflow_call.secrets` 两个 optional 声明和所有旧 caller mapping，避免旧 private caller 被 Actions schema 拒绝；C1 不改 caller template。 |
+| C1 前置（先于部署/合并） | Gate 现有 Silo key 供给按已获授权的固定路径候选 `/opt/review-auth/silo.json` 管理：host-managed、root-owned、0600、runner 内只读；quality runner 不可见。all28 与真实 adapter 前置通过前不实施供给、不标 ready/merge/@v2。 |
+| C1 runtime PR（≤160 行代码/测试） | 可信 `github.repository_id` 只在 Gate `1295374164` 选择 `managed-profile`，其他 caller 选择 `legacy-env`；wrapper 在 managed 模式添加固定 flag 并清除 AWS env，legacy 保留旧 env，空/未知 selector fail-fast。四个 job 的 source 与 AWS env 一致，15 个操作和 aggregate 都走同一 `SILO_EXEC`；aggregate 保留源码路径默认值与 standalone 兼容。保留两个 optional secrets 声明；无改 schema/path/namespace/ACL/终态。 |
 | C2 caller/终态验收 | 在 C1 runtime 与供给就绪后，更新 public caller 模板/README/契约测试，移除 public template 的 Silo key mapping；callee optional secret 声明保留为旧 private caller 兼容 API，但 gate-v2 jobs 不消费/不注入它们。disposition 的 caller key contract 原样保留，另卡裁决迁移。运行 private、public 同仓、external fork、Dependabot、draft→ready 矩阵，读取测试结论、主审 audit 身份与 `SUCCESS`/`SKIPPED`/unavailable 原因；真实矩阵需用户授权平台部署/运行。 |
 
 ## 不变式与未知

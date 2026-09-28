@@ -3,7 +3,7 @@
 ## 源码与发布事实
 
 - 基线：`85916ed5c4f9d181fec866f15d1bb5f58111c9c8`，gate worktree HEAD、`origin/main` 与 `git ls-remote origin refs/heads/main` 一致。PR #251 merged `08a3baa16650e314f05d4e3aea9ec3631cad3760`，2026-09-26；canary run `36400763527` success。均不代替真实 public/private/fork/draft/Dependabot 矩阵。
-- `scripts/silo_store.py:85-100` 的 `connect()` 集中取两个 AWS key 与 endpoint。`.github/workflows/gate-v2.yml:674-677,1126-1129,1627-1630,1946-1949` 是 primary/OCR/gate/ledger job key 注入；15 个 `AWS_ACCESS_KEY_ID` precheck 分布在这四个 job。`aggregate.py:2150-2165` 以 `SILO_ENDPOINT` 判断 configured 并直接 subprocess 调 trusted store。
+- `scripts/silo_store.py::connect()` 保持 managed profile 固定文件与 legacy AWS env 两条互斥读取路径。C1 在 `gate-v2.yml` 按 caller `github.repository_id` 一次选源：仅 Gate `1295374164` 是 managed，primary/OCR/gate/ledger 的 AWS env 对 Gate 为空；其余 caller 映射旧 secrets。15 个调用去掉散落 flag，aggregate 通过同一 `SILO_EXEC` 继承 selector。
 - `quality` job 无 Silo key env；bundle producer 写 `GITHUB_OUTPUT`，`needs.quality.outputs.ledger_input_bundle` 交给 trusted ledger。gate 仓 no-artifact 测试禁止 GitHub artifact actions。
 - Caller 文件 `templates/caller-gate-v2.yml:110-112` 与 README:32-33、131-139 仍要求 caller keys。另一个 consumer 不能忽略：`.github/workflows/gate-v2-disposition.yml` 的 `workflow_call.secrets` 声明与 `control` job (`runs-on: [self-hosted, linux, ci]`) 把 caller keys 注入 AWS env，经 `silo_exec.sh` 在两处 get/put；无 host-managed profile。C1 若全局改 env 默认会破坏该路径。
 - gate-v2 `workflow_call.secrets.SILO_ACCESS_KEY/SECRET_KEY` 当前均 `required: false`。C1 保留这两个声明和旧 caller mapping；移除它们会让仍映射 key 的 reusable-workflow caller 在 GitHub 解析阶段失败。Public template mapping 的移除单独归 C2。
@@ -16,10 +16,17 @@
 - `/proc` probe 脚本固定为 `/bin/sh /workspace/proc_alias_probe.sh`，只读 `/proc/self/root/opt/review-auth/marker.txt` 与 `/proc/1/root/opt/review-auth/marker.txt`，只输出 rc/是否非空；不扫描 `/proc`。真实 `command_execution` 完成 exit 0，聚合输出 `SELF_RC=1 SELF_CONTENT=empty`、`PID1_RC=1 PID1_CONTENT=empty`。同一 synthetic fixture 与 image/security 参数下另一个 raw-shell 临时容器两 alias 均 `rc=0`、内容 nonempty；host marker 36 bytes 且未变。Codex exec 与 raw-shell 正控是两个短命容器，不能写成同容器对照。
 - 可复查文件：`/tmp/gate-hub-proc-alias.EIYJ11/workspace/proc_alias_probe.sh`、`output/events.jsonl`；前序 direct profile 证据 `/tmp/gate-hub-codex-marker-probe.iF8n0W/`。只有 synthetic marker，未取/打印真实 secret。此证据只支持当前 Codex 实际 tool 路径的两个 alias，不证明 OCR/Claude 或所有 proc/state 路径。
 
+## C1 本地实现与验证记录
+
+- H0 基线红验：`/run/user/1000/gate-c1-red-H0.log`，4 项新契约失败、pytest exit 1；覆盖 wrapper selector、四 job source 与 aggregate subprocess producer。
+- 定点绿验：`/run/user/1000/gate-c1-green-target.log`，9 passed、exit 0；真实 wrapper 子进程记录 argv/env，managed 清除 AWS keys、legacy 保留 keys。
+- 受影响五文件+store/no-runtime：`/run/user/1000/gate-c1-focused-files.log`，597 passed in 86.52s、exit 0；包含 managed profile 缺文件时有 env key 也 fail-fast。
+- `python3 scripts/check_pinned_uses.py` exit 0。全量、actionlint 与冻结 SHA 的独立 review 尚未完成；此处不代表完整验收。
+
 ## 尚未验收
 
-- public same-repo trusted review 无 caller Silo secret、private compatibility、外部 fork 有效测试与显式 skip、Dependabot、draft→ready 均未在本轮真实运行。Hosted consumer 不会有 managed file；须核其现有 Silo fail/unavailable/skip 终态不被 C1 flag 改坏。
-- `/opt/review-auth/silo.json` 尚只是固定路径候选；生产 managed profile 未创建，trusted/quality runner 各自可见性与 file owner/mode 未实测。需用户授权后由 owner 准备部署，再按 C1 前置验收。
+- 其他 public caller 的 managed key/namespace/ACL 不在本卡授权范围；无旧 secrets 时仍不可用。private compatibility、外部 fork 有效测试与显式 skip、Dependabot、draft→ready 的真实平台矩阵未运行。Gate 现有 key 的受管供给虽获分阶段授权，但 all28 与真实 adapter 前置未过，尚未实施。
+- `/opt/review-auth/silo.json` 仍是 Gate 受管供给固定路径候选；需在 all28 与真实 adapter 前置通过后验证实际文件、owner/mode 及 trusted/quality runner 可见性。未变更 Silo schema/path/namespace/ACL，disposition 继续 caller-key legacy env。
 - Codex CLI 0.146.0 synthetic probe 不覆盖两条 active Claude tool adapters、其他 repo/tier 的 active reviewer 或非缓存 host state；这些均为 merge/@v2 前置。Silo server-side repo/prefix ACL 未由本任务复核；disposition env mode 保持不变且需要独立决策其长期迁移。无生产槽启停、生产配置修改或 secret 读取。
 
 ## 独立顾问与根侧裁决

@@ -117,6 +117,7 @@ on:
         required: false
 
 env:
+  SILO_CREDENTIAL_SOURCE: ${{ github.repository_id == '1295374164' && 'managed-profile' || 'legacy-env' }}
   GATE_CHECKOUT_MIRROR_SCRIPT: |
     set -euo pipefail
     result_emitted=0
@@ -673,6 +674,8 @@ jobs:
     env:
       SILO_STORE: ${{ github.workspace }}/_gate-silo-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-silo-src/scripts/silo_exec.sh
+      AWS_ACCESS_KEY_ID: ${{ github.repository_id != '1295374164' && secrets.SILO_ACCESS_KEY || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.repository_id != '1295374164' && secrets.SILO_SECRET_KEY || '' }}
     # Per-PR cancel of stale primary only. Own group (not shared with
     # quality) so one run's lint and review never queue or kill each other.
     concurrency:
@@ -999,7 +1002,7 @@ jobs:
           AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put \
+          "$SILO_EXEC" put \
             --tier d14 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1015,7 +1018,7 @@ jobs:
           DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put-dir \
+          "$SILO_EXEC" put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1121,6 +1124,8 @@ jobs:
     env:
       SILO_STORE: ${{ github.workspace }}/_gate-silo-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-silo-src/scripts/silo_exec.sh
+      AWS_ACCESS_KEY_ID: ${{ github.repository_id != '1295374164' && secrets.SILO_ACCESS_KEY || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.repository_id != '1295374164' && secrets.SILO_SECRET_KEY || '' }}
     steps:
       - name: Record network bytes before checkout (ocr-1)
         if: matrix.reviewer != '__none__'
@@ -1569,7 +1574,7 @@ jobs:
           ADVISORY_DIR: ${{ runner.temp }}/shadow-events/advisory
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put-dir \
+          "$SILO_EXEC" put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1619,6 +1624,8 @@ jobs:
     env:
       SILO_STORE: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_exec.sh
+      AWS_ACCESS_KEY_ID: ${{ github.repository_id != '1295374164' && secrets.SILO_ACCESS_KEY || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.repository_id != '1295374164' && secrets.SILO_SECRET_KEY || '' }}
     steps:
       # `uses:` cannot itself take an expression, so the only way to pin the
       # aggregator script to the EXACT commit this reusable workflow file is
@@ -1681,7 +1688,7 @@ jobs:
             echo "artifact_name="
           } >> "$GITHUB_OUTPUT"
           set +e
-          selected="$("$SILO_EXEC" --managed-profile resolve \
+          selected="$("$SILO_EXEC" resolve \
             --tier d14 \
             --repo-id "$REPO_ID" \
             --name-prefix "$AUDIT_PREFIX" \
@@ -1713,7 +1720,7 @@ jobs:
           DEST: ${{ runner.temp }}/primary-audit
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile get \
+          "$SILO_EXEC" get \
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
 
@@ -1791,7 +1798,7 @@ jobs:
           RECEIPT_DIR: ${{ runner.temp }}/convergence-receipt
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put-dir \
+          "$SILO_EXEC" put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1806,7 +1813,7 @@ jobs:
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put \
+          "$SILO_EXEC" put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1821,7 +1828,7 @@ jobs:
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put \
+          "$SILO_EXEC" put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1878,7 +1885,7 @@ jobs:
           PANEL_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
         run: |
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put \
+          "$SILO_EXEC" put \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -1930,6 +1937,8 @@ jobs:
     env:
       SILO_STORE: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-aggregator-src/scripts/silo_exec.sh
+      AWS_ACCESS_KEY_ID: ${{ github.repository_id != '1295374164' && secrets.SILO_ACCESS_KEY || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.repository_id != '1295374164' && secrets.SILO_SECRET_KEY || '' }}
     steps:
       - name: Checkout ledger action at this workflow's own commit
         env:
@@ -1985,7 +1994,7 @@ jobs:
           set -euo pipefail
           silo_resolve() {
             local tier="$1" prefix="$2"
-            "$SILO_EXEC" --managed-profile resolve \
+            "$SILO_EXEC" resolve \
               --tier "$tier" --repo-id "$REPO_ID" --name-prefix "$prefix" --attempt "$CURRENT_ATTEMPT"
           }
           resolve_or_empty() {
@@ -2265,7 +2274,7 @@ jobs:
         run: |
           echo "::notice::step-start: Upload v2 review ledger inputs"
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put \
+          "$SILO_EXEC" put \
             --tier d1 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -2284,7 +2293,7 @@ jobs:
         run: |
           echo "::notice::step-start: Retry upload v2 review ledger inputs"
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put \
+          "$SILO_EXEC" put \
             --tier d1 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
@@ -2299,7 +2308,7 @@ jobs:
         run: |
           echo "::notice::step-start: Download canonical primary audit for ledger"
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile get \
+          "$SILO_EXEC" get \
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
 
@@ -2311,7 +2320,7 @@ jobs:
         run: |
           echo "::notice::step-start: Download gate terminal envelope for ledger"
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile get \
+          "$SILO_EXEC" get \
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
 
@@ -2341,7 +2350,7 @@ jobs:
         run: |
           echo "::notice::step-start: Upload v2 review effectiveness ledger"
           set -euo pipefail
-          "$SILO_EXEC" --managed-profile put \
+          "$SILO_EXEC" put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
