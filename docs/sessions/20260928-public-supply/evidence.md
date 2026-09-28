@@ -19,9 +19,10 @@
 ## C1 本地实现与验证记录
 
 - H0 基线红验：`/run/user/1000/gate-c1-red-H0.log`，4 项新契约失败、pytest exit 1；覆盖 wrapper selector、四 job source 与 aggregate subprocess producer。
-- 定点绿验：`/run/user/1000/gate-c1-green-target.log`，9 passed、exit 0；真实 wrapper 子进程记录 argv/env，managed 清除 AWS keys、legacy 保留 keys。
-- 受影响五文件+store/no-runtime：`/run/user/1000/gate-c1-focused-files.log`，597 passed in 86.52s、exit 0；包含 managed profile 缺文件时有 env key 也 fail-fast。
-- `python3 scripts/check_pinned_uses.py` exit 0；CI lint `SHELLCHECK_OPTS=--severity=warning actionlint -color .github/workflows/*.yml templates/*.yml` exit 0；全量 `uv run --python 3.12 --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` 在冻结代码 SHA `5cfcb043` 上 1272 passed in 117.42s。OCR预扫仍在运行，独立完整review待主脑另派；此处不代表完整验收。
+- H1 standalone 缺省 selector 回归红验：`/run/user/1000/gate-c1-standalone-regression-red.log`，1 failed；H2 修复后真实 wrapper 子进程 managed/legacy/缺省三格绿验：`/run/user/1000/gate-c1-regression-green.log`，10 passed、exit 0。
+- H2 受影响五文件+store/no-runtime：`/run/user/1000/gate-c1-focused-H2.log`，598 passed in 88.32s、exit 0；含 managed profile 缺失但 AWS env 有值仍 fail-fast。
+- H2 全量：`/run/user/1000/gate-c1-full-H2.log`，规定的 `uv run --python 3.12 --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` exit 0，1273 passed in 129.71s；同 SHA 的 CI actionlint（severity=warning）与 pin 检查均 exit 0。
+- OCR完整 envelope：`/run/user/1000/gate-c1-ocr-envelope.json`，`reviewed_fallback`（primary minimax 900.112s timeout，backup deepseek-v4-flash success）；Codex verifier确认1条medium finding，aggregate standalone 缺省 source 与旧 managed 默认不兼容，已在 H2 修复。H1 本地主审原文保存在 `reviews/c1-compat-89bf-verdict.md`，结论仍为需修复后复审，不是clean；H2 fresh review待主脑安排。
 
 ## 尚未验收
 
