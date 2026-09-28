@@ -7,7 +7,7 @@
 - 公共 caller 不持有/转发能访问 Silo 的长期 key；quality job 持续执行业务测试，但拿不到该 profile 或 key。
 - gate-v2 可信 Silo subprocess 通过显式 managed mode 读 host-managed profile；disposition 继续走显式 legacy env mode。两个入口互斥，managed mode 缺 profile 就失败，不回落 env；不加 broker、policy knob 或重试。
 - Gate 现有 Silo key 的 runner-managed 供给已获分阶段授权；但 all28 与真实 adapter 前置尚未通过，因此本卡未创建/部署 profile。#1183 只证明共享缓存隔离，不证明所有 host state 隔离。
-- 设计/证据合计新增预算 ≤120 行；后续 runtime C1 ≤200 行代码与测试。只写当前 docs 目录两文件。
+- 设计/证据合计新增预算 ≤120 行；原始 runtime C1（`85916ed5c4f9d181fec866f15d1bb5f58111c9c8..0b5da65fa37ec00864d64a698844dc2b69f7642f`）新增代码与测试 189 行，符合 ≤200 行；兼容修订（`0b5da65fa37ec00864d64a698844dc2b69f7642f..8e894d5d2e166d76f94ceb3ebdff6d88c3bd4156`）另按 ≤160 行卡验收，新增 151 行。当前 PR 累计新增代码与测试 296 行，不是单张修订卡预算，也不回溯放宽原卡。只写当前 docs 目录两文件。
 
 ## 当前真实消费者（固定 SHA）
 
