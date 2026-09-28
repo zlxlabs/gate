@@ -2945,14 +2945,10 @@ def test_caller_permissions_minimal_and_no_secrets_inherit():
     assert "inherit" not in code
 
 
-def test_caller_forwards_silo_secrets():
+def test_caller_forwards_only_feishu_secret():
     raw, _ = _load_caller()
     secrets = raw["jobs"]["gate"]["secrets"]
-    assert secrets["SILO_ACCESS_KEY"] == "${{ secrets.SILO_ACCESS_KEY }}"
-    assert secrets["SILO_SECRET_KEY"] == "${{ secrets.SILO_SECRET_KEY }}"
-    text = CALLER_TEMPLATE.read_text(encoding="utf-8")
-    assert "SILO_ACCESS_KEY 未传入" in text
-    assert "公开仓应配置专属仓级密钥" in text
+    assert secrets == {"FEISHU_CI_WEBHOOK": "${{ secrets.FEISHU_CI_WEBHOOK }}"}
 
 
 def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error():

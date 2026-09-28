@@ -47,17 +47,21 @@ PERMISSION_SCOPES = (
 )
 
 
-def test_caller_templates_forward_only_named_silo_secrets():
-    expected = {
+def test_public_gate_uses_managed_profile_and_disposition_keeps_legacy_secrets():
+    silo_secrets = {
         "SILO_ACCESS_KEY": "${{ secrets.SILO_ACCESS_KEY }}",
         "SILO_SECRET_KEY": "${{ secrets.SILO_SECRET_KEY }}",
     }
-    for filename in ("caller-gate-v2.yml", "caller-gate-disposition.yml"):
-        document = yaml.safe_load((REPO_ROOT / "templates" / filename).read_text())
-        for job in document["jobs"].values():
-            if job.get("uses", "").startswith("zlxlabs/gate/"):
-                assert job.get("secrets", {}) != "inherit"
-                assert {name: job["secrets"][name] for name in expected} == expected
+    public = yaml.safe_load((REPO_ROOT / "templates/caller-gate-v2.yml").read_text())
+    assert public["jobs"]["gate"]["secrets"] == {
+        "FEISHU_CI_WEBHOOK": "${{ secrets.FEISHU_CI_WEBHOOK }}"
+    }
+    disposition = yaml.safe_load((REPO_ROOT / "templates/caller-gate-disposition.yml").read_text())
+    assert disposition["jobs"]["disposition"]["secrets"] == silo_secrets
+
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
+    jobs = yaml.safe_dump(workflow["jobs"])
+    assert all(name not in jobs for name in silo_secrets)
 
 
 def _workflow_call(document):
