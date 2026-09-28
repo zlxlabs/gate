@@ -13,4 +13,6 @@ Refs #264 / #249；PR #265 为基于 C1 分支的 draft，不关闭 issue。
 - 新 base 初次点测命中旧断言“gate-v2 jobs 全无 Silo secret 名称”；按 Gate ID / private legacy 合同修正后，caller 与 gate-v2 contract 点测 210 passed in 78.68s，exit 0。红、绿原始日志均保留。
 - 冻结代码与测试于 `11a943cf306e521bf18958a8b2375914fc1903b8`、C1 base `e7a57ece42d4b6d87d7eb27668d167d376c388e0`；全量命令 `uv run --python 3.12 --with pytest,PyYAML,diff-cover,coverage python -m pytest -q`：1273 passed in 119.02s，exit 0。全量原始日志保留。
 - `SHELLCHECK_OPTS=--severity=warning actionlint -color .github/workflows/*.yml templates/*.yml` 与 `python3 scripts/check_pinned_uses.py` 均 exit 0。
-- 本仓无 Makefile，`make lint` 不可用；未作生产 profile 部署或真实事件矩阵验收。
+- OCR 前置扫描固定范围 `e7a57ece42d4b6d87d7eb27668d167d376c388e0..101a7ba3a3d5ca66ab2e602f2f644e368f2b92e7` 返回 `reviewed`、`coverage=complete`、`findings=[]`；无 finding 导致 verify 子步骤 skipped。原始 stdout/stderr/background 保存在执行器外部。
+- 该固定范围的独立审查另报 P2：README 把 quality runner 对档案文件不可见写成已验证事实。README 已改为源码只证明不映射 keys/不调用 Silo，profile 权限与真实 consumer 可见性仍待生产验收；root 文档点验待完成。此前 OCR 范围 `0b5da65..6398433` 保持历史记录。
+- 本次 docs-only 修订未重跑测试；本仓无 Makefile，`make lint` 不可用。未作生产 profile 部署或真实事件矩阵验收。

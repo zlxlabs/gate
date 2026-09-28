@@ -36,8 +36,9 @@ Required Gate 公共 caller 模板不映射 Silo key。只有可信仓库 `zlxla
 （`github.repository_id == 1295374164`）的 gate jobs 使用 runner 管理的固定档案
 `/opt/review-auth/silo.json`；既有 private callers 仍可用 optional secrets 走 legacy AWS
 env，缺少凭据时 fail-fast。其他 public caller 不获新的 managed profile；使用无 key 模板时，
-其 Silo 操作仍不可用。quality job 不接收 key，也不可见该档案。代码合并、生产 runner
-安装档案、真实事件矩阵验收是三个独立状态，合并源码不代表已部署。
+其 Silo 操作仍不可用。quality job 的 workflow 源码不映射 Silo keys，也不调用 Silo；这不
+证明 runner 对固定档案文件物理不可见，实际文件权限/可见性仍待生产 quality consumer 验证。
+代码合并、生产 runner 安装档案、真实事件矩阵验收是三个独立状态，合并源码不代表已部署。
 
 ### 仓库自有质量入口（推荐）
 
@@ -136,6 +137,8 @@ Required Gate 公共模板不传 Silo key；`workflow_call.secrets.SILO_ACCESS_K
 callers 可继续传入 optional secrets 并由 jobs 映射到 legacy AWS env，缺凭据时 fail-fast。
 其他 public caller 没有旧 keys 时，其 Silo 操作仍 unavailable；C2 不为其他仓增加 managed
 keys、namespace 或 ACL。
+quality 相关测试只锁定源码不映射 Silo keys、不调用 Silo；生产 consumer 的 profile 文件权限
+与可见性仍待实际 runner 验证。
 
 disposition 是独立 workflow，仍使用 legacy caller-key 环境契约；部署
 `caller-gate-disposition.yml` 时继续映射这两项。GitHub-hosted 没有 runner 档案或
