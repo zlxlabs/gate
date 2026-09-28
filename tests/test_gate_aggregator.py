@@ -3766,31 +3766,59 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
     assert recorded_calls[0][0:3] == ["list", "--prefix", prefix]
 
 
-def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
-    # 跨进程边界断言：聚合器实际发出的 argv 必须是 [解释器, 仓内脚本, ...]，
-    # 不得出现 uv/uvx/pip/npx。捕获真实 argv（不执行），本机有无 uv 结果一致。
-    recorded = []
+@pytest.mark.parametrize(
+    ("source", "expected_source", "expected_access", "expected_secret", "managed"),
+    [
+        ("unset", "managed-profile", "unset", "unset", True),
+        ("managed-profile", "managed-profile", "unset", "unset", True),
+        ("legacy-env", "legacy-env", "legacy-access-sentinel", "legacy-secret-sentinel", False),
+    ],
+)
+def test_silo_cli_uses_wrapper_source_in_real_subprocess(
+    monkeypatch, tmp_path, source, expected_source, expected_access, expected_secret, managed,
+):
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    output = tmp_path / "producer.txt"
+    stub = stub_bin / "python3"
+    stub.write_text(
+        "#!/bin/sh\nset -eu\n"
+        "printf 'PWD=%s\\nSOURCE=%s\\nAWS_ACCESS_KEY_ID=%s\\nAWS_SECRET_ACCESS_KEY=%s\\n' "
+        "\"$PWD\" \"${SILO_CREDENTIAL_SOURCE-unset}\" \"${AWS_ACCESS_KEY_ID-unset}\" "
+        "\"${AWS_SECRET_ACCESS_KEY-unset}\" > \"$STUB_OUTPUT\"\n"
+        "for arg in \"$@\"; do printf 'ARG=%s\\n' \"$arg\" >> \"$STUB_OUTPUT\"; done\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    store_path = tmp_path / "fake-silo-store.py"
+    store_path.write_text("# captured by the python3 producer stub\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", f"{stub_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    monkeypatch.setenv("STUB_OUTPUT", str(output))
+    monkeypatch.setenv("SILO_EXEC", str(ROOT / "scripts" / "silo_exec.sh"))
+    monkeypatch.setenv("SILO_STORE", str(store_path))
+    if source == "unset":
+        monkeypatch.delenv("SILO_CREDENTIAL_SOURCE", raising=False)
+    else:
+        monkeypatch.setenv("SILO_CREDENTIAL_SOURCE", source)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "legacy-access-sentinel")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "legacy-secret-sentinel")
 
-    class _Proc:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    result = AGG._silo_cli(["list", "--prefix", "d30/1/"])
 
-    def fake_run(argv, **kwargs):
-        recorded.append(list(argv))
-        return _Proc()
-
-    monkeypatch.setattr(AGG.subprocess, "run", fake_run)
-    monkeypatch.setenv("SILO_STORE", "/tmp/fake-silo-store.py")
-    AGG._silo_cli(["list", "--prefix", "d30/1/"])
-    assert len(recorded) == 1
-    argv = recorded[0]
-    assert argv[0] == sys.executable
-    assert argv[1] == "/tmp/fake-silo-store.py"
-    assert argv[2:] == ["list", "--prefix", "d30/1/"]
-    joined = " ".join(argv)
-    for banned in ("uv run", "uvx", "pip install", "npx", "--with"):
-        assert banned not in joined
+    assert result.returncode == 0, result.stderr
+    records = output.read_text(encoding="utf-8").splitlines()
+    assert records[:4] == [
+        f"PWD={runner_temp}", f"SOURCE={expected_source}",
+        f"AWS_ACCESS_KEY_ID={expected_access}", f"AWS_SECRET_ACCESS_KEY={expected_secret}",
+    ]
+    expected_argv = [str(store_path)]
+    if managed:
+        expected_argv.append("--managed-profile")
+    expected_argv.extend(["list", "--prefix", "d30/1/"])
+    assert [line.removeprefix("ARG=") for line in records[4:]] == expected_argv
 
 
 # ── gate#199 止血：主审未产出结论时 quality 不得定罪 ──────────────────────

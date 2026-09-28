@@ -595,6 +595,26 @@ def test_silo_store_env_aligns_with_job_checkout_path():
         assert_workflow_sha_checkout(checkout_step, path=checkout_dir)
 
 
+def test_gate_silo_source_is_selected_by_trusted_repository_id():
+    raw, _ = _load_workflow()
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    assert raw.get("env", {}).get("SILO_ENDPOINT")
+    assert raw["env"]["SILO_CREDENTIAL_SOURCE"] == (
+        "${{ github.repository_id == '1295374164' && 'managed-profile' || 'legacy-env' }}"
+    )
+    access_key = "${{ github.repository_id != '1295374164' && secrets.SILO_ACCESS_KEY || '' }}"
+    secret_key = "${{ github.repository_id != '1295374164' && secrets.SILO_SECRET_KEY || '' }}"
+    for job_name in ("primary", "ocr", "gate", "ledger"):
+        env = raw["jobs"][job_name].get("env", {})
+        assert env["AWS_ACCESS_KEY_ID"] == access_key
+        assert env["AWS_SECRET_ACCESS_KEY"] == secret_key
+    calls = [line for line in workflow_text.splitlines() if '"$SILO_EXEC"' in line]
+    assert len(calls) == 15
+    assert all("--managed-profile" not in line for line in calls)
+    assert "${AWS_ACCESS_KEY_ID:-}" not in workflow_text
+    assert "${AWS_SECRET_ACCESS_KEY:-}" not in workflow_text
+
+
 def test_secrets_explicit_and_feishu_optional():
     code = "\n".join(ln for ln in WORKFLOW.read_text().splitlines() if not ln.lstrip().startswith("#"))
     assert "inherit" not in code
@@ -1400,7 +1420,8 @@ def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
     assert "--tier d14" in upload["run"]
     assert upload["env"]["AUDIT_PATH"] == "${{ runner.temp }}/primary-review-audit.json"
     assert "|| true" not in upload["run"]
-    assert "SILO_ACCESS_KEY 未传入" in upload["run"]
+    assert '"$SILO_EXEC" put' in upload["run"]
+    assert "--managed-profile" not in upload["run"]
 
 
 def test_primary_uploads_review_diagnostics_after_canonical_audit():
@@ -1485,7 +1506,8 @@ def test_artifact_listing_resolvers_retry_with_bounded_timeout(job_name, step_na
     assert "$SILO_EXEC" in run
     assert " resolve" in run
     assert "--attempt" in run
-    assert "SILO_ACCESS_KEY 未传入" in run
+    assert '"$SILO_EXEC"' in run
+    assert "--managed-profile" not in run
     assert "while true" not in run
     assert "until true" not in run
 

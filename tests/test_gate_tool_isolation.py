@@ -74,7 +74,7 @@ def test_diff_coverage_runs_on_plain_interpreter_without_runtime_install():
     assert 'python3 "$GITHUB_ACTION_PATH/advisory.py"' in advisory_run
 
 
-def _run_with_python_stub(tmp_path: Path, exit_code: int = 0):
+def _run_with_python_stub(tmp_path: Path, exit_code: int = 0, credential_source: str | None = None):
     poisoned = tmp_path / "poisoned"
     poisoned.mkdir()
     (poisoned / "pyproject.toml").write_text(
@@ -91,6 +91,9 @@ def _run_with_python_stub(tmp_path: Path, exit_code: int = 0):
         "#!/bin/sh\n"
         "set -eu\n"
         "printf 'PWD=%s\\n' \"$PWD\" > \"$STUB_OUTPUT\"\n"
+        "printf 'SOURCE=%s\\n' \"${SILO_CREDENTIAL_SOURCE-unset}\" >> \"$STUB_OUTPUT\"\n"
+        "printf 'AWS_ACCESS_KEY_ID=%s\\n' \"${AWS_ACCESS_KEY_ID-unset}\" >> \"$STUB_OUTPUT\"\n"
+        "printf 'AWS_SECRET_ACCESS_KEY=%s\\n' \"${AWS_SECRET_ACCESS_KEY-unset}\" >> \"$STUB_OUTPUT\"\n"
         "for arg in \"$@\"; do printf 'ARG=%s\\n' \"$arg\" >> \"$STUB_OUTPUT\"; done\n"
         "exit \"${STUB_EXIT:-0}\"\n",
         encoding="utf-8",
@@ -106,10 +109,16 @@ def _run_with_python_stub(tmp_path: Path, exit_code: int = 0):
             "SILO_STORE": str(silo_store),
             "STUB_OUTPUT": str(stub_output),
             "STUB_EXIT": str(exit_code),
+            "AWS_ACCESS_KEY_ID": "legacy-access-sentinel",
+            "AWS_SECRET_ACCESS_KEY": "legacy-secret-sentinel",
         }
     )
+    if credential_source is not None:
+        env["SILO_CREDENTIAL_SOURCE"] = credential_source
+    command = [str(SILO_EXEC)]
+    command.extend(["get", "--key", "example"])
     result = subprocess.run(
-        [str(SILO_EXEC), "get", "--key", "example"],
+        command,
         cwd=poisoned,
         env=env,
         capture_output=True,
@@ -125,9 +134,33 @@ def test_silo_wrapper_emits_isolated_cwd_and_argv(tmp_path):
     records = stub_output.read_text(encoding="utf-8").splitlines()
     assert Path(records[0].removeprefix("PWD=")).resolve() == runner_temp.resolve()
     assert Path(records[0].removeprefix("PWD=")).resolve() != poisoned.resolve()
-    argv = [line.removeprefix("ARG=") for line in records[1:]]
+    assert records[1:] == [
+        "SOURCE=unset", "AWS_ACCESS_KEY_ID=legacy-access-sentinel",
+        "AWS_SECRET_ACCESS_KEY=legacy-secret-sentinel",
+        f"ARG={silo_store}", "ARG=get", "ARG=--key", "ARG=example",
+    ]
+    argv = [line.removeprefix("ARG=") for line in records if line.startswith("ARG=")]
     # stdlib client: plain python3, no package manager in the argv.
     assert argv == [str(silo_store), "get", "--key", "example"]
+
+
+def test_silo_wrapper_passes_managed_profile_as_store_argv(tmp_path):
+    result, _, _, silo_store, stub_output = _run_with_python_stub(
+        tmp_path, credential_source="managed-profile",
+    )
+    assert result.returncode == 0, result.stderr
+    records = stub_output.read_text(encoding="utf-8").splitlines()
+    assert records[1:4] == [
+        "SOURCE=managed-profile", "AWS_ACCESS_KEY_ID=unset", "AWS_SECRET_ACCESS_KEY=unset",
+    ]
+    argv = [line.removeprefix("ARG=") for line in records if line.startswith("ARG=")]
+    assert argv == [str(silo_store), "--managed-profile", "get", "--key", "example"]
+
+
+def test_silo_wrapper_rejects_empty_credential_source(tmp_path):
+    result, *_ = _run_with_python_stub(tmp_path, credential_source="")
+    assert result.returncode == 1
+    assert "Unsupported SILO_CREDENTIAL_SOURCE" in result.stderr
 
 
 def test_silo_wrapper_transparent_exit_code(tmp_path):
