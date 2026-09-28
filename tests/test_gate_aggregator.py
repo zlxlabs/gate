@@ -3767,14 +3767,15 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("source", "expected_access", "expected_secret", "managed"),
+    ("source", "expected_source", "expected_access", "expected_secret", "managed"),
     [
-        ("managed-profile", "unset", "unset", True),
-        ("legacy-env", "legacy-access-sentinel", "legacy-secret-sentinel", False),
+        ("unset", "managed-profile", "unset", "unset", True),
+        ("managed-profile", "managed-profile", "unset", "unset", True),
+        ("legacy-env", "legacy-env", "legacy-access-sentinel", "legacy-secret-sentinel", False),
     ],
 )
 def test_silo_cli_uses_wrapper_source_in_real_subprocess(
-    monkeypatch, tmp_path, source, expected_access, expected_secret, managed,
+    monkeypatch, tmp_path, source, expected_source, expected_access, expected_secret, managed,
 ):
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
@@ -3798,7 +3799,10 @@ def test_silo_cli_uses_wrapper_source_in_real_subprocess(
     monkeypatch.setenv("STUB_OUTPUT", str(output))
     monkeypatch.setenv("SILO_EXEC", str(ROOT / "scripts" / "silo_exec.sh"))
     monkeypatch.setenv("SILO_STORE", str(store_path))
-    monkeypatch.setenv("SILO_CREDENTIAL_SOURCE", source)
+    if source == "unset":
+        monkeypatch.delenv("SILO_CREDENTIAL_SOURCE", raising=False)
+    else:
+        monkeypatch.setenv("SILO_CREDENTIAL_SOURCE", source)
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "legacy-access-sentinel")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "legacy-secret-sentinel")
 
@@ -3807,7 +3811,7 @@ def test_silo_cli_uses_wrapper_source_in_real_subprocess(
     assert result.returncode == 0, result.stderr
     records = output.read_text(encoding="utf-8").splitlines()
     assert records[:4] == [
-        f"PWD={runner_temp}", f"SOURCE={source}",
+        f"PWD={runner_temp}", f"SOURCE={expected_source}",
         f"AWS_ACCESS_KEY_ID={expected_access}", f"AWS_SECRET_ACCESS_KEY={expected_secret}",
     ]
     expected_argv = [str(store_path)]

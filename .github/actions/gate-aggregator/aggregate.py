@@ -2162,6 +2162,8 @@ def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
     child_env["SILO_STORE"] = store_path
     child_env["SILO_EXEC"] = exec_path
     child_env.setdefault("RUNNER_TEMP", tempfile.gettempdir())
+    # Standalone aggregate calls historically used managed-profile; workflow source wins.
+    child_env.setdefault("SILO_CREDENTIAL_SOURCE", "managed-profile")
     return subprocess.run(
         [exec_path, *argv],
         capture_output=True,
