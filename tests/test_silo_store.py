@@ -568,6 +568,7 @@ def test_managed_profile_reaches_all_five_commands_and_signs_profile_identity(mo
         monkeypatch.setenv("SILO_ENDPOINT", f"http://127.0.0.1:{server.server_port}")
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "environment-access")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "environment-secret")
+        assert store.MANAGED_PROFILE_PATH == Path("/opt/review-auth/silo.json")
         profile_path = tmp_path / "silo.json"
         profile_path.write_text(json.dumps({"access_key_id": "profile-access", "secret_access_key": "profile-secret"}))
         monkeypatch.setattr(store, "MANAGED_PROFILE_PATH", profile_path)
