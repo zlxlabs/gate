@@ -11,7 +11,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -112,14 +111,16 @@ def _run_diff_cover(repo: Path, base_sha: str, lcov_path: Path) -> dict[str, Any
                 ("unrecognized_args", b"unrecognized arguments"), ("no_module_named", b"no module named"),
                 ("no_such_file", b"no such file"), ("xml_syntax_error", b"xmlsyntaxerror"),
             )}
-            exception_type = re.search(r"[A-Za-z][A-Za-z0-9]*(?:Error|Exception)$", type(error).__name__)
-            trace_frames = [(Path(frame.filename).name, frame.lineno, frame.name)
-                for frame in traceback.extract_tb(error.__traceback__)[-4:]]
+            exception_types = re.findall(rb"(?m)^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))(?::|$)", stderr)
+            frame_pattern = rb'(?m)^\s*File "([^"]+)", line ([0-9]+), in ([A-Za-z_][A-Za-z0-9_]*)'
+            matches = re.findall(frame_pattern, stderr)
+            trace_frames = [[os.path.basename(path).decode("ascii", "replace"), int(line),
+                function.decode()] for path, line, function in matches[-4:]]
             print("::notice::DIFF_COVERAGE_PROBE_V1 " + json.dumps({"event": "failure", "exit": error.returncode,
                 "stdout_bytes": len(stdout), "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
                 "stderr_bytes": len(stderr), "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
                 "stderr_categories": categories,
-                "exception_type": exception_type.group(0) if exception_type else "unknown",
+                "exception_type": exception_types[-1].rsplit(b".", 1)[-1].decode() if exception_types else "unknown",
                 "trace_frames": trace_frames}, sort_keys=True), file=sys.stderr)
             raise
         return json.loads(report_path.read_text(encoding="utf-8"))
