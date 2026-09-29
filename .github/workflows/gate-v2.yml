@@ -309,7 +309,7 @@ jobs:
     # results and aggregates them fail-closed.
     # 仅同仓合法人类 PR 可选 ci 标签；Bot、fork、非法作者走 hosted。
     # 标签不证明镜像隔离或应用依赖，部署状态须由平台实测确认。
-    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
+    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && (github.repository_id == '1293158679' && fromJSON('["self-hosted","linux","ci","gatehub-diffcover-1185-slot61-arm64-20260929"]') || github.repository_id != '1293158679' && fromJSON('["self-hosted","linux","ci"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     outputs:
       ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
