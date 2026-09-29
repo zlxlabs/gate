@@ -94,6 +94,8 @@ def _run_diff_cover(repo: Path, base_sha: str, lcov_path: Path) -> dict[str, Any
             str(lcov_path),
             "--compare-branch",
             base_sha,
+            "--diff-range-notation",
+            "..",
             "--format",
             f"json:{report_path}",
         ]
