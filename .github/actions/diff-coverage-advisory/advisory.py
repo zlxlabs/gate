@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -97,7 +98,23 @@ def _run_diff_cover(repo: Path, base_sha: str, lcov_path: Path) -> dict[str, Any
             "--format",
             f"json:{report_path}",
         ]
-        subprocess.run(command, cwd=repo, check=True, capture_output=True, text=True)
+        try:
+            subprocess.run(command, cwd=repo, check=True, capture_output=True)
+        except subprocess.CalledProcessError as error:
+            stdout = error.stdout or b""
+            stderr = error.stderr or b""
+            lowered_stderr = stderr.lower()
+            categories = {name: marker in lowered_stderr for name, marker in (
+                ("dubious_ownership", b"dubious ownership"), ("bad_revision", b"bad revision"),
+                ("bad_object", b"bad object"), ("ambiguous_argument", b"ambiguous argument"),
+                ("unrecognized_args", b"unrecognized arguments"), ("no_module_named", b"no module named"),
+                ("no_such_file", b"no such file"), ("xml_syntax_error", b"xmlsyntaxerror"),
+            )}
+            print(json.dumps({"event": "diff_cover_subprocess_failure_v1", "exit": error.returncode,
+                "stdout_bytes": len(stdout), "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+                "stderr_bytes": len(stderr), "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                "stderr_categories": categories}, sort_keys=True), file=sys.stderr)
+            raise
         return json.loads(report_path.read_text(encoding="utf-8"))
 
 
@@ -145,6 +162,9 @@ def measure(
             "head_sha": head_sha,
         }
 
+    lcov_bytes = resolved_lcov.read_bytes()
+    print(json.dumps({"event": "diff_cover_lcov_input_v1", "exists": True, "bytes": len(lcov_bytes),
+        "sha256": hashlib.sha256(lcov_bytes).hexdigest()}, sort_keys=True), file=sys.stderr)
     report = _run_diff_cover(repo, base_sha, resolved_lcov)
     total_lines = int(report["total_num_lines"])
     if total_lines == 0:
@@ -205,6 +225,9 @@ def main() -> int:
             args.head_sha,
             lcov_path=Path(args.lcov_path),
         )
+    except subprocess.CalledProcessError:
+        print("::warning::diff-coverage advisory degraded to missing note: diff-cover subprocess failed")
+        return 0
     except Exception as error:  # noqa: BLE001 — advisory must never fail the workflow
         print(f"::warning::diff-coverage advisory degraded to missing note: {error}")
         return 0
