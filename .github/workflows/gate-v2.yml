@@ -2112,10 +2112,10 @@ jobs:
           if not terminal_required and terminal_artifact is None:
               print("::notice::本轮未评审/豁免，无终态产物")
 
-          GATE_AGGREGATOR_JOB_NAMES = ("gate", "gate / gate", "gate / gate (draft)")
-
           def is_gate_aggregator_job(name):
-              return isinstance(name, str) and name in GATE_AGGREGATOR_JOB_NAMES
+              return name == "gate" or (
+                  isinstance(name, str) and (name.endswith(" / gate") or name.endswith(" / gate (draft)"))
+              )
 
           def jobs_pages(payload):
               pages = payload if isinstance(payload, list) else [payload]

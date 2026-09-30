@@ -2010,7 +2010,7 @@ def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp
     assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-3')}" not in output
 
 
-@pytest.mark.parametrize("gate_job_name", GATE_AGGREGATOR_JOB_NAMES)
+@pytest.mark.parametrize("gate_job_name", (*GATE_AGGREGATOR_JOB_NAMES, "ci / gate"))
 def test_ledger_resolver_hard_fails_when_aggregator_ran_without_terminal(tmp_path, gate_job_name):
     artifacts = [
         {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
