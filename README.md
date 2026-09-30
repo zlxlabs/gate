@@ -63,7 +63,7 @@ Calibration 拆成两个独立 reusable workflow；旧版 `gate.yml` 已删除�
 
 | workflow(`name:`) | job 拓扑 | 说明 |
 |---|---|---|
-| `.github/workflows/gate-v2.yml`(`gate`) | `quality` ∥ `primary` → `gate`(`needs: [quality, primary]`,`if: always()`) | Required Gate。`gate` job id 与 `name:` 都字面等于 `gate`，required status check context 为 `gate / gate`。 |
+| `.github/workflows/gate-v2.yml`(`gate`) | `quality` ∥ `primary` → `gate`(`needs: [quality, primary]`,`if: always()`) | Required Gate。draft 事件产生 `gate / gate (draft)`；`gate / gate` 只由非 draft 事件产生，代表完整裁决。 |
 | `.github/workflows/gate-shadow-v2.yml`(`gate-shadow`) | `resolve` → `shadow`(matrix，每 reviewer 一个 job)→ `summary` | Shadow Calibration。**不产生任何 required status check**，只用于校准；失败/取消/超时不影响 Required Gate。 |
 
 PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式固定为

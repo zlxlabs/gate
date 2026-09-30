@@ -40,12 +40,9 @@
 #   ocr      — runs one `review-shadow` advisory matrix leg per resolved
 #              policy.advisory reviewer and posts its non-empty comment artifact
 #              to the PR. It is never a dependency of the required gate.
-#   gate     — the ONLY required-check-bearing job. Job id MUST stay literally
-#              `gate` (this file's `name:` is also `gate`) — that combination
-#              is what keeps the existing required status check context
-#              `gate / gate` unchanged (see the plan's "Required status check
-#              compatibility"). `if: always()` so a skipped/failed dependency
-#              can never make this job silently skip too. Validates
+#   gate     — required aggregator; keep job id `gate`. Draft events emit
+#              `gate / gate (draft)`; other events emit trusted `gate / gate`.
+#              `if: always()` keeps it running after skipped/failed dependencies. Validates
 #              needs.quality/needs.primary + the canonical primary audit
 #              artifact via the portable aggregator script in
 #              .github/actions/gate-aggregator/aggregate.py, and is the only
@@ -64,8 +61,8 @@
 # gate keeps cancel-in-progress: false; ledger has no concurrency group because
 # it writes only run-local files and a run-local artifact. OCR / advisory jobs
 # stay unlocked (first-cut scope). ocr is advisory: job-level continue-on-error
-# keeps its failure out of the run-level conclusion; gate / gate is the only
-# verdict check — do not read run.conclusion downstream.
+# Only non-draft `gate / gate` is trusted; draft `gate / gate (draft)` records
+# draft quality. Do not read run.conclusion downstream.
 #
 # Job graph note (gate#129, owner 2026-09-07): primary and quality are
 # independent again, so a passing run does not pay a primary-before-quality
@@ -1605,6 +1602,7 @@ jobs:
 
   # ── gate (final aggregator — required check) ────────────────────────────
   gate:
+    name: ${{ format('gate{0}', github.event.pull_request.draft && ' (draft)' || '') }}
     needs: [quality, primary, classify_pr_paths]
     # always(): an aggregator gated by the default `success()` would itself be
     # skipped whenever a dependency fails/is skipped, and GitHub treats a
@@ -2114,8 +2112,10 @@ jobs:
           if not terminal_required and terminal_artifact is None:
               print("::notice::本轮未评审/豁免，无终态产物")
 
+          GATE_AGGREGATOR_JOB_NAMES = ("gate", "gate / gate", "gate / gate (draft)")
+
           def is_gate_aggregator_job(name):
-              return name == "gate" or (isinstance(name, str) and name.endswith(" / gate"))
+              return isinstance(name, str) and name in GATE_AGGREGATOR_JOB_NAMES
 
           def jobs_pages(payload):
               pages = payload if isinstance(payload, list) else [payload]
