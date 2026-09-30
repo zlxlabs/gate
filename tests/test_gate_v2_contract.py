@@ -88,6 +88,8 @@ CONVERGENCE_RECEIPT_NAME_EXPR = (
     "-${{ github.run_id }}-${{ github.run_attempt }}"
 )
 CONVERGENCE_RECEIPT_PATH = "${{ runner.temp }}/convergence-receipt"
+GATE_AGGREGATOR_JOB_NAMES = ("gate", "gate / gate", "gate / gate (draft)")
+GATE_AGGREGATOR_NAME_EXPRESSION = "${{ format('gate{0}', github.event.pull_request.draft && ' (draft)' || '') }}"
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -1093,6 +1095,15 @@ def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
     assert raw["jobs"]["gate"]["needs"] == ["quality", "primary", "classify_pr_paths"]
 
 
+def test_aggregator_check_name_separates_draft_events():
+    raw, _ = _load_workflow()
+    assert "gate" in raw["jobs"]
+    gate = raw["jobs"]["gate"]
+    assert gate.get("name") == GATE_AGGREGATOR_NAME_EXPRESSION
+    assert gate["if"] == "always()"
+    assert gate["needs"] == ["quality", "primary", "classify_pr_paths"]
+
+
 def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
     raw, _ = _load_workflow()
     step = next(
@@ -1999,7 +2010,7 @@ def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp
     assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-3')}" not in output
 
 
-@pytest.mark.parametrize("gate_job_name", ["gate", "gate / gate"])
+@pytest.mark.parametrize("gate_job_name", (*GATE_AGGREGATOR_JOB_NAMES, "ci / gate"))
 def test_ledger_resolver_hard_fails_when_aggregator_ran_without_terminal(tmp_path, gate_job_name):
     artifacts = [
         {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
