@@ -1,0 +1,19 @@
+### 2026-09-30 · 按名反查审计
+
+**当前阶段**：implementing；已完成决策 6 的只读排查。
+
+**本段结论**：唯一会按 Jobs API 的 job `name` 判断本聚合 job 的运行时代码在 `.github/workflows/gate-v2.yml:2117-2206`，当前识别 `gate` 与 `*/ gate`，改名后会漏掉 `gate / gate (draft)`，需扩为三个精确名称并补 resolver 参数测试。`tests/test_gate_v2_contract.py:2002-2014` 是这条运行逻辑的行为测试，需加 draft 名；`1858` 是 ready attempt 的固定契约 fixture，语义仍是 ready 检查名，保留不改。其余 `rg -n "gate / gate|\"gate\"|'gate'|job_name" .github scripts tests` 命中均为 job id、其他 job/step、workflow 身份或只描述 required context 的文案；不是按本 job 显示名反查，无需同步。
+
+**关键决策与已否决方案**：只调整现有 `is_gate_aggregator_job` 名称匹配，不新增共享抽象；测试复用一个三项 job-name tuple 覆盖裸 job 名、ready 检查名和 draft 检查名。下游只读确认：`agent-config/scripts/git/pr_merge_ready.py:292` 在 draft 名不存在时无法接受 primary failure 的 gate disposition，`372-374` 对 skipped primary 因缺少成功的 `gate / gate` 返回 NOT_READY；`agent-config/scripts/git/gate_disposition.py:20,203-206` 的 `rerun-gate` 只查 `gate / gate`，draft 阶段没有该 check 时无法定位可重跑 job。按卡面不修改下游。
+
+**下一步唯一动作**：调整聚合器 draft 判定与 workflow job 检查名，并为对应语义补测试。
+
+### 2026-09-30 · 聚合器 draft 判定
+
+**当前阶段**：implementing；聚合器实现与整文件测试完成，已提交。
+
+**本段结论**：`evaluate()` 现只按 draft 事件 payload 接受 primary skipped，并将记录说明为 draft 阶段检查；`main()` 在该分支不扫描 waiver 回执，零 GitHub API 请求由 CLI 测试锁定。移除了实时 PR 状态参数、查询重试和两个失效 reason code；非 draft 缺失 primary 的原逻辑未改。`tests/test_gate_aggregator.py`：343 passed。
+
+**关键决策与已否决方案**：不保留实时查询、重试或 stale/unverifiable 结果分支；draft 结果由独立检查名表达其阶段。现有非 draft `skipped` 路径是 `integration_error/unexpected_primary_skip`，不是任务卡文字所称的 `review_unavailable`；保留基线行为，`cancelled` 仍是 `review_unavailable/primary_cancelled`，报告说明差异。
+
+**下一步唯一动作**：验证 workflow 名称契约和按名反查测试，再提交该单元。
