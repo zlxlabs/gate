@@ -6,7 +6,7 @@ on:
 jobs:
   gate:
     if: always()
-    name: gate${{ github.event.pull_request.draft && ' (draft)' || '' }}
+    name: ${{ format('gate{0}', github.event.pull_request.draft && ' (draft)' || '') }}
     runs-on: ubuntu-latest
     steps:
       - run: echo "probe job completed"
