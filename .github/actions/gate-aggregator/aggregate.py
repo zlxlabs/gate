@@ -2447,7 +2447,8 @@ def _build_panel_delivery(
     *, body: str, repository: Optional[str], pr_number: Optional[int], identity: Optional[Identity],
     delivery: str, reason_code: str, error_category: Optional[str] = None,
     http_status: Optional[int] = None, history_error: Optional[str] = None,
-    operation: Optional[str] = None, history_skipped_records: Optional[list[dict[str, str]]] = None,
+    operation: Optional[str] = None, attempts: Optional[int] = None,
+    exception_type: Optional[str] = None, history_skipped_records: Optional[list[dict[str, str]]] = None,
     history_incomplete_reasons: Optional[list[str]] = None, self_heal_errors: Optional[list[str]] = None,
     identity_source: Optional[str] = None, completed_operations: Optional[list[str]] = None,
     pending_operations: Optional[list[str]] = None,
@@ -2475,6 +2476,8 @@ def _build_panel_delivery(
         "history_incomplete": bool(history_incomplete_reasons),
         "self_heal_errors": self_heal_errors or [],
         "operation": operation,
+        "attempts": attempts,
+        "exception_type": exception_type,
         "identity_source": identity_source,
         "completed_operations": completed_operations or [],
         "pending_operations": pending_operations or [],
@@ -2482,23 +2485,42 @@ def _build_panel_delivery(
     }
 
 
-def _panel_failure(exc: BaseException) -> tuple[str, str, Optional[int]]:
+def _panel_failure(exc: BaseException) -> tuple[str, str, Optional[int], str]:
+    raw_reason = getattr(exc, "reason", "")
+    if isinstance(raw_reason, BaseException):
+        raw_reason = type(raw_reason).__name__
+    if not isinstance(raw_reason, str):
+        raw_reason = ""
+    raw_reason = re.sub(r"https?://[^\s?#]+\?[^\s#]*", "<URL>", raw_reason)
+    raw_reason = re.sub(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?\S+", r"\1[REDACTED]", raw_reason)
+    raw_reason = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", raw_reason)
+    raw_reason = re.sub(r"(?i)([?&][^=\s#]+)=([^&\s#]*)", r"\1=[REDACTED]", raw_reason)
+    safe_reason = scrub_for_publish(raw_reason, runtime_values=runtime_values_from_environment())[:200]
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code == 403 or exc.code == 429:
-            return f"http_{exc.code}", "permission_or_rate_limit", exc.code
+            return f"http_{exc.code}", "permission_or_rate_limit", exc.code, safe_reason
         if exc.code >= 500:
-            return "http_5xx", "server_error", exc.code
-        return "http_error", "http_error", exc.code
-    return "network_indeterminate", "network_error", None
+            return "http_5xx", "server_error", exc.code, safe_reason
+        return "http_error", "http_error", exc.code, safe_reason
+    return "network_indeterminate", "network_error", None, safe_reason
 
 
-def _panel_warning(*, phase: str, exc: BaseException, reason_code: str, category: str, http_status: Optional[int]) -> None:
+def _panel_warning(
+    *, phase: str, exc: BaseException, reason_code: str, category: str,
+    http_status: Optional[int], operation: Optional[str] = None,
+    attempts: int = 1, safe_reason: str = "",
+) -> None:
     status = str(http_status) if http_status is not None else "unavailable"
     _warn(
         f"::warning::gate status panel {phase} failed — HTTP status={status}; "
         f"permission category={category}; reason={reason_code}; "
         "gate verdict is unchanged and Step Summary remains authoritative"
     )
+    if operation:
+        _warn(
+            f"::warning::PANEL_PUBLISH_FAILED operation={operation} attempts={attempts} "
+            f"exc_type={type(exc).__name__} reason={safe_reason[:200]}"
+        )
 
 
 def _post_status_panel_fail_open_with_budget(
@@ -2511,6 +2533,8 @@ def _post_status_panel_fail_open_with_budget(
         runtime_values=runtime_values_from_environment(),
     )
     identity_source: Optional[str] = None
+    failure_operation: Optional[str] = None
+    failure_attempts = 1
     try:
         if not repository or pr_number is None:
             reason_code, category, status = "missing_target", "configuration", None
@@ -2529,7 +2553,7 @@ def _post_status_panel_fail_open_with_budget(
         except _PublishBudgetExhausted:
             raise
         except Exception as exc:
-            reason_code, category, status = _panel_failure(exc)
+            reason_code, category, status, _ = _panel_failure(exc)
             _panel_warning(phase="identity", exc=exc, reason_code=reason_code, category=category, http_status=status)
             return body, _build_panel_delivery(
                 body=body, repository=repository, pr_number=pr_number, identity=identity,
@@ -2539,8 +2563,10 @@ def _post_status_panel_fail_open_with_budget(
             )
         identity_source = owner.get("identity_source", "user_api")
         budget.begin("COMMENT_LOOKUP")
+        failure_operation = "comment_lookup"
         comments = _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number)
         budget.complete("COMMENT_LOOKUP")
+        failure_operation = None
         own_panels = _find_panel_comments(comments, owner)
         existing = own_panels[0] if own_panels else None
         cached_rows = _parse_panel_history(existing.get("body", "")) if existing else []
@@ -2555,13 +2581,18 @@ def _post_status_panel_fail_open_with_budget(
         except _PublishBudgetExhausted:
             raise
         except Exception as exc:
-            reason_code, category, status = _panel_failure(exc)
-            _panel_warning(phase="history reconstruction", exc=exc, reason_code=reason_code, category=category, http_status=status)
+            reason_code, category, status, safe_reason = _panel_failure(exc)
+            _panel_warning(
+                phase="history reconstruction", exc=exc, reason_code=reason_code,
+                category=category, http_status=status, operation="history_load",
+                attempts=1, safe_reason=safe_reason,
+            )
             cached_body = existing.get("body", body) if existing else body
             return cached_body, _build_panel_delivery(
                 body=cached_body, repository=repository, pr_number=pr_number, identity=identity,
                 delivery="not_created", reason_code="history_unavailable", error_category=category,
-                http_status=status, history_error=f"{type(exc).__name__}: {exc}", operation="LOOKUP",
+                http_status=status, history_error=f"{type(exc).__name__}: {safe_reason}",
+                operation="history_load", attempts=1, exception_type=type(exc).__name__,
                 identity_source=identity_source, completed_operations=budget.completed_operations,
                 pending_operations=budget.pending_operations,
             )
@@ -2586,8 +2617,10 @@ def _post_status_panel_fail_open_with_budget(
         if existing:
             budget.discard("POST_VERIFY")
             budget.begin("COMMENT_PUBLISH")
+            failure_operation = "comment_patch"
             _patch_issue_comment(repository=repository, comment_id=int(existing["id"]), body=body, token=token)
             budget.complete("COMMENT_PUBLISH")
+            failure_operation = None
             for duplicate in own_panels[1:]:
                 budget.add("SELF_HEAL")
                 budget.begin("SELF_HEAL")
@@ -2609,8 +2642,10 @@ def _post_status_panel_fail_open_with_budget(
                 pending_operations=budget.pending_operations,
             )
         budget.begin("COMMENT_PUBLISH")
+        failure_operation = "comment_create"
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
         budget.complete("COMMENT_PUBLISH")
+        failure_operation = None
         budget.begin("POST_VERIFY")
         try:
             after_post = _find_panel_comments(
@@ -2662,20 +2697,33 @@ def _post_status_panel_fail_open_with_budget(
             completed_operations=budget.completed_operations, pending_operations=budget.pending_operations,
         )
     except urllib.error.HTTPError as exc:
-        reason_code, category, status = _panel_failure(exc)
-        _panel_warning(phase="comment publish", exc=exc, reason_code=reason_code, category=category, http_status=status)
+        reason_code, category, status, safe_reason = _panel_failure(exc)
+        _panel_warning(
+            phase="comment publish", exc=exc, reason_code=reason_code,
+            category=category, http_status=status, operation=failure_operation,
+            attempts=failure_attempts, safe_reason=safe_reason,
+        )
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
-            delivery="not_created", reason_code=reason_code, error_category=category, http_status=status,
+            delivery="not_created" if status is not None and status < 500 else "unknown",
+            reason_code=reason_code, error_category=category, http_status=status,
+            operation=failure_operation, attempts=failure_attempts,
+            exception_type=type(exc).__name__,
             identity_source=identity_source, completed_operations=budget.completed_operations,
             pending_operations=budget.pending_operations,
         )
     except Exception as exc:
-        reason_code, category, status = _panel_failure(exc)
-        _panel_warning(phase="comment publish", exc=exc, reason_code=reason_code, category=category, http_status=status)
+        reason_code, category, status, safe_reason = _panel_failure(exc)
+        _panel_warning(
+            phase="comment publish", exc=exc, reason_code=reason_code,
+            category=category, http_status=status, operation=failure_operation,
+            attempts=failure_attempts, safe_reason=safe_reason,
+        )
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery="unknown", reason_code=reason_code, error_category=category, http_status=status,
+            operation=failure_operation, attempts=failure_attempts,
+            exception_type=type(exc).__name__,
             identity_source=identity_source, completed_operations=budget.completed_operations,
             pending_operations=budget.pending_operations,
         )
@@ -2841,6 +2889,8 @@ def _append_panel_diagnostic(summary_path: Optional[str], receipt: dict[str, Any
         f"- Permission category: `{receipt.get('error_category')}`\n"
         f"- Reason: `{receipt.get('reason_code')}`\n"
     )
+    if receipt.get("exception_type"):
+        diagnostic += "- 面板发布失败，面板可能显示旧状态\n"
     if receipt.get("history_error"):
         diagnostic += f"- History reconstruction: `{receipt['history_error']}`\n"
     if receipt.get("history_skipped_count"):

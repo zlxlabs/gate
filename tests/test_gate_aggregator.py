@@ -2179,11 +2179,11 @@ def test_slow_repo_wide_history_yields_to_comment_publish(monkeypatch):
     "failure,expected_delivery,expected_status",
     [
         (urllib.error.HTTPError("https://api.github.com/x", 429, "rate", hdrs=None, fp=None), "not_created", 429),
-        (urllib.error.URLError("timed out"), "unknown", None),
+        (urllib.error.URLError("Authorization: Bearer ghs_xxx https://api.github.com/path?token=query-secret"), "unknown", None),
     ],
     ids=["http-429", "network-timeout"],
 )
-def test_publish_only_transport_failures_are_fail_open_and_leave_receipt(monkeypatch, tmp_path, failure, expected_delivery, expected_status):
+def test_publish_only_transport_failures_are_fail_open_and_leave_receipt(monkeypatch, capsys, tmp_path, failure, expected_delivery, expected_status):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
     audit_dir = tmp_path / "audit"
@@ -2199,7 +2199,11 @@ def test_publish_only_transport_failures_are_fail_open_and_leave_receipt(monkeyp
     monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
     monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
     monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
-    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: (_ for _ in ()).throw(failure))
+    post_calls = []
+    def fail_post(**kwargs):
+        post_calls.append(kwargs)
+        raise failure
+    monkeypatch.setattr(AGG, "_post_issue_comment", fail_post)
     args = _cli_args(
         audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
     ) + ["--publish-only"]
@@ -2207,7 +2211,18 @@ def test_publish_only_transport_failures_are_fail_open_and_leave_receipt(monkeyp
     receipt = json.loads(delivery_path.read_text(encoding="utf-8"))
     assert receipt["delivery"] == expected_delivery
     assert receipt["http_status"] == expected_status
-    assert "HTTP status" in summary_path.read_text(encoding="utf-8")
+    assert len(post_calls) == 1
+    assert receipt["operation"] == "comment_create"
+    assert receipt["attempts"] == 1
+    assert receipt["exception_type"] == type(failure).__name__
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "HTTP status" in summary
+    assert "面板发布失败，面板可能显示旧状态" in summary
+    output = capsys.readouterr().out
+    assert "PANEL_PUBLISH_FAILED operation=comment_create attempts=1" in output
+    assert "exc_type=" + type(failure).__name__ in output
+    assert "ghs_xxx" not in output + summary + json.dumps(receipt)
+    assert "query-secret" not in output + summary + json.dumps(receipt)
 
 
 def test_warning_output_failure_stays_fail_open(monkeypatch):
