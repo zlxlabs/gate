@@ -2523,6 +2523,69 @@ def _panel_warning(
         )
 
 
+def _bounded_panel_request(
+    request: Any, *, before_retry: Optional[Any] = None,
+) -> tuple[Any, int, bool, Optional[Exception]]:
+    """Retry only the idempotent panel GET/PATCH operations, at most three times."""
+    attempts = 0
+    last_error: Optional[Exception] = None
+    while attempts < 3:
+        attempts += 1
+        try:
+            return request(), attempts, False, None
+        except Exception as exc:
+            last_error = exc
+            retryable = (
+                isinstance(exc, urllib.error.HTTPError) and exc.code >= 500
+            ) or (
+                not isinstance(exc, urllib.error.HTTPError)
+                and isinstance(exc, (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError))
+            )
+            if not retryable or attempts >= 3:
+                return None, attempts, False, exc
+        if before_retry is not None:
+            try:
+                if before_retry():
+                    return None, attempts, True, None
+            except Exception as exc:
+                last_error = exc
+                attempts += 1
+                retryable = (
+                    isinstance(exc, urllib.error.HTTPError) and exc.code >= 500
+                ) or (
+                    not isinstance(exc, urllib.error.HTTPError)
+                    and isinstance(exc, (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError))
+                )
+                if not retryable or attempts >= 3:
+                    return None, attempts, False, exc
+        time.sleep(2)
+    return None, attempts, False, last_error
+
+
+def _publish_panel_patch(
+    *, repository: str, comment_id: int, body: str, token: str, run_id: int, run_attempt: int,
+) -> tuple[int, bool, Optional[Exception]]:
+    def already_written() -> bool:
+        comment = _github_json(
+            token=token,
+            url=f"https://api.github.com/repos/{repository}/issues/comments/{comment_id}",
+        )
+        if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+            raise ValueError("issue comment readback has an invalid shape")
+        return any(
+            row["run_id"] == run_id and row["run_attempt"] == run_attempt
+            for row in _parse_panel_history(comment["body"])
+        )
+
+    _, attempts, recovered, error = _bounded_panel_request(
+        lambda: _patch_issue_comment(
+            repository=repository, comment_id=comment_id, body=body, token=token,
+        ),
+        before_retry=already_written,
+    )
+    return attempts, recovered, error
+
+
 def _post_status_panel_fail_open_with_budget(
     *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
     pr_number: Optional[int], identity: Optional[Identity], budget: _PublishBudget,
@@ -2535,6 +2598,7 @@ def _post_status_panel_fail_open_with_budget(
     identity_source: Optional[str] = None
     failure_operation: Optional[str] = None
     failure_attempts = 1
+    comment_was_created = False
     try:
         if not repository or pr_number is None:
             reason_code, category, status = "missing_target", "configuration", None
@@ -2564,9 +2628,14 @@ def _post_status_panel_fail_open_with_budget(
         identity_source = owner.get("identity_source", "user_api")
         budget.begin("COMMENT_LOOKUP")
         failure_operation = "comment_lookup"
-        comments = _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number)
+        comments, failure_attempts, _, lookup_error = _bounded_panel_request(
+            lambda: _fetch_panel_comments(token=token, repository=repository, pr_number=pr_number),
+        )
+        if lookup_error is not None:
+            raise lookup_error
         budget.complete("COMMENT_LOOKUP")
         failure_operation = None
+        failure_attempts = 1
         own_panels = _find_panel_comments(comments, owner)
         existing = own_panels[0] if own_panels else None
         cached_rows = _parse_panel_history(existing.get("body", "")) if existing else []
@@ -2618,7 +2687,12 @@ def _post_status_panel_fail_open_with_budget(
             budget.discard("POST_VERIFY")
             budget.begin("COMMENT_PUBLISH")
             failure_operation = "comment_patch"
-            _patch_issue_comment(repository=repository, comment_id=int(existing["id"]), body=body, token=token)
+            failure_attempts, _, patch_error = _publish_panel_patch(
+                repository=repository, comment_id=int(existing["id"]), body=body, token=token,
+                run_id=current["run_id"], run_attempt=current["run_attempt"],
+            )
+            if patch_error is not None:
+                raise patch_error
             budget.complete("COMMENT_PUBLISH")
             failure_operation = None
             for duplicate in own_panels[1:]:
@@ -2645,6 +2719,7 @@ def _post_status_panel_fail_open_with_budget(
         failure_operation = "comment_create"
         _post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token)
         budget.complete("COMMENT_PUBLISH")
+        comment_was_created = True
         failure_operation = None
         budget.begin("POST_VERIFY")
         try:
@@ -2664,13 +2739,22 @@ def _post_status_panel_fail_open_with_budget(
                 budget.add("SELF_HEAL")
                 budget.begin("SELF_HEAL")
                 try:
-                    _patch_issue_comment(repository=repository, comment_id=int(winner["id"]), body=body, token=token)
+                    failure_operation = "comment_patch"
+                    failure_attempts, _, patch_error = _publish_panel_patch(
+                        repository=repository, comment_id=int(winner["id"]), body=body, token=token,
+                        run_id=current["run_id"], run_attempt=current["run_attempt"],
+                    )
+                    if patch_error is not None:
+                        raise patch_error
+                    failure_operation = None
                     for duplicate in after_post[1:]:
                         _delete_issue_comment(repository=repository, comment_id=int(duplicate["id"]), token=token)
                     budget.complete("SELF_HEAL")
                 except _PublishBudgetExhausted:
                     raise
                 except Exception as exc:
+                    if failure_operation == "comment_patch":
+                        raise
                     self_heal_errors.append(f"post self-heal: {type(exc).__name__}: {exc}")
             else:
                 budget.discard("SELF_HEAL")
@@ -2685,15 +2769,18 @@ def _post_status_panel_fail_open_with_budget(
             pending_operations=budget.pending_operations,
         )
     except _PublishBudgetExhausted as exc:
-        delivery = "unknown" if "COMMENT_PUBLISH" in budget.completed_operations else "not_created"
+        delivery = "unknown" if failure_operation in ("comment_patch", "comment_create") else "not_created"
+        _, _, _, safe_reason = _panel_failure(exc)
         _panel_warning(
             phase="publish budget", exc=exc, reason_code="publish_budget_exhausted",
-            category="network_error", http_status=None,
+            category="network_error", http_status=None, operation=failure_operation,
+            attempts=failure_attempts, safe_reason=safe_reason,
         )
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
             delivery=delivery, reason_code="publish_budget_exhausted", error_category="network_error",
-            operation=exc.operation, identity_source=identity_source,
+            operation=failure_operation or exc.operation, attempts=failure_attempts,
+            exception_type=type(exc).__name__, identity_source=identity_source,
             completed_operations=budget.completed_operations, pending_operations=budget.pending_operations,
         )
     except urllib.error.HTTPError as exc:
@@ -2705,7 +2792,10 @@ def _post_status_panel_fail_open_with_budget(
         )
         return body, _build_panel_delivery(
             body=body, repository=repository, pr_number=pr_number, identity=identity,
-            delivery="not_created" if status is not None and status < 500 else "unknown",
+            delivery=(
+                "unknown" if comment_was_created and failure_operation == "comment_patch"
+                else "not_created" if status is not None and status < 500 else "unknown"
+            ),
             reason_code=reason_code, error_category=category, http_status=status,
             operation=failure_operation, attempts=failure_attempts,
             exception_type=type(exc).__name__,

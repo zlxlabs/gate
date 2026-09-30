@@ -1921,10 +1921,17 @@ def test_status_panel_post_or_patch_failure_is_fail_open(monkeypatch, existing):
     monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
     monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments)
     monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    requests = []
     if existing:
-        monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: (_ for _ in ()).throw(error))
+        def fail_patch(**kwargs):
+            requests.append("PATCH")
+            raise error
+        monkeypatch.setattr(AGG, "_patch_issue_comment", fail_patch)
     else:
-        monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: (_ for _ in ()).throw(error))
+        def fail_post(**kwargs):
+            requests.append("POST")
+            raise error
+        monkeypatch.setattr(AGG, "_post_issue_comment", fail_post)
     _, receipt = AGG._post_status_panel_fail_open(
         current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
         identity=IDENTITY,
@@ -1932,6 +1939,11 @@ def test_status_panel_post_or_patch_failure_is_fail_open(monkeypatch, existing):
     assert receipt["http_status"] == 403
     assert receipt["error_category"] == "permission_or_rate_limit"
     assert receipt["comment_created"] is False
+    assert requests == ["PATCH" if existing else "POST"]
+    assert receipt["attempts"] == 1
+    assert receipt["exception_type"] == "HTTPError"
+    assert receipt["operation"] == ("comment_patch" if existing else "comment_create")
+    assert receipt["reason_code"] == "http_403"
 
 
 def test_status_panel_mail_invariant_for_five_runs(monkeypatch):
@@ -2021,6 +2033,117 @@ def test_publish_only_consumes_the_real_terminal_producer_fixture_after_upload(m
     assert operations and AGG.PANEL_MARKER in operations[0]
 
 
+def test_publish_only_subprocess_writes_additive_delivery_receipt_bytes(monkeypatch, tmp_path):
+    # Captured from base 85916ed's real _build_panel_delivery producer for this terminal row.
+    old_receipt = {
+        "comment_body_sha256": "4762e9457a159bd48c303106f4194e3cf07ce65d49ab675f8b72388dab1ff0cd",
+        "comment_created": True, "comment_expected": True,
+        "completed_operations": ["IDENTITY", "COMMENT_LOOKUP", "HISTORY_RECONSTRUCTION", "COMMENT_PUBLISH", "POST_VERIFY"],
+        "delivery": "created", "error_category": None, "head_sha": "a" * 40,
+        "history_error": None, "history_incomplete": False, "history_incomplete_reasons": [],
+        "history_skipped_count": 0, "history_skipped_records": [], "http_status": None,
+        "identity_source": "user_api", "kind": "gate_v2_status_panel_delivery",
+        "operation": "POST", "pending_operations": [], "pr_number": 42, "reason_code": "posted",
+        "repository": "zlxlabs/gate", "repository_id": 123, "run_attempt": 1, "run_id": 999,
+        "schema_version": 1, "self_heal_errors": [],
+    }
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
+    terminal_path, summary_path = tmp_path / "terminal.json", tmp_path / "summary.md"
+    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
+    owner = {"id": 99, "login": "workflow-bot"}
+
+    import http.server
+
+    class Api(http.server.BaseHTTPRequestHandler):
+        def respond(self, value):
+            payload = json.dumps(value).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/user":
+                return self.respond(owner)
+            if self.path.startswith("/repos/zlxlabs/gate/issues/42/comments"):
+                return self.respond(self.server.comments)
+            if self.path.startswith("/repos/zlxlabs/gate/actions/artifacts"):
+                return self.respond({"artifacts": []})
+            self.send_error(404)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.server.comments.append({
+                "id": 1, "created_at": "2026-09-30T00:00:00Z", "body": body["body"], "user": owner,
+            })
+            self.respond({})
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Api)
+    server.comments = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        site_dir = tmp_path / "site"
+        site_dir.mkdir()
+        (site_dir / "sitecustomize.py").write_text(
+            "import urllib.request\n"
+            "_urlopen = urllib.request.urlopen\n"
+            f"_local = 'http://127.0.0.1:{server.server_port}'\n"
+            "def urlopen(request, *args, **kwargs):\n"
+            "    if isinstance(request, urllib.request.Request) and request.full_url.startswith('https://api.github.com'):\n"
+            "        request = urllib.request.Request(request.full_url.replace('https://api.github.com', _local, 1), data=request.data, headers=dict(request.header_items()), method=request.get_method())\n"
+            "    return _urlopen(request, *args, **kwargs)\n"
+            "urllib.request.urlopen = urlopen\n",
+            encoding="utf-8",
+        )
+        silo_store = tmp_path / "fake_silo.py"
+        artifact_name = "gate-terminal-v1-123-" + "a" * 40 + "-999-1"
+        key = f"d30/123/{artifact_name}/gate-terminal.json"
+        silo_store.write_text(
+            "import pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "dest = pathlib.Path(args[args.index('--dest') + 1])\n"
+            f"key = {key!r}\n"
+            "target = dest / key.split('/')[2] / key.split('/', 3)[3]\n"
+            "target.parent.mkdir(parents=True, exist_ok=True)\n"
+            f"target.write_bytes(pathlib.Path({str(terminal_path)!r}).read_bytes())\n"
+            "print(key)\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.pop("GITHUB_TOKEN", None)
+        env["GH_TOKEN"] = "test-token"
+        env["SILO_ENDPOINT"] = "http://local-test"
+        env["SILO_STORE"] = str(silo_store)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(site_dir), env.get("PYTHONPATH", "")]))
+        delivery_path = tmp_path / "delivery.json"
+        args = _cli_args(
+            audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
+        ) + ["--publish-only"]
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), *args], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=20,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert result.returncode == 0, result.stderr
+    receipt_bytes = delivery_path.read_bytes()
+    receipt = json.loads(receipt_bytes)
+    assert receipt_bytes.endswith(b"\n")
+    assert b'"attempts": null' in receipt_bytes
+    assert b'"exception_type": null' in receipt_bytes
+    assert receipt == {**old_receipt, "attempts": None, "exception_type": None}
+
+
 @pytest.mark.parametrize(
     "status,category",
     [(403, "permission_or_rate_limit"), (500, "server_error")],
@@ -2073,6 +2196,147 @@ def test_github_timeout_and_publish_budget_defaults_are_centralized(monkeypatch)
     assert len(urlopen_calls) == 1
     timeout_keywords = [keyword for keyword in urlopen_calls[0].keywords if keyword.arg == "timeout"]
     assert len(timeout_keywords) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("temporary"),
+        urllib.error.HTTPError("https://api.github.com/x", 503, "server", hdrs=None, fp=None),
+    ],
+    ids=["network", "http-5xx"],
+)
+def test_comment_lookup_retries_transient_failure_twice(monkeypatch, failure):
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = [{"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}]
+    requests = []
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG.time, "sleep", lambda seconds: None)
+
+    def fake_urlopen(request, timeout=None):
+        requests.append(request)
+        if request.get_method() == "GET":
+            if sum(item.get_method() == "GET" for item in requests) < 3:
+                raise failure
+            return _FakeResponse(json.dumps(comments).encode())
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=_panel_terminal_row(999, 1, "pass", "a" * 40),
+        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+    )
+    assert [request.get_method() for request in requests] == ["GET", "GET", "GET", "PATCH"]
+    assert sum(request.get_method() == "GET" for request in requests) == 3
+    assert receipt["delivery"] == "updated"
+
+
+def test_comment_lookup_http_4xx_is_not_retried(monkeypatch):
+    owner = {"id": 99, "login": "workflow-bot"}
+    requests = []
+    error = urllib.error.HTTPError("https://api.github.com/x", 404, "missing", hdrs=None, fp=None)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=None: (requests.append(request), (_ for _ in ()).throw(error))[1])
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=_panel_terminal_row(999, 1, "pass", "a" * 40),
+        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+    )
+    assert len(requests) == 1
+    assert requests[0].get_method() == "GET"
+    assert receipt["delivery"] == "not_created"
+    assert receipt["operation"] == "comment_lookup"
+    assert receipt["attempts"] == 1
+    assert receipt["reason_code"] == "http_error"
+
+
+@pytest.mark.parametrize("server_applied,expected_patch_calls", [(True, 1), (False, 2)])
+def test_patch_timeout_reads_back_before_retry(monkeypatch, server_applied, expected_patch_calls):
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = [{"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}]
+    requests = []
+    patch_calls = 0
+    readback_calls = 0
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG.time, "sleep", lambda seconds: None)
+
+    def fake_urlopen(request, timeout=None):
+        nonlocal patch_calls, readback_calls
+        requests.append(request)
+        if request.get_method() == "GET":
+            if request.full_url.endswith("/issues/comments/77"):
+                readback_calls += 1
+                return _FakeResponse(json.dumps({"body": comments[0]["body"]}).encode())
+            return _FakeResponse(json.dumps(comments).encode())
+        patch_calls += 1
+        next_body = json.loads(request.data.decode())["body"]
+        if patch_calls == 1:
+            if server_applied:
+                comments[0]["body"] = next_body
+            raise socket.timeout("response lost")
+        comments[0]["body"] = next_body
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _, receipt = AGG._post_status_panel_fail_open(
+        current=_panel_terminal_row(999, 1, "pass", "a" * 40),
+        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
+    )
+    assert patch_calls == expected_patch_calls
+    assert readback_calls == 1
+    assert [request.get_method() for request in requests] == (
+        ["GET", "PATCH", "GET"] if server_applied else ["GET", "PATCH", "GET", "PATCH"]
+    )
+    assert receipt["delivery"] == "updated"
+
+
+@pytest.mark.parametrize("readback_fails", [False, True], ids=["patch-exhausted", "readback-failure-counts"])
+def test_patch_retry_exhaustion_is_visible_and_publish_only_stays_green(monkeypatch, capsys, tmp_path, readback_fails):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
+    summary_path = tmp_path / "summary.md"
+    terminal_path = tmp_path / "gate-terminal.json"
+    delivery_path = tmp_path / "panel-delivery.json"
+    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
+
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = [{"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}]
+    requests = []
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG.time, "sleep", lambda seconds: None)
+
+    def fake_urlopen(request, timeout=None):
+        requests.append(request)
+        if request.get_method() == "GET":
+            if readback_fails and request.full_url.endswith("/issues/comments/77"):
+                raise urllib.error.URLError("readback unavailable")
+            if request.full_url.endswith("/issues/comments/77"):
+                return _FakeResponse(json.dumps({"body": comments[0]["body"]}).encode())
+            return _FakeResponse(json.dumps(comments).encode())
+        raise urllib.error.URLError("temporary")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    args = _cli_args(
+        audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
+    ) + ["--publish-only"]
+    assert AGG.main(args) == 0
+    receipt = json.loads(delivery_path.read_bytes())
+    assert receipt["delivery"] == "unknown"
+    assert receipt["operation"] == "comment_patch"
+    assert receipt["attempts"] == 3
+    assert receipt["exception_type"] == "URLError"
+    assert sum(request.get_method() == "PATCH" for request in requests) == (2 if readback_fails else 3)
+    assert sum(request.get_method() == "GET" for request in requests) == (2 if readback_fails else 3)
+    output = capsys.readouterr().out
+    assert "PANEL_PUBLISH_FAILED operation=comment_patch attempts=3 exc_type=URLError" in output
+    assert "面板发布失败，面板可能显示旧状态" in summary_path.read_text(encoding="utf-8")
 
 
 def test_history_reconstruction_budget_has_one_bounded_configuration_point(monkeypatch):

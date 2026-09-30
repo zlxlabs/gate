@@ -97,3 +97,11 @@ self-healing. It uses the same `/user` 403/404 Actions-bot fallback and
 Step Summary plus the uploaded delivery diagnostic/event artifact with HTTP
 status and permission category. OCR GitHub calls are capped at 15 seconds and
 share a 120-second publish budget.
+
+## 发布失败与陈旧面板
+
+面板查找 GET 和更新评论 PATCH 对网络错误、超时及 HTTP 5xx 最多尝试三次，间隔固定两秒；HTTP 4xx 不重试。PATCH 结果不明时先 GET 原评论，按 `run_id` + `run_attempt` 解析历史行；行已存在即视为成功，回读失败会占用尝试次数。创建评论 POST 不重试。
+
+日志可用 `PANEL_PUBLISH_FAILED` 检索，包含 `operation`、`attempts`、`exc_type` 和脱敏的 `reason`。delivery 回执新增 `operation`（`comment_lookup`、`comment_patch`、`comment_create`、`history_load`）、`attempts` 与 `exception_type`；失败时 `delivery=unknown` 表示服务端结果可能不明，旧字段语义保持不变。面板发布失败不会改变 gate 裁决或 `--publish-only` 退出码。
+
+尝试耗尽、不可重试错误或之后再无 gate 事件时，面板仍可能显示旧状态。人工处置：重跑该 run 的 gate job。
