@@ -1,0 +1,9 @@
+name: gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+
+jobs:
+  gate:
+    uses: ./.github/workflows/probe-name-called.yml

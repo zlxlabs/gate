@@ -1,0 +1,12 @@
+name: probe-name-called
+
+on:
+  workflow_call:
+
+jobs:
+  gate:
+    if: always()
+    name: gate${{ github.event.pull_request.draft && ' (draft)' || '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe job completed"
