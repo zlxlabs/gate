@@ -27,3 +27,13 @@
 **关键决策与已否决方案**：只扩展现有 resolver 的精确名称集合，不改下游仓；保留 job id、`if` 和 `needs` 不变。单独 actionlint 曾因未设置仓库 CI 的 `SHELLCHECK_OPTS=--severity=warning` 报出既有 style/info 信息并返回 1；按 CI 命令复跑退出码 0、无输出。
 
 **下一步唯一动作**：对已提交的四项关键约束运行预定红验并记录原始失败输出。
+
+### 2026-09-30 · 约束红验
+
+**当前阶段**：implementing；四项约束红验完成，所有临时破坏已恢复。
+
+**本段结论**：draft 路径临时发起 PR API 请求，零请求测试以 AssertionError 转红；非 draft skipped 临时接受后，fail-closed 测试观察到 exit code 0 并转红；workflow `name` 删除或改为字面 `gate` 时静态 YAML 契约均以 AssertionError 转红。四项被破坏点均已恢复，`git diff --check` 通过，退役标识 rg 零命中。
+
+**关键决策与已否决方案**：保留上述断言边界；不把临时反向改动留在源码或测试里。报告保存各红验 pytest 原始输出与退出码。
+
+**下一步唯一动作**：运行任务卡要求的全量 pytest。
