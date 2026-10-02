@@ -137,6 +137,28 @@ def test_missing_lcov_reports_no_coverage_data_not_zero(module, tmp_path):
     assert "0%" not in module.render_note_line(result)
 
 
+def test_run_diff_cover_uses_two_dot_range_notation(module, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lcov_path = repo / "lcov.info"
+    lcov_path.write_text("TN:\n")
+    command: list[str] = []
+
+    def capture_run(args, **kwargs):
+        command.extend(args)
+        report_arg = args[args.index("--format") + 1]
+        Path(report_arg.removeprefix("json:")).write_text("{}")
+
+    monkeypatch.setattr(module.subprocess, "run", capture_run)
+
+    assert module._run_diff_cover(repo, "base-sha", lcov_path) == {}
+    compare_arg = command.index("--compare-branch")
+    assert command[compare_arg + 1] == "base-sha"
+    assert "--diff-range-notation" in command
+    notation_arg = command.index("--diff-range-notation")
+    assert command[notation_arg + 1] == ".."
+
+
 def test_real_lcov_fixture_reports_percent_and_counts(module, tmp_path):
     repo, base, head, _ = _repo_with_code_change(tmp_path, covered=True)
 
