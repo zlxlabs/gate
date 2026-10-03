@@ -625,7 +625,7 @@ def test_classify_target_prepares_the_workflow_repository(tmp_path, request):
     _git("init", "-b", "main", cwd=work)
     (work / "README.md").write_text("workflow repo\n")
     _git("add", "README.md", cwd=work)
-    _git("commit", "-m", "workflow", cwd=work)
+    _git(*_IDENTITY, "commit", "-m", "workflow", cwd=work)
     gate_sha = _git("rev-parse", "HEAD", cwd=work)
     _git("push", gate_origin, f"{gate_sha}:refs/heads/main", cwd=work)
     script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
