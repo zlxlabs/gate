@@ -303,7 +303,12 @@ def _script(name: str, workflow: str = "gate-v2") -> str:
 
 
 def _script_env(env: dict[str, str]) -> None:
-    for name in ("GATE_SOURCE_DECIDE_SCRIPT", "GATE_SOURCE_BOOTSTRAP_SCRIPT", "GATE_CHECKOUT_MIRROR_SCRIPT"):
+    for name in (
+        "GATE_SOURCE_DECIDE_SCRIPT",
+        "GATE_SOURCE_PREPARE_SCRIPT",
+        "GATE_SOURCE_BOOTSTRAP_SCRIPT",
+        "GATE_CHECKOUT_MIRROR_SCRIPT",
+    ):
         env[name] = _script(name)
 
 
@@ -1060,20 +1065,54 @@ def test_pin_mismatch_is_reported_not_swallowed(source_host, monkeypatch):
     assert error.value.code == gate_source.PATH_MISSING
 
 
+def _client_call_block(script: str) -> list[str]:
+    """The shell lines of the one client call, dedented so the workflow that
+    wraps it in `gate_source_prepare()` and the workflow that inlines it
+    compare equal.  Indentation is the only difference; the bytes are the same."""
+    lines = script.splitlines()
+    start = next(
+        index for index, line in enumerate(lines)
+        if line.strip().startswith("repository=${GATE_CHECKOUT_REPOSITORY")
+    )
+    end = next(
+        index for index, line in enumerate(lines)
+        if index > start and "SOURCE-CLIENT-FAILED" in line
+    )
+    return [line.strip() for line in lines[start:end + 1]]
+
+
 def test_shadow_and_disposition_share_the_same_declaration_scripts(source_host):
     gate = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["env"]
     shadow = yaml.safe_load(SHADOW_WORKFLOW.read_text(encoding="utf-8"))["env"]
     disposition = yaml.safe_load(DISPOSITION_WORKFLOW.read_text(encoding="utf-8"))["env"]
+    for name in ("GATE_SOURCE_DECIDE_SCRIPT", "GATE_SOURCE_PREPARE_SCRIPT"):
+        assert shadow[name] == gate[name]
     for name in ("GATE_SOURCE_DECIDE_SCRIPT", "GATE_SOURCE_BOOTSTRAP_SCRIPT"):
         assert shadow[name] == gate[name]
-        assert disposition[name] == gate[name]
+    # gate-v2-disposition.yml is outside W3c's scope, so its bootstrap still
+    # inlines the client call while gate-v2 / gate-shadow-v2 call the shared
+    # fragment.  The lock therefore moved from the whole bootstrap to the call
+    # itself: same bytes, same reply verdict, no second implementation.
+    assert disposition["GATE_SOURCE_DECIDE_SCRIPT"] == gate["GATE_SOURCE_DECIDE_SCRIPT"]
+    assert "GATE_SOURCE_PREPARE_SCRIPT" not in disposition
     decide = gate["GATE_SOURCE_DECIDE_SCRIPT"]
     assert decide.count(gate_source.MODE_UNREADABLE) == 1
     assert decide.count(gate_source.MODE_INVALID) == 1
     assert decide.count("/SOURCE-MODE") == 1
-    # The client must run before the consume lock or the host writer deadlocks.
-    assert gate["GATE_SOURCE_BOOTSTRAP_SCRIPT"].index("git-source-prepare") < \
-        gate["GATE_SOURCE_BOOTSTRAP_SCRIPT"].index("consume.lock")
+    # One implementation of the client call, called from both places that need a
+    # commit prepared.  gate-v2-disposition.yml (out of scope for W3c) still
+    # inlines it, so its copy must stay byte-equal to the shared fragment's.
+    prepare = gate["GATE_SOURCE_PREPARE_SCRIPT"]
+    shared = _client_call_block(prepare)
+    assert _client_call_block(disposition["GATE_SOURCE_BOOTSTRAP_SCRIPT"]) == shared
+    assert prepare.count("git-source-prepare") == 1
+    assert "gate_source_prepare" in gate["GATE_SOURCE_BOOTSTRAP_SCRIPT"]
+    assert "git-source-prepare" not in gate["GATE_SOURCE_BOOTSTRAP_SCRIPT"]
+    # The client must run before the consume lock or the host writer deadlocks —
+    # in the bootstrap it reads the mirror only after the call returns, and the
+    # caller-checkout prime (W3c) takes its lock in a later step of the script.
+    mirror = gate["GATE_CHECKOUT_MIRROR_SCRIPT"]
+    assert mirror.index("gate_source_prepare\n") < mirror.index('exec {mirror_lock_fd}<"$lock_file"')
     assert gate["GATE_SOURCE_BUDGET_SECS"] == "180"
 
 
