@@ -346,7 +346,7 @@ def _extraheader(workspace: Path) -> str | None:
     return completed.stdout.strip() if completed.returncode == 0 else None
 
 
-def test_workflow_sha_tool_bootstrap_never_persists_credentials(source_host):
+def test_sparse_tool_checkout_service_clears_a_stale_dest(source_host):
     """Non-workspace-root dests owe the same guarantee (e.g. `_gate-classify-src`)."""
     workspace = source_host["tmp_path"] / "workspace"
     stale_dest = workspace / "_gate-action-src"
