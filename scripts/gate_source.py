@@ -20,6 +20,7 @@ bootstrap, the PR-size preflight action and the diff-coverage advisory action.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
 import json
@@ -54,6 +55,11 @@ REF_ENV = "GATE_CHECKOUT_REF"
 PATH_ENV = "GATE_CHECKOUT_PATH"
 SPARSE_ENV = "GATE_CHECKOUT_SPARSE"
 ORIGIN_URL_ENV = "GATE_CHECKOUT_ORIGIN_URL"
+TOKEN_ENV = "GATE_GITHUB_TOKEN"
+PERSIST_ENV = "GATE_SOURCE_PERSIST_CREDENTIALS"
+# `actions/checkout` writes the token as a placeholder and then rewrites the config
+# file in place, so the credential never appears in argv or in process audit logs.
+CREDENTIAL_PLACEHOLDER = "AUTHORIZATION: basic ***"
 
 SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -78,6 +84,7 @@ FETCH_FAILED = "SOURCE-FETCH-FAILED"
 CHECKOUT_FAILED = "SOURCE-CHECKOUT-FAILED"
 PIN_MISMATCH = "SOURCE-PIN-MISMATCH"
 PATH_MISSING = "SOURCE-PATH-MISSING"
+CREDENTIALS_FAILED = "SOURCE-CREDENTIALS-FAILED"
 
 
 class SourceError(RuntimeError):
@@ -270,6 +277,40 @@ def fetch_demand_ref(repo: Path, mirror_repo: Path, commit: str, *, timeout: int
         )
 
 
+def extraheader_key() -> str:
+    """`actions/checkout` keys the credential by the server URL origin."""
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+    return f"http.{server}/.extraheader"
+
+
+def persist_credentials(repo: Path, timeout: int) -> None:
+    """Leave the same credential `actions/checkout` leaves with its default
+    `persist-credentials: true`, for caller-owned scripts that fetch or push.
+
+    Callers that never persisted (the workflow_sha tool bootstraps) must not call
+    this; the caller-checkout sites opt in through `PERSIST_ENV`.
+    """
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    if not token:
+        fail(CREDENTIALS_FAILED, f"{TOKEN_ENV} is required to persist checkout credentials")
+    key = extraheader_key()
+    with contextlib.suppress(OSError):
+        subprocess.run(
+            ["git", "config", "--local", "--unset-all", key], cwd=repo, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout,
+        )
+    _git(["config", "--local", key, CREDENTIAL_PLACEHOLDER], cwd=repo, code=CREDENTIALS_FAILED, timeout=timeout)
+    config = repo / ".git" / "config"
+    try:
+        text = config.read_text(encoding="utf-8")
+    except OSError as error:
+        fail(CREDENTIALS_FAILED, f"{config}: {error.strerror}")
+    if text.count(CREDENTIAL_PLACEHOLDER) != 1:
+        fail(CREDENTIALS_FAILED, f"{config} does not hold exactly one credential placeholder")
+    value = "AUTHORIZATION: basic " + base64.b64encode(f"x-access-token:{token}".encode("ascii")).decode("ascii")
+    config.write_text(text.replace(CREDENTIAL_PLACEHOLDER, value), encoding="utf-8")
+
+
 def _workspace() -> Path:
     return Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd())
 
@@ -330,6 +371,8 @@ def checkout(
     for relative in paths:
         if not (dest / relative).exists():
             fail(PATH_MISSING, f"sparse path missing after checkout: {relative}")
+    if os.environ.get(PERSIST_ENV, "").strip() == "1":
+        persist_credentials(dest, budget)
     return {
         "mode": MODE_SERVICE,
         "step": "checkout",

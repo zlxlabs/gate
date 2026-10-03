@@ -21,3 +21,26 @@ origin、保留「命中也 origin depth-1 fetch」、以客户端文件存在�
 
 **下一步唯一动作**：主脑按本目录同批报告逐条复核 checkout 副作用审计清单，
 并在 gate-hub W3b-1 的 `SOURCE-MODE` 落到全部主机后以 merge commit 合并。
+### 2026-10-03 · 修复轮 1：凭据持久化与文档契约
+
+**当前阶段**：implementing；R1（文档与代码矛盾）与 R2（service 路径恢复
+`actions/checkout` 凭据持久化）已完成并提交。
+
+**本段结论**：替代 `actions/checkout` 的 5 处（gate-v2 quality/primary/ocr、
+gate-shadow-v2 classify/shadow）现在按该 action 默认 `persist-credentials: true`
+的语义，在工作区 `.git/config` 写入
+`http.<server>/.extraheader = AUTHORIZATION: basic base64("x-access-token:<token>")`，
+令牌以占位符先写后原地替换，不进 argv、不进遥测与 stderr；10 处 workflow_sha
+工具自举维持原样不写。设计文档中「提前合并也安全」的说法已删除，改为：env 已注入而
+`SOURCE-MODE` 不可读的主机一律 `SOURCE-MODE-UNREADABLE` 非零失败，本 PR 必须在
+gate-hub W3b-1 部署到全部自托管主机之后才能合并。全量 1309 passed。
+
+**关键决策与已否决方案**：按 pinned commit `11d5960a` 的源码逐字对齐键名与值格式
+（`git-auth-helper.ts` 的 `http.${serverUrl.origin}/.extraheader` +
+`AUTHORIZATION: basic <base64(x-access-token:token)>`），并照抄其「占位符 + 改写
+config 文件」的手法，理由是该 action 明确以此避免令牌进入进程创建审计。已否决：把令牌
+直接作为 `git config` 的 argv 传入；在工具自举目录也写凭据（等于扩大既有权限面）；
+补 job 级 `post:` 步骤清理（超出本轮边界且在本仓无先例，见报告「与卡面的偏差」）。
+
+**下一步唯一动作**：主脑验收后在 gate-hub W3b-1 部署完成的前提下以 merge commit 合并
+PR #276；凭据清理时机（action 的 post 步骤）是否需要跟进，另开一轮决定。

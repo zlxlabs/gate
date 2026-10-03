@@ -62,11 +62,28 @@ gate 的三个共享工作流（`gate-v2.yml` / `gate-shadow-v2.yml` / `gate-v2-
 `SOURCE-CLIENT-MISSING`、`SOURCE-CLIENT-CONTRACT`、`SOURCE-CLIENT-FAILED`、
 `SOURCE-DEADLINE-EXCEEDED`、`SOURCE-LOCK-UNREADABLE`、`SOURCE-LOCK-TIMEOUT`、
 `SOURCE-MIRROR-UNREADABLE`、`SOURCE-DEMAND-REF-MISSING`、`SOURCE-FETCH-FAILED`、
-`SOURCE-CHECKOUT-FAILED`、`SOURCE-PIN-MISMATCH`、`SOURCE-PATH-MISSING`，
-以及 `gate_bounded_retry.py` 侧的 `SOURCE-SCRIPT-MISSING`。全部由
-`tests/test_gate_source.py` 锁住。
+`SOURCE-CHECKOUT-FAILED`、`SOURCE-PIN-MISMATCH`、`SOURCE-PATH-MISSING`、
+`SOURCE-CREDENTIALS-FAILED`，以及 `gate_bounded_retry.py` 侧的
+`SOURCE-SCRIPT-MISSING`。全部由 `tests/test_gate_source.py` 锁住。
+
+## 凭据持久化（与 `actions/checkout` 默认语义等价）
+
+原 caller checkout 是 `actions/checkout` 默认 `persist-credentials: true`，它在工作区
+的 `.git/config` 里留下
+
+    http.<GITHUB_SERVER_URL 的 origin>/.extraheader = AUTHORIZATION: basic base64("x-access-token:<github.token>")
+
+caller 仓自带脚本（`make test`、`scripts/gate-quality`、业务仓自己的 `git fetch/push`）
+依赖它。service 路径替代 `actions/checkout` 的 5 处（gate-v2 quality/primary/ocr、
+gate-shadow-v2 classify/shadow）必须写同样的键和值：值先以
+`AUTHORIZATION: basic ***` 占位写入、再就地替换，令牌既不进 argv 也不进日志；
+`origin` remote URL 仍不带凭据。工具自举那 10 处（`_gate-action-src` / `_gate-silo-src` 等）
+在 `actions/checkout` 时代也不持久化（`gate_bounded_retry.py` 用临时
+`GIT_CONFIG_GLOBAL`，用后即删），因此 service 路径同样不写。
 
 ## 合并前置
 
-本卡的合并须在 gate-hub W3b-1 的 `SOURCE-MODE` 文件部署到全部主机之后由主脑执行。
-声明文件尚未落地的主机一律走 `origin`，因此提前合并也安全，只是没有收益。
+本 PR **必须**在 gate-hub W3b-1 把 `SOURCE-MODE` 部署到全部自托管主机之后才可合并：
+`GATE_HUB_GIT_MIRROR_DIR` 已注入而 `SOURCE-MODE` 缺失 / 不可读的主机会以
+`SOURCE-MODE-UNREADABLE` **非零失败**（声明已下发、只是文件没落地同样算非法声明），
+这些 job 会直接变红。只有 GitHub-hosted 因没有该 env 而安全地走 `origin`。

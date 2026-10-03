@@ -13,6 +13,7 @@ job never reached GitHub (no `origin` argv, no https/git:// URL, no curl).
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import importlib.util
 import json
@@ -343,6 +344,48 @@ def test_caller_checkout_service_materializes_merge_commit_without_github(source
         assert (workspace / name).read_bytes() == expected
     assert not (workspace / ".git/objects/info/alternates").exists()
     assert _network_argv(source_host) == []
+    # `actions/checkout` (persist-credentials default true) leaves this behind, so
+    # caller-owned scripts keep fetching and pushing with the job token.
+    assert _extraheader(workspace) == "AUTHORIZATION: basic " + base64.b64encode(
+        b"x-access-token:fixture-token"
+    ).decode("ascii")
+    assert _git("remote", "get-url", "origin", cwd=workspace) == f"https://github.com/{REPOSITORY}"
+    assert "fixture-token" not in run.stdout
+    assert "fixture-token" not in run.stderr
+    assert not any("fixture-token" in line for line in _argv(source_host))
+
+
+def _extraheader(workspace: Path) -> str | None:
+    completed = subprocess.run(
+        ["git", "config", "--local", "--get", "http.https://github.com/.extraheader"],
+        cwd=workspace, env={**os.environ, **GIT_ENV}, capture_output=True, text=True,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def test_workflow_sha_tool_bootstrap_never_persists_credentials(source_host):
+    """The ten workflow_sha tool bootstraps never had credentials in `.git/config`
+    (gate_bounded_retry fetches through a temporary GIT_CONFIG_GLOBAL it deletes),
+    so the service path must not add one there."""
+    workspace = source_host["tmp_path"] / "workspace"
+    env = _env(
+        source_host, workspace,
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+        GATE_CHECKOUT_PATH="_gate-action-src",
+    )
+    _script_env(env)
+
+    run = _run_bash(
+        'bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"\n'
+        'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout',
+        env,
+    )
+
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    assert _extraheader(workspace / "_gate-action-src") is None
+    assert "fixture-token" not in run.stdout
+    assert "fixture-token" not in run.stderr
 
 
 def test_workflow_sha_sparse_checkout_service_pins_and_keeps_paths(source_host):
@@ -595,6 +638,18 @@ def test_origin_declaration_keeps_the_pre_existing_git_bounded_retry_path(source
     ), _argv(source_host)
 
 
+def test_missing_token_fails_loudly_instead_of_writing_a_broken_credential(source_host, monkeypatch):
+    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
+    monkeypatch.delenv("GATE_GITHUB_TOKEN", raising=False)
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    _git("init", "-q", cwd=workspace)
+    with pytest.raises(gate_source.SourceError) as error:
+        gate_source.persist_credentials(workspace, 30)
+    assert error.value.code == gate_source.CREDENTIALS_FAILED
+    assert _extraheader(workspace) is None
+
+
 def test_unset_mirror_dir_declares_origin(monkeypatch):
     monkeypatch.delenv("GATE_HUB_GIT_MIRROR_DIR", raising=False)
     assert gate_source.declared_mode() == "origin"
@@ -616,6 +671,7 @@ def test_repositories_outside_the_fleet_are_rejected(source_host, monkeypatch):
         gate_source.MIRROR_DIR_MISSING, gate_source.MODE_UNREADABLE, gate_source.MODE_INVALID,
         gate_source.MODE_NOT_SERVICE, gate_source.REPOSITORY_REJECTED, gate_source.COMMIT_INVALID,
         gate_source.CLIENT_MISSING, gate_source.CLIENT_CONTRACT, gate_source.CLIENT_FAILED,
+        gate_source.CREDENTIALS_FAILED,
         gate_source.DEADLINE_EXCEEDED, gate_source.LOCK_UNREADABLE, gate_source.LOCK_TIMEOUT,
         gate_source.MIRROR_UNREADABLE, gate_source.DEMAND_REF_MISSING, gate_source.FETCH_FAILED,
         gate_source.CHECKOUT_FAILED, gate_source.PIN_MISMATCH, gate_source.PATH_MISSING,
@@ -648,6 +704,17 @@ def test_shadow_and_disposition_share_the_same_declaration_scripts(source_host):
     for name in ("GATE_SOURCE_DECIDE_SCRIPT", "GATE_SOURCE_BOOTSTRAP_SCRIPT"):
         assert shadow[name] == gate[name]
         assert disposition[name] == gate[name]
+    # Credential persistence belongs to the five sites that replaced an
+    # `actions/checkout`, and to nowhere else.
+    mirror = gate["GATE_CHECKOUT_MIRROR_SCRIPT"]
+    assert 'GATE_SOURCE_PERSIST_CREDENTIALS=1 python3 "$RUNNER_TEMP/gate_source.py" checkout' in mirror
+    for path, expected in ((WORKFLOW, 9), (DISPOSITION_WORKFLOW, 1)):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        runs = [
+            step["run"] for job in raw["jobs"].values()
+            for step in job.get("steps", []) if "run" in step
+        ]
+        assert not any("GATE_SOURCE_PERSIST_CREDENTIALS" in run for run in runs)
     decide = gate["GATE_SOURCE_DECIDE_SCRIPT"]
     assert decide.count(gate_source.MODE_UNREADABLE) == 1
     assert decide.count(gate_source.MODE_INVALID) == 1
