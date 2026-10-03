@@ -218,20 +218,6 @@ env:
     flock --unlock "$source_lock_fd"
   GATE_CHECKOUT_MIRROR_SCRIPT: |
     set -euo pipefail
-    eval "$GATE_SOURCE_DECIDE_SCRIPT"
-    if [ "$(cat "$RUNNER_TEMP/gate-source-mode")" = service ]; then
-      service_started=$(date +%s%3N)
-      GATE_CHECKOUT_REPOSITORY="${GATE_SOURCE_TOOL_REPOSITORY:?}" \
-      GATE_CHECKOUT_REF="${GATE_SOURCE_TOOL_REF:?}" \
-        bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
-      # These five sites replace an `actions/checkout` with its default
-      # `persist-credentials: true`, so the workspace must keep the same
-      # extraheader caller-owned scripts fetch and push with.
-      GATE_SOURCE_PERSIST_CREDENTIALS=1 python3 "$RUNNER_TEMP/gate_source.py" checkout
-      printf 'GATE-CHECKOUT-MIRROR-V1 {"mode":"service","hit":1,"reason":"service-checkout","elapsed_ms":%s}\n' "$(( $(date +%s%3N) - service_started ))"
-      printf 'mode=service\n' >> "${GITHUB_OUTPUT:-/dev/null}"
-      exit 0
-    fi
     result_emitted=0
     lock_held=0
     consumer_step=startup
@@ -368,18 +354,14 @@ jobs:
           printf 'GATE_CHECKOUT_RX_BYTES_%s=%s\n' "$GATE_CHECKOUT_SEQUENCE" "$total" >> "$GITHUB_ENV"
           exit 0
       - name: Prime checkout from host Git mirror
-        id: gate-checkout-prime
         env:
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
           GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
           GATE_CHECKOUT_PATH: _gate-classify-src
           GATE_GITHUB_TOKEN: ${{ github.token }}
-          GATE_SOURCE_TOOL_REPOSITORY: ${{ job.workflow_repository }}
-          GATE_SOURCE_TOOL_REF: ${{ job.workflow_sha }}
         run: bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"
       - name: Checkout classify script at this workflow's own commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: ${{ steps.gate-checkout-prime.outputs.mode != 'service' }}
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -698,15 +680,12 @@ jobs:
           printf 'GATE_CHECKOUT_RX_BYTES_%s=%s\n' "$GATE_CHECKOUT_SEQUENCE" "$total" >> "$GITHUB_ENV"
           exit 0
       - name: Prime checkout from host Git mirror
-        id: gate-checkout-prime
         if: matrix.reviewer != '__none__'
         env:
           GATE_GITHUB_TOKEN: ${{ github.token }}
-          GATE_SOURCE_TOOL_REPOSITORY: ${{ job.workflow_repository }}
-          GATE_SOURCE_TOOL_REF: ${{ job.workflow_sha }}
         run: bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: ${{ matrix.reviewer != '__none__' && steps.gate-checkout-prime.outputs.mode != 'service' }}
+        if: matrix.reviewer != '__none__'
         with: { fetch-depth: 1 }
       - name: Record network bytes after checkout (shadow-1)
         if: always() && matrix.reviewer != '__none__'

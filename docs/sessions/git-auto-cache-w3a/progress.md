@@ -105,3 +105,29 @@ F5 判据读字节、恰 `origin\n`/`service\n`，与工作流 bash 判定同形
 
 **下一步唯一动作**：主脑验收后以 merge commit 合并 PR #276（前置：gate-hub W3b-1
 的 `SOURCE-MODE` 部署到全部自托管主机）。
+
+### 2026-10-03 · 收窄轮：撤回 caller checkout 替换，只留工具自举与 action 补拉
+
+**当前阶段**：implementing；按主脑决定（Opus/Codex 咨询结论：替换 `actions/checkout`
+是开放式规格、评审无法收敛，拆 PR 止血）撤回本 PR 的 caller checkout service 替换，
+保留工具自举与 preflight/advisory 补拉。
+
+**本段结论**：5 处 caller checkout（gate-v2 quality/primary/ocr、shadow
+classify/shadow）的 prime step、`actions/checkout`、字节统计 step 恢复为与
+origin/main 76ce334 逐字节相等（新契约测试 `tests/test_caller_checkout_baseline.py`
+从 fixture 基准字节锁住，加回 mode 守卫即红）；`GATE_CHECKOUT_MIRROR_SCRIPT` 恢复
+基准原文，service 序言删除。`gate_source.py` 删除仅服务 caller checkout 的代码
+（工作区根清空、凭据持久化、origin remote 设置及相关字面量/常量），`checkout()`
+只负责非工作区根 dest 的整目录重建物化，PATH 缺失或非子目录即 fail loud。
+新增浅仓交互测试：depth-1 浅克隆（HEAD 为合成 merge 提交）下 advisory 经服务补拉
+base 后 `git diff base head` 与上游一致、零网络 argv。全量测试绿。
+
+**关键决策与已否决方案**：caller checkout 改走宿主服务的方案改为另开卡做
+（「保留 actions/checkout、step 级 URL 改写到作业私有临时仓」，见
+`/home/zlx/.local/state/consult/git-auto-cache-w3a-convergence/{opus,codex}.md`），
+不在本 PR。已否决：在本 PR 内继续补 `actions/checkout` 等价契约（咨询结论：
+没有成文契约时「做完」无定义，评审永远能再找到一条）。夹具上游补推
+`refs/heads/base`，让假客户端能为「PR 基线」SHA 供数（此前只有分支尖端可服务）。
+
+**下一步唯一动作**：主脑验收后以 merge commit 合并 PR #276（前置：gate-hub W3b-1
+的 `SOURCE-MODE` 部署到全部自托管主机）；caller checkout 取码另开卡实施。

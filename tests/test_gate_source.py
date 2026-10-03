@@ -13,7 +13,6 @@ job never reached GitHub (no `origin` argv, no https/git:// URL, no curl).
 
 from __future__ import annotations
 
-import base64
 import fcntl
 import importlib.util
 import json
@@ -203,6 +202,7 @@ def source_host(tmp_path):
     _git("remote", "add", "fixture", str(caller_bare), cwd=work)
     _git(
         "push", "--quiet", "fixture",
+        f"{base_sha}:refs/heads/base",
         f"{head_sha}:refs/heads/feature",
         f"{merge_sha}:refs/heads/pr-1-merge",
         f"{sibling_sha}:refs/heads/sibling",
@@ -312,11 +312,6 @@ def _marker(stdout: str) -> dict:
     return json.loads(line.removeprefix("GATE-SOURCE-V1 "))
 
 
-def _mirror_line(stdout: str) -> dict:
-    line = next(line for line in stdout.splitlines() if line.startswith("GATE-CHECKOUT-MIRROR-V1 "))
-    return json.loads(line.removeprefix("GATE-CHECKOUT-MIRROR-V1 "))
-
-
 def _argv(host) -> list[str]:
     if not host["argv_log"].exists():
         return []
@@ -343,47 +338,6 @@ def _source_mode(host, value: str | None) -> None:
         path.write_text(value)
 
 
-def test_caller_checkout_service_materializes_merge_commit_without_github(source_host):
-    workspace = source_host["tmp_path"] / "workspace"
-    workspace.mkdir()
-    env = _env(source_host, workspace)
-    env["GATE_SOURCE_TOOL_REPOSITORY"] = GATE_REPOSITORY
-    env["GATE_SOURCE_TOOL_REF"] = source_host["gate_sha"]
-    _script_env(env)
-
-    run = _run_bash('bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"', env)
-
-    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
-    assert _mirror_line(run.stdout)["mode"] == "service"
-    assert _marker(run.stdout)["step"] == "checkout"
-    assert _marker(run.stdout)["source"] in {"hit", "cold"}
-    assert (source_host["tmp_path"] / "github-output").read_text().strip() == "mode=service"
-
-    assert _git("rev-parse", "HEAD", cwd=workspace) == source_host["merge_sha"]
-    assert _git("rev-parse", "--is-shallow-repository", cwd=workspace) == "false"
-    assert _git("remote", "get-url", "origin", cwd=workspace) == f"https://github.com/{REPOSITORY}"
-    # gate-hub's review entry treats a non-shallow checkout as self-sufficient.
-    assert _git("rev-parse", f"{source_host['base_sha']}^{{commit}}", cwd=workspace) == source_host["base_sha"]
-    for name in ("README.md", "app.py", "feature.txt"):
-        expected = subprocess.run(
-            ["git", "--git-dir", str(source_host["caller_bare"]), "cat-file", "blob",
-             f"{source_host['merge_sha']}:{name}"],
-            env={**os.environ, **GIT_ENV}, check=True, capture_output=True,
-        ).stdout
-        assert (workspace / name).read_bytes() == expected
-    assert not (workspace / ".git/objects/info/alternates").exists()
-    assert _network_argv(source_host) == []
-    # `actions/checkout` (persist-credentials default true) leaves this behind, so
-    # caller-owned scripts keep fetching and pushing with the job token.
-    assert _extraheader(workspace) == "AUTHORIZATION: basic " + base64.b64encode(
-        b"x-access-token:fixture-token"
-    ).decode("ascii")
-    assert _git("remote", "get-url", "origin", cwd=workspace) == f"https://github.com/{REPOSITORY}"
-    assert "fixture-token" not in run.stdout
-    assert "fixture-token" not in run.stderr
-    assert not any("fixture-token" in line for line in _argv(source_host))
-
-
 def _extraheader(workspace: Path) -> str | None:
     completed = subprocess.run(
         ["git", "config", "--local", "--get", "http.https://github.com/.extraheader"],
@@ -392,59 +346,7 @@ def _extraheader(workspace: Path) -> str | None:
     return completed.stdout.strip() if completed.returncode == 0 else None
 
 
-def _assert_merge_tree_matches_upstream(source_host, workspace: Path) -> None:
-    assert _git("rev-parse", "HEAD", cwd=workspace) == source_host["merge_sha"]
-    assert _git("rev-parse", "--is-shallow-repository", cwd=workspace) == "false"
-    for name in ("README.md", "app.py", "feature.txt"):
-        expected = subprocess.run(
-            ["git", "--git-dir", str(source_host["caller_bare"]), "cat-file", "blob",
-             f"{source_host['merge_sha']}:{name}"],
-            env={**os.environ, **GIT_ENV}, check=True, capture_output=True,
-        ).stdout
-        assert (workspace / name).read_bytes() == expected
-
-
-def test_caller_checkout_service_clears_everything_the_previous_job_left(source_host):
-    """The service path replaces `actions/checkout` (clean: true by default) on a
-    shared self-hosted workspace, so the previous job's leftovers — untracked,
-    ignored, read-only, and symlinks pointing outside the workspace — must all
-    be gone while the tree of the target commit stays byte-exact."""
-    workspace = source_host["tmp_path"] / "workspace"
-    workspace.mkdir()
-    outside_dir = source_host["tmp_path"] / "outside"
-    outside_dir.mkdir()
-    outside_file = outside_dir / "precious.txt"
-    outside_file.write_text("do not delete\n")
-    (workspace / "stale-untracked.txt").write_text("stale\n")
-    (workspace / ".gitignore").write_text("build/\n")
-    (workspace / "build").mkdir()
-    (workspace / "build" / "output.bin").write_bytes(b"stale artifact\n")
-    (workspace / "old-dir").mkdir()
-    (workspace / "old-dir" / "nested.txt").write_text("stale\n")
-    readonly = workspace / "readonly.txt"
-    readonly.write_text("stale\n")
-    readonly.chmod(0o444)
-    (workspace / "outside-dir-link").symlink_to(outside_dir)
-    (workspace / "outside-file-link").symlink_to(outside_file)
-    env = _env(source_host, workspace)
-    env["GATE_SOURCE_TOOL_REPOSITORY"] = GATE_REPOSITORY
-    env["GATE_SOURCE_TOOL_REF"] = source_host["gate_sha"]
-    _script_env(env)
-
-    run = _run_bash('bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"', env)
-
-    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
-    for residual in (
-        "stale-untracked.txt", ".gitignore", "build", "old-dir",
-        "readonly.txt", "outside-dir-link", "outside-file-link",
-    ):
-        assert not (workspace / residual).exists(), residual
-    assert outside_file.read_text() == "do not delete\n"
-    _assert_merge_tree_matches_upstream(source_host, workspace)
-    assert _network_argv(source_host) == []
-
-
-def test_sparse_tool_checkout_service_clears_a_stale_dest(source_host):
+def test_workflow_sha_tool_bootstrap_never_persists_credentials(source_host):
     """Non-workspace-root dests owe the same guarantee (e.g. `_gate-classify-src`)."""
     workspace = source_host["tmp_path"] / "workspace"
     stale_dest = workspace / "_gate-action-src"
@@ -573,6 +475,43 @@ def test_advisory_and_preflight_service_fetch_absent_base_from_the_mirror(source
     assert _network_argv(source_host) == []
 
 
+def test_advisory_service_pulls_base_into_a_shallow_checkout(source_host):
+    """Caller checkout is `actions/checkout` fetch-depth 1 again, so the workspace
+    is a SHALLOW repo whose HEAD is the synthetic merge commit and whose base is
+    absent.  The advisory's service 补拉 must supply the missing objects so
+    `git diff base head` matches the upstream diff — no origin fetch, no curl."""
+    workspace = source_host["tmp_path"] / "workspace"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--depth", "1", "--no-local", "--branch", "pr-1-merge",
+         str(source_host["caller_bare"]), str(workspace)],
+        env={**os.environ, **GIT_ENV}, check=True, capture_output=True, text=True,
+    )
+    _git("remote", "set-url", "origin", f"https://github.com/{REPOSITORY}", cwd=workspace)
+    assert _git("rev-parse", "HEAD", cwd=workspace) == source_host["merge_sha"]
+    assert _git("rev-parse", "--is-shallow-repository", cwd=workspace) == "true"
+    env = _env(source_host, workspace, GITHUB_REPOSITORY=REPOSITORY)
+    _script_env(env)
+
+    advisory_run = subprocess.run(
+        ["python3", str(ADVISORY),
+         "--base-sha", source_host["base_sha"],
+         "--head-sha", source_host["merge_sha"],
+         "--lcov-path", "coverage/lcov.info"],
+        env=env, cwd=workspace, capture_output=True, text=True, timeout=180,
+    )
+
+    assert advisory_run.returncode == 0, f"{advisory_run.stderr}\n{advisory_run.stdout}"
+    names = _git("diff", "--name-only", source_host["base_sha"], source_host["merge_sha"],
+                 cwd=workspace).splitlines()
+    upstream = subprocess.run(
+        ["git", "--git-dir", str(source_host["caller_bare"]), "diff", "--name-only",
+         source_host["base_sha"], source_host["merge_sha"]],
+        env={**os.environ, **GIT_ENV}, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert names == upstream
+    assert _network_argv(source_host) == []
+
+
 def test_preflight_action_uses_the_service_for_an_absent_base(source_host, monkeypatch):
     workspace = source_host["tmp_path"] / "workspace"
     workspace.mkdir()
@@ -611,12 +550,14 @@ def test_preflight_action_uses_the_service_for_an_absent_base(source_host, monke
 )
 def test_broken_source_mode_declaration_is_a_hard_failure(source_host, declaration, expected_code):
     _source_mode(source_host, declaration)
-    env = _env(source_host, source_host["tmp_path"] / "workspace")
-    env["GATE_SOURCE_TOOL_REPOSITORY"] = GATE_REPOSITORY
-    env["GATE_SOURCE_TOOL_REF"] = source_host["gate_sha"]
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
     _script_env(env)
 
-    run = _run_bash('bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"', env)
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
 
     assert run.returncode != 0
     assert expected_code in run.stderr
@@ -632,20 +573,22 @@ def test_service_mode_is_required_for_every_service_operation(source_host, monke
 
 
 def test_client_failure_is_fatal_and_never_reaches_origin(source_host):
-    workspace = source_host["tmp_path"] / "workspace"
-    workspace.mkdir()
-    env = _env(source_host, workspace, GATE_FAKE_CLIENT="fail")
-    env["GATE_SOURCE_TOOL_REPOSITORY"] = GATE_REPOSITORY
-    env["GATE_SOURCE_TOOL_REF"] = source_host["gate_sha"]
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT="fail",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
     _script_env(env)
 
-    run = _run_bash('bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"', env)
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
 
     assert run.returncode != 0
     assert gate_source.CLIENT_FAILED in run.stderr
     assert "SOURCE-COLD-FAILED" in run.stderr
     assert _network_argv(source_host) == []
-    assert not (workspace / ".git").exists()
+    assert not (source_host["runner_temp"] / "gate_source.py").exists()
+    assert not (source_host["runner_temp"] / "gate_bounded_retry.py").exists()
 
 
 def test_client_contract_violation_is_rejected(source_host):
@@ -1058,18 +1001,6 @@ def test_unset_mirror_dir_without_marker_keeps_the_origin_checkout(source_host):
     assert _git("rev-parse", "HEAD", cwd=workspace) == source_host["head_sha"]
 
 
-def test_missing_token_fails_loudly_instead_of_writing_a_broken_credential(source_host, monkeypatch):
-    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
-    monkeypatch.delenv("GATE_GITHUB_TOKEN", raising=False)
-    workspace = source_host["tmp_path"] / "workspace"
-    workspace.mkdir()
-    _git("init", "-q", cwd=workspace)
-    with pytest.raises(gate_source.SourceError) as error:
-        gate_source.persist_credentials(workspace, 30)
-    assert error.value.code == gate_source.CREDENTIALS_FAILED
-    assert _extraheader(workspace) is None
-
-
 def test_unset_mirror_dir_declares_origin(monkeypatch):
     monkeypatch.delenv("GATE_HUB_GIT_MIRROR_DIR", raising=False)
     assert gate_source.declared_mode() == "origin"
@@ -1091,7 +1022,6 @@ def test_repositories_outside_the_fleet_are_rejected(source_host, monkeypatch):
         gate_source.MIRROR_DIR_MISSING, gate_source.MODE_UNREADABLE, gate_source.MODE_INVALID,
         gate_source.MODE_NOT_SERVICE, gate_source.REPOSITORY_REJECTED, gate_source.COMMIT_INVALID,
         gate_source.CLIENT_MISSING, gate_source.CLIENT_CONTRACT, gate_source.CLIENT_FAILED,
-        gate_source.CREDENTIALS_FAILED,
         gate_source.DEADLINE_EXCEEDED, gate_source.LOCK_UNREADABLE, gate_source.LOCK_TIMEOUT,
         gate_source.MIRROR_UNREADABLE, gate_source.DEMAND_REF_MISSING, gate_source.FETCH_FAILED,
         gate_source.CHECKOUT_FAILED, gate_source.PIN_MISMATCH, gate_source.PATH_MISSING,
@@ -1137,17 +1067,6 @@ def test_shadow_and_disposition_share_the_same_declaration_scripts(source_host):
     for name in ("GATE_SOURCE_DECIDE_SCRIPT", "GATE_SOURCE_BOOTSTRAP_SCRIPT"):
         assert shadow[name] == gate[name]
         assert disposition[name] == gate[name]
-    # Credential persistence belongs to the five sites that replaced an
-    # `actions/checkout`, and to nowhere else.
-    mirror = gate["GATE_CHECKOUT_MIRROR_SCRIPT"]
-    assert 'GATE_SOURCE_PERSIST_CREDENTIALS=1 python3 "$RUNNER_TEMP/gate_source.py" checkout' in mirror
-    for path, expected in ((WORKFLOW, 9), (DISPOSITION_WORKFLOW, 1)):
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        runs = [
-            step["run"] for job in raw["jobs"].values()
-            for step in job.get("steps", []) if "run" in step
-        ]
-        assert not any("GATE_SOURCE_PERSIST_CREDENTIALS" in run for run in runs)
     decide = gate["GATE_SOURCE_DECIDE_SCRIPT"]
     assert decide.count(gate_source.MODE_UNREADABLE) == 1
     assert decide.count(gate_source.MODE_INVALID) == 1
@@ -1167,3 +1086,4 @@ def test_every_workflow_bootstrap_shares_the_one_script():
         ]
         assert sum('"$GATE_SOURCE_BOOTSTRAP_SCRIPT"' in run for run in runs) == expected
         assert not any("api.github.com" in run for run in runs if "$GATE_SOURCE_BOOTSTRAP_SCRIPT" in run)
+
