@@ -70,6 +70,8 @@ def emit(status, code, source="cold"):
     sys.stderr.write("GIT-SOURCE-PREPARE-V1 " + json.dumps(payload, sort_keys=True) + chr(10))
 
 
+time.sleep(float(os.environ.get("GATE_FAKE_CLIENT_SLEEP", "0")))
+
 mode = os.environ.get("GATE_FAKE_CLIENT", "ok")
 if mode == "hang":
     time.sleep(3600)
@@ -586,6 +588,147 @@ def test_unknown_commit_from_the_client_is_fatal(source_host):
 
     assert run.returncode != 0
     assert gate_source.CLIENT_FAILED in run.stderr
+
+
+def _held_lock(source_host, repository: str) -> Path:
+    """An exclusive hold on `repository`'s consume lock."""
+    mirror_repo = source_host["mirror_root"] / f"{repository}.git"
+    if not mirror_repo.exists():
+        _git("init", "--bare", "--quiet", str(mirror_repo))
+    lock = mirror_repo / "consume.lock"
+    lock.touch()
+    return lock
+
+
+INVALID_DECLARATIONS = [
+    b"service\n\n", b"service", b"service\r\n", b" service\n", b"service \n",
+    b"Origin\n", b"service\norigin\n", b"",
+]
+INVALID_IDS = [
+    "extra-blank-line", "no-final-newline", "crlf", "leading-space", "trailing-space",
+    "wrong-case", "two-lines", "empty",
+]
+
+
+@pytest.mark.parametrize("payload", INVALID_DECLARATIONS, ids=INVALID_IDS)
+def test_shell_declaration_is_byte_exact(payload, source_host):
+    """`$(cat)` would swallow trailing newlines; the workflow's real bash must not."""
+    mirror_root = source_host["mirror_root"]
+    (mirror_root / "SOURCE-MODE").write_bytes(payload)
+    env = _env(source_host, source_host["tmp_path"] / "workspace")
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_DECIDE_SCRIPT"', env)
+
+    assert run.returncode != 0, f"{payload!r} was accepted: {run.stdout}"
+    assert gate_source.MODE_INVALID in run.stderr
+    assert not (source_host["runner_temp"] / "gate-source-mode").exists()
+
+
+@pytest.mark.parametrize("payload,mode", [(b"service\n", "service"), (b"origin\n", "origin")])
+def test_shell_declaration_accepts_only_the_two_exact_files(payload, mode, source_host):
+    mirror_root = source_host["mirror_root"]
+    (mirror_root / "SOURCE-MODE").write_bytes(payload)
+    env = _env(source_host, source_host["tmp_path"] / "workspace")
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_DECIDE_SCRIPT"', env)
+
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    assert (source_host["runner_temp"] / "gate-source-mode").read_bytes() == f"{mode}\n".encode("ascii")
+
+
+@pytest.mark.parametrize("payload", INVALID_DECLARATIONS, ids=INVALID_IDS)
+def test_python_declaration_matches_the_shell_verdict(payload, source_host, monkeypatch):
+    mirror_root = source_host["mirror_root"]
+    (mirror_root / "SOURCE-MODE").write_bytes(payload)
+    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(mirror_root))
+    with pytest.raises(gate_source.SourceError) as error:
+        gate_source.declared_mode()
+    assert error.value.code == gate_source.MODE_INVALID
+
+
+def test_shell_lock_waits_only_on_what_is_left_of_the_budget(source_host):
+    """The client ate the budget: the lock must not be granted a fresh full one."""
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    env = _env(
+        source_host, workspace,
+        GATE_SOURCE_BUDGET_SECS="3",
+        GATE_FAKE_CLIENT_SLEEP="2",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+    lock = _held_lock(source_host, GATE_REPOSITORY)
+    handle = os.open(lock, os.O_RDONLY)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    try:
+        started = time.monotonic()
+        run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
+        elapsed = time.monotonic() - started
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
+
+    assert run.returncode != 0
+    # 2s client + 1s left: a fresh 3s budget would spend until ~5s.
+    assert elapsed < 4.0, f"waited {elapsed:.2f}s"
+    assert gate_source.LOCK_TIMEOUT in run.stderr or gate_source.DEADLINE_EXCEEDED in run.stderr
+
+
+def test_python_lock_waits_only_on_what_is_left_of_the_budget(source_host, monkeypatch):
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    for name, value in _env(source_host, workspace).items():
+        if name.startswith(("GATE_", "GITHUB_", "RUNNER_")):
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv("GATE_FAKE_CLIENT_SLEEP", "4.5")
+    lock = _held_lock(source_host, REPOSITORY)
+    handle = os.open(lock, os.O_RDONLY)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    try:
+        started = time.monotonic()
+        with pytest.raises(gate_source.SourceError) as error:
+            gate_source.checkout(
+                REPOSITORY, source_host["merge_sha"], workspace, timeout=5,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
+
+    # One 5s budget, a client that spends 4.5s of it, and a lock nobody releases:
+    # every later step used to be handed the full budget or `max(1, remaining)`
+    # seconds of its own, so this ran past 5s.
+    # Either literal is fine; the wall clock is what pins the budget.
+    assert error.value.code in {gate_source.DEADLINE_EXCEEDED, gate_source.LOCK_TIMEOUT}
+    assert elapsed < 5.0, f"waited {elapsed:.2f}s"
+
+
+def test_python_lock_timeout_stays_inside_one_budget(source_host, monkeypatch):
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    for name, value in _env(source_host, workspace).items():
+        if name.startswith(("GATE_", "GITHUB_", "RUNNER_")):
+            monkeypatch.setenv(name, value)
+    lock = _held_lock(source_host, REPOSITORY)
+    handle = os.open(lock, os.O_RDONLY)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    try:
+        started = time.monotonic()
+        with pytest.raises(gate_source.SourceError) as error:
+            gate_source.checkout(
+                REPOSITORY, source_host["merge_sha"], workspace, timeout=3,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
+
+    assert error.value.code == gate_source.LOCK_TIMEOUT
+    # The wait runs to the 3s budget (the old code gave up in well under a second).
+    assert 1.5 <= elapsed < 4.0, f"waited {elapsed:.2f}s"
 
 
 def test_lock_timeout_is_a_bounded_failure(source_host):

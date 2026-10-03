@@ -111,21 +111,25 @@ def mirror_root() -> Path:
 
 
 def declared_mode() -> str:
-    """`origin` or `service`; a present but unreadable/invalid declaration fails."""
+    """`origin` or `service`; a present but unreadable/invalid declaration fails.
+
+    Byte-exact, matching the shell side: the file must be exactly `origin\\n` or
+    `service\\n`.  Read as bytes so a CRLF file cannot be normalized into a pass.
+    """
     if not os.environ.get(MIRROR_DIR_ENV, "").strip():
         return MODE_ORIGIN
     mode_file = mirror_root() / MODE_FILE_NAME
     try:
-        raw = mode_file.read_text(encoding="utf-8")
+        raw = mode_file.read_bytes()
     except OSError as error:
         fail(MODE_UNREADABLE, f"{mode_file}: {error.strerror}")
-    lines = raw.split("\n")
-    if len(lines) > 2 or (len(lines) == 2 and lines[1] != ""):
-        fail(MODE_INVALID, f"{mode_file}: {raw!r} is not exactly one line")
-    mode = lines[0]
-    if mode not in MODES:
-        fail(MODE_INVALID, f"{mode_file}: {raw!r} is not one of {MODES}")
-    return mode
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as error:
+        fail(MODE_INVALID, f"{mode_file}: {error}")
+    if text not in {f"{MODE_ORIGIN}\n", f"{MODE_SERVICE}\n"}:
+        fail(MODE_INVALID, f"{mode_file}: {raw!r} is not exactly 'origin\\n' or 'service\\n'")
+    return text.strip()
 
 
 def require_service_mode() -> str:
@@ -200,6 +204,19 @@ def _client_line(stderr: str) -> dict[str, Any]:
     return payload
 
 
+def left(deadline_epoch: int) -> int:
+    """Whole seconds left before the one budget this checkout is allowed."""
+    return deadline_epoch - int(time.time())
+
+
+def remaining(deadline_epoch: int) -> int:
+    """Seconds left, or fail: no step may start a fresh full budget."""
+    seconds = left(deadline_epoch)
+    if seconds < 1:
+        fail(DEADLINE_EXCEEDED, f"budget exhausted at deadline {deadline_epoch}")
+    return seconds
+
+
 def run_client(repository: str, commit: str, deadline_epoch: int) -> dict[str, Any]:
     """Prepare `commit` through the host service.  Never touches the network."""
     client = mirror_root() / CLIENT_NAME
@@ -213,7 +230,7 @@ def run_client(repository: str, commit: str, deadline_epoch: int) -> dict[str, A
     ]
     try:
         completed = subprocess.run(
-            argv, check=False, text=True, capture_output=True, timeout=max(1, deadline_epoch - int(time.time()))
+            argv, check=False, text=True, capture_output=True, timeout=remaining(deadline_epoch)
         )
     except subprocess.TimeoutExpired:
         fail(DEADLINE_EXCEEDED, f"client exceeded deadline {deadline_epoch}")
@@ -239,7 +256,7 @@ def shared_consume_lock(mirror_repo: Path, deadline_epoch: int) -> Iterator[None
                 fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if int(time.time()) >= deadline_epoch:
+                if left(deadline_epoch) <= 0:
                     fail(LOCK_TIMEOUT, f"{lock} still held at deadline {deadline_epoch}")
                 time.sleep(0.05)
         yield
@@ -260,20 +277,23 @@ def prepare(repository: str, commit: str, deadline_epoch: int) -> tuple[Path, di
     return mirror_repo, payload
 
 
-def fetch_demand_ref(repo: Path, mirror_repo: Path, commit: str, *, timeout: int) -> None:
-    """Copy the prepared closure into the job repository as its own objects."""
-    with shared_consume_lock(mirror_repo, int(time.time()) + timeout):
+def fetch_demand_ref(repo: Path, mirror_repo: Path, commit: str, *, deadline_epoch: int) -> None:
+    """Copy the prepared closure into the job repository as its own objects.
+
+    The lock waits on the caller's deadline, never on a fresh budget of its own.
+    """
+    with shared_consume_lock(mirror_repo, deadline_epoch):
         if _git(
             ["--git-dir", str(mirror_repo), "rev-parse", "--verify", "--quiet", DEMAND_REF.format(sha=commit)],
             code=DEMAND_REF_MISSING,
-            timeout=timeout,
+            timeout=remaining(deadline_epoch),
         ) != commit:
             fail(DEMAND_REF_MISSING, f"{mirror_repo}:{DEMAND_REF.format(sha=commit)} is not {commit}")
         _git(
             ["fetch", "--no-tags", "--no-recurse-submodules", str(mirror_repo), DEMAND_REF.format(sha=commit)],
             cwd=repo,
             code=FETCH_FAILED,
-            timeout=timeout,
+            timeout=remaining(deadline_epoch),
         )
 
 
@@ -341,7 +361,9 @@ def checkout(
     require_service_mode()
     budget = budget_secs() if timeout is None else timeout
     started = time.monotonic()
-    deadline = int(started) + budget
+    # Epoch seconds: the client is handed this deadline as --deadline-epoch, and
+    # every remaining-budget check below compares against the same clock.
+    deadline = int(time.time()) + budget
     if dest.resolve() == _workspace().resolve():
         if (dest / ".git").exists():
             shutil.rmtree(dest / ".git")
@@ -351,28 +373,28 @@ def checkout(
             shutil.rmtree(dest)
         dest.mkdir(parents=True)
     mirror_repo, payload = prepare(repository, ref, deadline)
-    _git(["init", "--quiet"], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
-    _git(["remote", "add", "origin", origin_url(repository)], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+    _git(["init", "--quiet"], cwd=dest, code=CHECKOUT_FAILED, timeout=remaining(deadline))
+    _git(["remote", "add", "origin", origin_url(repository)], cwd=dest, code=CHECKOUT_FAILED, timeout=remaining(deadline))
     if paths:
-        _git(["sparse-checkout", "init", "--no-cone"], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+        _git(["sparse-checkout", "init", "--no-cone"], cwd=dest, code=CHECKOUT_FAILED, timeout=remaining(deadline))
         try:
             subprocess.run(
                 ["git", "sparse-checkout", "set", "--no-cone", "--stdin"],
                 cwd=dest, check=True, text=True, input="\n".join(paths) + "\n",
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=budget,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=remaining(deadline),
             )
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
             fail(CHECKOUT_FAILED, f"git sparse-checkout set failed: {error}")
-    fetch_demand_ref(dest, mirror_repo, ref, timeout=max(1, deadline - int(time.time())))
-    _git(["checkout", "--force", "--detach", ref], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
-    head = _git(["rev-parse", "HEAD"], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+    fetch_demand_ref(dest, mirror_repo, ref, deadline_epoch=deadline)
+    _git(["checkout", "--force", "--detach", ref], cwd=dest, code=CHECKOUT_FAILED, timeout=remaining(deadline))
+    head = _git(["rev-parse", "HEAD"], cwd=dest, code=CHECKOUT_FAILED, timeout=remaining(deadline))
     if head.lower() != ref.lower():
         fail(PIN_MISMATCH, f"checked out {head}, expected {ref}")
     for relative in paths:
         if not (dest / relative).exists():
             fail(PATH_MISSING, f"sparse path missing after checkout: {relative}")
     if os.environ.get(PERSIST_ENV, "").strip() == "1":
-        persist_credentials(dest, budget)
+        persist_credentials(dest, remaining(deadline))
     return {
         "mode": MODE_SERVICE,
         "step": "checkout",
@@ -397,13 +419,13 @@ def ensure_commits(
     """Make base/head available in the job repository from the mirror."""
     require_service_mode()
     budget = budget_secs() if timeout is None else timeout
-    deadline = int(time.monotonic()) + budget
+    deadline = int(time.time()) + budget
     started = time.monotonic()
     for sha in (base_sha, head_sha):
         if has_commit(repo, sha):
             continue
         mirror_repo, _ = prepare(repository, sha, deadline)
-        fetch_demand_ref(repo, mirror_repo, sha, timeout=max(1, deadline - int(time.time())))
+        fetch_demand_ref(repo, mirror_repo, sha, deadline_epoch=deadline)
     emit({
         "mode": MODE_SERVICE,
         "step": "ensure",

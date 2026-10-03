@@ -127,10 +127,16 @@ env:
     if [ -n "$source_root" ]; then
       mode_file="$source_root/SOURCE-MODE"
       [ -r "$mode_file" ] || { echo "::error::SOURCE-MODE-UNREADABLE: $mode_file" >&2; exit 1; }
-      mode=$(cat "$mode_file")
-      case "$mode" in
-        origin|service) ;;
-        *) echo "::error::SOURCE-MODE-INVALID: $mode_file does not contain one of origin/service" >&2; exit 1 ;;
+      # Byte-exact: the file must be exactly "origin\n" or "service\n".  Command
+      # substitution strips trailing newlines, so append a sentinel that keeps the
+      # file's own trailing bytes in the captured value; anything else (extra blank
+      # line, missing final newline, CRLF, spaces) falls through to invalid.
+      mode_raw=$(cat "$mode_file"; printf x)
+      nl=$'\n'
+      case "$mode_raw" in
+        "origin${nl}x") mode=origin ;;
+        "service${nl}x") mode=service ;;
+        *) echo "::error::SOURCE-MODE-INVALID: $mode_file must contain exactly origin or service followed by one newline" >&2; exit 1 ;;
       esac
     fi
     printf '%s\n' "$mode" > "$RUNNER_TEMP/gate-source-mode"
@@ -165,7 +171,13 @@ env:
     lock_file="$mirror_repo/consume.lock"
     [ -f "$lock_file" ] || { echo "::error::SOURCE-LOCK-UNREADABLE: $lock_file" >&2; exit 1; }
     exec {source_lock_fd}<"$lock_file"
-    flock --shared -w "$budget" "$source_lock_fd" || { echo "::error::SOURCE-LOCK-TIMEOUT: $lock_file" >&2; exit 1; }
+    # One budget covers the client and the lock: wait only for what is left of the
+    # deadline the client was given, never for a fresh full budget.
+    remaining=$(( deadline - $(date +%s) ))
+    [ "$remaining" -ge 1 ] || { echo "::error::SOURCE-DEADLINE-EXCEEDED: budget $budget exhausted before the lock" >&2; exit 1; }
+    flock --shared -w "$remaining" "$source_lock_fd" || { echo "::error::SOURCE-LOCK-TIMEOUT: $lock_file after ${remaining}s of a ${budget}s budget" >&2; exit 1; }
+    remaining=$(( deadline - $(date +%s) ))
+    [ "$remaining" -ge 1 ] || { flock --unlock "$source_lock_fd"; echo "::error::SOURCE-DEADLINE-EXCEEDED: budget $budget exhausted before reading the mirror" >&2; exit 1; }
     for gate_script in scripts/gate_source.py scripts/gate_bounded_retry.py; do
       if ! git --git-dir="$mirror_repo" show "refs/demand/$commit:$gate_script" > "$RUNNER_TEMP/${gate_script##*/}"; then
         flock --unlock "$source_lock_fd"

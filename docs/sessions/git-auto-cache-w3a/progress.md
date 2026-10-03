@@ -44,3 +44,25 @@ config 文件」的手法，理由是该 action 明确以此避免令牌进入�
 
 **下一步唯一动作**：主脑验收后在 gate-hub W3b-1 部署完成的前提下以 merge commit 合并
 PR #276；凭据清理时机（action 的 post 步骤）是否需要跟进，另开一轮决定。
+
+### 2026-10-03 · 修复轮 2：声明按字节判定 + 单一 deadline
+
+**当前阶段**：implementing；F1（bash 判定吞尾部换行）、F2（锁等待重置预算）已完成并提交。
+
+**本段结论**：`GATE_SOURCE_DECIDE_SCRIPT` 现在把声明文件读进一个哨兵字符后面再比对，
+只有恰好 `origin\n` / `service\n` 通过，多余空行、缺尾换行、CRLF、前后空格一律
+`SOURCE-MODE-INVALID`；`scripts/gate_source.py` 侧改为**读字节**并用同一判据
+（此前 `read_text` 的通用换行会把 CRLF 规整成合法）。锁等待与镜像 fetch/show 现在共享
+客户端拿到的那个 epoch deadline，不再各自领一份满预算。顺带修掉一个此前没人注意的
+时钟错误：`deadline` 用 `time.monotonic()` 构造、却拿去和 `time.time()` 相减，
+等于交给客户端一个「开机秒数」的 `--deadline-epoch`，且每步 timeout 都被压成 1 秒。
+全量 1330 passed。
+
+**关键决策与已否决方案**：F2 的 Python 侧没有走「把满预算传给锁」，而是把绝对 deadline
+贯穿 `checkout → fetch_demand_ref → shared_consume_lock`，并新增 `left()/remaining()`
+两个小函数（`remaining` 在剩余 ≤0 时 fail loud），理由是「每步自己算剩余」正是这次出错的
+形状。已否决：用 `cmp` 判字节（多依赖一个 coreutils 工具，纯 bash 哨兵法即可且与镜像上的
+最小假设一致）；给 job 级 `post:` 凭据清理——主脑已裁定**不修**，理由记此：`GITHUB_TOKEN`
+在作业结束时即失效，且 service 路径每次重建 `.git`，残留的 extraheader 没有可用的令牌。
+
+**下一步唯一动作**：主脑在 gate-hub W3b-1 部署完成的前提下以 merge commit 合并 PR #276。
