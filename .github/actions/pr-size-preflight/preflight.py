@@ -18,6 +18,7 @@ GATE_ROOT = Path(__file__).resolve().parents[3]
 if str(GATE_ROOT) not in sys.path:
     sys.path.insert(0, str(GATE_ROOT))
 
+from scripts.gate_source import declared_mode, ensure_commits
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
@@ -44,13 +45,17 @@ def ensure_review_commits(repo: Path, base_sha: str, head_sha: str) -> None:
     `actions/checkout` intentionally fetches only the workflow ref.  A PR diff is
     nevertheless fully defined by its base and head commits, so fetch just those
     objects when either is absent instead of making every Gate run clone every
-    branch and tag in the repository.
+    branch and tag in the repository.  On a host that declares `service`, the two
+    objects come from the host source service instead of GitHub.
     """
     try:
         for sha in (base_sha, head_sha):
             _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
     except subprocess.CalledProcessError:
-        _git(repo, "fetch", "--no-tags", "origin", base_sha, head_sha)
+        if declared_mode() == "service":
+            ensure_commits(repo, os.environ.get("GITHUB_REPOSITORY", ""), base_sha, head_sha)
+        else:
+            _git(repo, "fetch", "--no-tags", "origin", base_sha, head_sha)
 
 
 def classify(diff_lines: int, max_diff_lines: int, warn_lines: int, max_review_shards: int) -> tuple[str, bool]:

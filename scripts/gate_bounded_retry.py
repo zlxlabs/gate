@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import base64
 import os
 import shutil
@@ -84,8 +85,47 @@ def run_with_retries(operation: Callable[[], T], *, label: str) -> T:
     assert last_error is not None
     raise last_error
 
+SOURCE_MODE_MARKER = "gate-source-mode"
+SOURCE_SCRIPT_NAME = "gate_source.py"
+SOURCE_SCRIPT_MISSING = "SOURCE-SCRIPT-MISSING"
+# Same literals as scripts/gate_source.py: the marker is that module's verdict
+# handed across the process boundary, so the vocabulary must not fork.
+SOURCE_MODE_MARKER_UNREADABLE = "SOURCE-MODE-UNREADABLE"
+SOURCE_MODE_MARKER_INVALID = "SOURCE-MODE-INVALID"
+
 def _temp() -> Path:
     return Path(os.environ.get("RUNNER_TEMP") or os.environ.get("TMPDIR") or "/tmp")
+
+def declared_source_mode() -> str:
+    """Handoff from the workflow's GATE_SOURCE_DECIDE_SCRIPT (single decision point).
+
+    The marker file is written by the one bash declaration reader every caller
+    shares, so the service branch never re-implements the SOURCE-MODE rule.
+    With GATE_HUB_GIT_MIRROR_DIR set, a missing/unreadable/invalid marker must
+    fail: silently treating it as `origin` would download from GitHub on a host
+    whose declaration could not be read.
+    """
+    if not os.environ.get("GATE_HUB_GIT_MIRROR_DIR", "").strip():
+        return "origin"
+    marker = _temp() / SOURCE_MODE_MARKER
+    try:
+        raw = marker.read_bytes()
+    except OSError as error:
+        raise SystemExit(f"{SOURCE_MODE_MARKER_UNREADABLE}: {marker}: {error.strerror}")
+    if raw not in (b"origin\n", b"service\n"):
+        raise SystemExit(
+            f"{SOURCE_MODE_MARKER_INVALID}: {marker}: {raw!r} is not exactly 'origin\\n' or 'service\\n'"
+        )
+    return raw.decode("ascii").strip()
+
+def load_gate_source():
+    path = _temp() / SOURCE_SCRIPT_NAME
+    if not path.is_file():
+        raise SystemExit(f"{SOURCE_SCRIPT_MISSING}: {path}")
+    spec = importlib.util.spec_from_file_location("gate_source", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 def _workspace() -> Path:
     return Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd())
@@ -161,6 +201,12 @@ def checkout_once(dest: Path, repository: str, ref: str, paths: list[str], env: 
             raise RuntimeError(f"sparse path missing after checkout: {relative}")
 
 def cmd_checkout() -> int:
+    if declared_source_mode() == "service":
+        # One attempt, no retry: a source-service failure is terminal and must
+        # never fall back to GitHub.
+        source = load_gate_source()
+        source.emit(source.checkout_from_environment())
+        return 0
     repository = os.environ.get(REPOSITORY_ENV, "").strip()
     ref = os.environ.get(REF_ENV, "").strip()
     if not repository or not ref:

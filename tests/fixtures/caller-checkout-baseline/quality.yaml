@@ -1,0 +1,62 @@
+- name: Record network bytes before checkout (quality-1)
+  env:
+    GATE_CHECKOUT_CONTEXT: workflow=gate-v2 job=quality step=quality-1 repo=${{ github.repository
+      }}
+    GATE_CHECKOUT_SEQUENCE: '1'
+    NET_SYSFS_ROOT: ${{ vars.NET_SYSFS_ROOT }}
+  run: 'set +e
+
+    root=${NET_SYSFS_ROOT:-/sys/class/net}; total=0
+
+    [ -r "$root" ] || total=unavailable
+
+    for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] &&
+    continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value"
+    in ''''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ]
+    || total=$((total + 10#$value)); done
+
+    printf ''GATE_CHECKOUT_RX_BYTES_%s=%s\n'' "$GATE_CHECKOUT_SEQUENCE" "$total" >>
+    "$GITHUB_ENV"
+
+    exit 0
+
+    '
+- name: Prime checkout from host Git mirror
+  env:
+    GATE_GITHUB_TOKEN: ${{ github.token }}
+  run: bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"
+- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+  with:
+    fetch-depth: 1
+- name: Record network bytes after checkout (quality-1)
+  if: always()
+  env:
+    GATE_CHECKOUT_CONTEXT: workflow=gate-v2 job=quality step=quality-1 repo=${{ github.repository
+      }}
+    GATE_CHECKOUT_SEQUENCE: '1'
+    NET_SYSFS_ROOT: ${{ vars.NET_SYSFS_ROOT }}
+  run: 'set +e
+
+    root=${NET_SYSFS_ROOT:-/sys/class/net}; total=0
+
+    [ -r "$root" ] || total=unavailable
+
+    for path in "$root"/*; do [ -d "$path" ] || continue; [ "${path##*/}" = lo ] &&
+    continue; value=$(cat "$path/statistics/rx_bytes" 2>/dev/null); case "$value"
+    in ''''|*[!0-9]*) total=unavailable; break;; esac; [ "$total" = unavailable ]
+    || total=$((total + 10#$value)); done
+
+    variable=GATE_CHECKOUT_RX_BYTES_${GATE_CHECKOUT_SEQUENCE}; before=$(printenv "$variable"
+    2>/dev/null)
+
+    case "$before" in ''''|unavailable) total=unavailable;; *) [ "$total" = unavailable
+    ] || total=$((total - 10#$before));; esac
+
+    printf ''GATE-CHECKOUT-BYTES-V1 %s rx_bytes=%s\n'' "$GATE_CHECKOUT_CONTEXT" "$total"
+
+    [ ! -d "$GITHUB_WORKSPACE/.git" ] || git -C "$GITHUB_WORKSPACE" update-ref -d
+    refs/internal/gate-checkout-target >/dev/null 2>&1
+
+    exit 0
+
+    '

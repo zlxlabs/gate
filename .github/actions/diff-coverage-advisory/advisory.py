@@ -16,6 +16,7 @@ GATE_ROOT = Path(__file__).resolve().parents[3]
 if str(GATE_ROOT) not in sys.path:
     sys.path.insert(0, str(GATE_ROOT))
 
+from scripts.gate_source import declared_mode, ensure_commits
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 NOTE_PREFIX = "diff-coverage: "
@@ -59,7 +60,10 @@ def ensure_review_commits(repo: Path, base_sha: str, head_sha: str) -> None:
         for sha in (base_sha, head_sha):
             _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
     except subprocess.CalledProcessError:
-        _git(repo, "fetch", "--no-tags", "origin", base_sha, head_sha)
+        if declared_mode() == "service":
+            ensure_commits(repo, os.environ.get("GITHUB_REPOSITORY", ""), base_sha, head_sha)
+        else:
+            _git(repo, "fetch", "--no-tags", "origin", base_sha, head_sha)
 
 
 def changed_paths(repo: Path, base_sha: str, head_sha: str) -> list[str]:
