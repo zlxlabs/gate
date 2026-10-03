@@ -191,7 +191,7 @@ def _git(args: Sequence[str], *, cwd: Path | None = None, code: str, timeout: in
     return completed.stdout.strip()
 
 
-def _client_line(stderr: str) -> dict[str, Any]:
+def _client_line(stderr: str, repository: str, commit: str, exit_code: int) -> dict[str, Any]:
     lines = [line for line in stderr.splitlines() if line.startswith(f"{CLIENT_MARKER} ")]
     if len(lines) != 1:
         fail(CLIENT_CONTRACT, f"expected exactly one {CLIENT_MARKER} line, got {len(lines)}")
@@ -199,8 +199,16 @@ def _client_line(stderr: str) -> dict[str, Any]:
         payload = json.loads(lines[0][len(CLIENT_MARKER) + 1 :])
     except json.JSONDecodeError as error:
         fail(CLIENT_CONTRACT, f"{error}")
-    if not isinstance(payload, dict) or payload.get("status") != "ready":
-        fail(CLIENT_CONTRACT, f"status={payload.get('status')!r}")
+    expected_status = "ready" if exit_code == 0 else "failed"
+    if not isinstance(payload, dict):
+        fail(CLIENT_CONTRACT, "reply must be a JSON object")
+    if (
+        payload.get("status") != expected_status
+        or payload.get("repository") != repository
+        or payload.get("commit_sha") != commit
+        or payload.get("source") not in ("hit", "cold")
+    ):
+        fail(CLIENT_CONTRACT, "status, repository, commit_sha, or source does not match the request")
     return payload
 
 
@@ -234,7 +242,7 @@ def run_client(repository: str, commit: str, deadline_epoch: int) -> dict[str, A
         )
     except subprocess.TimeoutExpired:
         fail(DEADLINE_EXCEEDED, f"client exceeded deadline {deadline_epoch}")
-    payload = _client_line(completed.stderr)
+    payload = _client_line(completed.stderr, repository, commit, completed.returncode)
     if completed.returncode != 0:
         fail(CLIENT_FAILED, f"exit={completed.returncode} code={payload.get('code')!r}")
     if payload.get("commit_sha") != commit or payload.get("repository") != repository:
@@ -283,14 +291,16 @@ def fetch_demand_ref(repo: Path, mirror_repo: Path, commit: str, *, deadline_epo
     The lock waits on the caller's deadline, never on a fresh budget of its own.
     """
     with shared_consume_lock(mirror_repo, deadline_epoch):
-        if _git(
-            ["--git-dir", str(mirror_repo), "rev-parse", "--verify", "--quiet", DEMAND_REF.format(sha=commit)],
+        demand_ref = DEMAND_REF.format(sha=commit)
+        resolved = _git(
+            ["--git-dir", str(mirror_repo), "rev-parse", "--verify", "--quiet", f"{demand_ref}^{{commit}}"],
             code=DEMAND_REF_MISSING,
             timeout=remaining(deadline_epoch),
-        ) != commit:
-            fail(DEMAND_REF_MISSING, f"{mirror_repo}:{DEMAND_REF.format(sha=commit)} is not {commit}")
+        )
+        if resolved != commit:
+            fail(PIN_MISMATCH, f"{mirror_repo}:{demand_ref} resolves to {resolved}, expected {commit}")
         _git(
-            ["fetch", "--no-tags", "--no-recurse-submodules", str(mirror_repo), DEMAND_REF.format(sha=commit)],
+            ["fetch", "--no-tags", "--no-recurse-submodules", str(mirror_repo), demand_ref],
             cwd=repo,
             code=FETCH_FAILED,
             timeout=remaining(deadline_epoch),

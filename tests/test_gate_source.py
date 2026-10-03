@@ -71,6 +71,8 @@ def emit(status, code, source="cold"):
 
 
 time.sleep(float(os.environ.get("GATE_FAKE_CLIENT_SLEEP", "0")))
+if os.environ.get("GATE_FAKE_CLIENT_NOISE") == "1":
+    sys.stderr.write("fetch progress: fixture noise is allowed" + chr(10))
 
 mode = os.environ.get("GATE_FAKE_CLIENT", "ok")
 if mode == "hang":
@@ -84,6 +86,26 @@ if mode == "unready":
 if mode == "fail":
     emit("failed", "SOURCE-COLD-FAILED")
     sys.exit(3)
+reply = os.environ.get("GATE_FAKE_CLIENT_REPLY")
+if reply:
+    payload = {
+        "status": "ready", "code": "OK", "repository": repository,
+        "commit_sha": commit, "source": "cold", "elapsed_ms": 0,
+    }
+    if reply == "failed-status":
+        payload["status"] = "failed"
+    elif reply == "wrong-repository":
+        payload["repository"] = "zlxlabs/other"
+    elif reply == "wrong-commit":
+        payload["commit_sha"] = "f" * 40
+    elif reply == "invalid-source":
+        payload["source"] = "unknown"
+    if reply == "invalid-json":
+        sys.stderr.write("GIT-SOURCE-PREPARE-V1 {not-json}" + chr(10))
+    else:
+        line = "GIT-SOURCE-PREPARE-V1 " + json.dumps(payload, sort_keys=True) + chr(10)
+        sys.stderr.write(line * (2 if reply == "duplicate" else 1))
+    sys.exit(0)
 if not os.path.isdir(os.path.join(mirror, "objects")):
     subprocess.run(["git", "init", "--bare", "--quiet", mirror], check=True)
     open(os.path.join(mirror, "consume.lock"), "a").close()
@@ -114,7 +136,7 @@ warm = subprocess.run(
 ).returncode == 0
 subprocess.run(
     ["git", "-c", "advice.detachedHead=false", "--git-dir", mirror, "fetch", "--no-tags",
-     upstream, refs[0] + ":" + demand],
+     upstream, os.environ.get("GATE_FAKE_DEMAND_REF_TARGET", refs[0]) + ":" + demand],
     check=True, capture_output=True,
 )
 emit("ready", "OK", source="hit" if warm else "cold")
@@ -199,6 +221,9 @@ def source_host(tmp_path):
     gate_bare = upstream / f"{GATE_REPOSITORY}.git"
     _git("init", "--bare", "--quiet", "-b", "main", gate_bare)
     _git("push", "--quiet", gate_bare, f"{gate_sha}:refs/heads/main", cwd=gate_work)
+    gate_tree = _git("rev-parse", f"{gate_sha}^{{tree}}", cwd=gate_work)
+    gate_other_sha = _git("commit-tree", gate_tree, "-m", "other gate commit", cwd=gate_work)
+    _git("push", "--quiet", gate_bare, f"{gate_other_sha}:refs/heads/other", cwd=gate_work)
 
     mirror_root = tmp_path / "cache/git"
     mirror_root.mkdir(parents=True)
@@ -230,6 +255,7 @@ def source_host(tmp_path):
         "merge_sha": merge_sha,
         "sibling_sha": sibling_sha,
         "gate_sha": gate_sha,
+        "gate_other_sha": gate_other_sha,
     }
 
 
@@ -420,6 +446,7 @@ def test_workflow_sha_sparse_checkout_service_pins_and_keeps_paths(source_host):
 def test_tool_bootstrap_service_reads_pinned_scripts_from_the_mirror(source_host):
     env = _env(
         source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT_NOISE="1",
         GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
         GATE_CHECKOUT_REF=source_host["gate_sha"],
     )
@@ -551,6 +578,95 @@ def test_client_contract_violation_is_rejected(source_host):
     assert run.returncode != 0
     assert gate_source.CLIENT_CONTRACT in run.stderr
     assert not (source_host["runner_temp"] / "gate_source.py").exists()
+
+
+BAD_CLIENT_REPLIES = (
+    "failed-status", "wrong-repository", "wrong-commit", "duplicate", "invalid-json", "invalid-source",
+)
+
+
+@pytest.mark.parametrize("reply", BAD_CLIENT_REPLIES)
+def test_bootstrap_rejects_untrusted_success_replies(source_host, reply):
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT_REPLY=reply,
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
+
+    assert run.returncode != 0
+    assert gate_source.CLIENT_CONTRACT in run.stderr
+    assert not (source_host["runner_temp"] / "gate_source.py").exists()
+    assert not (source_host["runner_temp"] / "gate_bounded_retry.py").exists()
+
+
+@pytest.mark.parametrize("reply", BAD_CLIENT_REPLIES)
+def test_python_client_reader_rejects_untrusted_success_replies(source_host, monkeypatch, reply):
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT_REPLY=reply,
+    )
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(gate_source.SourceError) as error:
+        gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
+
+    assert error.value.code == gate_source.CLIENT_CONTRACT
+
+
+def test_python_client_reader_ignores_nonprotocol_stderr(source_host, monkeypatch):
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT_NOISE="1",
+    )
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    payload = gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
+
+    assert payload["status"] == "ready"
+
+
+def test_bootstrap_rejects_a_demand_ref_for_another_commit(source_host):
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_DEMAND_REF_TARGET="refs/heads/other",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
+
+    assert run.returncode != 0
+    assert gate_source.PIN_MISMATCH in run.stderr
+    assert not (source_host["runner_temp"] / "gate_source.py").exists()
+    assert not (source_host["runner_temp"] / "gate_bounded_retry.py").exists()
+
+
+def test_python_checkout_rejects_a_demand_ref_for_another_commit(source_host, monkeypatch):
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    env = _env(
+        source_host, workspace,
+        GATE_FAKE_DEMAND_REF_TARGET="refs/heads/sibling",
+    )
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(gate_source.SourceError) as error:
+        gate_source.checkout(REPOSITORY, source_host["head_sha"], workspace)
+
+    assert error.value.code == gate_source.PIN_MISMATCH
+    assert not any(
+        f"fetch --no-tags --no-recurse-submodules {source_host['mirror_root']}/{REPOSITORY}.git" in line
+        for line in _argv(source_host)
+    )
+    assert _network_argv(source_host) == []
 
 
 def test_consumer_never_calls_the_client_under_the_read_lock(source_host):

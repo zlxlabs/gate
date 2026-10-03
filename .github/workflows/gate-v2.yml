@@ -164,8 +164,24 @@ env:
     client="$source_root/git-source-prepare"
     [ -x "$client" ] || { echo "::error::SOURCE-CLIENT-MISSING: $client" >&2; exit 1; }
     client_raw=$("$client" --repository "$repository" --commit "$commit" --deadline-epoch "$deadline" 2>&1 >/dev/null) && client_status=0 || client_status=$?
-    client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ' || true)
-    [ -n "$client_line" ] || { echo "::error::SOURCE-CLIENT-CONTRACT: no GIT-SOURCE-PREPARE-V1 line in: $client_raw" >&2; exit 1; }
+    if ! printf '%s\n' "$client_raw" | GATE_SOURCE_EXPECTED_REPOSITORY="$repository" GATE_SOURCE_EXPECTED_COMMIT="$commit" GATE_SOURCE_CLIENT_EXIT="$client_status" python3 -c '
+    import json, os, sys
+    marker = "GIT-SOURCE-PREPARE-V1 "
+    lines = [line[len(marker):] for line in sys.stdin.read().splitlines() if line.startswith(marker)]
+    try:
+        if len(lines) != 1:
+            raise ValueError("expected exactly one protocol line")
+        payload = json.loads(lines[0])
+        status = "ready" if os.environ["GATE_SOURCE_CLIENT_EXIT"] == "0" else "failed"
+        if not isinstance(payload, dict) or payload.get("status") != status or payload.get("repository") != os.environ["GATE_SOURCE_EXPECTED_REPOSITORY"] or payload.get("commit_sha") != os.environ["GATE_SOURCE_EXPECTED_COMMIT"] or payload.get("source") not in ("hit", "cold"):
+            raise ValueError("reply fields do not match the request")
+    except (json.JSONDecodeError, ValueError):
+        raise SystemExit(1)
+    ' ; then
+      echo "::error::SOURCE-CLIENT-CONTRACT: invalid GIT-SOURCE-PREPARE-V1 reply" >&2
+      exit 1
+    fi
+    client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ')
     [ "$client_status" -eq 0 ] || { echo "::error::SOURCE-CLIENT-FAILED: $client_line" >&2; exit 1; }
     mirror_repo="$source_root/$repository.git"
     lock_file="$mirror_repo/consume.lock"
@@ -178,6 +194,17 @@ env:
     flock --shared -w "$remaining" "$source_lock_fd" || { echo "::error::SOURCE-LOCK-TIMEOUT: $lock_file after ${remaining}s of a ${budget}s budget" >&2; exit 1; }
     remaining=$(( deadline - $(date +%s) ))
     [ "$remaining" -ge 1 ] || { flock --unlock "$source_lock_fd"; echo "::error::SOURCE-DEADLINE-EXCEEDED: budget $budget exhausted before reading the mirror" >&2; exit 1; }
+    demand_ref="refs/demand/$commit"
+    demand_commit=$(git --git-dir="$mirror_repo" rev-parse --verify --quiet "$demand_ref^{commit}") || {
+      flock --unlock "$source_lock_fd"
+      echo "::error::SOURCE-DEMAND-REF-MISSING: $demand_ref" >&2
+      exit 1
+    }
+    if [ "$demand_commit" != "$commit" ]; then
+      flock --unlock "$source_lock_fd"
+      echo "::error::SOURCE-PIN-MISMATCH: $demand_ref resolves to $demand_commit, expected $commit" >&2
+      exit 1
+    fi
     for gate_script in scripts/gate_source.py scripts/gate_bounded_retry.py; do
       if ! git --git-dir="$mirror_repo" show "refs/demand/$commit:$gate_script" > "$RUNNER_TEMP/${gate_script##*/}"; then
         flock --unlock "$source_lock_fd"
