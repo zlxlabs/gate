@@ -84,6 +84,18 @@ if mode == "fail":
 if not os.path.isdir(os.path.join(mirror, "objects")):
     subprocess.run(["git", "init", "--bare", "--quiet", mirror], check=True)
     open(os.path.join(mirror, "consume.lock"), "a").close()
+if os.environ.get("GATE_FAKE_CLIENT_PROBE_LOCK") == "1":
+    # The host writer needs the exclusive side of consume.lock to publish, so a
+    # consumer that calls us while holding the shared side is a real deadlock.
+    import fcntl
+    probe = os.open(os.path.join(mirror, "consume.lock"), os.O_RDONLY)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        emit("failed", "SOURCE-MIRROR-LOCK-HELD")
+        sys.exit(5)
+    fcntl.flock(probe, fcntl.LOCK_UN)
+    os.close(probe)
 refs = subprocess.run(
     ["git", "--git-dir", upstream, "for-each-ref", "--points-at", commit,
      "--format=%(refname)", "refs/heads"],
@@ -285,10 +297,11 @@ def _network_argv(host) -> list[str]:
     """Anything that could have talked to GitHub: a fetch/pull over the network,
     or a Contents API curl.  `git remote add origin <url>` is a local config write
     and is deliberately not counted."""
+    mirror = str(host["mirror_root"])
     return [
         line for line in _argv(host)
         if line.startswith(("curl", "git pull"))
-        or ("fetch" in line and ("origin" in line or "http" in line or "git://" in line))
+        or ("fetch" in line and mirror not in line)
     ]
 
 
@@ -493,6 +506,23 @@ def test_client_contract_violation_is_rejected(source_host):
     assert run.returncode != 0
     assert gate_source.CLIENT_CONTRACT in run.stderr
     assert not (source_host["runner_temp"] / "gate_source.py").exists()
+
+
+def test_consumer_never_calls_the_client_under_the_read_lock(source_host):
+    """The host writer takes consume.lock exclusively; a shared lock held across
+    the client call would deadlock, so the client itself asserts it can write."""
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT_PROBE_LOCK="1",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+
+    for _ in range(2):
+        run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
+
+        assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
 
 
 def test_python_client_reader_rejects_an_unready_status(source_host, monkeypatch):
