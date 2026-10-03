@@ -160,13 +160,17 @@ jobs:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SILO_SECRET_KEY }}
-      SILO_STORE: ${{ github.workspace }}/scripts/silo_store.py
-      SILO_EXEC: ${{ github.workspace }}/scripts/silo_exec.sh
+      SILO_STORE: ${{ github.workspace }}/_gate-disposition-src/scripts/silo_store.py
+      SILO_EXEC: ${{ github.workspace }}/_gate-disposition-src/scripts/silo_exec.sh
     steps:
       - name: Checkout disposition producer
         env:
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
           GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          # gate_source.checkout_from_environment refuses an empty or "." path:
+          # the workspace root belongs to actions/checkout, so this entry point
+          # materializes its tools in a subdirectory like every gate-v2 site does.
+          GATE_CHECKOUT_PATH: _gate-disposition-src
           GATE_CHECKOUT_SPARSE: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
@@ -269,7 +273,7 @@ jobs:
           head_sha = pull["head"]["sha"]
           if audit["base_sha"] != base_sha or audit["head_sha"] != head_sha:
               raise SystemExit("canonical audit scope disagrees with current PR base/head")
-          module_path = Path(".github/actions/gate-aggregator/convergence.py").resolve()
+          module_path = Path("_gate-disposition-src/.github/actions/gate-aggregator/convergence.py").resolve()
           spec = importlib.util.spec_from_file_location("gate_convergence_scope", module_path)
           if spec is None or spec.loader is None:
               raise ImportError(f"convergence module is unavailable: {module_path}")
@@ -321,7 +325,7 @@ jobs:
           test -n "$DISPOSITION_APPROVER"
           test -n "$DISPOSITION_APPROVER_ID"
           approved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          output="$(python3 .github/actions/gate-disposition/issue_receipt.py issue \
+          output="$(python3 _gate-disposition-src/.github/actions/gate-disposition/issue_receipt.py issue \
             --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
             --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
             --head-sha "$CURRENT_HEAD_SHA" --finding-id "$FINDING_ID" \

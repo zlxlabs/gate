@@ -10,6 +10,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -33,6 +34,9 @@ DISPOSITION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2-dispositio
 CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-v2.yml"
 DISPOSITION_CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-disposition.yml"
 DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
+# gate#278: the disposition entry point materializes its tools below the
+# workspace, exactly like every gate-v2 workflow_sha checkout site.
+DISPOSITION_CHECKOUT_SUBDIR = "_gate-disposition-src"
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 PREFLIGHT_SCRIPT = REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
 ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
@@ -96,6 +100,7 @@ CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 BOUNDED_RETRY_HELPER = REPO_ROOT / "scripts" / "gate_bounded_retry.py"
 CHECKOUT_HELPER_RUN = 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout'
 BOOTSTRAP_CALL = 'bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"'
+GATE_CHECKOUT_MIRROR_CALL = 'bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"'
 MAGICDNS_HELPER_RUN = 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns'
 UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 EXPECTED_ACTION_REFS = {
@@ -155,17 +160,27 @@ def _sparse_env_paths(step: dict) -> list[str]:
 
 
 def assert_workflow_sha_checkout(step: dict, *, path: str | None = None, sparse: list[str] | str | None = None) -> None:
-    """Lock reusable-workflow identity + helper invocation without weakening fields."""
+    """Lock reusable-workflow identity + helper invocation without weakening fields.
+
+    Every call site must name a destination below the workspace: gate#278 was a
+    disposition site that declared none, and `gate_source.checkout_from_environment`
+    rejects an empty or "." path, so `path=""` no longer means "workspace root"
+    anywhere.  Passing `path` asserts one specific subdirectory; omitting it
+    still asserts that a real subdirectory is declared.
+    """
 
     uses = str(step.get("uses", ""))
     assert not uses.startswith("actions/checkout"), step.get("name")
     env = step["env"]
     assert env["GATE_CHECKOUT_REPOSITORY"] == "${{ job.workflow_repository }}"
     assert env["GATE_CHECKOUT_REF"] == "${{ job.workflow_sha }}"
-    if path:
-        assert env["GATE_CHECKOUT_PATH"] == path
-    elif path == "":
-        assert "GATE_CHECKOUT_PATH" not in env
+    declared = env.get("GATE_CHECKOUT_PATH", "")
+    assert declared and declared != ".", (
+        f"{step.get('name')}: GATE_CHECKOUT_PATH must name a subdirectory below the workspace, got {declared!r}"
+    )
+    assert not declared.startswith("/") and ".." not in declared.split("/"), declared
+    if path is not None:
+        assert declared == path
     assert env["GATE_GITHUB_TOKEN"] == "${{ github.token }}"
     if sparse is not None:
         expected = sparse.splitlines() if isinstance(sparse, str) else list(sparse)
@@ -183,6 +198,35 @@ def assert_workflow_sha_checkout(step: dict, *, path: str | None = None, sparse:
     assert "${{" not in run
     assert "x-access-token" not in run
     assert "github.token" not in run
+
+
+def _disposition_checkout_step() -> dict:
+    raw, _ = _load_disposition_workflow()
+    return next(
+        step
+        for step in raw["jobs"]["control"]["steps"]
+        if step.get("name") == "Checkout disposition producer"
+    )
+
+
+def _disposition_step(name: str) -> dict:
+    raw, _ = _load_disposition_workflow()
+    return next(step for step in raw["jobs"]["control"]["steps"] if step.get("name") == name)
+
+
+def _checkout_shaped_workspace(tmp_path, subdir: str, sparse: list[str]) -> Path:
+    """A workspace shaped exactly like the tool-sparse checkout leaves it.
+
+    Only `subdir` exists: every declared sparse file is present below it and
+    absent from the workspace root, so a consumer still addressing the root
+    resolves to nothing instead of silently working in the source tree.
+    """
+    workspace = tmp_path / "workspace"
+    for relative in sparse:
+        target = workspace / subdir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(REPO_ROOT / relative, target)
+    return workspace
 
 
 def _disposition_scope_python() -> str:
@@ -294,7 +338,10 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert "GITHUB_TRIGGERING_ACTOR" not in issue.get("env", {})
     assert "--triggering-actor" not in issue["run"]
     assert "env -i" not in issue["run"]
-    assert "python3 .github/actions/gate-disposition/issue_receipt.py issue" in issue["run"]
+    assert (
+        f"python3 {DISPOSITION_CHECKOUT_SUBDIR}/.github/actions/gate-disposition/issue_receipt.py issue"
+        in issue["run"]
+    )
 
 
 def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_artifact():
@@ -403,10 +450,15 @@ def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(t
     pr_path = tmp_path / "pr.json"
     audit_path.write_text(json.dumps(audit), encoding="utf-8")
     pr_path.write_text(json.dumps(pull), encoding="utf-8")
+    # The module is loaded from the workflow's own checkout subdirectory, so the
+    # only copy in existence has to be the one a sparse checkout leaves there.
+    workspace = _checkout_shaped_workspace(tmp_path, DISPOSITION_CHECKOUT_SUBDIR, [
+        ".github/actions/gate-aggregator/convergence.py",
+    ])
     result = subprocess.run(
         [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
         input=source,
-        cwd=REPO_ROOT,
+        cwd=workspace,
         capture_output=True,
         text=True,
         check=False,
@@ -446,7 +498,7 @@ def test_disposition_checkout_uses_reusable_workflow_identity():
         for step in raw["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
     )
-    assert_workflow_sha_checkout(checkout, path="", sparse=[
+    assert_workflow_sha_checkout(checkout, path=DISPOSITION_CHECKOUT_SUBDIR, sparse=[
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
         "scripts/silo_store.py",
@@ -709,7 +761,160 @@ def test_workflow_sha_checkouts_use_centralized_bounded_retry():
         step for step in disposition["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
     )
-    assert_workflow_sha_checkout(producer, path="")
+    assert_workflow_sha_checkout(producer, path=DISPOSITION_CHECKOUT_SUBDIR)
+
+
+def test_every_workflow_sha_checkout_names_a_workspace_subdirectory():
+    """gate#278: one call site out of ten declared no destination and the whole
+    disposition job died in `checkout_from_environment`.  Sweep every real call
+    site of every gate workflow instead of trusting a hand-written list; the
+    count is reported, never frozen."""
+    helper_sites = []
+    mirror_sites = []
+    for path in sorted((REPO_ROOT / ".github/workflows").glob("gate*.yml")):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for job_name, job in (raw.get("jobs") or {}).items():
+            for step in job.get("steps", []):
+                run = str(step.get("run", ""))
+                step_env = step.get("env") or {}
+                if step_env.get("GATE_CHECKOUT_REF") != "${{ job.workflow_sha }}":
+                    continue
+                site = (path.name, job_name, step.get("name"))
+                if CHECKOUT_HELPER_RUN in run:
+                    helper_sites.append(site)
+                    assert_workflow_sha_checkout(step)
+                    continue
+                if GATE_CHECKOUT_MIRROR_CALL in run:
+                    mirror_sites.append(site)
+                    # The mirror prefetch checks out into
+                    # `$GITHUB_WORKSPACE/$GATE_CHECKOUT_PATH`, so it owes the same
+                    # non-empty, non-"." destination.
+                    declared = step_env.get("GATE_CHECKOUT_PATH", "")
+                    assert declared and declared != ".", site
+    assert helper_sites, "no workflow_sha checkout call sites found"
+    assert len(helper_sites) + len(mirror_sites) >= 10, f"call sites disappeared: {helper_sites}"
+    disposition = [site for site in helper_sites if site[0] == "gate-v2-disposition.yml"]
+    assert [site[1:] for site in disposition] == [("control", "Checkout disposition producer")]
+
+
+def test_disposition_silo_and_script_consumers_read_from_the_checkout_subdirectory(tmp_path):
+    """The four root-relative consumers of the disposition job.
+
+    `SILO_STORE` / `SILO_EXEC` are the Silo helpers the MagicDNS and audit steps
+    invoke; the other two are the inline script invocations.  Each is resolved
+    against a workspace that contains the tools ONLY below the declared
+    subdirectory, so a consumer left addressing the workspace root resolves to
+    nothing instead of quietly working in the source tree.
+    """
+    raw, _ = _load_disposition_workflow()
+    job = raw["jobs"]["control"]
+    checkout = _disposition_checkout_step()
+    subdir = checkout["env"]["GATE_CHECKOUT_PATH"]
+    sparse = _sparse_env_paths(checkout)
+    workspace = _checkout_shaped_workspace(tmp_path, subdir, sparse)
+
+    assert job["env"]["SILO_STORE"] == (
+        f"${{{{ github.workspace }}}}/{subdir}/scripts/silo_store.py"
+    )
+    assert job["env"]["SILO_EXEC"] == (
+        f"${{{{ github.workspace }}}}/{subdir}/scripts/silo_exec.sh"
+    )
+    module_ref = re.search(
+        r'module_path = Path\("([^"]+)"\)', _disposition_scope_python()
+    ).group(1)
+    producer_ref = re.search(
+        r'python3 (\S+) issue', _disposition_step("Issue immutable disposition artifact")["run"]
+    ).group(1)
+    assert module_ref == f"{subdir}/.github/actions/gate-aggregator/convergence.py"
+    assert producer_ref == f"{subdir}/.github/actions/gate-disposition/issue_receipt.py"
+    for relative in (
+        f"{subdir}/scripts/silo_store.py",
+        f"{subdir}/scripts/silo_exec.sh",
+        module_ref,
+        producer_ref,
+    ):
+        assert (workspace / relative).is_file(), relative
+        assert (workspace / relative).read_bytes() == (REPO_ROOT / relative[len(subdir) + 1:]).read_bytes()
+    # Nothing resolves from the workspace root any more.
+    for relative in ("scripts/silo_store.py", "scripts/silo_exec.sh", ".github"):
+        assert not (workspace / relative).exists()
+
+
+def test_disposition_receipt_step_runs_the_producer_from_the_checkout_subdirectory(tmp_path):
+    """Run the receipt step's own `run` body, from a checkout-shaped workspace,
+    and check that it signs a real receipt from the producer the checkout left
+    below the subdirectory."""
+    raw, _ = _load_disposition_workflow()
+    step = _disposition_step("Issue immutable disposition artifact")
+    subdir = _disposition_checkout_step()["env"]["GATE_CHECKOUT_PATH"]
+    sparse = _sparse_env_paths(_disposition_checkout_step())
+    workspace = _checkout_shaped_workspace(tmp_path, subdir, sparse)
+
+    scope = {
+        "repository_id": 123, "pr_number": 42, "base_sha": "b" * 40,
+        "head_sha": "a" * 40, "diff_digest": "d" * 64, "policy_version": "policy-v1",
+        "policy_digest": "p" * 64, "tier": "personal", "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "r" * 40,
+    }
+    audit = {
+        **scope, "repository": "zlxlabs/gate", "pr": 42, "run_id": 7, "run_attempt": 1,
+        "verdict": "fail",
+        "result": {"findings": [{
+            "id": "finding-one", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/guard.py", "line": 12, "category": "correctness",
+        }]},
+    }
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    output_dir = tmp_path / "artifact"
+    output_dir.mkdir()
+    github_env = tmp_path / "github-env"
+    github_env.write_text("")
+    github_output = tmp_path / "github-output"
+    github_output.write_text("")
+
+    env = {
+        **os.environ,
+        "AUDIT_PATH": str(audit_path),
+        "CURRENT_HEAD_SHA": scope["head_sha"],
+        "CURRENT_AUDIT_DIGEST": "d" * 64,
+        "CURRENT_EPOCH": "e" * 64,
+        "CURRENT_SCOPE_JSON": json.dumps(scope),
+        "REPOSITORY_ID": "123",
+        "PR_NUMBER": "42",
+        "FINDING_ID": "finding-one",
+        "DISPOSITION_REASON": "canonical evidence reviewed",
+        "DISPOSITION_KIND": "false-positive",
+        "DISPOSITION_COUNTEREVIDENCE_JSON": json.dumps({
+            "command": "pytest -q tests/test_regression.py",
+            "output": "1 passed",
+            "result": "refuted",
+            "pointer": "tests/test_regression.py::test_behavior",
+        }),
+        "DISPOSITION_TRACKING_ISSUE": "",
+        "DISPOSITION_APPROVER": "owner",
+        "DISPOSITION_APPROVER_ID": "10",
+        "DISPOSITION_REPOSITORY": "zlxlabs/gate",
+        "OUTPUT_DIR": str(output_dir),
+        "GITHUB_TRIGGERING_ACTOR": "owner",
+        "GITHUB_ENV": str(github_env),
+        "GITHUB_OUTPUT": str(github_output),
+    }
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=workspace, env=env, capture_output=True, text=True, timeout=180,
+    )
+
+    assert result.returncode == 0, f"{result.stderr}\n{result.stdout}"
+    artifact_name = next(
+        line.split("=", 1)[1] for line in github_output.read_text().splitlines()
+        if line.startswith("artifact_name=")
+    )
+    receipt = json.loads((output_dir / artifact_name).read_text(encoding="utf-8"))
+    assert receipt["kind"] == "gate-disposition-receipt-v3"
+    assert receipt["disposition"] == "false-positive"
+    assert receipt["finding_id"] == "finding-one"
+    assert receipt["approver"] == "owner"
 
 
 def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_if():
