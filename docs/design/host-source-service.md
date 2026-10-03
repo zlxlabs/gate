@@ -18,7 +18,9 @@ gate 的三个共享工作流（`gate-v2.yml` / `gate-shadow-v2.yml` / `gate-v2-
 判定只在工作流级 `GATE_SOURCE_DECIDE_SCRIPT` 里实现一次，结果写入
 `$RUNNER_TEMP/gate-source-mode`；`GATE_SOURCE_BOOTSTRAP_SCRIPT`、
 `GATE_CHECKOUT_MIRROR_SCRIPT` 的 service 分支和 `scripts/gate_bounded_retry.py`
-都读这一个判定结果，不各自重写规则。
+都读这一个判定结果，不各自重写规则。`GATE_HUB_GIT_MIRROR_DIR` 已设置而标记缺失 /
+不可读 / 内容非法时，`gate_bounded_retry.py` 以 `SOURCE-MODE-UNREADABLE` /
+`SOURCE-MODE-INVALID` 非零失败，绝不静默按 `origin` 处理。
 
 ## 读取协议（service）
 
@@ -39,7 +41,7 @@ gate 的三个共享工作流（`gate-v2.yml` / `gate-shadow-v2.yml` / `gate-v2-
 
 | 调用点 | service | origin |
 | --- | --- | --- |
-| caller checkout（quality / primary / ocr / classify / shadow） | 镜像 fetch 全量历史 + `checkout --force --detach`，`actions/checkout` 不执行 | 原内联 mirror 段 + `actions/checkout`（fetch-depth 1） |
+| caller checkout（quality / primary / ocr / classify / shadow） | 物化前清空工作区（等价 `actions/checkout` 默认 `clean: true`：不属于目标提交的未跟踪 / 忽略 / 只读残留与符号链接全部移除，链接不跟随出工作区）+ 镜像 fetch 全量历史 + `checkout --force --detach`，`actions/checkout` 不执行 | 原内联 mirror 段 + `actions/checkout`（fetch-depth 1） |
 | 工具自举（gate-v2 9 处 + disposition 1 处） | `gate_source.py` / `gate_bounded_retry.py` 从镜像 `workflow_sha` 读出 | Contents API 下载 `gate_bounded_retry.py` |
 | `pr-size-preflight` / `diff-coverage-advisory` 的 base/head | 对象缺失时经服务从镜像取 | `git fetch --no-tags origin base head` |
 

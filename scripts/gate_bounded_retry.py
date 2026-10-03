@@ -88,6 +88,10 @@ def run_with_retries(operation: Callable[[], T], *, label: str) -> T:
 SOURCE_MODE_MARKER = "gate-source-mode"
 SOURCE_SCRIPT_NAME = "gate_source.py"
 SOURCE_SCRIPT_MISSING = "SOURCE-SCRIPT-MISSING"
+# Same literals as scripts/gate_source.py: the marker is that module's verdict
+# handed across the process boundary, so the vocabulary must not fork.
+SOURCE_MODE_MARKER_UNREADABLE = "SOURCE-MODE-UNREADABLE"
+SOURCE_MODE_MARKER_INVALID = "SOURCE-MODE-INVALID"
 
 def _temp() -> Path:
     return Path(os.environ.get("RUNNER_TEMP") or os.environ.get("TMPDIR") or "/tmp")
@@ -97,9 +101,22 @@ def declared_source_mode() -> str:
 
     The marker file is written by the one bash declaration reader every caller
     shares, so the service branch never re-implements the SOURCE-MODE rule.
+    With GATE_HUB_GIT_MIRROR_DIR set, a missing/unreadable/invalid marker must
+    fail: silently treating it as `origin` would download from GitHub on a host
+    whose declaration could not be read.
     """
+    if not os.environ.get("GATE_HUB_GIT_MIRROR_DIR", "").strip():
+        return "origin"
     marker = _temp() / SOURCE_MODE_MARKER
-    return marker.read_text(encoding="ascii").strip() if marker.is_file() else "origin"
+    try:
+        raw = marker.read_bytes()
+    except OSError as error:
+        raise SystemExit(f"{SOURCE_MODE_MARKER_UNREADABLE}: {marker}: {error.strerror}")
+    if raw not in (b"origin\n", b"service\n"):
+        raise SystemExit(
+            f"{SOURCE_MODE_MARKER_INVALID}: {marker}: {raw!r} is not exactly 'origin\\n' or 'service\\n'"
+        )
+    return raw.decode("ascii").strip()
 
 def load_gate_source():
     path = _temp() / SOURCE_SCRIPT_NAME

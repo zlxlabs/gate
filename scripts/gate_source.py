@@ -345,6 +345,22 @@ def _workspace() -> Path:
     return Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd())
 
 
+def _clear_residuals(dest: Path) -> None:
+    """Empty `dest` without following symlinks out of it.
+
+    `actions/checkout` (`clean: true`, the default) guarantees a job starts from
+    a pristine tree; the service path replaces that action on the shared
+    self-hosted workspace, so it owes the same guarantee.  Symlinks are
+    unlinked, never chased, so a link pointing outside `dest` cannot make us
+    delete its target.
+    """
+    for entry in dest.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+
 def checkout_from_environment(timeout: int | None = None) -> dict[str, Any]:
     """Materialize GATE_CHECKOUT_* through the service (same env contract as
     `gate_bounded_retry.py checkout`, which delegates here in service mode)."""
@@ -375,9 +391,8 @@ def checkout(
     # every remaining-budget check below compares against the same clock.
     deadline = int(time.time()) + budget
     if dest.resolve() == _workspace().resolve():
-        if (dest / ".git").exists():
-            shutil.rmtree(dest / ".git")
         dest.mkdir(parents=True, exist_ok=True)
+        _clear_residuals(dest)
     else:
         if dest.exists():
             shutil.rmtree(dest)

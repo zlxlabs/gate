@@ -76,3 +76,32 @@ PR #276；凭据清理时机（action 的 post 步骤）是否需要跟进，另
 **关键决策与已否决方案**：客户端成功（退出码 0）必须回 `ready`，失败退出必须回 `failed`，以保留宿主协议的 `SOURCE-*` 失败语义；允许 stderr 中存在非协议进度行，但必须恰有一行协议前缀。已否决：仅检查 marker 存在后直接执行镜像中的工具文件。
 
 **下一步唯一动作**：运行本仓规定的全量测试与 pin 检查，随后提交并推送修复轮 3。
+
+### 2026-10-03 · 修复轮 4：service 工作区清理 + 内部标记 fail-closed
+
+**当前阶段**：implementing；F4（service caller checkout 清理上一作业残留）、
+F5（`gate_bounded_retry.py` 内部模式标记缺失时静默回落 origin）已完成并提交。
+
+**本段结论**：service 路径物化 caller checkout 前先清空工作区全部内容
+（等价替代掉的 `actions/checkout` 默认 `clean: true`）：未跟踪、被忽略、只读
+残留与符号链接全部移除，链接只 unlink 不跟随，指向 dest 外的目标完好；非工作区根
+dest（`_gate-action-src` 等）沿用整目录重建，同样无残留，两类都有真实 git 夹具
+用例跑工作流抽出的真实 bash 锁住。`declared_source_mode()` 在
+`GATE_HUB_GIT_MIRROR_DIR` 已设置而 `$RUNNER_TEMP/gate-source-mode` 缺失 /
+不可读 / 非法时以 `SOURCE-MODE-UNREADABLE` / `SOURCE-MODE-INVALID` 非零失败
+（与 `gate_source.py` 同一词汇表，由测试锁定相等），只有 env 未设置/空或标记恰为
+`origin` 才走 origin；service 环境删标记跑 `gate_bounded_retry.py checkout` 非零且
+零 git/curl argv。全量 1356 passed。
+
+**关键决策与已否决方案**：F4 选「物化前清空 dest」而非「checkout 后
+`git clean -ffdx`」：不依赖 git 对嵌套仓/只读目录的清理语义，清理由 Python 一次
+iterdir 完成（目录且非符号链接 → rmtree，其余 → unlink），且清理不占取码预算；
+F5 判据读字节、恰 `origin\n`/`service\n`，与工作流 bash 判定同形。已否决：标记
+缺失回退 origin（正是本卡要消灭的静默出错）。顺带把修复轮 2 引入的
+`test_python_lock_waits_only_on_what_is_left_of_the_budget` 上界从 5.0 放到 5.5：
+锁循环 50ms 轮询会让 deadline 检测最多晚一个间隔，基线 commit 加 CPU 负载实测
+5.14s 超 5.0（与本轮改动无关），5.5 保留余量且不影响该测试本来的锁语义判别
+（判别的红验由 `test_python_lock_timeout_stays_inside_one_budget` 承担）。
+
+**下一步唯一动作**：主脑验收后以 merge commit 合并 PR #276（前置：gate-hub W3b-1
+的 `SOURCE-MODE` 部署到全部自托管主机）。

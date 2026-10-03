@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from scripts import gate_bounded_retry
 from scripts import gate_source
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -389,6 +390,88 @@ def _extraheader(workspace: Path) -> str | None:
         cwd=workspace, env={**os.environ, **GIT_ENV}, capture_output=True, text=True,
     )
     return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _assert_merge_tree_matches_upstream(source_host, workspace: Path) -> None:
+    assert _git("rev-parse", "HEAD", cwd=workspace) == source_host["merge_sha"]
+    assert _git("rev-parse", "--is-shallow-repository", cwd=workspace) == "false"
+    for name in ("README.md", "app.py", "feature.txt"):
+        expected = subprocess.run(
+            ["git", "--git-dir", str(source_host["caller_bare"]), "cat-file", "blob",
+             f"{source_host['merge_sha']}:{name}"],
+            env={**os.environ, **GIT_ENV}, check=True, capture_output=True,
+        ).stdout
+        assert (workspace / name).read_bytes() == expected
+
+
+def test_caller_checkout_service_clears_everything_the_previous_job_left(source_host):
+    """The service path replaces `actions/checkout` (clean: true by default) on a
+    shared self-hosted workspace, so the previous job's leftovers — untracked,
+    ignored, read-only, and symlinks pointing outside the workspace — must all
+    be gone while the tree of the target commit stays byte-exact."""
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    outside_dir = source_host["tmp_path"] / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "precious.txt"
+    outside_file.write_text("do not delete\n")
+    (workspace / "stale-untracked.txt").write_text("stale\n")
+    (workspace / ".gitignore").write_text("build/\n")
+    (workspace / "build").mkdir()
+    (workspace / "build" / "output.bin").write_bytes(b"stale artifact\n")
+    (workspace / "old-dir").mkdir()
+    (workspace / "old-dir" / "nested.txt").write_text("stale\n")
+    readonly = workspace / "readonly.txt"
+    readonly.write_text("stale\n")
+    readonly.chmod(0o444)
+    (workspace / "outside-dir-link").symlink_to(outside_dir)
+    (workspace / "outside-file-link").symlink_to(outside_file)
+    env = _env(source_host, workspace)
+    env["GATE_SOURCE_TOOL_REPOSITORY"] = GATE_REPOSITORY
+    env["GATE_SOURCE_TOOL_REF"] = source_host["gate_sha"]
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"', env)
+
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    for residual in (
+        "stale-untracked.txt", ".gitignore", "build", "old-dir",
+        "readonly.txt", "outside-dir-link", "outside-file-link",
+    ):
+        assert not (workspace / residual).exists(), residual
+    assert outside_file.read_text() == "do not delete\n"
+    _assert_merge_tree_matches_upstream(source_host, workspace)
+    assert _network_argv(source_host) == []
+
+
+def test_sparse_tool_checkout_service_clears_a_stale_dest(source_host):
+    """Non-workspace-root dests owe the same guarantee (e.g. `_gate-classify-src`)."""
+    workspace = source_host["tmp_path"] / "workspace"
+    stale_dest = workspace / "_gate-action-src"
+    stale_dest.mkdir(parents=True)
+    (stale_dest / "leftover.txt").write_text("stale\n")
+    (stale_dest / "stale-dir").mkdir()
+    (stale_dest / "stale-dir" / "nested.txt").write_text("stale\n")
+    env = _env(
+        source_host, workspace,
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+        GATE_CHECKOUT_PATH="_gate-action-src",
+        GATE_CHECKOUT_SPARSE="scripts/gate_source.py\nscripts/gate_bounded_retry.py\n",
+    )
+    _script_env(env)
+
+    run = _run_bash(
+        'bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"\n'
+        'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout',
+        env,
+    )
+
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    assert not (stale_dest / "leftover.txt").exists()
+    assert not (stale_dest / "stale-dir").exists()
+    assert _git("rev-parse", "HEAD", cwd=stale_dest) == source_host["gate_sha"]
+    assert _network_argv(source_host) == []
 
 
 def test_workflow_sha_tool_bootstrap_never_persists_credentials(source_host):
@@ -818,8 +901,11 @@ def test_python_lock_waits_only_on_what_is_left_of_the_budget(source_host, monke
     # every later step used to be handed the full budget or `max(1, remaining)`
     # seconds of its own, so this ran past 5s.
     # Either literal is fine; the wall clock is what pins the budget.
+    # The lock loop polls at 50ms, so the deadline can be detected up to one
+    # poll interval late; 5.5 leaves that slack while the pre-fix code (fresh
+    # 1s wait after a 4.5s client, ~5.6s+) stays red.
     assert error.value.code in {gate_source.DEADLINE_EXCEEDED, gate_source.LOCK_TIMEOUT}
-    assert elapsed < 5.0, f"waited {elapsed:.2f}s"
+    assert elapsed < 5.5, f"waited {elapsed:.2f}s"
 
 
 def test_python_lock_timeout_stays_inside_one_budget(source_host, monkeypatch):
@@ -897,6 +983,81 @@ def test_origin_declaration_keeps_the_pre_existing_git_bounded_retry_path(source
     ), _argv(source_host)
 
 
+def test_missing_mode_marker_fails_closed_instead_of_origin(source_host):
+    """On a host with GATE_HUB_GIT_MIRROR_DIR set, a missing decide-step marker
+    must fail closed: the old silent `origin` fallback would download from
+    GitHub exactly where the declaration said `service`."""
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    env = _env(
+        source_host, workspace,
+        GATE_CHECKOUT_REPOSITORY=REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["head_sha"],
+        GATE_CHECKOUT_ORIGIN_URL=str(source_host["caller_bare"]),
+    )
+    assert not (source_host["runner_temp"] / "gate-source-mode").exists()
+
+    run = subprocess.run(
+        ["python3", str(BOUNDED_RETRY), "checkout"], env=env, cwd=workspace,
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert run.returncode != 0
+    assert gate_bounded_retry.SOURCE_MODE_MARKER_UNREADABLE in run.stderr
+    assert "SOURCE-MODE" in run.stderr
+    assert _argv(source_host) == []
+
+
+INVALID_MARKERS = [
+    b"", b"service", b"service\r\n", b"origin\norigin\n", b"service \n", b"Service\n",
+]
+INVALID_MARKER_IDS = ["empty", "no-final-newline", "crlf", "two-lines", "trailing-space", "wrong-case"]
+
+
+@pytest.mark.parametrize("payload", INVALID_MARKERS, ids=INVALID_MARKER_IDS)
+def test_invalid_mode_marker_fails_closed(source_host, payload):
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    env = _env(
+        source_host, workspace,
+        GATE_CHECKOUT_REPOSITORY=REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["head_sha"],
+        GATE_CHECKOUT_ORIGIN_URL=str(source_host["caller_bare"]),
+    )
+    (source_host["runner_temp"] / "gate-source-mode").write_bytes(payload)
+
+    run = subprocess.run(
+        ["python3", str(BOUNDED_RETRY), "checkout"], env=env, cwd=workspace,
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert run.returncode != 0
+    assert gate_bounded_retry.SOURCE_MODE_MARKER_INVALID in run.stderr
+    assert _argv(source_host) == []
+
+
+def test_unset_mirror_dir_without_marker_keeps_the_origin_checkout(source_host):
+    """No env, no marker: the pre-existing origin path is unchanged."""
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    env = _env(
+        source_host, workspace,
+        GATE_CHECKOUT_REPOSITORY=REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["head_sha"],
+        GATE_CHECKOUT_ORIGIN_URL=str(source_host["caller_bare"]),
+    )
+    del env["GATE_HUB_GIT_MIRROR_DIR"]
+    assert not (source_host["runner_temp"] / "gate-source-mode").exists()
+
+    run = subprocess.run(
+        ["python3", str(BOUNDED_RETRY), "checkout"], env=env, cwd=workspace,
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    assert _git("rev-parse", "HEAD", cwd=workspace) == source_host["head_sha"]
+
+
 def test_missing_token_fails_loudly_instead_of_writing_a_broken_credential(source_host, monkeypatch):
     monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
     monkeypatch.delenv("GATE_GITHUB_TOKEN", raising=False)
@@ -940,6 +1101,19 @@ def test_failure_literals_are_stable_and_unique(literal):
     assert literal.startswith("SOURCE-")
     assert literal not in {"SOURCE-", "SOURCE-X"}
     assert literal == literal.strip().upper()
+
+
+def test_bounded_retry_marker_literals_match_gate_source():
+    """gate_bounded_retry fails with the same SOURCE-MODE-* vocabulary; the
+    marker is gate_source's verdict handed across the process boundary."""
+    assert gate_bounded_retry.SOURCE_MODE_MARKER_UNREADABLE == gate_source.MODE_UNREADABLE
+    assert gate_bounded_retry.SOURCE_MODE_MARKER_INVALID == gate_source.MODE_INVALID
+    for literal in (
+        gate_bounded_retry.SOURCE_MODE_MARKER_UNREADABLE,
+        gate_bounded_retry.SOURCE_MODE_MARKER_INVALID,
+    ):
+        assert literal.startswith("SOURCE-")
+        assert literal == literal.strip().upper()
 
 
 def test_pin_mismatch_is_reported_not_swallowed(source_host, monkeypatch):
