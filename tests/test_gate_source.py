@@ -216,6 +216,21 @@ def source_host(tmp_path):
     shutil.copy(REPO_ROOT / "scripts/gate_source.py", gate_work / "scripts/gate_source.py")
     shutil.copy(REPO_ROOT / "scripts/gate_bounded_retry.py", gate_work / "scripts/gate_bounded_retry.py")
     (gate_work / "scripts/unrelated.py").write_text("# not fetched\n")
+    # The disposition sparse list names four more files; checkout_from_environment
+    # fails the step when a declared sparse path is absent after checkout, so the
+    # fixture repo has to carry them for the disposition entry point to run.
+    shutil.copy(REPO_ROOT / "scripts/silo_store.py", gate_work / "scripts/silo_store.py")
+    shutil.copy(REPO_ROOT / "scripts/silo_exec.sh", gate_work / "scripts/silo_exec.sh")
+    (gate_work / ".github/actions/gate-disposition").mkdir(parents=True)
+    (gate_work / ".github/actions/gate-aggregator").mkdir(parents=True)
+    shutil.copy(
+        REPO_ROOT / ".github/actions/gate-disposition/issue_receipt.py",
+        gate_work / ".github/actions/gate-disposition/issue_receipt.py",
+    )
+    shutil.copy(
+        REPO_ROOT / ".github/actions/gate-aggregator/convergence.py",
+        gate_work / ".github/actions/gate-aggregator/convergence.py",
+    )
     _git("add", "-A", cwd=gate_work)
     _git("commit", "-qm", "gate tools", cwd=gate_work)
     gate_sha = _git("rev-parse", "HEAD", cwd=gate_work)
@@ -312,6 +327,39 @@ def _script_env(env: dict[str, str]) -> None:
         env[name] = _script(name)
 
 
+def _disposition_env() -> dict:
+    return yaml.safe_load(DISPOSITION_WORKFLOW.read_text(encoding="utf-8"))["env"]
+
+
+def _disposition_step(name: str) -> dict:
+    raw = yaml.safe_load(DISPOSITION_WORKFLOW.read_text(encoding="utf-8"))
+    return next(s for s in raw["jobs"]["control"]["steps"] if s.get("name") == name)
+
+
+def _disposition_checkout(source_host, workspace: Path, **overrides: str) -> tuple[subprocess.CompletedProcess, dict[str, str]]:
+    """Run the disposition workflow's real checkout step.
+
+    The step's own `env` block and its own `run` body are the producer: nothing
+    here re-derives the sparse list, the helper invocation or the script text.
+    Only the GitHub expressions are resolved to fixture values, and the
+    workflow-level env is injected the way the runner injects it.
+    """
+    step = _disposition_step("Checkout disposition producer")
+    env = _env(
+        source_host, workspace,
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    for key, value in (step.get("env") or {}).items():
+        if not str(value).startswith("${{"):
+            env[key] = value
+    workflow_env = _disposition_env()
+    env["GATE_SOURCE_DECIDE_SCRIPT"] = workflow_env["GATE_SOURCE_DECIDE_SCRIPT"]
+    env["GATE_SOURCE_BOOTSTRAP_SCRIPT"] = workflow_env["GATE_SOURCE_BOOTSTRAP_SCRIPT"]
+    env.update(overrides)
+    return _run_bash(step["run"], env), env
+
+
 def _marker(stdout: str) -> dict:
     line = next(line for line in stdout.splitlines() if line.startswith("GATE-SOURCE-V1 "))
     return json.loads(line.removeprefix("GATE-SOURCE-V1 "))
@@ -379,6 +427,67 @@ def test_sparse_tool_checkout_service_clears_a_stale_dest(source_host):
     assert not (stale_dest / "stale-dir").exists()
     assert _git("rev-parse", "HEAD", cwd=stale_dest) == source_host["gate_sha"]
     assert _network_argv(source_host) == []
+
+
+def test_disposition_checkout_service_materializes_the_declared_subdirectory(source_host):
+    """gate#278: the disposition entry point must name a dest below the workspace.
+
+    `gate_source.checkout_from_environment` rejects an empty or "." path, so a
+    disposition step without GATE_CHECKOUT_PATH fails the whole job before any
+    Silo work happens.  This runs the workflow's real step against a real
+    service-mode mirror and asserts where the files actually land.
+    """
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+
+    run, env = _disposition_checkout(source_host, workspace)
+
+    # Fail on the step's own exit status first: that is what names the real
+    # SOURCE-* code the runner would print.
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    declared = env.get("GATE_CHECKOUT_PATH", "")
+    assert declared and declared != ".", "disposition checkout must declare a subdirectory"
+    dest = workspace / declared
+    assert _git("rev-parse", "HEAD", cwd=dest) == source_host["gate_sha"]
+    for line in env["GATE_CHECKOUT_SPARSE"].splitlines():
+        sparse_path = line.strip()
+        assert sparse_path and (dest / sparse_path).is_file(), sparse_path
+    # The workspace root stays the domain of actions/checkout.
+    assert not (workspace / "scripts" / "silo_store.py").exists()
+    assert not (workspace / ".github").exists()
+    assert _network_argv(source_host) == []
+
+
+def test_disposition_checkout_origin_mode_materializes_the_same_subdirectory(source_host):
+    """The same declared subdirectory has to work on a host that never declared
+    `service`: the origin branch must not fall back to the workspace root."""
+    _source_mode(source_host, "origin\n")
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    # On an origin host the bootstrap script's `curl` is the only way the helper
+    # reaches RUNNER_TEMP, and the fixture's curl refuses to reach the network;
+    # put the real helper where the step's own argv expects it.
+    runner_temp = source_host["tmp_path"] / "runner-temp"
+    runner_temp.mkdir(exist_ok=True)
+    shutil.copy(BOUNDED_RETRY, runner_temp / "gate_bounded_retry.py")
+
+    run, env = _disposition_checkout(
+        source_host, workspace,
+        GATE_CHECKOUT_ORIGIN_URL=str(source_host["gate_bare"]),
+    )
+
+    # Fail on the step's own exit status first: that is what names the real
+    # SOURCE-* code the runner would print.
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+    declared = env.get("GATE_CHECKOUT_PATH", "")
+    assert declared and declared != ".", "disposition checkout must declare a subdirectory"
+    dest = workspace / declared
+    assert _git("rev-parse", "HEAD", cwd=dest) == source_host["gate_sha"]
+    for line in env["GATE_CHECKOUT_SPARSE"].splitlines():
+        sparse_path = line.strip()
+        assert sparse_path and (dest / sparse_path).is_file(), sparse_path
+    assert not (workspace / ".git").exists()
+    assert not (workspace / "scripts" / "silo_store.py").exists()
 
 
 def test_workflow_sha_tool_bootstrap_never_persists_credentials(source_host):
