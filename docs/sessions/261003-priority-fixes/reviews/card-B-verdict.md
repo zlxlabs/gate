@@ -18,7 +18,8 @@
 - Spec：错误提示须真实可操作，且不得让调用方误以为补 `tracking_issue` 能放行被禁止的 deferred。
 - 复现：用真实 workflow 输入映射及 run 块运行 `legacy-empty-evidence`，预检返回 1，提示包含 “a deferred needs tracking_issue”；同一真实 receipt producer 对 `deferred` + `#12` 的差分结果为预检 0、producer 1，错误为 `deferred_not_allowed_for_tier`。权威拒绝位于 `.github/actions/gate-disposition/issue_receipt.py:253-262`。因此旧 caller 按通用提示暴露并转发 deferred 与 tracking 后，仍会在后续失败。
 - 建议文案说明 deferred 无论 tracking 值如何都由权威 validator 拒绝；不要把它列作可通过的证据路径。
-- P1 两问：真实代码路径可由空证据输入稳定触发，但本次没有运行生产 workflow，无法量频率；后果是误导重试并多走后续读取步骤，receipt 仍被拒绝，没有数据丢失、错误放行或崩溃，判 P2。
+- P1 问1（真实使用会触发吗）：空证据输入可稳定触发该文案；本次没有运行生产 workflow，不能量频率。
+- P1 问2（触发后果能否接受）：可能误导重试并多走后续读取步骤，但 receipt 仍被拒绝，没有数据丢失、错误放行或崩溃，故判 P2。
 
 ### P2 — “未触达 Silo/audit”断言没有执行后续 workflow 控制流
 
@@ -26,7 +27,8 @@
 - Spec：早拒须在 Silo/canonical audit 前终止，并以真实控制流及访问记录证明；还需确认拒绝来自目标机制而非 fixture 错误。
 - 复现：`test_disposition_preflight_failure_never_reaches_silo_or_the_audit` 只调用 `_run_preflight` 执行预检步骤的 shell body。`gh`、`curl`、`aws`、`jq`、`git` 与 Silo recorder 因而没有机会被后续步骤调用，`record` 不存在不能证明 job 调度跳过了 Silo/audit。现有顺序检查确认预检为首步并找到后续步骤，但没有锁定它们的条件。
 - 当前 workflow 本身的控制流安全：前 6 步为默认 `success()`；最终上传虽为 `always()`，仍要求 `steps.disposition.outcome == 'success'`。缺口在测试覆盖，不是当前路径已经访问了 Silo。
-- P1 两问：本次读取的 workflow 没有触发该失效；只有后续改成失败后仍执行访问步骤时才会触发。届时可能多做 Silo/audit 读取，但不会因此生成被拒 receipt 或丢失数据，判 P2。
+- P1 问1（真实使用会触发吗）：当前 workflow 不会触发；需后续把访问步骤改成失败后仍执行才触发。
+- P1 问2（触发后果能否接受）：可能多做 Silo/audit 读取，但不会因此生成被拒 receipt 或丢失数据，故判 P2。
 
 ## 不变式核对与降层三问
 
