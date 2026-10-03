@@ -157,35 +157,8 @@ env:
       [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
       exit 0
     fi
-    repository=${GATE_CHECKOUT_REPOSITORY:?}
-    commit=${GATE_CHECKOUT_REF:?}
-    if [ "${#commit}" -ne 40 ] || [[ "$commit" == *[!0-9a-f]* ]]; then echo "::error::SOURCE-COMMIT-INVALID: $commit" >&2; exit 1; fi
-    case "$repository" in zlxlabs/*) ;; *) echo "::error::SOURCE-REPOSITORY-REJECTED: $repository" >&2; exit 1 ;; esac
-    source_root=$(realpath -e "$source_root") || { echo "::error::SOURCE-MIRROR-UNREADABLE: $source_root" >&2; exit 1; }
-    budget=${GATE_SOURCE_BUDGET_SECS:-180}
-    deadline=$(( $(date +%s) + budget ))
-    client="$source_root/git-source-prepare"
-    [ -x "$client" ] || { echo "::error::SOURCE-CLIENT-MISSING: $client" >&2; exit 1; }
-    client_raw=$("$client" --repository "$repository" --commit "$commit" --deadline-epoch "$deadline" 2>&1 >/dev/null) && client_status=0 || client_status=$?
-    if ! printf '%s\n' "$client_raw" | GATE_SOURCE_EXPECTED_REPOSITORY="$repository" GATE_SOURCE_EXPECTED_COMMIT="$commit" GATE_SOURCE_CLIENT_EXIT="$client_status" python3 -c '
-    import json, os, sys
-    marker = "GIT-SOURCE-PREPARE-V1 "
-    lines = [line[len(marker):] for line in sys.stdin.read().splitlines() if line.startswith(marker)]
-    try:
-        if len(lines) != 1:
-            raise ValueError("expected exactly one protocol line")
-        payload = json.loads(lines[0])
-        status = "ready" if os.environ["GATE_SOURCE_CLIENT_EXIT"] == "0" else "failed"
-        if not isinstance(payload, dict) or payload.get("status") != status or payload.get("repository") != os.environ["GATE_SOURCE_EXPECTED_REPOSITORY"] or payload.get("commit_sha") != os.environ["GATE_SOURCE_EXPECTED_COMMIT"] or payload.get("source") not in ("hit", "cold"):
-            raise ValueError("reply fields do not match the request")
-    except (json.JSONDecodeError, ValueError):
-        raise SystemExit(1)
-    ' ; then
-      echo "::error::SOURCE-CLIENT-CONTRACT: invalid GIT-SOURCE-PREPARE-V1 reply" >&2
-      exit 1
-    fi
-    client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ')
-    [ "$client_status" -eq 0 ] || { echo "::error::SOURCE-CLIENT-FAILED: $client_line" >&2; exit 1; }
+    eval "$GATE_SOURCE_PREPARE_SCRIPT"
+    gate_source_prepare
     mirror_repo="$source_root/$repository.git"
     lock_file="$mirror_repo/consume.lock"
     [ -f "$lock_file" ] || { echo "::error::SOURCE-LOCK-UNREADABLE: $lock_file" >&2; exit 1; }
@@ -216,13 +189,63 @@ env:
       fi
     done
     flock --unlock "$source_lock_fd"
+  # The one host-client call, shared by the two places that need a commit
+  # prepared before they read the mirror: GATE_SOURCE_BOOTSTRAP_SCRIPT (the
+  # workflow_sha tool bootstrap) and GATE_CHECKOUT_MIRROR_SCRIPT (the
+  # caller-checkout prime, gate-hub W3c).  Reads GATE_CHECKOUT_REPOSITORY /
+  # GATE_CHECKOUT_REF and sets `repository`, `commit`, the realpathed
+  # `source_root`, the `deadline` a lock may still spend and `prepare_source`
+  # (hit|cold).  Every failure is fatal with a SOURCE-* literal: the service
+  # path never retries and never falls back to origin.  It MUST run before a
+  # consumer takes consume.lock — the host writer needs the exclusive side of
+  # that lock, so calling the client while holding the shared side deadlocks.
+  # gate-v2-disposition.yml (out of scope for W3c) still carries the same call
+  # inline; tests/test_gate_source.py pins the two bodies byte for byte.
+  GATE_SOURCE_PREPARE_SCRIPT: |
+    gate_source_prepare() {
+        repository=${GATE_CHECKOUT_REPOSITORY:?}
+        commit=${GATE_CHECKOUT_REF:?}
+        if [ "${#commit}" -ne 40 ] || [[ "$commit" == *[!0-9a-f]* ]]; then echo "::error::SOURCE-COMMIT-INVALID: $commit" >&2; exit 1; fi
+        case "$repository" in zlxlabs/*) ;; *) echo "::error::SOURCE-REPOSITORY-REJECTED: $repository" >&2; exit 1 ;; esac
+        source_root=$(realpath -e "$source_root") || { echo "::error::SOURCE-MIRROR-UNREADABLE: $source_root" >&2; exit 1; }
+        budget=${GATE_SOURCE_BUDGET_SECS:-180}
+        deadline=$(( $(date +%s) + budget ))
+        client="$source_root/git-source-prepare"
+        [ -x "$client" ] || { echo "::error::SOURCE-CLIENT-MISSING: $client" >&2; exit 1; }
+        client_raw=$("$client" --repository "$repository" --commit "$commit" --deadline-epoch "$deadline" 2>&1 >/dev/null) && client_status=0 || client_status=$?
+        if ! printf '%s\n' "$client_raw" | GATE_SOURCE_EXPECTED_REPOSITORY="$repository" GATE_SOURCE_EXPECTED_COMMIT="$commit" GATE_SOURCE_CLIENT_EXIT="$client_status" python3 -c '
+    import json, os, sys
+    marker = "GIT-SOURCE-PREPARE-V1 "
+    lines = [line[len(marker):] for line in sys.stdin.read().splitlines() if line.startswith(marker)]
+    try:
+        if len(lines) != 1:
+            raise ValueError("expected exactly one protocol line")
+        payload = json.loads(lines[0])
+        status = "ready" if os.environ["GATE_SOURCE_CLIENT_EXIT"] == "0" else "failed"
+        if not isinstance(payload, dict) or payload.get("status") != status or payload.get("repository") != os.environ["GATE_SOURCE_EXPECTED_REPOSITORY"] or payload.get("commit_sha") != os.environ["GATE_SOURCE_EXPECTED_COMMIT"] or payload.get("source") not in ("hit", "cold"):
+            raise ValueError("reply fields do not match the request")
+    except (json.JSONDecodeError, ValueError):
+        raise SystemExit(1)
+    ' ; then
+          echo "::error::SOURCE-CLIENT-CONTRACT: invalid GIT-SOURCE-PREPARE-V1 reply" >&2
+          exit 1
+        fi
+        client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ')
+        [ "$client_status" -eq 0 ] || { echo "::error::SOURCE-CLIENT-FAILED: $client_line" >&2; exit 1; }
+        # `source` for the caller's own telemetry.  Read from the one protocol
+        # line the validator above already accepted, so this cannot disagree with
+        # it: no second reply shape, no second verdict.
+        prepare_source=$(printf '%s\n' "$client_line" | python3 -c 'import json, sys; print(json.loads(sys.stdin.read().removeprefix("GIT-SOURCE-PREPARE-V1 "))["source"])')
+    }
   GATE_CHECKOUT_MIRROR_SCRIPT: |
     set -euo pipefail
     result_emitted=0
     lock_held=0
     consumer_step=startup
+    prepare_state=skipped
+    prepare_ms=0
     emit_result() {
-      printf 'GATE-CHECKOUT-MIRROR-V1 {"hit":%s,"reason":"%s"%s}\n' "$1" "$2" "${3:-}"
+      printf 'GATE-CHECKOUT-MIRROR-V1 {"hit":%s,"reason":"%s","prepare":"%s","prepare_ms":%s%s}\n' "$1" "$2" "$prepare_state" "$prepare_ms" "${3:-}"
       result_emitted=1
     }
     fail_prefetch() {
@@ -254,6 +277,27 @@ env:
     [[ ! -e "$workspace/.git" ]] || mirror_miss workspace-existing
     [[ -d "$mirror_root" ]] || mirror_miss mirror-dir-missing
     mirror_root=$(realpath -e "$mirror_root") || mirror_miss mirror-dir-unreadable
+    # Host-declared source service (gate-hub W3c).  101 of 184 measured prefetches
+    # asked for a repository the host mirror does not have yet (reason
+    # mirror-repo-missing), so nothing was prepared and the whole closure came
+    # back over the wire.  On a `service` host the commit is therefore prepared
+    # by the host client BEFORE consume.lock is taken: the host writer needs the
+    # exclusive side of that lock, so calling the client under the shared side
+    # would deadlock.  This phase is fatal with a SOURCE-* literal (no fallback
+    # to origin), unlike the soft mirror_miss paths above — hence the result trap
+    # stays off until the client has answered.  An `origin` host, or a host with
+    # no declaration at all, never calls the client and keeps the previous bytes.
+    trap - EXIT
+    eval "$GATE_SOURCE_DECIDE_SCRIPT"
+    if [ "$mode" = service ]; then
+      export GATE_CHECKOUT_REPOSITORY="$repository" GATE_CHECKOUT_REF="$sha"
+      eval "$GATE_SOURCE_PREPARE_SCRIPT"
+      prepare_started=$(date +%s%3N)
+      gate_source_prepare
+      prepare_ms=$(( $(date +%s%3N) - prepare_started ))
+      prepare_state=$prepare_source
+    fi
+    trap finish_result EXIT
     mirror_repo=$(realpath -e "$mirror_root/$repository.git") || mirror_miss mirror-repo-missing
     case "$mirror_repo" in "$mirror_root"/*) ;; *) mirror_miss mirror-outside-root ;; esac
     [[ -d "$mirror_repo/objects" && -r "$mirror_repo/objects" ]] || mirror_miss mirror-objects-unreadable
