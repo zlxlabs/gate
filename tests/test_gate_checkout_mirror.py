@@ -595,8 +595,10 @@ def test_origin_declaration_never_calls_the_client(tmp_path, request):
 def test_prepare_runs_before_the_consume_lock_is_taken(tmp_path, request):
     """The host writer needs the exclusive side of consume.lock to publish, so a
     consumer that calls the client while holding the shared side deadlocks; the
-    fake client asserts it can take that exclusive lock, like #276's bootstrap."""
-    fixture = _fixture(tmp_path, with_mirror=False, source_mode="service\n")
+    fake client asserts it can take that exclusive lock, like #276's bootstrap.
+    The mirror here already holds the repository and its lock, so the only thing
+    that can make the client fail is the caller holding that lock."""
+    fixture = _fixture(tmp_path, source_mode="service\n")
     request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
     _install_fake_client(fixture)
     script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
