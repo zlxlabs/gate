@@ -163,6 +163,35 @@ jobs:
       SILO_STORE: ${{ github.workspace }}/_gate-disposition-src/scripts/silo_store.py
       SILO_EXEC: ${{ github.workspace }}/_gate-disposition-src/scripts/silo_exec.sh
     steps:
+      # gate#275: a caller still pinned to the legacy five inputs sends no
+      # evidence at all, and the authoritative receipt rejection then lands only
+      # after the Silo fetch and the canonical audit read.  Two shapes are
+      # provably rejected by `issue_receipt.py` for ANY audit, so name them here,
+      # before this job touches the network.  Nothing else is pre-judged: the
+      # remaining input shapes (counterevidence shape, tracking issue validity,
+      # deferred, finding matching) stay with the authoritative validator, whose
+      # accept domain this step must not change.
+      - name: Preflight disposition evidence inputs
+        env:
+          DISPOSITION_KIND: ${{ inputs.disposition }}
+          DISPOSITION_COUNTEREVIDENCE_JSON: ${{ inputs.counterevidence_json }}
+          DISPOSITION_TRACKING_ISSUE: ${{ inputs.tracking_issue }}
+        run: |
+          set -euo pipefail
+          hint="no disposition evidence arrived with this request. A false-positive needs counterevidence_json (a JSON object with non-empty command, output, result=refuted and pointer); a deferred needs tracking_issue. If your caller only declares the legacy five inputs (pr_number, primary_run_id, primary_run_attempt, finding_id, reason) it cannot forward any of them: expose and forward disposition, counterevidence_json and tracking_issue, then retry. An empty value here means the evidence was not sent by this request, not that the calling repository has migrated."
+          # Same normalization as issue_receipt.py: an empty disposition is the
+          # false-positive default there, so it is checked as false-positive here.
+          kind="${DISPOSITION_KIND:-}"
+          [ -n "$kind" ] || kind=false-positive
+          if [ "$kind" != false-positive ] && [ "$kind" != deferred ]; then
+            echo "::error::DISPOSITION_INPUT_PREFLIGHT_FAILED: disposition is '$kind', not false-positive or deferred. $hint" >&2
+            exit 1
+          fi
+          if [ "$kind" = false-positive ] && [ -z "${DISPOSITION_COUNTEREVIDENCE_JSON:-}" ]; then
+            echo "::error::DISPOSITION_INPUT_PREFLIGHT_FAILED: false-positive disposition with an empty counterevidence_json. $hint" >&2
+            exit 1
+          fi
+
       - name: Checkout disposition producer
         env:
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}

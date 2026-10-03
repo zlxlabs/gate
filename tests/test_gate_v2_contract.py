@@ -917,6 +917,212 @@ def test_disposition_receipt_step_runs_the_producer_from_the_checkout_subdirecto
     assert receipt["approver"] == "owner"
 
 
+# gate#275: a caller still pinned to the legacy five inputs carries no evidence
+# channel at all.  The receipt rejects it either way; the preflight only makes
+# that rejection readable, and only for shapes the receipt rejects for ANY audit.
+DISPOSITION_PREFLIGHT_ERROR = "DISPOSITION_INPUT_PREFLIGHT_FAILED"
+PREFLIGHT_STEP_NAME = "Preflight disposition evidence inputs"
+# The env the workflow maps the three optional inputs into, at the preflight
+# step and at the authoritative receipt step; both must read the same values.
+EVIDENCE_INPUT_ENV = {
+    "DISPOSITION_KIND": "${{ inputs.disposition }}",
+    "DISPOSITION_COUNTEREVIDENCE_JSON": "${{ inputs.counterevidence_json }}",
+    "DISPOSITION_TRACKING_ISSUE": "${{ inputs.tracking_issue }}",
+}
+VALID_COUNTEREVIDENCE = {
+    "command": "pytest -q tests/test_regression.py",
+    "output": "1 passed",
+    "result": "refuted",
+    "pointer": "tests/test_regression.py::test_behavior",
+}
+# What a legacy five-input caller sends: every optional input absent/empty.
+LEGACY_FIVE_INPUTS = {
+    "pr_number": "42", "primary_run_id": "7", "primary_run_attempt": "1",
+    "finding_id": "finding-one", "reason": "canonical evidence reviewed",
+}
+
+
+def _preflight_step() -> dict:
+    return _disposition_step(PREFLIGHT_STEP_NAME)
+
+
+def _input_env(step: dict, values: dict[str, str]) -> dict[str, str]:
+    """Render a step's input-backed env from workflow input values (absent -> "")."""
+    rendered = {}
+    for var, expression in step["env"].items():
+        match = re.fullmatch(r"\$\{\{ inputs\.(\w+) \}\}", expression)
+        if match is None:
+            continue  # github.* context, filled by the runner or by the caller below
+        rendered[var] = values.get(match.group(1), "")
+    return {**os.environ, **rendered}
+
+
+def _run_preflight(values: dict[str, str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    step = _preflight_step()
+    return subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        env=env or _input_env(step, values), capture_output=True, text=True, timeout=120,
+    )
+
+
+def _run_receipt_step(tmp_path, values: dict[str, str]) -> subprocess.CompletedProcess:
+    """Run the receipt step's own `run` body against the real producer bytes."""
+    step = _disposition_step("Issue immutable disposition artifact")
+    checkout = _disposition_checkout_step()
+    workspace = _checkout_shaped_workspace(
+        tmp_path, checkout["env"]["GATE_CHECKOUT_PATH"], _sparse_env_paths(checkout)
+    )
+    scope = {
+        "repository_id": 123, "pr_number": 42, "base_sha": "b" * 40,
+        "head_sha": "a" * 40, "diff_digest": "d" * 64, "policy_version": "policy-v1",
+        "policy_digest": "p" * 64, "tier": "personal", "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "r" * 40,
+    }
+    audit = {
+        **scope, "repository": "zlxlabs/gate", "pr": 42, "run_id": 7, "run_attempt": 1,
+        "verdict": "fail",
+        "result": {"findings": [{
+            "id": "finding-one", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/guard.py", "line": 12, "category": "correctness",
+        }]},
+    }
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    output_dir = tmp_path / "artifact"
+    output_dir.mkdir(exist_ok=True)
+    github_env = tmp_path / "github-env"
+    github_env.write_text("")
+    github_output = tmp_path / "github-output"
+    github_output.write_text("")
+    env = {
+        **_input_env(step, values),
+        "AUDIT_PATH": str(audit_path),
+        "CURRENT_HEAD_SHA": scope["head_sha"],
+        "CURRENT_AUDIT_DIGEST": "d" * 64,
+        "CURRENT_EPOCH": "e" * 64,
+        "CURRENT_SCOPE_JSON": json.dumps(scope),
+        "REPOSITORY_ID": "123",
+        "PR_NUMBER": "42",
+        "FINDING_ID": "finding-one",
+        "DISPOSITION_REASON": "canonical evidence reviewed",
+        "DISPOSITION_APPROVER": "owner",
+        "DISPOSITION_APPROVER_ID": "10",
+        "DISPOSITION_REPOSITORY": "zlxlabs/gate",
+        "OUTPUT_DIR": str(output_dir),
+        "GITHUB_TRIGGERING_ACTOR": "owner",
+        "GITHUB_ENV": str(github_env),
+        "GITHUB_OUTPUT": str(github_output),
+    }
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=workspace, env=env, capture_output=True, text=True, timeout=180,
+    )
+    result.receipt_dir = output_dir  # type: ignore[attr-defined]
+    return result
+
+
+def test_disposition_preflight_reads_the_same_inputs_as_the_receipt_step():
+    """The preflight may only pre-judge what the receipt already rejects, so its
+    view of the three optional inputs must be the receipt step's view."""
+    raw, _ = _load_disposition_workflow()
+    steps = raw["jobs"]["control"]["steps"]
+    preflight = _preflight_step()
+    receipt = _disposition_step("Issue immutable disposition artifact")
+    assert set(preflight["env"]) == set(EVIDENCE_INPUT_ENV), preflight["env"]
+    assert {name: preflight["env"][name] for name in EVIDENCE_INPUT_ENV} == EVIDENCE_INPUT_ENV
+    assert {name: receipt["env"][name] for name in EVIDENCE_INPUT_ENV} == EVIDENCE_INPUT_ENV
+    # An absent input renders as "", and issue_receipt.py turns exactly that into
+    # its documented false-positive default (`... or "false-positive"`).
+    producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()
+    assert '_value(args, envelope, "disposition", "DISPOSITION_KIND") or "false-positive"' in producer
+    assert 'if counterevidence_raw is None or counterevidence_raw == "":' in producer
+    assert DISPOSITION_PREFLIGHT_ERROR in preflight["run"]
+    # Nothing outside the three inputs: no evidence channel the preflight could
+    # invent, and no Silo/audit/network token for it to touch.
+    run = preflight["run"]
+    for token in ("SILO_", "AWS_", "RUNNER_TEMP", "gh ", "curl", "audit", "github.token"):
+        assert token not in run, token
+    # Before every step that can reach Silo or the canonical audit: the job stops
+    # at the first failing step, so an early non-zero keeps them untouched.
+    assert steps[0]["name"] == PREFLIGHT_STEP_NAME
+    later = [
+        index for index, step in enumerate(steps)
+        if index and any(token in str(step.get("run", "")) for token in ("SILO_EXEC", "SILO_STORE", "gh api"))
+    ]
+    assert later, "no Silo/audit step found to order the preflight against"
+
+
+@pytest.mark.parametrize(
+    "values, expect_preflight_rc, expect_receipt_failure",
+    [
+        # Legacy five-input caller: nothing to forward, rejected for any audit.
+        (LEGACY_FIVE_INPUTS, 1, "counterevidence_required"),
+        ({**LEGACY_FIVE_INPUTS, "disposition": "false-positive"}, 1, "counterevidence_required"),
+        ({**LEGACY_FIVE_INPUTS, "disposition": "yes-please"}, 1, "disposition must be false-positive or deferred"),
+        # The default empty disposition is the false-positive default, so it is
+        # checked with counterevidence exactly as the receipt checks it.
+        ({**LEGACY_FIVE_INPUTS, "counterevidence_json": json.dumps(VALID_COUNTEREVIDENCE)}, 0, None),
+        ({**LEGACY_FIVE_INPUTS, "disposition": "false-positive",
+          "counterevidence_json": json.dumps(VALID_COUNTEREVIDENCE)}, 0, None),
+        # Deferred keeps its existing rejection boundary, untouched.
+        ({**LEGACY_FIVE_INPUTS, "disposition": "deferred", "tracking_issue": "#12"}, 0,
+         "deferred_not_allowed_for_tier"),
+        # Malformed evidence stays with the authoritative validator.
+        ({**LEGACY_FIVE_INPUTS, "counterevidence_json": "not json"}, 0, "counterevidence"),
+    ],
+)
+def test_disposition_preflight_never_changes_the_authoritative_outcome(
+    tmp_path, values, expect_preflight_rc, expect_receipt_failure,
+):
+    preflight = _run_preflight(values)
+    assert preflight.returncode == expect_preflight_rc, preflight.stderr
+    if expect_preflight_rc:
+        assert DISPOSITION_PREFLIGHT_ERROR in preflight.stderr
+        # Readable, actionable, and not a verdict on the calling repository: name
+        # the evidence channel and say what the caller has to expose and forward.
+        for name in EVIDENCE_INPUT_ENV.values():
+            assert name.split(".")[-1].rstrip(" }") in preflight.stderr
+        assert (
+            "expose and forward disposition, counterevidence_json and tracking_issue"
+            in preflight.stderr
+        )
+        assert "caller" in preflight.stderr
+        assert "counterevidence_required" not in preflight.stderr
+    # Every early rejection is one the producer makes anyway; every shape the
+    # preflight waves through keeps the outcome it had before.
+    receipt = _run_receipt_step(tmp_path, values)
+    if expect_receipt_failure is None:
+        assert receipt.returncode == 0, receipt.stderr
+        assert len(list(receipt.receipt_dir.iterdir())) == 1
+    else:
+        assert receipt.returncode != 0
+        assert expect_receipt_failure in receipt.stderr
+
+
+def test_disposition_preflight_failure_never_reaches_silo_or_the_audit(tmp_path):
+    """Recorded-access fixture: every network/Silo entry point of this job is
+    wired to a recorder, so an early rejection that touched one would leave a
+    mark instead of silently passing."""
+    record = tmp_path / "touched.log"
+    recorder = tmp_path / "touched.sh"
+    recorder.write_text(f'#!/bin/sh\necho "$0 $*" >> "{record}"\nexit 0\n')
+    recorder.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("gh", "curl", "aws", "jq", "git"):
+        (bin_dir / tool).symlink_to(recorder)
+    env = {
+        **_input_env(_preflight_step(), LEGACY_FIVE_INPUTS),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "SILO_EXEC": str(recorder), "SILO_STORE": str(recorder),
+        "AWS_ACCESS_KEY_ID": "would-not-be-here", "AWS_SECRET_ACCESS_KEY": "x",
+    }
+    result = _run_preflight(LEGACY_FIVE_INPUTS, env=env)
+    assert result.returncode != 0
+    assert DISPOSITION_PREFLIGHT_ERROR in result.stderr
+    assert not record.exists(), "preflight reached Silo or a network client"
+
+
 def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_if():
     raw, _ = _load_workflow()
     primary_if = raw["jobs"]["primary"]["if"]
