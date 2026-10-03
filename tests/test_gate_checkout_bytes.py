@@ -40,16 +40,20 @@ def test_every_checkout_is_bracketed_by_fail_open_measurements():
         before = steps[index - 2]
         prime = steps[index - 1]
         assert prime.get("name") == "Prime checkout from host Git mirror"
-        assert prime.get("if") == checkout.get("if")
+        # The prime step decides the mode (gate-hub W3a); the checkout keeps every
+        # guard it had and additionally skips itself on a `service` host, where the
+        # prime step already materialized the workspace.
+        guard = prime.get("if")
+        checkout_condition = str(checkout.get("if", ""))
+        assert "steps.gate-checkout-prime.outputs.mode != 'service'" in checkout_condition
+        if guard is not None:
+            assert guard in checkout_condition
+            assert guard in str(before.get("if", ""))
         assert prime.get("env", {}).get("GATE_GITHUB_TOKEN") == "${{ github.token }}"
         after = steps[index + 1]
         assert before.get("name", "").startswith(BEFORE_STEP)
         assert after.get("name", "").startswith(AFTER_STEP)
-        assert before.get("if") == checkout.get("if")
-        checkout_condition = checkout.get("if")
-        expected_after_condition = (
-            f"always() && {checkout_condition}" if checkout_condition else "always()"
-        )
+        expected_after_condition = f"always() && {guard}" if guard else "always()"
         assert after.get("if") == expected_after_condition
         for step in (before, after):
             assert step.get("run")

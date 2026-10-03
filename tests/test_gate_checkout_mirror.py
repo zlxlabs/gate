@@ -89,6 +89,9 @@ def _fixture(tmp_path, *, advance_mirror=False):
     mirror_root = tmp_path / "cache/git"
     mirror_repo = mirror_root / "zlxlabs/repo.git"
     mirror_repo.parent.mkdir(parents=True)
+    # An origin-mode host declares it explicitly (gate-hub W3b-1); the service
+    # branch is covered by tests/test_gate_source.py.
+    (mirror_root / "SOURCE-MODE").write_text("origin\n")
     _git("clone", "--mirror", origin, mirror_repo)
     (mirror_repo / "consume.lock").write_text("")
     if advance_mirror:
@@ -136,7 +139,12 @@ def _run_mirror_script(script, fixture, workspace, mirror_root=None, server_url=
     env = os.environ.copy()
     for name in ("GATE_CHECKOUT_REPOSITORY", "GATE_CHECKOUT_REF", "GATE_CHECKOUT_PATH"):
         env.pop(name, None)
+    runner_temp = Path(workspace).parent / "runner-temp"
+    runner_temp.mkdir(exist_ok=True)
     env.update(
+        RUNNER_TEMP=str(runner_temp),
+        GATE_SOURCE_DECIDE_SCRIPT=_workflow()["env"]["GATE_SOURCE_DECIDE_SCRIPT"],
+        GATE_SOURCE_BOOTSTRAP_SCRIPT=_workflow()["env"]["GATE_SOURCE_BOOTSTRAP_SCRIPT"],
         GITHUB_WORKSPACE=str(workspace),
         GITHUB_REPOSITORY="zlxlabs/repo",
         GITHUB_SERVER_URL=fixture["server_url"] if server_url is None else server_url,
@@ -203,8 +211,11 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
         assert prime["name"] == MIRROR_STEP
         assert prime["run"] == 'bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"'
         assert prime["env"]["GATE_GITHUB_TOKEN"] == "${{ github.token }}"
-        assert prime.get("if") == checkout.get("if")
+        assert prime["id"] == "gate-checkout-prime"
         assert checkout["uses"] == CHECKOUT_ACTION
+        assert "steps.gate-checkout-prime.outputs.mode != 'service'" in checkout["if"]
+        if prime.get("if") is not None:
+            assert prime["if"] in checkout["if"]
         assert checkout["with"] == {"fetch-depth": 1}
         assert after.get("name", "").startswith(BYTE_STEP)
         assert "GATE_CHECKOUT_RX_BYTES" in before["run"]
@@ -231,7 +242,8 @@ def test_shadow_checkouts_prime_from_the_same_script_and_keep_checkout_fallback(
         assert prime["name"] == MIRROR_STEP
         assert prime["run"] == 'bash -euo pipefail -c "$GATE_CHECKOUT_MIRROR_SCRIPT"'
         assert prime["env"]["GATE_GITHUB_TOKEN"] == "${{ github.token }}"
-        assert prime.get("if") == checkout.get("if")
+        assert prime["id"] == "gate-checkout-prime"
+        assert "steps.gate-checkout-prime.outputs.mode != 'service'" in checkout["if"]
         assert checkout["uses"] == CHECKOUT_ACTION
         assert after.get("name", "").startswith(BYTE_STEP)
         assert "GATE-CHECKOUT-BYTES-V1" in after["run"]
@@ -371,10 +383,13 @@ def test_mirror_misses_report_reason_and_origin_checkout_succeeds(tmp_path, requ
     request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
     script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
 
+    # A mirror root that exists as a host config but not on disk can no longer be
+    # mistaken for "no mirror": the declaration is unreadable, so the step fails
+    # loudly instead of silently degrading to an origin prefetch.
     absent_workspace = tmp_path / "absent-mirror"
     absent = _run_mirror_script(script, fixture, absent_workspace, tmp_path / "missing-cache")
-    assert absent.returncode == 0, absent.stderr
-    assert _result_line(absent) == {"hit": 0, "reason": "mirror-dir-missing"}
+    assert absent.returncode != 0
+    assert "SOURCE-MODE-UNREADABLE" in absent.stderr
     assert not (absent_workspace / ".git").exists()
     _run_action_checkout(absent_workspace, fixture["origin_url"], fixture["sha"])
     assert _git("rev-parse", "HEAD", cwd=absent_workspace) == fixture["sha"]

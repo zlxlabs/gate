@@ -41,6 +41,66 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Host-declared git source (gate-hub W3b-1): $GATE_HUB_GIT_MIRROR_DIR/SOURCE-MODE
+  # holds exactly one line, `service` or `origin`.  Decide it once, here, so the
+  # checkout and every tool bootstrap below take the same branch; a declaration
+  # that is present but unreadable or malformed fails the step.
+  GATE_SOURCE_BUDGET_SECS: "180"
+  GATE_SOURCE_DECIDE_SCRIPT: |
+    set -euo pipefail
+    export RUNNER_TEMP="${RUNNER_TEMP:-$(mktemp -d)}"
+    mode=origin
+    source_root=${GATE_HUB_GIT_MIRROR_DIR:-}
+    if [ -n "$source_root" ]; then
+      mode_file="$source_root/SOURCE-MODE"
+      [ -r "$mode_file" ] || { echo "::error::SOURCE-MODE-UNREADABLE: $mode_file" >&2; exit 1; }
+      mode=$(cat "$mode_file")
+      case "$mode" in
+        origin|service) ;;
+        *) echo "::error::SOURCE-MODE-INVALID: $mode_file does not contain one of origin/service" >&2; exit 1 ;;
+      esac
+    fi
+    printf '%s\n' "$mode" > "$RUNNER_TEMP/gate-source-mode"
+  # Fetch the gate-owned tools.  origin keeps the Contents API download; service
+  # prepares workflow_sha through the host client (no network from the job) and
+  # reads both scripts out of the read-only mirror under a shared consume lock.
+  # The client is invoked BEFORE the lock: the host writer needs the exclusive
+  # side of that lock, so holding it here would deadlock.
+  GATE_SOURCE_BOOTSTRAP_SCRIPT: |
+    set -euo pipefail
+    eval "$GATE_SOURCE_DECIDE_SCRIPT"
+    mode=$(cat "$RUNNER_TEMP/gate-source-mode")
+    if [ "$mode" != service ]; then
+      python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
+      [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+      exit 0
+    fi
+    repository=${GATE_CHECKOUT_REPOSITORY:?}
+    commit=${GATE_CHECKOUT_REF:?}
+    if [ "${#commit}" -ne 40 ] || [[ "$commit" == *[!0-9a-f]* ]]; then echo "::error::SOURCE-COMMIT-INVALID: $commit" >&2; exit 1; fi
+    case "$repository" in zlxlabs/*) ;; *) echo "::error::SOURCE-REPOSITORY-REJECTED: $repository" >&2; exit 1 ;; esac
+    source_root=$(realpath -e "$source_root") || { echo "::error::SOURCE-MIRROR-UNREADABLE: $source_root" >&2; exit 1; }
+    budget=${GATE_SOURCE_BUDGET_SECS:-180}
+    deadline=$(( $(date +%s) + budget ))
+    client="$source_root/git-source-prepare"
+    [ -x "$client" ] || { echo "::error::SOURCE-CLIENT-MISSING: $client" >&2; exit 1; }
+    client_raw=$("$client" --repository "$repository" --commit "$commit" --deadline-epoch "$deadline" 2>&1 >/dev/null) && client_status=0 || client_status=$?
+    client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ' || true)
+    [ -n "$client_line" ] || { echo "::error::SOURCE-CLIENT-CONTRACT: no GIT-SOURCE-PREPARE-V1 line in: $client_raw" >&2; exit 1; }
+    [ "$client_status" -eq 0 ] || { echo "::error::SOURCE-CLIENT-FAILED: $client_line" >&2; exit 1; }
+    mirror_repo="$source_root/$repository.git"
+    lock_file="$mirror_repo/consume.lock"
+    [ -f "$lock_file" ] || { echo "::error::SOURCE-LOCK-UNREADABLE: $lock_file" >&2; exit 1; }
+    exec {source_lock_fd}<"$lock_file"
+    flock --shared -w "$budget" "$source_lock_fd" || { echo "::error::SOURCE-LOCK-TIMEOUT: $lock_file" >&2; exit 1; }
+    for gate_script in scripts/gate_source.py scripts/gate_bounded_retry.py; do
+      if ! git --git-dir="$mirror_repo" show "refs/demand/$commit:$gate_script" > "$RUNNER_TEMP/${gate_script##*/}"; then
+        flock --unlock "$source_lock_fd"
+        echo "::error::SOURCE-DEMAND-REF-MISSING: $gate_script at $commit" >&2
+        exit 1
+      fi
+    done
+    flock --unlock "$source_lock_fd"
   SILO_ENDPOINT: https://zlx-vm-work-i5-infra.taile9071.ts.net:9000
   SILO_BUCKET: ci-artifacts
   GATE_NET_RETRY_ATTEMPTS: "3"
@@ -76,8 +136,7 @@ jobs:
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -c "import os, pathlib; p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gate-api.hdr'; p.write_text('Authorization: Bearer ' + os.environ['GATE_GITHUB_TOKEN'] + chr(10) + 'Accept: application/vnd.github.raw' + chr(10) + 'User-Agent: gate-bounded-retry' + chr(10), encoding='ascii'); p.chmod(0o600)"
-          [ -f "${RUNNER_TEMP}/gate_bounded_retry.py" ] || curl --fail -sS --retry "${GATE_NET_RETRY_ATTEMPTS}" --retry-all-errors --retry-delay "${GATE_NET_RETRY_BACKOFF_SECS%% *}" --max-time "${GATE_NET_ATTEMPT_TIMEOUT_SECS}" -H "@${RUNNER_TEMP}/gate-api.hdr" -o "${RUNNER_TEMP}/gate_bounded_retry.py" "${GITHUB_API_URL:-https://api.github.com}/repos/${GATE_CHECKOUT_REPOSITORY}/contents/scripts/gate_bounded_retry.py?ref=${GATE_CHECKOUT_REF}"
+          bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
       - name: Resolve Silo hostname via MagicDNS

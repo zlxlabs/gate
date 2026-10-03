@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""Host-declared git source for the shared gate workflows.
+
+A host declares how its CI jobs may obtain git objects by writing exactly one
+line into ``$GATE_HUB_GIT_MIRROR_DIR/SOURCE-MODE``:
+
+* unset / empty ``$GATE_HUB_GIT_MIRROR_DIR`` — ``origin``: no service on this
+  host, every caller keeps the pre-existing GitHub fetch behaviour.
+* ``origin`` — same as above, stated explicitly.
+* ``service`` — the host runs the read-only source service: prepare any commit
+  SHA through ``$GATE_HUB_GIT_MIRROR_DIR/git-source-prepare`` (no network from
+  the job at all) and read the object closure out of the read-only mirror under
+  a shared consume lock.  Any service failure is fatal — the service path never
+  falls back to ``origin`` and never retries.
+
+The declaration file is read exactly once per process and every caller shares
+this module: the caller-checkout bash, the ``gate_bounded_retry.py`` tool
+bootstrap, the PR-size preflight action and the diff-coverage advisory action.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+MIRROR_DIR_ENV = "GATE_HUB_GIT_MIRROR_DIR"
+MODE_FILE_NAME = "SOURCE-MODE"
+CLIENT_NAME = "git-source-prepare"
+CLIENT_MARKER = "GIT-SOURCE-PREPARE-V1"
+SOURCE_MARKER = "GATE-SOURCE-V1"
+LOCK_NAME = "consume.lock"
+DEMAND_REF = "refs/demand/{sha}"
+BUDGET_ENV = "GATE_SOURCE_BUDGET_SECS"
+DEFAULT_BUDGET_SECS = 180
+
+MODE_ORIGIN = "origin"
+MODE_SERVICE = "service"
+MODES = (MODE_ORIGIN, MODE_SERVICE)
+ALLOWED_ORGANIZATION = "zlxlabs"
+
+REPOSITORY_ENV = "GATE_CHECKOUT_REPOSITORY"
+REF_ENV = "GATE_CHECKOUT_REF"
+PATH_ENV = "GATE_CHECKOUT_PATH"
+SPARSE_ENV = "GATE_CHECKOUT_SPARSE"
+ORIGIN_URL_ENV = "GATE_CHECKOUT_ORIGIN_URL"
+
+SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+
+# Stable failure literals.  Every service-path failure class is one of these;
+# they are the operator-facing grep handles for a red job.
+MIRROR_DIR_MISSING = "SOURCE-MIRROR-DIR-MISSING"
+MODE_UNREADABLE = "SOURCE-MODE-UNREADABLE"
+MODE_INVALID = "SOURCE-MODE-INVALID"
+MODE_NOT_SERVICE = "SOURCE-MODE-NOT-SERVICE"
+REPOSITORY_REJECTED = "SOURCE-REPOSITORY-REJECTED"
+COMMIT_INVALID = "SOURCE-COMMIT-INVALID"
+CLIENT_MISSING = "SOURCE-CLIENT-MISSING"
+CLIENT_CONTRACT = "SOURCE-CLIENT-CONTRACT"
+CLIENT_FAILED = "SOURCE-CLIENT-FAILED"
+DEADLINE_EXCEEDED = "SOURCE-DEADLINE-EXCEEDED"
+LOCK_UNREADABLE = "SOURCE-LOCK-UNREADABLE"
+LOCK_TIMEOUT = "SOURCE-LOCK-TIMEOUT"
+MIRROR_UNREADABLE = "SOURCE-MIRROR-UNREADABLE"
+DEMAND_REF_MISSING = "SOURCE-DEMAND-REF-MISSING"
+FETCH_FAILED = "SOURCE-FETCH-FAILED"
+CHECKOUT_FAILED = "SOURCE-CHECKOUT-FAILED"
+PIN_MISMATCH = "SOURCE-PIN-MISMATCH"
+PATH_MISSING = "SOURCE-PATH-MISSING"
+
+
+class SourceError(RuntimeError):
+    """A service-path failure carrying one of the SOURCE-* literals."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def fail(code: str, detail: str = "") -> None:
+    raise SourceError(code, detail)
+
+
+def mirror_root() -> Path:
+    raw = os.environ.get(MIRROR_DIR_ENV, "").strip()
+    if not raw:
+        fail(MIRROR_DIR_MISSING, MIRROR_DIR_ENV)
+    root = Path(raw)
+    if not root.is_dir():
+        fail(MIRROR_UNREADABLE, f"{root} is not a directory")
+    return root
+
+
+def declared_mode() -> str:
+    """`origin` or `service`; a present but unreadable/invalid declaration fails."""
+    if not os.environ.get(MIRROR_DIR_ENV, "").strip():
+        return MODE_ORIGIN
+    mode_file = mirror_root() / MODE_FILE_NAME
+    try:
+        raw = mode_file.read_text(encoding="utf-8")
+    except OSError as error:
+        fail(MODE_UNREADABLE, f"{mode_file}: {error.strerror}")
+    lines = raw.split("\n")
+    if len(lines) > 2 or (len(lines) == 2 and lines[1] != ""):
+        fail(MODE_INVALID, f"{mode_file}: {raw!r} is not exactly one line")
+    mode = lines[0]
+    if mode not in MODES:
+        fail(MODE_INVALID, f"{mode_file}: {raw!r} is not one of {MODES}")
+    return mode
+
+
+def require_service_mode() -> str:
+    mode = declared_mode()
+    if mode != MODE_SERVICE:
+        fail(MODE_NOT_SERVICE, f"declared mode is {mode!r}")
+    return mode
+
+
+def budget_secs() -> int:
+    raw = os.environ.get(BUDGET_ENV, "").strip()
+    if not raw:
+        return DEFAULT_BUDGET_SECS
+    value = int(raw)
+    if value < 1:
+        fail(DEADLINE_EXCEEDED, f"{BUDGET_ENV}={value} must be >= 1")
+    return value
+
+
+def check_repository(repository: str) -> str:
+    if not REPOSITORY_RE.match(repository) or repository.split("/", 1)[0] != ALLOWED_ORGANIZATION:
+        fail(REPOSITORY_REJECTED, repository)
+    return repository
+
+
+def check_commit(commit: str) -> str:
+    if not SHA_RE.match(commit):
+        fail(COMMIT_INVALID, commit)
+    return commit
+
+
+def origin_url(repository: str) -> str:
+    override = os.environ.get(ORIGIN_URL_ENV, "").strip()
+    url = override or "{}/{}".format(
+        os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/"), repository
+    )
+    parsed = urlparse(url)
+    if parsed.username or parsed.password:
+        fail(REPOSITORY_REJECTED, f"origin URL must not contain credentials: {url}")
+    return url
+
+
+def _git(args: Sequence[str], *, cwd: Path | None = None, code: str, timeout: int) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        fail(code, f"git {' '.join(args)} exceeded {timeout}s")
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or "").strip().splitlines()
+        fail(code, f"git {' '.join(args)}: {detail[-1] if detail else error.returncode}")
+    return completed.stdout.strip()
+
+
+def _client_line(stderr: str) -> dict[str, Any]:
+    lines = [line for line in stderr.splitlines() if line.startswith(f"{CLIENT_MARKER} ")]
+    if len(lines) != 1:
+        fail(CLIENT_CONTRACT, f"expected exactly one {CLIENT_MARKER} line, got {len(lines)}")
+    try:
+        payload = json.loads(lines[0][len(CLIENT_MARKER) + 1 :])
+    except json.JSONDecodeError as error:
+        fail(CLIENT_CONTRACT, f"{error}")
+    if not isinstance(payload, dict) or payload.get("status") != "ready":
+        fail(CLIENT_CONTRACT, f"status={payload.get('status')!r}")
+    return payload
+
+
+def run_client(repository: str, commit: str, deadline_epoch: int) -> dict[str, Any]:
+    """Prepare `commit` through the host service.  Never touches the network."""
+    client = mirror_root() / CLIENT_NAME
+    if not os.access(client, os.X_OK):
+        fail(CLIENT_MISSING, str(client))
+    argv = [
+        str(client),
+        "--repository", repository,
+        "--commit", commit,
+        "--deadline-epoch", str(deadline_epoch),
+    ]
+    try:
+        completed = subprocess.run(
+            argv, check=False, text=True, capture_output=True, timeout=max(1, deadline_epoch - int(time.time()))
+        )
+    except subprocess.TimeoutExpired:
+        fail(DEADLINE_EXCEEDED, f"client exceeded deadline {deadline_epoch}")
+    payload = _client_line(completed.stderr)
+    if completed.returncode != 0:
+        fail(CLIENT_FAILED, f"exit={completed.returncode} code={payload.get('code')!r}")
+    if payload.get("commit_sha") != commit or payload.get("repository") != repository:
+        fail(CLIENT_CONTRACT, f"client answered for {payload.get('repository')}@{payload.get('commit_sha')}")
+    return payload
+
+
+@contextlib.contextmanager
+def shared_consume_lock(mirror_repo: Path, deadline_epoch: int) -> Iterator[None]:
+    """Bounded shared lock on the mirror; released before anything else runs."""
+    lock = mirror_repo / LOCK_NAME
+    try:
+        handle = os.open(lock, os.O_RDONLY)
+    except OSError as error:
+        fail(LOCK_UNREADABLE, f"{lock}: {error.strerror}")
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if int(time.time()) >= deadline_epoch:
+                    fail(LOCK_TIMEOUT, f"{lock} still held at deadline {deadline_epoch}")
+                time.sleep(0.05)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
+
+
+def prepare(repository: str, commit: str, deadline_epoch: int) -> tuple[Path, dict[str, Any]]:
+    """Client first, then the lock — the client must never run under the lock."""
+    check_repository(repository)
+    check_commit(commit)
+    payload = run_client(repository, commit, deadline_epoch)
+    mirror_repo = mirror_root() / f"{repository}.git"
+    if not (mirror_repo / "objects").is_dir():
+        fail(MIRROR_UNREADABLE, str(mirror_repo))
+    return mirror_repo, payload
+
+
+def fetch_demand_ref(repo: Path, mirror_repo: Path, commit: str, *, timeout: int) -> None:
+    """Copy the prepared closure into the job repository as its own objects."""
+    with shared_consume_lock(mirror_repo, int(time.time()) + timeout):
+        if _git(
+            ["--git-dir", str(mirror_repo), "rev-parse", "--verify", "--quiet", DEMAND_REF.format(sha=commit)],
+            code=DEMAND_REF_MISSING,
+            timeout=timeout,
+        ) != commit:
+            fail(DEMAND_REF_MISSING, f"{mirror_repo}:{DEMAND_REF.format(sha=commit)} is not {commit}")
+        _git(
+            ["fetch", "--no-tags", "--no-recurse-submodules", str(mirror_repo), DEMAND_REF.format(sha=commit)],
+            cwd=repo,
+            code=FETCH_FAILED,
+            timeout=timeout,
+        )
+
+
+def _workspace() -> Path:
+    return Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd())
+
+
+def checkout_from_environment(timeout: int | None = None) -> dict[str, Any]:
+    """Materialize GATE_CHECKOUT_* through the service (same env contract as
+    `gate_bounded_retry.py checkout`, which delegates here in service mode)."""
+    require_service_mode()
+    repository = os.environ.get(REPOSITORY_ENV, "").strip() or os.environ.get("GITHUB_REPOSITORY", "").strip()
+    ref = os.environ.get(REF_ENV, "").strip() or os.environ.get("GITHUB_SHA", "").strip()
+    if not repository or not ref:
+        fail(REPOSITORY_REJECTED, f"{REPOSITORY_ENV}/{REF_ENV} and GITHUB_REPOSITORY/GITHUB_SHA are required")
+    relative = os.environ.get(PATH_ENV, "").strip()
+    dest = _workspace() / relative if relative not in {"", "."} else _workspace()
+    paths = [line.strip() for line in os.environ.get(SPARSE_ENV, "").splitlines() if line.strip()]
+    return checkout(repository, ref, dest, paths, timeout=timeout)
+
+
+def checkout(
+    repository: str,
+    ref: str,
+    dest: Path,
+    paths: Sequence[str] = (),
+    *,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    """Full (non-shallow) checkout of `ref` from the read-only mirror."""
+    require_service_mode()
+    budget = budget_secs() if timeout is None else timeout
+    started = time.monotonic()
+    deadline = int(started) + budget
+    if dest.resolve() == _workspace().resolve():
+        if (dest / ".git").exists():
+            shutil.rmtree(dest / ".git")
+        dest.mkdir(parents=True, exist_ok=True)
+    else:
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+    mirror_repo, payload = prepare(repository, ref, deadline)
+    _git(["init", "--quiet"], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+    _git(["remote", "add", "origin", origin_url(repository)], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+    if paths:
+        _git(["sparse-checkout", "init", "--no-cone"], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+        try:
+            subprocess.run(
+                ["git", "sparse-checkout", "set", "--no-cone", "--stdin"],
+                cwd=dest, check=True, text=True, input="\n".join(paths) + "\n",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=budget,
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+            fail(CHECKOUT_FAILED, f"git sparse-checkout set failed: {error}")
+    fetch_demand_ref(dest, mirror_repo, ref, timeout=max(1, deadline - int(time.time())))
+    _git(["checkout", "--force", "--detach", ref], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+    head = _git(["rev-parse", "HEAD"], cwd=dest, code=CHECKOUT_FAILED, timeout=budget)
+    if head.lower() != ref.lower():
+        fail(PIN_MISMATCH, f"checked out {head}, expected {ref}")
+    for relative in paths:
+        if not (dest / relative).exists():
+            fail(PATH_MISSING, f"sparse path missing after checkout: {relative}")
+    return {
+        "mode": MODE_SERVICE,
+        "step": "checkout",
+        "source": payload.get("source", "unknown"),
+        "reason": "ok",
+        "repository": repository,
+        "commit_sha": ref,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+def has_commit(repo: Path, sha: str) -> bool:
+    return subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def ensure_commits(
+    repo: Path, repository: str, base_sha: str, head_sha: str, *, timeout: int | None = None
+) -> None:
+    """Make base/head available in the job repository from the mirror."""
+    require_service_mode()
+    budget = budget_secs() if timeout is None else timeout
+    deadline = int(time.monotonic()) + budget
+    started = time.monotonic()
+    for sha in (base_sha, head_sha):
+        if has_commit(repo, sha):
+            continue
+        mirror_repo, _ = prepare(repository, sha, deadline)
+        fetch_demand_ref(repo, mirror_repo, sha, timeout=max(1, deadline - int(time.time())))
+    emit({
+        "mode": MODE_SERVICE,
+        "step": "ensure",
+        "source": "present" if has_commit(repo, base_sha) else "cold",
+        "reason": "ok",
+        "repository": repository,
+        "commit_sha": head_sha,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    })
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print(f"{SOURCE_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if args[:1] == ["mode"]:
+            emit({"mode": declared_mode(), "step": "mode", "reason": "ok", "elapsed_ms": 0})
+            return 0
+        if args[:1] == ["checkout"]:
+            emit(checkout_from_environment())
+            return 0
+        raise SystemExit(f"usage: gate_source.py mode|checkout (got {args!r})")
+    except SourceError as error:
+        print(f"{SOURCE_MARKER} {json.dumps({'mode': MODE_SERVICE, 'step': 'error', 'reason': error.code, 'detail': error.detail}, separators=(',', ':'), sort_keys=True)}", file=sys.stderr)
+        print(f"::error::{error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

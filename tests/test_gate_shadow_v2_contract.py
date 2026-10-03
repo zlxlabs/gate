@@ -377,7 +377,9 @@ def test_shadow_job_steps_each_carry_the_sentinel_guard():
         label = step.get("name") or step.get("uses")
         if label in guarded_step_names:
             seen.add(label)
-            assert str(step.get("if", "")) == "matrix.reviewer != '__none__'", (
+            # The checkout also carries the service-mode guard; the sentinel must
+            # still appear verbatim inside it.
+            assert "matrix.reviewer != '__none__'" in str(step.get("if", "")), (
                 f"step {label!r} must carry the sentinel guard verbatim, got {step.get('if')!r}"
             )
     assert seen == guarded_step_names

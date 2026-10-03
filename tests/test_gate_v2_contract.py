@@ -95,6 +95,7 @@ QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 BOUNDED_RETRY_HELPER = REPO_ROOT / "scripts" / "gate_bounded_retry.py"
 CHECKOUT_HELPER_RUN = 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout'
+BOOTSTRAP_CALL = 'bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"'
 MAGICDNS_HELPER_RUN = 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns'
 UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 EXPECTED_ACTION_REFS = {
@@ -172,8 +173,13 @@ def assert_workflow_sha_checkout(step: dict, *, path: str | None = None, sparse:
         assert _sparse_env_paths(step) == expected
     run = step["run"]
     assert CHECKOUT_HELPER_RUN in run
-    assert "os.environ['GATE_GITHUB_TOKEN']" in run
-    assert "-H \"@${RUNNER_TEMP}/gate-api.hdr\"" in run
+    # The Contents API fetch moved into the one workflow-level bootstrap script
+    # that all 10 call sites share (gate-hub W3a); the token -> header write and
+    # the curl live there now, so the invariant is asserted where the bytes are.
+    bootstrap = _load_workflow()[0]["env"]["GATE_SOURCE_BOOTSTRAP_SCRIPT"]
+    assert BOOTSTRAP_CALL in run
+    assert "os.environ['GATE_GITHUB_TOKEN']" in bootstrap
+    assert "-H \"@${RUNNER_TEMP}/gate-api.hdr\"" in bootstrap
     assert "${{" not in run
     assert "x-access-token" not in run
     assert "github.token" not in run
@@ -2678,7 +2684,7 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
     assert_workflow_sha_checkout(
         checkout,
         path="_gate-action-src",
-        sparse=[".github/actions", "scripts/scrub_outbound.py"],
+        sparse=[".github/actions", "scripts/gate_source.py", "scripts/scrub_outbound.py"],
     )
     names = [step.get("name") for step in steps]
     assert names.index(checkout["name"]) < names.index("PR size preflight")
@@ -2749,6 +2755,9 @@ def test_v2_aggregator_jobs_do_not_execute_caller_quality_code():
         )
 
 
+SHARED_ACTION_MODULES = ("scripts/gate_source.py", "scripts/scrub_outbound.py")
+
+
 def test_quality_action_sparse_checkout_excludes_tests_tree():
     raw, _ = _load_workflow()
     checkout = next(
@@ -2758,7 +2767,10 @@ def test_quality_action_sparse_checkout_excludes_tests_tree():
     sparse_paths = _sparse_env_paths(checkout)
     assert ".github/actions" in sparse_paths
     assert "scripts/scrub_outbound.py" in sparse_paths
-    assert not any(path == "scripts" or path.startswith("scripts/") and path != "scripts/scrub_outbound.py" for path in sparse_paths)
+    assert not any(
+        path == "scripts" or path.startswith("scripts/") and path not in SHARED_ACTION_MODULES
+        for path in sparse_paths
+    )
     assert not any(path == "tests" or path.startswith("tests/") for path in sparse_paths)
 
 
@@ -2774,6 +2786,11 @@ def test_every_scrub_import_has_checkout_coverage_for_action_and_module():
             import_files = [
                 path for path in action_dir.rglob("*.py")
                 if "from scripts.scrub_outbound import" in path.read_text()
+            ]
+            imported_modules = [
+                "scripts.gate_source" if "from scripts.gate_source import" in path.read_text()
+                else "scripts.scrub_outbound"
+                for path in import_files
             ]
             if not import_files:
                 continue
@@ -2811,9 +2828,10 @@ def test_every_scrub_import_has_checkout_coverage_for_action_and_module():
                     assert covered(relative_import), (
                         f"{job_name}: checkout for {uses} misses {relative_import}"
                     )
-                    assert covered("scripts/scrub_outbound.py"), (
-                        f"{job_name}: checkout for {uses} misses scripts/scrub_outbound.py"
-                    )
+                    for module in set(imported_modules):
+                        assert covered(module.replace(".", "/") + ".py"), (
+                            f"{job_name}: checkout for {uses} misses {module}"
+                        )
 
 
 def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():
@@ -2962,7 +2980,7 @@ def test_diff_coverage_advisory_runs_after_caller_tests_with_continue_on_error()
     assert_workflow_sha_checkout(
         checkout,
         path="_gate-action-src",
-        sparse=[".github/actions", "scripts/scrub_outbound.py"],
+        sparse=[".github/actions", "scripts/gate_source.py", "scripts/scrub_outbound.py"],
     )
 
     advisory = steps[advisory_index]
