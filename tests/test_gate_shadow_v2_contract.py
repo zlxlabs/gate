@@ -10,6 +10,9 @@ Required Gate leaves workflow-level concurrency unset and Shadow retains its own
 shadow/draft lifecycle group.
 """
 from pathlib import Path
+import json
+import os
+import re
 import subprocess
 import tempfile
 
@@ -26,6 +29,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-shadow-v2.yml"
 CALLER_TEMPLATE = REPO_ROOT / "templates" / "caller-gate-shadow-v2.yml"
 REQUIRED_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
+SHADOW_SNAPSHOT_DIR = REPO_ROOT / "docs" / "sessions" / "261004-shadow-snapshot"
+RESOLVED_POLICY_FIXTURE = SHADOW_SNAPSHOT_DIR / "resolved-policy.fixture.json"
+OLD_SHADOW_CONSUMER = SHADOW_SNAPSHOT_DIR / "old-review-shadow"
+NEW_SHADOW_CONSUMER = SHADOW_SNAPSHOT_DIR / "new-review-shadow"
+_GHA_EXPRESSION = re.compile(r"\$\{\{\s*(.*?)\s*\}\}", re.DOTALL)
+_GITHUB_OUTPUT_HEREDOC = re.compile(
+    rb"^([A-Za-z0-9_]+)<<(\S+)\n(.*?)\n\2(?:\n|$)", re.DOTALL | re.MULTILINE
+)
+_STUB_RESOLVE_POLICY = (
+    "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+    "Path(sys.argv[1]).read_bytes()\n"
+    "sys.stdout.write(Path(os.environ['RESOLVE_POLICY_STDOUT_FIXTURE']).read_text())\n"
+)
 
 # Byte-identical to test_gate_v2_contract.py's own FORK_GUARD/DRAFT_GUARD/RUNNER_GUARD —
 # redefined locally (rather than imported) so this test file has no import-time coupling
@@ -63,6 +79,90 @@ def _load_caller():
 def _load_required_workflow():
     raw = yaml.safe_load(REQUIRED_WORKFLOW.read_text())
     return raw
+
+
+def _resolve_policy_step():
+    raw, _ = _load_workflow()
+    return next(s for s in raw["jobs"]["resolve"]["steps"] if s.get("id") == "resolve-policy")
+
+
+def _run_review_shadow_step():
+    raw, _ = _load_workflow()
+    return next(s for s in raw["jobs"]["shadow"]["steps"] if s.get("name") == "Run review-shadow")
+
+
+def _materialize_gha(run: str, values: dict[str, str]) -> str:
+    def repl(match):
+        key = " ".join(match.group(1).split())
+        if key not in values:
+            raise AssertionError(f"unsubstituted GHA expression {key!r}")
+        return values[key]
+    return _GHA_EXPRESSION.sub(repl, run)
+
+
+def _parse_github_output(payload: bytes) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    remaining = payload
+    while remaining:
+        heredoc = _GITHUB_OUTPUT_HEREDOC.match(remaining)
+        if heredoc:
+            parsed[heredoc.group(1).decode()] = heredoc.group(3).decode()
+            remaining = remaining[heredoc.end():]
+            continue
+        line, sep, remaining = remaining.partition(b"\n")
+        if not line:
+            if not sep:
+                break
+            continue
+        if b"=" not in line:
+            raise AssertionError(f"unparsed GITHUB_OUTPUT line: {line!r}")
+        key, value = line.split(b"=", 1)
+        parsed[key.decode()] = value.decode()
+    return parsed
+
+
+def _install_hub(directory: Path, *, consumer: Path, commit: str) -> Path:
+    hub = directory / "gate-hub"
+    review_dir = hub / "scripts" / "review"
+    review_dir.mkdir(parents=True)
+    (hub / "registry.yaml").write_text("shadow: [pi-glm-quote]\n", encoding="utf-8")
+    (hub / "REGISTRY_COMMIT").write_text(commit, encoding="utf-8")
+    resolve_script = review_dir / "resolve_policy.py"
+    resolve_script.write_text(_STUB_RESOLVE_POLICY, encoding="utf-8")
+    resolve_script.chmod(0o755)
+    target = review_dir / "review-shadow"
+    target.write_bytes(consumer.read_bytes())
+    target.chmod(0o755)
+    return hub
+
+
+def _run_extracted_resolve(tmp_path: Path, *, commit: str, fixture: Path | None = None,
+                           write_commit: bool = True) -> subprocess.CompletedProcess:
+    hub = _install_hub(tmp_path, consumer=NEW_SHADOW_CONSUMER, commit=commit)
+    if not write_commit:
+        (hub / "REGISTRY_COMMIT").unlink()
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    env = {
+        **os.environ,
+        "GATE_HUB_DIR": str(hub),
+        "GITHUB_OUTPUT": str(tmp_path / "github-output"),
+        "RUNNER_TEMP": str(runner_temp),
+        "GATE_TIER": "personal",
+        "RESOLVE_POLICY_STDOUT_FIXTURE": str(fixture or RESOLVED_POLICY_FIXTURE),
+    }
+    script = _materialize_gha(_resolve_policy_step()["run"], {"github.repository": "zlxlabs/example"})
+    return subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True, check=False, cwd=tmp_path)
+
+
+def _run_extracted_leg(tmp_path: Path, *, consumer: Path, env_extra: dict[str, str]):
+    hub = _install_hub(tmp_path, consumer=consumer, commit="a" * 40)
+    capture = tmp_path / "consumer-capture.json"
+    env = {**os.environ, "GATE_HUB_DIR": str(hub), "REVIEWER": "pi-glm-quote",
+           "CAPTURE_PATH": str(capture), **env_extra}
+    script = _materialize_gha(_run_review_shadow_step()["run"], {"github.event.pull_request.number": "42"})
+    proc = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True, check=False, cwd=tmp_path)
+    return proc, capture
 
 
 # ── reusable workflow shape ──────────────────────────────────────────────────
@@ -568,6 +668,8 @@ def test_run_review_shadow_env_has_required_v2_identity_vars():
     # P2 hygiene fix (2026-07-26 codex review): matrix.reviewer routed through env:,
     # referenced in the run: script as "$REVIEWER", never interpolated directly.
     assert env["REVIEWER"] == "${{ matrix.reviewer }}"
+    assert env["REVIEW_RESOLVED_POLICY_JSON"] == "${{ needs.resolve.outputs.resolved_policy_json }}"
+    assert env["REVIEW_REGISTRY_COMMIT"] == "${{ needs.resolve.outputs.registry_commit }}"
     assert "review-shadow" in run_step["run"]
     assert '"${{ github.event.pull_request.number }}"' in run_step["run"]
     assert '"$REVIEWER"' in run_step["run"]
@@ -585,8 +687,11 @@ def test_run_review_shadow_invokes_python3_not_bash():
     steps = raw["jobs"]["shadow"]["steps"]
     run_step = next(s for s in steps if s.get("name") == "Run review-shadow")
     run = run_step["run"].strip()
-    assert run.startswith("python3 "), f"expected an explicit python3 invocation, got: {run!r}"
-    assert not run.startswith("bash ")
+    invoke = [line.strip() for line in run.splitlines() if "scripts/review/review-shadow" in line]
+    assert invoke, run
+    assert invoke[0].startswith("python3 "), f"expected an explicit python3 invocation, got: {invoke[0]!r}"
+    assert not invoke[0].startswith("bash ")
+    assert "--require-resolved-policy" in invoke[0]
 
 
 # ── summary job: always() + explicit non-empty guard, no PR-write permission ───
@@ -863,3 +968,121 @@ def test_no_gha_expression_anywhere_uses_arithmetic_operators():
 def test_caller_template_also_has_no_gha_arithmetic_operators():
     offenders = find_arithmetic_gha_expression_offenders(CALLER_TEMPLATE)
     assert not offenders, f"found arithmetic-looking operator(s) inside GHA expression(s): {offenders!r}"
+
+
+# ── resolved policy snapshot producer / consumer contract (card C) ─────────────
+
+
+def test_snapshot_contract_wiring_and_no_gate_v2_change():
+    text = REQUIRED_WORKFLOW.read_text()
+    assert "--require-resolved-policy" not in text
+    assert "REVIEW_RESOLVED_POLICY_JSON" not in text
+    outputs = _load_workflow()[0]["jobs"]["resolve"]["outputs"]
+    assert outputs["resolved_policy_json"] == "${{ steps.resolve-policy.outputs.resolved_policy_json }}"
+    assert outputs["registry_commit"] == "${{ steps.resolve-policy.outputs.registry_commit }}"
+    run = _resolve_policy_step()["run"]
+    assert run.count("scripts/review/resolve_policy.py") == 1
+    assert "github.sha" not in run and "GITHUB_SHA" not in run and "rev-parse" not in run
+    assert "resolved_policy_json<<RESOLVED_POLICY_JSON_EOF" in run
+    assert 'dirname "$registry_file")/REGISTRY_COMMIT' in run
+    step = _run_review_shadow_step()
+    assert step["env"]["REVIEW_RESOLVED_POLICY_JSON"] == "${{ needs.resolve.outputs.resolved_policy_json }}"
+    assert step["env"]["REVIEW_REGISTRY_COMMIT"] == "${{ needs.resolve.outputs.registry_commit }}"
+    invoke = [ln.strip() for ln in step["run"].splitlines() if "scripts/review/review-shadow" in ln]
+    assert invoke and invoke[0].startswith("python3 ")
+    assert "--require-resolved-policy" in invoke[0]
+    assert step["run"].index("python3 ") < step["run"].index("--require-resolved-policy") < step["run"].index("${{ github.event.pull_request.number }}")
+
+
+def test_resolve_shell_producer_writes_full_json_github_output_bytes(tmp_path):
+    commit = "cafebabecafebabecafebabecafebabecafebabe"
+    proc = _run_extracted_resolve(tmp_path, commit=commit)
+    payload = (tmp_path / "github-output").read_bytes()
+    assert proc.returncode == 0, proc.stderr
+    parsed = _parse_github_output(payload)
+    fixture = json.loads(RESOLVED_POLICY_FIXTURE.read_text(encoding="utf-8"))
+    roundtrip = json.loads(parsed["resolved_policy_json"])
+    assert roundtrip == fixture
+    model = roundtrip["reviewers"]["pi-glm-quote"]["model"]
+    assert '"' in model and "\n" in model
+    assert roundtrip["reviewers"]["pi-glm-quote"]["auth"] == "glm-profile"
+    assert parsed["registry_commit"] == commit
+    assert json.loads(parsed["shadow_reviewers"]) == ["pi-glm-quote"]
+    assert parsed["has_shadows"] == "true"
+    assert not {"target_repo", "tier", "repository"} & set(roundtrip)
+    assert RESOLVED_POLICY_FIXTURE.read_text(encoding="utf-8").strip().encode() in payload
+
+
+def test_resolve_shell_producer_fail_fast_on_missing_or_invalid_registry_commit(tmp_path):
+    missing = _run_extracted_resolve(tmp_path / "missing", commit="a" * 40, write_commit=False)
+    empty = _run_extracted_resolve(tmp_path / "empty", commit="\n")
+    short = _run_extracted_resolve(tmp_path / "short", commit="abc")
+    assert missing.returncode and empty.returncode and short.returncode
+    assert "REGISTRY_COMMIT" in (missing.stderr + missing.stdout)
+
+
+def test_extracted_leg_passes_full_env_and_real_pr_reviewer_to_dummy_consumer(tmp_path):
+    fixture = json.loads(RESOLVED_POLICY_FIXTURE.read_text(encoding="utf-8"))
+    commit = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    proc, capture = _run_extracted_leg(
+        tmp_path, consumer=NEW_SHADOW_CONSUMER,
+        env_extra={"REVIEW_RESOLVED_POLICY_JSON": json.dumps(fixture, ensure_ascii=False),
+                   "REVIEW_REGISTRY_COMMIT": commit},
+    )
+    assert proc.returncode == 0, proc.stderr
+    dumped = json.loads(capture.read_text(encoding="utf-8"))
+    assert dumped["argv"] == ["--require-resolved-policy", "42", "pi-glm-quote"]
+    assert dumped["policy"] == fixture and dumped["registry_commit"] == commit
+
+
+def test_missing_or_bad_snapshot_does_not_invoke_or_fails_closed(tmp_path):
+    fixture = RESOLVED_POLICY_FIXTURE.read_text(encoding="utf-8")
+    cases = [
+        ({"REVIEW_REGISTRY_COMMIT": "b" * 40}, True),
+        ({"REVIEW_RESOLVED_POLICY_JSON": "", "REVIEW_REGISTRY_COMMIT": "b" * 40}, True),
+        ({"REVIEW_RESOLVED_POLICY_JSON": "{not-json", "REVIEW_REGISTRY_COMMIT": "c" * 40}, True),
+        ({"REVIEW_RESOLVED_POLICY_JSON": fixture, "REVIEW_REGISTRY_COMMIT": "not-a-sha"}, True),
+    ]
+    for i, (extra, expect_no_capture) in enumerate(cases):
+        proc, capture = _run_extracted_leg(tmp_path / f"c{i}", consumer=NEW_SHADOW_CONSUMER, env_extra=extra)
+        assert proc.returncode != 0
+        if expect_no_capture:
+            assert not capture.exists()
+    direct = subprocess.run(
+        ["python3", str(NEW_SHADOW_CONSUMER), "--require-resolved-policy", "--extra", "42", "pi-glm-quote"],
+        env={**os.environ, "REVIEW_RESOLVED_POLICY_JSON": fixture, "REVIEW_REGISTRY_COMMIT": "d" * 40},
+        text=True, capture_output=True, check=False,
+    )
+    assert direct.returncode != 0 and "unknown flag" in direct.stderr
+
+
+def test_stale_local_registry_after_resolve_does_not_change_leg_payload(tmp_path):
+    commit = "1234567890abcdef1234567890abcdef12345678"
+    proc = _run_extracted_resolve(tmp_path, commit=commit)
+    assert proc.returncode == 0, proc.stderr
+    parsed = _parse_github_output((tmp_path / "github-output").read_bytes())
+    original = json.loads(parsed["resolved_policy_json"])
+    (tmp_path / "gate-hub" / "registry.yaml").write_text("shadow: [stale-reviewer]\n", encoding="utf-8")
+    leg_dir = tmp_path / "leg"
+    leg_dir.mkdir()
+    leg_proc, capture = _run_extracted_leg(
+        leg_dir, consumer=NEW_SHADOW_CONSUMER,
+        env_extra={"REVIEW_RESOLVED_POLICY_JSON": parsed["resolved_policy_json"],
+                   "REVIEW_REGISTRY_COMMIT": parsed["registry_commit"]},
+    )
+    assert leg_proc.returncode == 0, leg_proc.stderr
+    dumped = json.loads(capture.read_text(encoding="utf-8"))
+    assert dumped["policy"] == original and dumped["policy"]["shadow"] == ["pi-glm-quote"]
+
+
+def test_old_shadow_consumer_rejects_new_preamble_flag():
+    env = {**os.environ, "REVIEW_RESOLVED_POLICY_JSON": RESOLVED_POLICY_FIXTURE.read_text(encoding="utf-8"),
+           "REVIEW_REGISTRY_COMMIT": "e" * 40}
+    argv = ["--require-resolved-policy", "42", "pi-glm-quote"]
+    proc = subprocess.run(["python3", str(OLD_SHADOW_CONSUMER), *argv], env=env, text=True, capture_output=True, check=False)
+    assert proc.returncode != 0 and "usage: review-shadow" in proc.stderr
+    live = Path("/home/zlx/projects/personal/gate-hub/scripts/review/review-shadow")
+    if live.is_file():
+        live_proc = subprocess.run(["python3", str(live), *argv], text=True, capture_output=True, check=False)
+        assert live_proc.returncode != 0 and "usage: review-shadow" in live_proc.stderr
+

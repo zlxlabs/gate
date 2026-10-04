@@ -1,0 +1,30 @@
+resolved_policy_json<<RESOLVED_POLICY_JSON_EOF
+{
+  "chain": [
+    "codex-sub"
+  ],
+  "advisory": [],
+  "shadow": [
+    "pi-glm-quote"
+  ],
+  "parallel": [],
+  "rollout": {},
+  "reviewers": {
+    "codex-sub": {
+      "adapter": "codex",
+      "auth": "codex-sub",
+      "model": "gpt-5.6-luna",
+      "rate_limit_group": "codex"
+    },
+    "pi-glm-quote": {
+      "adapter": "pi",
+      "auth": "glm-profile",
+      "model": "glm-4.5 \"canary\" model\nsecond-line",
+      "rate_limit_group": "glm"
+    }
+  }
+}
+RESOLVED_POLICY_JSON_EOF
+registry_commit=cafebabecafebabecafebabecafebabecafebabe
+shadow_reviewers=["pi-glm-quote"]
+has_shadows=true

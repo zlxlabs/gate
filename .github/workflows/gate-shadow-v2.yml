@@ -495,6 +495,8 @@ jobs:
       # empty string, which never equals 'true' either — one boolean covers both skip
       # triggers the D2 task's "为空时后续 job 全 skip" calls for.
       has_shadows: ${{ steps.resolve-policy.outputs.has_shadows }}
+      resolved_policy_json: ${{ steps.resolve-policy.outputs.resolved_policy_json }}
+      registry_commit: ${{ steps.resolve-policy.outputs.registry_commit }}
       # Validated once here even when the policy resolves to no shadow legs; the matrix job
       # consumes this output instead of repeating the validation or arithmetic.
       review_gate_timeout_s: ${{ steps.validate-shadow-timeout.outputs.review_gate_timeout_s }}
@@ -594,6 +596,22 @@ jobs:
           gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
           registry_file="${REVIEW_REGISTRY_FILE:-$gate_hub_dir/registry.yaml}"
           policy_json="$(python3 "$gate_hub_dir/scripts/review/resolve_policy.py" "$registry_file" "${{ github.repository }}")"
+          registry_commit_file="$(dirname "$registry_file")/REGISTRY_COMMIT"
+          if [ ! -f "$registry_commit_file" ]; then
+            echo "::error::REGISTRY_COMMIT product missing next to $registry_file"
+            exit 1
+          fi
+          registry_commit="$(tr -d '[:space:]' < "$registry_commit_file")"
+          if [[ ! "$registry_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::REGISTRY_COMMIT product is empty or not a complete 40-hex source SHA"
+            exit 1
+          fi
+          {
+            echo "resolved_policy_json<<RESOLVED_POLICY_JSON_EOF"
+            printf '%s\n' "$policy_json"
+            echo "RESOLVED_POLICY_JSON_EOF"
+            echo "registry_commit=${registry_commit}"
+          } >> "$GITHUB_OUTPUT"
           filter_script="${RUNNER_TEMP:-/tmp}/resolve-shadow-filter.py"
           cat > "$filter_script" <<'PYEOF'
           import json
@@ -867,13 +885,25 @@ jobs:
           # Routed through env: rather than interpolated into the `run:` string below —
           # same hygiene fix as the "Resolve numeric job id" step above.
           REVIEWER: ${{ matrix.reviewer }}
+          REVIEW_RESOLVED_POLICY_JSON: ${{ needs.resolve.outputs.resolved_policy_json }}
+          REVIEW_REGISTRY_COMMIT: ${{ needs.resolve.outputs.registry_commit }}
         # P0 fix (2026-07-26, canary probe #2) — same class of bug, and same fix, as
         # gate-v2.yml's "Run review-primary" step (see that step's own comment for the
         # full story): review-shadow is a Python entry point, not a bash script — an
         # earlier draft's `bash "$GATE_HUB_DIR/..."` invocation fed its Python source to
         # bash instead of python3, confirmed in canary logs as `review-shadow: line 101:
         # import: command not found`. Explicit `python3` fixes it.
-        run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" "${{ github.event.pull_request.number }}" "$REVIEWER"
+        run: |
+          set -euo pipefail
+          if [ -z "${REVIEW_RESOLVED_POLICY_JSON:-}" ]; then
+            echo "::error::REVIEW_RESOLVED_POLICY_JSON is missing or empty; refusing to invoke review-shadow"
+            exit 1
+          fi
+          if [ -z "${REVIEW_REGISTRY_COMMIT:-}" ]; then
+            echo "::error::REVIEW_REGISTRY_COMMIT is missing or empty; refusing to invoke review-shadow"
+            exit 1
+          fi
+          python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-shadow" --require-resolved-policy "${{ github.event.pull_request.number }}" "$REVIEWER"
 
       # `if: always()`: review-shadow's own docstring guarantees a legal event file is
       # ALREADY on disk for every outcome except exit codes 2 (event write itself
