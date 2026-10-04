@@ -1081,8 +1081,14 @@ def test_old_shadow_consumer_rejects_new_preamble_flag():
     argv = ["--require-resolved-policy", "42", "pi-glm-quote"]
     proc = subprocess.run(["python3", str(OLD_SHADOW_CONSUMER), *argv], env=env, text=True, capture_output=True, check=False)
     assert proc.returncode != 0 and "usage: review-shadow" in proc.stderr
-    live = Path("/home/zlx/projects/personal/gate-hub/scripts/review/review-shadow")
-    if live.is_file():
+    live = None
+    hub = os.environ.get("GATE_HUB_DIR")
+    for candidate in ((Path(hub) / "scripts" / "review" / "review-shadow") if hub else None,
+                      Path("/opt/gate-hub/scripts/review/review-shadow")):
+        if candidate is not None and candidate.is_file():
+            live = candidate
+            break
+    if live is not None:
         live_proc = subprocess.run(["python3", str(live), *argv], text=True, capture_output=True, check=False)
         assert live_proc.returncode != 0 and "usage: review-shadow" in live_proc.stderr
 
