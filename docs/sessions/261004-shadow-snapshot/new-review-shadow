@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""New consumer: --require-resolved-policy before PR args; snapshot env only; typed fail."""
+from __future__ import annotations
+import json, os, re, sys
+from pathlib import Path
+_HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
+
+def _fail(msg, code=2):
+    print(f"::error::{msg}", file=sys.stderr)
+    return code
+
+def main(argv):
+    if not argv or argv[0] != "--require-resolved-policy":
+        return _fail("missing required flag --require-resolved-policy before PR args", 3)
+    rest = argv[1:]
+    unknown = [t for t in rest if t.startswith("-")]
+    if unknown:
+        return _fail(f"unknown flag(s): {unknown!r}")
+    if len(rest) != 2:
+        return _fail("usage: review-shadow --require-resolved-policy <pr-number> <reviewer>", 3)
+    raw = os.environ.get("REVIEW_RESOLVED_POLICY_JSON")
+    if raw is None or not raw.strip():
+        return _fail("REVIEW_RESOLVED_POLICY_JSON missing or empty")
+    try:
+        policy = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return _fail(f"REVIEW_RESOLVED_POLICY_JSON is not JSON: {exc}")
+    if not isinstance(policy, dict) or "reviewers" not in policy:
+        return _fail("REVIEW_RESOLVED_POLICY_JSON missing reviewers")
+    commit = os.environ.get("REVIEW_REGISTRY_COMMIT", "")
+    if not _HEX40.fullmatch(commit):
+        return _fail("REVIEW_REGISTRY_COMMIT is not a complete 40-hex source SHA")
+    cap = os.environ.get("CAPTURE_PATH")
+    if cap:
+        Path(cap).write_text(json.dumps({"argv": argv, "pr": rest[0], "reviewer": rest[1],
+                                         "policy": policy, "registry_commit": commit}, ensure_ascii=False), encoding="utf-8")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

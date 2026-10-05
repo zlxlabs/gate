@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Old review-shadow arity: extra flag including --require-resolved-policy is setup error."""
+from __future__ import annotations
+import json, os, sys
+from pathlib import Path
+
+def main(argv):
+    if len(argv) not in (1, 2):
+        print("usage: review-shadow <pr-number> [reviewer]", file=sys.stderr)
+        return 3
+    try:
+        pr = int(argv[0])
+    except ValueError:
+        print("usage: review-shadow <pr-number> [reviewer] (pr-number must be an integer)", file=sys.stderr)
+        return 3
+    if pr <= 0 or (len(argv) == 2 and not argv[1]) or (len(argv) == 1 and not os.environ.get("REVIEW_SHADOW_REVIEWER")):
+        print("usage: review-shadow <pr-number> [reviewer]", file=sys.stderr)
+        return 3
+    cap = os.environ.get("CAPTURE_PATH")
+    if cap:
+        Path(cap).write_text(json.dumps({"legacy": True, "argv": argv}), encoding="utf-8")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
