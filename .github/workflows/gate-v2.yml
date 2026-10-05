@@ -1039,6 +1039,31 @@ jobs:
             --audit-path "$audit" \
             --previous-findings-path "${RUNNER_TEMP}/previous-findings.json"
 
+      - name: Summarize primary findings in the job log
+        # gate-hub#1294: a `fail` primary round used to leave a downstream
+        # reader with nothing but a verdict line — the findings exist only in
+        # the canonical audit, which a caller repo cannot read (no silo
+        # credentials), so blind local reproduction was the only option. This
+        # republishes id/severity/file:line/title into the log and the Step
+        # Summary. Observability ONLY: it must never change this job's result,
+        # so it runs `if: always()` and the invocation is guarded such that
+        # every failure mode (missing source, broken renderer) leaves one
+        # greppable PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE line and exits 0.
+        # The same aggregate.py the relation step above uses is reused — it is
+        # already in this job's sparse checkout, so no extra fetch is added.
+        if: always()
+        run: |
+          set -euo pipefail
+          agg="_gate-silo-src/.github/actions/gate-aggregator/aggregate.py"
+          if [ ! -f "$agg" ]; then
+            echo "PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE reason=aggregator-source-missing"
+            exit 0
+          fi
+          python3 "$agg" --render-findings-summary \
+            --audit-path "${{ runner.temp }}/primary-review-audit.json" \
+            --summary-path "$GITHUB_STEP_SUMMARY" \
+            || echo "PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE reason=render-invocation-failed"
+
       - name: Write primary review diagnostics manifest
         # Best-effort finalizer for failed/cancelled review-primary; it records
         # metadata only and never reads provider bodies or stderr.
