@@ -50,6 +50,14 @@ IDENTITY_FIELDS or PRIMARY_VERDICTS ever change shape, this file must be
 updated by hand, and the two repos' contract tests are the thing that would
 catch a silent drift, not a runtime import.
 
+Finding summary (gate-hub#1294): `--render-findings-summary` is the one mode
+that only ADDS readable evidence — it republishes id/severity/file:line/title
+for every canonical-audit finding into the job log and the Step Summary, because
+a caller repo cannot read the canonical audit itself (no silo credentials) and
+used to be left with nothing but a verdict line. It never judges anything, never
+exits non-zero, and a degraded render always leaves exactly one greppable
+`PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE reason=<type>` line behind.
+
 Judgement responsibilities (see gate-v2.yml's `gate` job and this repo's
 tests/test_gate_aggregator.py for the full decision matrix):
   - `runner` must be a recognized value (`self`/`hosted`); anything else fails
@@ -201,6 +209,23 @@ RUNNER_DOMAIN = ("self", "hosted")
 # (SYNTHETIC_STATUSES) — this aggregator never invents a third one.
 SYNTHETIC_STATUS_TIMED_OUT = "job_timed_out"
 SYNTHETIC_STATUS_ARTIFACT_MISSING = "artifact_missing"
+
+# gate-hub#1294: a `fail` primary round used to publish nothing a downstream
+# reader could act on — the findings exist only inside the canonical audit,
+# which a caller repo cannot read (it has no silo credentials), so the only
+# readable evidence was a verdict line. `_render_findings_summary` republishes
+# four fields per finding (id, severity, file:line, title) into the job log and
+# the Step Summary. The caps below are anti-flood only: 50 rows is already past
+# a reviewable batch, and a title is a one-line label, never the finding body.
+FINDING_SUMMARY_MAX_FINDINGS = 50
+FINDING_SUMMARY_MAX_TITLE_CHARS = 200
+FINDING_SUMMARY_UNAVAILABLE = "PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE"
+# Column order of the published table; the log line is a key=value rendering of
+# the same four fields, so the two surfaces can never drift apart.
+_FINDING_SUMMARY_COLUMNS = ("severity", "id", "location", "title")
+# Any run of two or more colons collapses to one, so a `::error::`-shaped title
+# cannot carry the workflow-command prefix even at a line start.
+_COLON_RUN = re.compile(r":{2,}")
 
 
 class BoolParseError(ValueError):
@@ -763,6 +788,151 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     if isinstance(findings, list):
         apply_finding_relation(Outcome(ok=True), findings, previous)
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return 0
+
+
+class _FindingsSummaryUnavailable(Exception):
+    """One degraded finding-summary render; the message is the reason token
+    printed after `FINDING_SUMMARY_UNAVAILABLE reason=`."""
+
+
+def _summary_cell(value: Any) -> str:
+    """Flatten one finding field into a single line both surfaces can carry.
+
+    Every whitespace run (newline, tab, CR) collapses to one space, so a title
+    can never occupy a line of its own; a run of colons collapses to one, so
+    the `::` workflow-command prefix cannot survive at all; and the text is
+    length-capped so one finding cannot flood the log.
+    """
+    flat = "" if value is None else " ".join(str(value).split())
+    flat = _COLON_RUN.sub(":", flat)
+    if len(flat) > FINDING_SUMMARY_MAX_TITLE_CHARS:
+        flat = flat[: FINDING_SUMMARY_MAX_TITLE_CHARS - 1] + "…"
+    return flat
+
+
+def _markdown_cell(value: str) -> str:
+    """Escape the one character that would break a markdown table row."""
+    return value.replace("|", "\\|")
+
+
+def _append_step_summary(summary_path: Optional[str], text: str) -> None:
+    if not summary_path:
+        return
+    with open(summary_path, "a", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _degrade_findings_summary(reason: str, summary_path: Optional[str]) -> None:
+    """Announce one degraded render on both surfaces.
+
+    The reason vocabulary is code-owned (`audit-missing`, `audit-unparseable`,
+    `findings-field-missing`, `render-failed`), never audit content, so this
+    line needs no scrub. An absent audit is NOT the same claim as "the
+    reviewer found nothing" and must never be rendered as an empty table.
+    """
+    line = f"{FINDING_SUMMARY_UNAVAILABLE} reason={reason}"
+    print(line)
+    _append_step_summary(summary_path, f"## primary review findings\n\n{line}\n")
+
+
+def _load_audit_findings(audit_path: Path) -> tuple[list[Any], str]:
+    """(findings, verdict) from a canonical primary audit, or one degrade reason.
+
+    `title` is read because gate-hub's contracts._project_finding_text_aliases
+    copies it onto every finding whose `issue` is non-empty, so a real audit
+    always carries it alongside the schema-required `issue`.
+    """
+    if not audit_path.is_file():
+        raise _FindingsSummaryUnavailable("audit-missing")
+    try:
+        text = audit_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _FindingsSummaryUnavailable(f"audit-unreadable {type(exc).__name__}") from exc
+    try:
+        audit = json.loads(text)
+    except ValueError as exc:
+        # json.JSONDecodeError and UnicodeDecodeError are both ValueErrors:
+        # bytes the producer never wrote, not a file this job cannot open.
+        raise _FindingsSummaryUnavailable(f"audit-unparseable {type(exc).__name__}") from exc
+    if not isinstance(audit, dict):
+        raise _FindingsSummaryUnavailable("audit-unparseable root-not-object")
+    result = audit.get("result")
+    findings = result.get("findings") if isinstance(result, dict) else None
+    if not isinstance(findings, list):
+        raise _FindingsSummaryUnavailable("findings-field-missing")
+    return findings, str(audit.get("verdict"))
+
+
+def _finding_summary_rows(findings: list[Any]) -> list[dict[str, str]]:
+    rows = []
+    for finding in findings:
+        line = finding.get("line")
+        file_name = _summary_cell(finding.get("file"))
+        # `line` is model output exactly like `title` is, so it gets the same
+        # treatment before it is joined: a raw one would split the markdown row
+        # on `|`, start a fresh log line on a newline, and a line-leading `::`
+        # would be parsed as a workflow command — the exact shape this renderer
+        # exists to keep out of the log.
+        location = file_name if line is None else f"{file_name}:{_summary_cell(line)}"
+        rows.append({
+            "severity": _summary_cell(finding.get("severity")),
+            "id": _summary_cell(finding.get("id")),
+            "location": location,
+            "title": _summary_cell(finding.get("title")),
+        })
+    return rows
+
+
+def _render_findings_summary(audit_path: Path, summary_path: Optional[str]) -> None:
+    """Print the finding summary to stdout and append it to the Step Summary."""
+    try:
+        findings, verdict = _load_audit_findings(audit_path)
+        shown = _finding_summary_rows(findings[:FINDING_SUMMARY_MAX_FINDINGS])
+        overflow = len(findings) - len(shown)
+        lines = [
+            f"PRIMARY-FINDINGS-SUMMARY verdict={verdict} findings={len(findings)} shown={len(shown)}"
+        ]
+        for row in shown:
+            lines.append(
+                "PRIMARY-FINDING severity={severity} id={id} at={location} title={title}".format(**row)
+            )
+        if overflow:
+            lines.append(f"PRIMARY-FINDINGS-SUMMARY-OVERFLOW ... and {overflow} more")
+        table = [
+            f"## primary review findings (verdict {verdict}, {len(shown)} of {len(findings)} shown)",
+            "",
+            "| severity | id | location | title |",
+            "| --- | --- | --- | --- |",
+        ]
+        for row in shown:
+            table.append("| " + " | ".join(_markdown_cell(row[key]) for key in _FINDING_SUMMARY_COLUMNS) + " |")
+        if overflow:
+            table += ["", f"... and {overflow} more"]
+        runtime_values = runtime_values_from_environment()
+        print(scrub_for_publish("\n".join(lines) + "\n", runtime_values=runtime_values), end="")
+        _append_step_summary(
+            summary_path,
+            scrub_for_publish("\n".join(table) + "\n", runtime_values=runtime_values),
+        )
+    except _FindingsSummaryUnavailable as exc:
+        _degrade_findings_summary(str(exc), summary_path)
+
+
+def _render_findings_summary_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--audit-path", required=True)
+    parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
+    args = parser.parse_args(argv)
+    try:
+        _render_findings_summary(Path(args.audit_path), args.summary_path)
+    except Exception as exc:
+        # Fail-open observability boundary (gate-hub#1294): this mode exists to
+        # ADD readable evidence and must never change the primary job's result,
+        # so anything the renderer did not already classify leaves one greppable
+        # line behind and exits 0. The workflow step additionally guards its own
+        # invocation with `|| echo ... reason=render-invocation-failed`.
+        print(f"{FINDING_SUMMARY_UNAVAILABLE} reason=render-failed {type(exc).__name__}")
     return 0
 
 
@@ -3025,6 +3195,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _render_previous_context_cli(argv_list[1:])
     if argv_list[:1] == ["--annotate-primary-audit"]:
         return _annotate_primary_audit_cli(argv_list[1:])
+    if argv_list[:1] == ["--render-findings-summary"]:
+        return _render_findings_summary_cli(argv_list[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quality-result", required=True, help="needs.quality.result")
     parser.add_argument("--caller-checks", default="", help="needs.quality.outputs.caller_checks (not_started|passed|failed; empty when the evidence step never ran)")
