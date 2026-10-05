@@ -869,10 +869,16 @@ def _finding_summary_rows(findings: list[Any]) -> list[dict[str, str]]:
     for finding in findings:
         line = finding.get("line")
         file_name = _summary_cell(finding.get("file"))
+        # `line` is model output exactly like `title` is, so it gets the same
+        # treatment before it is joined: a raw one would split the markdown row
+        # on `|`, start a fresh log line on a newline, and a line-leading `::`
+        # would be parsed as a workflow command — the exact shape this renderer
+        # exists to keep out of the log.
+        location = file_name if line is None else f"{file_name}:{_summary_cell(line)}"
         rows.append({
             "severity": _summary_cell(finding.get("severity")),
             "id": _summary_cell(finding.get("id")),
-            "location": file_name if line is None else f"{file_name}:{line}",
+            "location": location,
             "title": _summary_cell(finding.get("title")),
         })
     return rows

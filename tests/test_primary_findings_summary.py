@@ -160,6 +160,22 @@ def test_injected_workflow_command_never_reaches_either_surface(tmp_path):
     assert r"| major | correctness.injected | app.py:1 | first line :error:injected \| pipe |" in summary.decode()
 
 
+def test_location_line_is_cleaned_like_every_other_field(tmp_path):
+    # `line` is model output too, and it is joined into the location cell, so a
+    # string carrying a newline, a `::` command prefix and a markdown-breaking
+    # `|` must not reach either surface raw.
+    audit = _write_audit(tmp_path, [_finding(id="correctness.line", line="3\n::error::x|y")])
+    proc, summary = _render(audit, tmp_path)
+    assert proc.returncode == 0
+    stdout = proc.stdout.decode()
+    assert not [line for line in stdout.splitlines() if line.startswith("::")]
+    assert (
+        "PRIMARY-FINDING severity=major id=correctness.line at=app.py:3 :error:x|y title=问题\n"
+    ) in stdout
+    # The published cell escapes the pipe so the table row survives.
+    assert "| major | correctness.line | app.py:3 :error:x\\|y | 问题 |" in summary.decode()
+
+
 def test_title_is_capped_and_finding_count_is_capped(tmp_path):
     long_title = "x" * 400
     audit = _write_audit(tmp_path, [_finding(id="correctness.long", title=long_title)] + [
