@@ -1328,3 +1328,55 @@ def test_all_state_event_cells_are_callable():
         expected["M"].update({"rerun": ("manual_required", 0, 3, 0, True, True), "new_digest": ("fail_closed", 0, 3, 0, False, False)})
         expected["F"]["new_digest"] = ("fail_closed", 0, 0, 0, False, False)
         assert (result.decision, result.clean_streak, result.eligible_rounds, result.unavailable_streak, result.accepted, result.no_op) == expected[state_name][event]
+
+
+def test_pr_round_budget_uses_tier_specific_cross_head_limits():
+    expected_limits = {"personal": 5, "internal": 8, "saas": 12}
+    for tier, limit in expected_limits.items():
+        result = CONV.pr_round_budget(
+            prior_run_ids=range(1, limit),
+            current_run_id=limit,
+            current_eligible=True,
+            tier=tier,
+        )
+        assert result == {
+            "history_status": "available",
+            "eligible_rounds": limit,
+            "limit": limit,
+            "terminal_decision": "arbitration_required",
+        }
+
+
+def test_pr_round_budget_deduplicates_run_attempts_and_counts_across_heads():
+    result = CONV.pr_round_budget(
+        prior_run_ids=(10, 10, 11, 12),
+        current_run_id=12,
+        current_eligible=True,
+        tier="personal",
+    )
+    assert result["eligible_rounds"] == 4
+    assert result["terminal_decision"] == "collecting"
+
+
+def test_pr_round_budget_unavailable_history_never_becomes_zero():
+    result = CONV.pr_round_budget(
+        prior_run_ids=(),
+        current_run_id=50,
+        current_eligible=True,
+        tier="personal",
+        history_status="history_unavailable",
+    )
+    assert result["history_status"] == "history_unavailable"
+    assert "eligible_rounds" not in result
+    assert result["terminal_decision"] == "history_unavailable"
+
+
+def test_pr_round_budget_unavailable_primary_does_not_increment():
+    result = CONV.pr_round_budget(
+        prior_run_ids=(10, 11),
+        current_run_id=12,
+        current_eligible=False,
+        tier="personal",
+    )
+    assert result["eligible_rounds"] == 2
+    assert result["terminal_decision"] == "collecting"

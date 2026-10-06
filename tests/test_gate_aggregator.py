@@ -3124,6 +3124,116 @@ def test_canonical_p1_projection_accepts_null_line():
     )
 
 
+def test_cross_head_shadow_cap_records_arbitration_without_changing_gate_result():
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    kwargs = _base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A)
+    before = AGG.evaluate(**kwargs)
+    after = AGG.evaluate(
+        **kwargs,
+        prior_eligible_run_ids=(101, 102, 103),
+        convergence_history_status="available",
+    )
+    assert (after.ok, after.classification, after.reason_code, after.gate_result) == (
+        before.ok, before.classification, before.reason_code, before.gate_result,
+    ) == (False, "code_fail", "primary_findings", "fail")
+    assert after.convergence_shadow == {
+        "history_status": "available",
+        "eligible_rounds": 4,
+        "limit": 5,
+        "terminal_decision": "collecting",
+        "eligible_this_round": True,
+    }
+
+
+def test_cross_head_shadow_cap_marks_arbitration_for_current_p1_round():
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    assert outcome.gate_result == "fail"
+    assert outcome.convergence_shadow["eligible_rounds"] == 5
+    assert outcome.convergence_shadow["terminal_decision"] == "arbitration_required"
+
+
+def test_clean_round_at_cross_head_cap_marks_shadow_but_preserves_pass():
+    audit = _valid_scoped_primary_record(
+        verdict="pass", tier="personal", result={"findings": []},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="success", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    assert outcome.gate_result == "pass"
+    assert outcome.convergence_shadow["eligible_rounds"] == 5
+    assert outcome.convergence_shadow["terminal_decision"] == "arbitration_required"
+
+
+def test_unavailable_primary_does_not_increment_cross_head_shadow_count():
+    audit = _valid_scoped_primary_record(
+        verdict="unavailable", tier="personal", result={"findings": []},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, 102),
+        convergence_history_status="available",
+    )
+    assert outcome.gate_result == "unavailable"
+    assert outcome.convergence_shadow["eligible_rounds"] == 2
+    assert outcome.convergence_shadow["eligible_this_round"] is False
+
+
+def test_unavailable_cross_head_history_has_no_zero_count():
+    audit = _valid_scoped_primary_record(
+        verdict="fail", tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(),
+        convergence_history_status="history_unavailable",
+    )
+    assert outcome.gate_result == "fail"
+    assert outcome.convergence_shadow["history_status"] == "history_unavailable"
+    assert "eligible_rounds" not in outcome.convergence_shadow
+
+
+def test_cross_head_shadow_rerun_same_run_attempt_is_idempotent():
+    audit = _valid_scoped_primary_record(
+        verdict="fail", tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, IDENTITY.run_id),
+        convergence_history_status="available",
+    )
+    assert outcome.convergence_shadow["eligible_rounds"] == 2
+    assert outcome.convergence_shadow["eligible_this_round"] is True
+
+
 def test_aggregate_projection_binds_stable_disposition_and_rejects_line_change():
     audit = _valid_scoped_primary_record(
         verdict="fail",
