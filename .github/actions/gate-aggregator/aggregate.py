@@ -2492,12 +2492,22 @@ def _fetch_silo_terminal_history(
     return result
 
 
-def _pr_target_run_ids(*, token: str, repository: str, pr_number: int) -> list[int]:
+def _pr_target_run_ids(*, token: str, repository: str, pr_number: int) -> Optional[list[int]]:
     """Cheaply enumerate this PR's prior Actions runs so history reads can be
     PR-targeted instead of repo-wide: the PR's head branch narrows the run
     list, and the silo/GitHub artifact filters drop everything that is not a
     gate terminal record. One page (newest first) is enough because
-    MAX_TARGETED_HISTORY_RUNS already caps the consumed set at 50."""
+    MAX_TARGETED_HISTORY_RUNS already caps the consumed set at 50.
+
+    Returns None instead of a partial list whenever the run list is known to
+    be incomplete — the API reports more runs than this page holds
+    (total_count, or a full page when total_count is absent), or the list
+    exceeds MAX_TARGETED_HISTORY_RUNS. INV-A4: a history that cannot be fully
+    listed must degrade to history_unavailable, never to a smaller count.
+    `event=pull_request` matches the only trigger the Required Gate caller
+    template declares (terminal records exist for pull_request runs only) and
+    keeps unrelated branch runs from triggering the truncation path.
+    """
     pull = _github_json(token=token, url=f"https://api.github.com/repos/{repository}/pulls/{pr_number}")
     if not isinstance(pull, dict) or not isinstance(pull.get("head"), dict):
         raise ValueError("PR response has an invalid shape")
@@ -2508,18 +2518,24 @@ def _pr_target_run_ids(*, token: str, repository: str, pr_number: int) -> list[i
         token=token,
         url=(
             f"https://api.github.com/repos/{repository}/actions/runs"
-            f"?branch={urllib.parse.quote(head_ref, safe='')}&per_page=100"
+            f"?event=pull_request&branch={urllib.parse.quote(head_ref, safe='')}&per_page=100"
         ),
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("workflow_runs"), list):
         raise ValueError("Actions runs response has an invalid shape")
+    workflow_runs = payload["workflow_runs"]
+    total_count = payload.get("total_count")
+    if isinstance(total_count, int) and total_count > len(workflow_runs):
+        return None
+    if not isinstance(total_count, int) and len(workflow_runs) >= 100:
+        return None
     run_ids = [
-        run["id"] for run in payload["workflow_runs"]
+        run["id"] for run in workflow_runs
         if isinstance(run, dict) and _is_strict_int(run.get("id")) and run["id"] > 0
     ]
     unique_run_ids = list(dict.fromkeys(run_ids))
     if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
-        unique_run_ids = unique_run_ids[:MAX_TARGETED_HISTORY_RUNS]
+        return None
     return unique_run_ids
 
 
@@ -2566,6 +2582,13 @@ def _load_pr_convergence_history(
         except Exception as exc:
             print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
             history.incomplete_reasons.append(f"GitHub run targeting unavailable: {type(exc).__name__}")
+            return "history_unavailable", (), history
+        if target_run_ids is None:
+            # INV-A4: a truncated run list must never shrink to a partial count.
+            print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_truncated")
+            history.incomplete_reasons.append(
+                "history truncated: this PR's branch has more pull_request runs than one page or the targeted cap"
+            )
             return "history_unavailable", (), history
         try:
             history = _fetch_silo_terminal_history(

@@ -3981,25 +3981,92 @@ def test_pr_target_run_ids_narrows_to_pr_branch(monkeypatch):
         urls.append(url)
         if "/pulls/42" in url:
             return {"head": {"ref": "feature/分支"}}
-        return {"workflow_runs": [{"id": 7}, {"id": 3}, {"id": 7}, {"id": "bad"}, {"id": 0}, {}]}
+        return {"total_count": 2, "workflow_runs": [{"id": 7}, {"id": 3}, {"id": 7}, {"id": "bad"}, {"id": 0}, {}]}
 
     monkeypatch.setattr(AGG, "_github_json", fake_github_json)
     run_ids = AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42)
     assert run_ids == [7, 3]
     assert sum("/pulls/42" in url for url in urls) == 1
     assert any("branch=feature%2F%E5%88%86%E6%94%AF" in url for url in urls)
+    # terminal 记录只由 pull_request 触发的 gate run 产生（caller 模板 on: 仅
+    # pull_request），过滤掉 push/dispatch 类 run 既降噪又降低截断概率。
+    assert any("event=pull_request" in url for url in urls)
 
 
-def test_pr_target_run_ids_caps_at_targeted_history_run_limit(monkeypatch):
+def test_pr_target_run_ids_returns_none_when_more_runs_than_one_page(monkeypatch):
     def fake_github_json(*, token, url):
         if "/pulls/42" in url:
             return {"head": {"ref": "main"}}
-        return {"workflow_runs": [{"id": run_id} for run_id in range(1000, 1000 + 60)]}
+        return {
+            "total_count": 150,
+            "workflow_runs": [{"id": run_id} for run_id in range(2000, 2000 + 100)],
+        }
 
     monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    run_ids = AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42)
-    assert len(run_ids) == AGG.MAX_TARGETED_HISTORY_RUNS
-    assert run_ids == list(range(1000, 1000 + AGG.MAX_TARGETED_HISTORY_RUNS))
+    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
+
+
+def test_pr_target_run_ids_returns_none_when_page_full_without_total_count(monkeypatch):
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "main"}}
+        return {"workflow_runs": [{"id": run_id} for run_id in range(2000, 2000 + 100)]}
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
+
+
+def test_pr_target_run_ids_returns_none_when_targeted_cap_reached(monkeypatch):
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "main"}}
+        return {
+            "total_count": 60,
+            "workflow_runs": [{"id": run_id} for run_id in range(1000, 1000 + 60)],
+        }
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
+
+
+def test_history_loader_run_list_truncation_is_history_unavailable(monkeypatch, capsys):
+    """F1 / INV-A4 锁：runs 列表截断（total_count 超过本页，或超过定向 cap）时
+    不得返回部分列表少算 eligible_rounds，必须整体判 history_unavailable 且打
+    reason=history_truncated。红验：去掉 `_pr_target_run_ids` 的截断判定后，
+    本测试必须以断言失败转红（打桩无 sleep，不存在挂起）。"""
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "card/long-lived"}}
+        return {
+            "total_count": 150,
+            "workflow_runs": [{"id": run_id} for run_id in range(3000, 3000 + 100)],
+        }
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    silo_calls = []
+
+    def fake_silo(**kwargs):
+        silo_calls.append(kwargs)
+        return AGG.HistoryLoad()
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", fake_silo)
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["no terminal artifact matched run 3000"],
+        ),
+    )
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert silo_calls == []
+    assert history.incomplete_reasons == [
+        "history truncated: this PR's branch has more pull_request runs than one page or the targeted cap"
+    ]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_truncated" in capsys.readouterr().out
 
 
 def test_fetch_silo_terminal_history_downloads_only_targeted_runs(monkeypatch):
