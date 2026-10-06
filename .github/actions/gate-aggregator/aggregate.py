@@ -163,6 +163,7 @@ PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
 CONVERGENCE_ENVELOPE_SCHEMA_VERSION = 1
 CONVERGENCE_ENVELOPE_KIND = "gate_convergence_round"
+TERMINAL_HISTORY_CACHE_SCHEMA_VERSION = 1
 GITHUB_API_TIMEOUT_SECONDS = 15
 DEFAULT_PUBLISH_BUDGET_SECONDS = 120
 PUBLISH_BUDGET_ENV = "GATE_PUBLISH_BUDGET_SECONDS"
@@ -2081,6 +2082,19 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")
     audit = record.get("audit")
+    shadow = record.get("convergence_shadow")
+    eligible_primary_round = (
+        isinstance(audit, dict)
+        and audit.get("available") is True
+        and record.get("primary_result") in ("success", "failure")
+        and record["gate_result"] in ("pass", "fail")
+    )
+    if shadow is not None:
+        if not isinstance(shadow, dict):
+            raise ValueError("gate terminal convergence_shadow is not an object")
+        if type(shadow.get("eligible_this_round")) is not bool:
+            raise ValueError("gate terminal convergence eligibility is invalid")
+        eligible_primary_round = shadow["eligible_this_round"]
     row = {
         "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
         "repository": repository,
@@ -2090,17 +2104,9 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "gate_result": record["gate_result"],
         "classification": record["classification"],
         "reason_code": record["reason_code"],
-        "_eligible_primary_round": (
-            isinstance(audit, dict)
-            and audit.get("available") is True
-            and record.get("primary_result") in ("success", "failure")
-            and record["gate_result"] in ("pass", "fail")
-        ),
+        "_eligible_primary_round": eligible_primary_round,
     }
-    shadow = record.get("convergence_shadow")
     if shadow is not None:
-        if not isinstance(shadow, dict):
-            raise ValueError("gate terminal convergence_shadow is not an object")
         history_status = shadow.get("history_status")
         decision = shadow.get("terminal_decision")
         if history_status not in ("available", "history_unavailable"):
@@ -2109,8 +2115,6 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
             raise ValueError("gate terminal convergence terminal_decision is invalid")
         if type(shadow.get("limit")) is not int or shadow["limit"] <= 0:
             raise ValueError("gate terminal convergence limit is invalid")
-        if type(shadow.get("eligible_this_round")) is not bool:
-            raise ValueError("gate terminal convergence eligibility is invalid")
         projected_shadow = {
             "history_status": history_status,
             "terminal_decision": decision,
@@ -2347,7 +2351,6 @@ def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         check=False,
-        timeout=GITHUB_API_TIMEOUT_SECONDS,
     )
 
 
@@ -2438,21 +2441,24 @@ def _fetch_silo_terminal_history(
 
 def _load_pr_convergence_history(
     *, repository: str, repository_id: int, pr_number: int,
-) -> tuple[str, tuple[int, ...]]:
-    """Load the PR's d30 terminal history for the shadow-only round count."""
+) -> tuple[str, tuple[int, ...], HistoryLoad]:
+    """Load d30 terminal history once for both shadow count and panel cache."""
+    history = HistoryLoad()
     if not _silo_configured():
         print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured")
-        return "history_unavailable", ()
+        history.incomplete_reasons.append("Silo terminal history unavailable: not configured")
+        return "history_unavailable", (), history
     try:
         history = _fetch_silo_terminal_history(
             repository=repository, repository_id=repository_id, pr_number=pr_number,
         )
     except Exception as exc:
         print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
-        return "history_unavailable", ()
+        history.incomplete_reasons.append(f"Silo terminal history unavailable: {type(exc).__name__}")
+        return "history_unavailable", (), history
     if history.incomplete_reasons:
         print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history")
-        return "history_unavailable", ()
+        return "history_unavailable", (), history
     if not history.rows:
         try:
             github_history = _fetch_github_terminal_history(
@@ -2463,21 +2469,58 @@ def _load_pr_convergence_history(
             )
         except Exception as exc:
             print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
-            return "history_unavailable", ()
+            history.incomplete_reasons.append(f"GitHub terminal history unavailable: {type(exc).__name__}")
+            return "history_unavailable", (), history
         if github_history.rows:
             print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_empty_but_github_has_terminal_history")
-            return "history_unavailable", ()
+            history.incomplete_reasons.append("Silo empty but GitHub has terminal history")
+            return "history_unavailable", (), history
         unexpected_reasons = [
             reason for reason in github_history.incomplete_reasons
             if not reason.startswith("no terminal artifact matched gate-terminal-v1-")
         ]
         if unexpected_reasons:
             print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_history_incomplete")
-            return "history_unavailable", ()
+            history.incomplete_reasons.append("GitHub terminal history incomplete")
+            return "history_unavailable", (), history
     return "available", tuple(
         row["run_id"] for row in history.rows
         if row.get("_eligible_primary_round") is True
-    )
+    ), history
+
+
+def _terminal_history_cache_path(terminal_path: str | Path) -> Path:
+    target = Path(terminal_path)
+    return target.with_name(target.name + ".history.json")
+
+
+def _write_terminal_history_cache(terminal_path: str | Path, history: HistoryLoad) -> None:
+    payload = {
+        "schema_version": TERMINAL_HISTORY_CACHE_SCHEMA_VERSION,
+        "rows": history.rows,
+        "skipped_records": history.skipped_records,
+        "incomplete_reasons": history.incomplete_reasons,
+    }
+    target = _terminal_history_cache_path(terminal_path)
+    temporary_path = target.with_name(f".{target.name}.tmp")
+    temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(target)
+
+
+def _read_terminal_history_cache(path: str | Path) -> HistoryLoad:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] != TERMINAL_HISTORY_CACHE_SCHEMA_VERSION:
+        raise ValueError("terminal history cache has an unsupported schema")
+    rows = payload.get("rows")
+    skipped_records = payload.get("skipped_records")
+    incomplete_reasons = payload.get("incomplete_reasons")
+    if (
+        not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+        or not isinstance(skipped_records, list) or any(not isinstance(row, dict) for row in skipped_records)
+        or not isinstance(incomplete_reasons, list) or any(not isinstance(reason, str) for reason in incomplete_reasons)
+    ):
+        raise ValueError("terminal history cache has an invalid payload")
+    return HistoryLoad(rows=rows, skipped_records=skipped_records, incomplete_reasons=incomplete_reasons)
 
 
 def _merge_history_loads(github: HistoryLoad, silo: HistoryLoad) -> HistoryLoad:
@@ -2496,6 +2539,7 @@ def _merge_history_loads(github: HistoryLoad, silo: HistoryLoad) -> HistoryLoad:
 def _fetch_terminal_history(
     *, token: str, repository: str, repository_id: int, pr_number: int,
     target_run_ids: Optional[list[int]] = None,
+    silo_history: Optional[HistoryLoad] = None,
 ) -> HistoryLoad:
     github = HistoryLoad()
     try:
@@ -2509,8 +2553,8 @@ def _fetch_terminal_history(
         github = HistoryLoad(
             incomplete_reasons=[f"GitHub terminal history unavailable: {type(exc).__name__}"],
         )
-    silo = HistoryLoad()
-    if _silo_configured():
+    silo = silo_history if silo_history is not None else HistoryLoad()
+    if silo_history is None and _silo_configured():
         try:
             silo = _fetch_silo_terminal_history(
                 repository=repository, repository_id=repository_id,
@@ -2819,6 +2863,7 @@ def _publish_panel_patch(
 def _post_status_panel_fail_open_with_budget(
     *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
     pr_number: Optional[int], identity: Optional[Identity], budget: _PublishBudget,
+    silo_history: Optional[HistoryLoad] = None,
 ) -> tuple[str, dict[str, Any]]:
     """Publish the one marker-located status panel without affecting verdict."""
     body = scrub_for_publish(
@@ -2875,6 +2920,7 @@ def _post_status_panel_fail_open_with_budget(
             history = _fetch_terminal_history(
                 token=token, repository=repository, repository_id=repository_id or 0,
                 pr_number=pr_number, target_run_ids=target_run_ids,
+                silo_history=silo_history,
             )
             budget.complete("HISTORY_RECONSTRUCTION")
         except _PublishBudgetExhausted:
@@ -3052,6 +3098,7 @@ def _post_status_panel_fail_open_with_budget(
 def _post_status_panel_fail_open(
     *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
     pr_number: Optional[int], identity: Optional[Identity],
+    silo_history: Optional[HistoryLoad] = None,
 ) -> tuple[str, dict[str, Any]]:
     body = render_status_panel([current])
     try:
@@ -3070,6 +3117,7 @@ def _post_status_panel_fail_open(
         return _post_status_panel_fail_open_with_budget(
             current=current, repository=repository, repository_id=repository_id,
             pr_number=pr_number, identity=identity, budget=budget,
+            silo_history=silo_history,
         )
     finally:
         _ACTIVE_PUBLISH_BUDGET.reset(token)
@@ -3150,11 +3198,22 @@ def _publish_only(args: argparse.Namespace) -> int:
         pr=args.pr_number,
     )
     current: dict[str, Any]
+    silo_history: Optional[HistoryLoad] = None
     try:
         if not args.terminal_path:
             raise ValueError("terminal path is missing")
         record = json.loads(Path(args.terminal_path).read_text(encoding="utf-8"))
         current = _terminal_row(record, repository=args.repository, repository_id=args.repository_id, pr_number=args.pr_number)
+        history_cache_path = _terminal_history_cache_path(args.terminal_path)
+        if history_cache_path.is_file():
+            try:
+                silo_history = _read_terminal_history_cache(history_cache_path)
+            except (OSError, ValueError) as exc:
+                print(f"GATE-CONVERGENCE-HISTORY-CACHE-UNAVAILABLE reason={type(exc).__name__}")
+                silo_history = HistoryLoad(incomplete_reasons=["terminal history cache unavailable"])
+        elif record.get("convergence_shadow") is not None:
+            print("GATE-CONVERGENCE-HISTORY-CACHE-UNAVAILABLE reason=missing")
+            silo_history = HistoryLoad(incomplete_reasons=["terminal history cache missing"])
     except Exception as exc:
         current = _panel_current_row(
             outcome=Outcome(ok=False, classification="integration_error", reason_code="audit_invalid", gate_result="unavailable"),
@@ -3184,7 +3243,7 @@ def _publish_only(args: argparse.Namespace) -> int:
             current["primary_audit"] = primary_audit
         body, receipt = _post_status_panel_fail_open(
             current=current, repository=args.repository, repository_id=args.repository_id,
-            pr_number=args.pr_number, identity=identity,
+            pr_number=args.pr_number, identity=identity, silo_history=silo_history,
         )
     _append_panel_diagnostic(args.summary_path, receipt)
     if args.panel_delivery_path:
@@ -3448,12 +3507,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     waiver_receipts: tuple[Any, ...] = ()
     prior_eligible_run_ids: tuple[int, ...] = ()
     convergence_history_status = "history_unavailable"
+    silo_terminal_history: Optional[HistoryLoad] = None
     if scope is not None:
-        convergence_history_status, prior_eligible_run_ids = _load_pr_convergence_history(
+        convergence_history_status, prior_eligible_run_ids, silo_terminal_history = _load_pr_convergence_history(
             repository=args.repository,
             repository_id=identity.repository_id,
             pr_number=identity.pr,
         )
+        if args.terminal_path:
+            try:
+                _write_terminal_history_cache(args.terminal_path, silo_terminal_history)
+            except OSError as exc:
+                print(f"GATE-CONVERGENCE-HISTORY-CACHE-UNAVAILABLE reason={type(exc).__name__}")
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token and scope is not None and not (is_draft and args.primary_result == "skipped"):
         try:

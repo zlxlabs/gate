@@ -33,6 +33,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 ABANDONED_FIXTURE = ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
+CONVERGENCE_HISTORY_FIXTURE = ROOT / "tests" / "fixtures" / "convergence_history" / "gate-hub-pr-928.json"
 
 
 def _module():
@@ -3790,9 +3791,11 @@ def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_obje
 
 def test_convergence_history_without_silo_configuration_is_greppable(monkeypatch, capsys):
     monkeypatch.setattr(AGG, "_silo_configured", lambda: False)
-    assert AGG._load_pr_convergence_history(
+    status, run_ids, history = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    ) == ("history_unavailable", ())
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["Silo terminal history unavailable: not configured"]
     assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured" in capsys.readouterr().out
 
 
@@ -3808,10 +3811,11 @@ def test_convergence_history_silo_failure_is_greppable_and_unavailable(monkeypat
         raise error
 
     monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", fail_listing)
-    status, run_ids = AGG._load_pr_convergence_history(
+    status, run_ids, history = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
     )
     assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == [f"Silo terminal history unavailable: {type(error).__name__}"]
     assert f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(error).__name__}" in capsys.readouterr().out
 
 
@@ -3826,10 +3830,11 @@ def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavail
         AGG, "_fetch_github_terminal_history",
         lambda **kwargs: AGG.HistoryLoad(rows=[prior]),
     )
-    status, run_ids = AGG._load_pr_convergence_history(
+    status, run_ids, history = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
     )
     assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["Silo empty but GitHub has terminal history"]
     assert "silo_empty_but_github_has_terminal_history" in capsys.readouterr().out
 
 
@@ -3839,10 +3844,11 @@ def test_convergence_history_malformed_silo_terminal_is_unavailable(monkeypatch,
         AGG, "_silo_objects_under",
         lambda prefix: [(_CANARY_TERMINAL_KEY, b"{")],
     )
-    status, run_ids = AGG._load_pr_convergence_history(
+    status, run_ids, history = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
     )
     assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons
     assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history" in capsys.readouterr().out
 
 
@@ -3855,22 +3861,124 @@ def test_convergence_history_empty_first_run_is_available_zero(monkeypatch):
             incomplete_reasons=["no terminal artifact matched gate-terminal-v1-1327629472-"],
         ),
     )
-    assert AGG._load_pr_convergence_history(
+    status, run_ids, history = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    ) == ("available", ())
+    )
+    assert (status, run_ids, history.rows, history.incomplete_reasons) == ("available", (), [], [])
 
 
-def test_silo_terminal_history_projects_eligible_primary_rounds(monkeypatch):
+def _real_convergence_history_silo_objects():
+    fixture = json.loads(CONVERGENCE_HISTORY_FIXTURE.read_text(encoding="utf-8"))
+    objects = [
+        (key, json.dumps(record, sort_keys=True).encode("utf-8"))
+        for key, record in zip(fixture["source_keys"], fixture["terminal_envelopes"], strict=True)
+    ]
+    return fixture, objects
+
+
+def test_real_silo_d30_terminal_fixture_drives_terminal_row_and_history_loader(monkeypatch):
+    fixture, objects = _real_convergence_history_silo_objects()
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    raw = _canary_terminal_bytes()
+    monkeypatch.setattr(AGG, "_silo_objects_under", lambda prefix: objects)
+    rows = [
+        AGG._terminal_row(
+            record, repository=fixture["repository"], repository_id=fixture["repository_id"],
+            pr_number=fixture["pr_number"],
+        )
+        for record in fixture["terminal_envelopes"]
+    ]
+    status, run_ids, _history = AGG._load_pr_convergence_history(
+        repository=fixture["repository"], repository_id=fixture["repository_id"],
+        pr_number=fixture["pr_number"],
+    )
+    assert len(fixture["source_keys"]) >= 2
+    assert all("findings" not in record and "result" not in record for record in fixture["terminal_envelopes"])
+    assert all(row["_eligible_primary_round"] is True for row in rows)
+    assert (status, run_ids) == ("available", (35424466527, 35423752741))
+
+
+def test_mixed_legacy_and_new_terminal_history_prefers_explicit_eligibility(monkeypatch):
+    fixture, objects = _real_convergence_history_silo_objects()
+    new_terminal = dict(fixture["terminal_envelopes"][0])
+    new_terminal.update({
+        "run_id": 35429999999,
+        "head_sha": "f" * 40,
+        "convergence_shadow": {
+            "history_status": "available",
+            "eligible_rounds": 1,
+            "limit": 8,
+            "terminal_decision": "collecting",
+            "eligible_this_round": False,
+        },
+    })
+    new_name = (
+        f"gate-terminal-v1-{fixture['repository_id']}-{new_terminal['head_sha']}-"
+        f"{new_terminal['run_id']}-{new_terminal['run_attempt']}"
+    )
+    objects.append((
+        f"d30/{fixture['repository_id']}/{new_name}/gate-terminal.json",
+        json.dumps(new_terminal, sort_keys=True).encode("utf-8"),
+    ))
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(AGG, "_silo_objects_under", lambda prefix: objects)
+    status, run_ids, _history = AGG._load_pr_convergence_history(
+        repository=fixture["repository"], repository_id=fixture["repository_id"],
+        pr_number=fixture["pr_number"],
+    )
+    assert (status, run_ids) == ("available", (35424466527, 35423752741))
+
+
+def test_one_gate_run_lists_terminal_silo_prefix_once_and_panel_reuses_cache(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_scoped_primary_record()))
+    terminal_path = tmp_path / "gate-terminal.json"
+    summary_path = tmp_path / "summary.md"
+    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.setattr(
-        AGG, "_silo_objects_under",
-        lambda prefix: [(_CANARY_TERMINAL_KEY, raw)],
+        AGG, "load_previous_round_findings",
+        lambda **kwargs: {"available": False, "detail": "fixture", "findings": []},
     )
-    status, run_ids = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["no terminal artifact matched gate-terminal-v1-123-"],
+        ),
     )
-    assert (status, run_ids) == ("available", (_CANARY_RUN_ID,))
+    terminal_prefix_calls = []
+
+    def fake_silo_cli(argv):
+        prefix = argv[argv.index("--prefix") + 1]
+        if prefix.startswith("d30/123/gate-terminal-v1-123-"):
+            terminal_prefix_calls.append(prefix)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
+    cache_path = AGG._terminal_history_cache_path(terminal_path)
+    cache_bytes = cache_path.read_bytes()
+    assert cache_bytes.endswith(b"\n")
+    assert json.loads(cache_bytes) == {
+        "schema_version": AGG.TERMINAL_HISTORY_CACHE_SCHEMA_VERSION,
+        "rows": [],
+        "skipped_records": [],
+        "incomplete_reasons": [],
+    }
+
+    received = {}
+
+    def fake_panel_publish(**kwargs):
+        received["history"] = kwargs["silo_history"]
+        return "", {"delivery": "not_created", "reason_code": "test", "history_error": None}
+
+    monkeypatch.setattr(AGG, "_post_status_panel_fail_open", fake_panel_publish)
+    publish_args = _cli_args(audit_dir, summary_path, terminal_path=str(terminal_path)) + ["--publish-only"]
+    assert AGG.main(publish_args) == 0
+    assert isinstance(received["history"], AGG.HistoryLoad)
+    assert received["history"].rows == []
+    assert terminal_prefix_calls == ["d30/123/gate-terminal-v1-123-"]
 
 
 def _canary_receipt(reason="locked upstream behavior", finding_id="p1"):
@@ -4154,7 +4262,7 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
 
 def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
     # 跨进程边界断言：聚合器实际发出的 argv 必须是 [解释器, 仓内脚本, ...]，
-    # 不得出现 uv/uvx/pip/npx。捕获真实 argv（不执行），本机有无 uv 结果一致。
+    # 不得出现 uv/uvx/pip/npx。Silo CLI 不加全局 timeout，避免截断历史扫描和旧 ledger 消费者。
     recorded = []
 
     class _Proc:
@@ -4163,14 +4271,15 @@ def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
         stderr = ""
 
     def fake_run(argv, **kwargs):
-        recorded.append(list(argv))
+        recorded.append((list(argv), kwargs.copy()))
         return _Proc()
 
     monkeypatch.setattr(AGG.subprocess, "run", fake_run)
     monkeypatch.setenv("SILO_STORE", "/tmp/fake-silo-store.py")
     AGG._silo_cli(["list", "--prefix", "d30/1/"])
     assert len(recorded) == 1
-    argv = recorded[0]
+    argv, kwargs = recorded[0]
+    assert "timeout" not in kwargs
     assert argv[0] == sys.executable
     assert argv[1] == "/tmp/fake-silo-store.py"
     assert argv[2:] == ["list", "--prefix", "d30/1/"]
