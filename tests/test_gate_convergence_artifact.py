@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -972,3 +973,61 @@ def test_receipt_source_attempt_artifact_and_epoch_guards_fail_closed_together()
         CONV.validate_receipt(replace(receipt, artifact_name=receipt.artifact_id, artifact_id="other"), SCOPE)
     with pytest.raises(CONV.ReceiptValidationError):
         CONV.validate_receipt(replace(receipt, epoch="0" * 64), SCOPE)
+
+
+def _terminal_record(run_id):
+    return json.dumps({
+        "schema_version": 1,
+        "kind": "gate_terminal",
+        "repository": "zlxlabs/gate",
+        "repository_id": 123,
+        "pr_number": 42,
+        "run_id": run_id,
+        "run_attempt": 1,
+        "head_sha": "a" * 40,
+        "gate_result": "pass",
+        "primary_result": "success",
+        "audit": {"available": True, "source_attempt": 1, "artifact_name": "primary-audit-v2-x"},
+        "classification": "code_pass",
+        "reason_code": "primary_pass",
+    }).encode()
+
+
+def test_history_budget_exhaustion_is_greppable_and_bounded(monkeypatch, capsys):
+    """gate#290 回滚的根因锁：`_load_pr_convergence_history` 的 Silo 读取与
+    GitHub 回退共享一个 HISTORY_RECONSTRUCTION 墙钟预算（此处压到 1 秒），
+    预算耗尽必须快速判 `history_unavailable` 并打出可 grep 的
+    reason=history_budget_exhausted，绝不允许无界扫描拖死汇总 job。
+    红验方式：去掉 `_fetch_silo_terminal_history` 里 `silo_timeout()` 的
+    deadline 检查后，本测试必须以断言失败转红（打桩为可控 sleep，不存在挂起）。"""
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS", "1")
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [101, 102, 103])
+    keys = [
+        f"d30/123/gate-terminal-v1-123-{'a' * 40}-{run_id}-1/gate-terminal.json"
+        for run_id in (101, 102, 103)
+    ]
+
+    def slow_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key in keys), stderr="",
+            )
+        time.sleep(0.6)
+        name = argv[argv.index("--key") + 1].split("/")[2]
+        run_id = int(name.rsplit("-", 2)[-2])
+        Path(argv[argv.index("--dest") + 1]).write_bytes(_terminal_record(run_id))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", slow_silo_cli)
+    started = time.monotonic()
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=123, pr_number=42,
+    )
+    elapsed = time.monotonic() - started
+    output = capsys.readouterr().out
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["history budget exhausted"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_budget_exhausted" in output
+    assert elapsed < 5

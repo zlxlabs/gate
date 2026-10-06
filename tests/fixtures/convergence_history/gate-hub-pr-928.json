@@ -1,0 +1,46 @@
+{
+  "source": "Silo d30 gate terminal history; whitelist projection",
+  "repository": "zlxlabs/gate-hub",
+  "repository_id": 1293158679,
+  "pr_number": 928,
+  "terminal_envelopes": [
+    {
+      "schema_version": 1,
+      "kind": "gate_terminal",
+      "repository": "zlxlabs/gate-hub",
+      "repository_id": 1293158679,
+      "pr_number": 928,
+      "run_id": 35424466527,
+      "run_attempt": 1,
+      "head_sha": "dc438916c86710b70f23239de05d4b8236ffaeb7",
+      "primary_result": "success",
+      "gate_result": "pass",
+      "classification": "code_pass",
+      "reason_code": "primary_pass",
+      "audit": {
+        "available": true
+      }
+    },
+    {
+      "schema_version": 1,
+      "kind": "gate_terminal",
+      "repository": "zlxlabs/gate-hub",
+      "repository_id": 1293158679,
+      "pr_number": 928,
+      "run_id": 35423752741,
+      "run_attempt": 1,
+      "head_sha": "69073ddffc3e03ca535b89aa35c8a521fac739a6",
+      "primary_result": "failure",
+      "gate_result": "fail",
+      "classification": "code_fail",
+      "reason_code": "primary_findings",
+      "audit": {
+        "available": true
+      }
+    }
+  ],
+  "source_keys": [
+    "d30/1293158679/gate-terminal-v1-1293158679-dc438916c86710b70f23239de05d4b8236ffaeb7-35424466527-1/gate-terminal.json",
+    "d30/1293158679/gate-terminal-v1-1293158679-69073ddffc3e03ca535b89aa35c8a521fac739a6-35423752741-1/gate-terminal.json"
+  ]
+}

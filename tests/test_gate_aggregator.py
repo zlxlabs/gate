@@ -33,6 +33,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 ABANDONED_FIXTURE = ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
+CONVERGENCE_HISTORY_FIXTURE = ROOT / "tests" / "fixtures" / "convergence_history" / "gate-hub-pr-928.json"
 
 
 def _module():
@@ -1199,6 +1200,42 @@ def test_terminal_envelope_bytes_unchanged_by_rendering_work():
     assert json.dumps(envelope, ensure_ascii=False, indent=2) + "\n" == _TERMINAL_GOLDEN
 
 
+def test_terminal_envelope_publishes_shadow_budget_bytes_without_changing_gate_result(tmp_path):
+    audit = _valid_scoped_primary_record()
+    terminal_path = tmp_path / "gate-terminal.json"
+    summary_path = tmp_path / "summary.md"
+    outcome = AGG.evaluate(
+        **_base_kwargs(
+            primary_result="success", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A,
+        ),
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    assert AGG._finish(
+        outcome, str(summary_path), terminal_path=str(terminal_path),
+        repository="zlxlabs/gate", identity=IDENTITY,
+        quality_result="success", primary_result="success", review_expected=True,
+        is_draft=False, runner="self", primary_audit=audit,
+    ) == 0
+    published = json.loads(terminal_path.read_bytes())
+    assert published["gate_result"] == "pass"
+    assert published["convergence_shadow"] == {
+        "history_status": "available",
+        "eligible_rounds": 5,
+        "limit": 5,
+        "terminal_decision": "arbitration_required",
+        "eligible_this_round": True,
+    }
+    summary = summary_path.read_text()
+    assert "5/5" in summary and "arbitration_required" in summary
+    row = AGG._terminal_row(
+        published, repository="zlxlabs/gate", repository_id=IDENTITY.repository_id,
+        pr_number=IDENTITY.pr,
+    )
+    panel = AGG.render_status_panel([row])
+    assert "5/5 · arbitration_required" in panel
+
+
 def _visible_scenario(tmp_path, overrides, audit_record="__default__"):
     audit_dir = tmp_path / "audit"
     if audit_record is not None:
@@ -1910,7 +1947,7 @@ def test_publish_only_consumes_the_real_terminal_producer_fixture_after_upload(m
 def test_publish_only_subprocess_writes_additive_delivery_receipt_bytes(monkeypatch, tmp_path):
     # Captured from base 85916ed's real _build_panel_delivery producer for this terminal row.
     old_receipt = {
-        "comment_body_sha256": "4762e9457a159bd48c303106f4194e3cf07ce65d49ab675f8b72388dab1ff0cd",
+        "comment_body_sha256": "e1eec6dfd3e6568367e09430ba0d4fd4f24924429ecfbe977fe448d6766cf370",
         "comment_created": True, "comment_expected": True,
         "completed_operations": ["IDENTITY", "COMMENT_LOOKUP", "HISTORY_RECONSTRUCTION", "COMMENT_PUBLISH", "POST_VERIFY"],
         "delivery": "created", "error_category": None, "head_sha": "a" * 40,
@@ -1982,11 +2019,15 @@ def test_publish_only_subprocess_writes_additive_delivery_receipt_bytes(monkeypa
         silo_store.write_text(
             "import pathlib, sys\n"
             "args = sys.argv[1:]\n"
-            "dest = pathlib.Path(args[args.index('--dest') + 1])\n"
             f"key = {key!r}\n"
-            "target = dest / key.split('/')[2] / key.split('/', 3)[3]\n"
-            "target.parent.mkdir(parents=True, exist_ok=True)\n"
-            f"target.write_bytes(pathlib.Path({str(terminal_path)!r}).read_bytes())\n"
+            f"body = pathlib.Path({str(terminal_path)!r}).read_bytes()\n"
+            "if args[0] == 'get':\n"
+            "    pathlib.Path(args[args.index('--dest') + 1]).write_bytes(body)\n"
+            "elif '--dest' in args:\n"
+            "    dest = pathlib.Path(args[args.index('--dest') + 1])\n"
+            "    target = dest / key.split('/')[2] / key.split('/', 3)[3]\n"
+            "    target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    target.write_bytes(body)\n"
             "print(key)\n",
             encoding="utf-8",
         )
@@ -3124,6 +3165,116 @@ def test_canonical_p1_projection_accepts_null_line():
     )
 
 
+def test_cross_head_shadow_cap_records_arbitration_without_changing_gate_result():
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    kwargs = _base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A)
+    before = AGG.evaluate(**kwargs)
+    after = AGG.evaluate(
+        **kwargs,
+        prior_eligible_run_ids=(101, 102, 103),
+        convergence_history_status="available",
+    )
+    assert (after.ok, after.classification, after.reason_code, after.gate_result) == (
+        before.ok, before.classification, before.reason_code, before.gate_result,
+    ) == (False, "code_fail", "primary_findings", "fail")
+    assert after.convergence_shadow == {
+        "history_status": "available",
+        "eligible_rounds": 4,
+        "limit": 5,
+        "terminal_decision": "collecting",
+        "eligible_this_round": True,
+    }
+
+
+def test_cross_head_shadow_cap_marks_arbitration_for_current_p1_round():
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    assert outcome.gate_result == "fail"
+    assert outcome.convergence_shadow["eligible_rounds"] == 5
+    assert outcome.convergence_shadow["terminal_decision"] == "arbitration_required"
+
+
+def test_clean_round_at_cross_head_cap_marks_shadow_but_preserves_pass():
+    audit = _valid_scoped_primary_record(
+        verdict="pass", tier="personal", result={"findings": []},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="success", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    assert outcome.gate_result == "pass"
+    assert outcome.convergence_shadow["eligible_rounds"] == 5
+    assert outcome.convergence_shadow["terminal_decision"] == "arbitration_required"
+
+
+def test_unavailable_primary_does_not_increment_cross_head_shadow_count():
+    audit = _valid_scoped_primary_record(
+        verdict="unavailable", tier="personal", result={"findings": []},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, 102),
+        convergence_history_status="available",
+    )
+    assert outcome.gate_result == "unavailable"
+    assert outcome.convergence_shadow["eligible_rounds"] == 2
+    assert outcome.convergence_shadow["eligible_this_round"] is False
+
+
+def test_unavailable_cross_head_history_has_no_zero_count():
+    audit = _valid_scoped_primary_record(
+        verdict="fail", tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(),
+        convergence_history_status="history_unavailable",
+    )
+    assert outcome.gate_result == "fail"
+    assert outcome.convergence_shadow["history_status"] == "history_unavailable"
+    assert "eligible_rounds" not in outcome.convergence_shadow
+
+
+def test_cross_head_shadow_rerun_same_run_attempt_is_idempotent():
+    audit = _valid_scoped_primary_record(
+        verdict="fail", tier="personal",
+        result={"findings": [{
+            "id": "p1", "severity": "major", "trigger_kind": "inferred",
+            "file": "src/lock.py", "line": 12, "category": "correctness",
+        }]},
+    )
+    outcome = AGG.evaluate(
+        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
+        prior_eligible_run_ids=(101, IDENTITY.run_id),
+        convergence_history_status="available",
+    )
+    assert outcome.convergence_shadow["eligible_rounds"] == 2
+    assert outcome.convergence_shadow["eligible_this_round"] is True
+
+
 def test_aggregate_projection_binds_stable_disposition_and_rejects_line_change():
     audit = _valid_scoped_primary_record(
         verdict="fail",
@@ -3606,6 +3757,8 @@ def _canary_terminal_bytes(gate_result="pass", *, run_id=_CANARY_RUN_ID, run_att
         "run_attempt": run_attempt,
         "head_sha": head_sha,
         "gate_result": gate_result,
+        "primary_result": "success" if gate_result == "pass" else "failure",
+        "audit": {"available": True, "source_attempt": 1, "artifact_name": "primary-audit-v2-canary"},
         "classification": "code_pass" if gate_result == "pass" else "code_fail",
         "reason_code": "primary_pass" if gate_result == "pass" else "primary_findings",
     }
@@ -3630,14 +3783,461 @@ def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_obje
     def fake_download(**kwargs):
         return github_blobs[kwargs["url"]]
 
-    def fake_silo(prefix):
+    def fake_silo(prefix, timeout_s):
         if silo_error is not None:
             raise silo_error
         return [(key, body) for key, body in silo_objects if key.startswith(prefix)]
 
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            prefix = argv[2]
+            keys = [key for key, _body in silo_objects if key.startswith(prefix)]
+            if silo_error is not None:
+                raise silo_error
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key in keys), stderr="",
+            )
+        key = argv[argv.index("--key") + 1]
+        body = dict(silo_objects)[key]
+        dest = argv[argv.index("--dest") + 1]
+        Path(dest).write_bytes(body)
+        return subprocess.CompletedProcess(argv, 0, stdout=dest, stderr="")
+
     monkeypatch.setattr(AGG, "_github_json", fake_github_json)
     monkeypatch.setattr(AGG, "_download_terminal_zip", fake_download)
     monkeypatch.setattr(AGG, "_silo_objects_under", fake_silo)
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+
+
+def test_convergence_history_without_silo_configuration_is_greppable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: False)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["Silo terminal history unavailable: not configured"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("Silo list denied"), subprocess.TimeoutExpired(["silo_store.py", "list"], 15)],
+    ids=["listing-error", "listing-timeout"],
+)
+def test_convergence_history_silo_failure_is_greppable_and_unavailable(monkeypatch, capsys, error):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
+
+    def fail_listing(**kwargs):
+        raise error
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", fail_listing)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == [f"Silo terminal history unavailable: {type(error).__name__}"]
+    assert f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(error).__name__}" in capsys.readouterr().out
+
+
+def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavailable(monkeypatch, capsys):
+    prior = AGG._terminal_row(
+        json.loads(_canary_terminal_bytes()),
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [_CANARY_RUN_ID])
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(rows=[prior]),
+    )
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["Silo empty but GitHub has terminal history"]
+    assert "silo_empty_but_github_has_terminal_history" in capsys.readouterr().out
+
+
+def test_convergence_history_malformed_silo_terminal_is_unavailable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [_CANARY_RUN_ID])
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{_CANARY_TERMINAL_KEY}\n", stderr="")
+        Path(argv[argv.index("--dest") + 1]).write_bytes(b"{")
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history" in capsys.readouterr().out
+
+
+def test_convergence_history_empty_first_run_is_available_zero(monkeypatch):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["no terminal artifact matched run 501"],
+        ),
+    )
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids, history.rows, history.incomplete_reasons) == ("available", (), [], [])
+
+
+def test_history_loader_without_token_fails_fast_before_silo_scan(monkeypatch, capsys):
+    # gate#290 教训：没有 token 就无法按 PR 定向，无定向的 Silo/GitHub 全仓
+    # 下载正是拖垮汇总 job 的路径，必须 fail-fast 而不是退回全仓扫描。
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    def must_not_run(**kwargs):
+        raise AssertionError("untargeted silo scan must not run without a token")
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", must_not_run)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["history loader needs GITHUB_TOKEN to target this PR's runs"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_token_missing" in capsys.readouterr().out
+
+
+def test_history_loader_run_targeting_failure_is_greppable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+
+    def fail_targeting(**kwargs):
+        raise ValueError("Actions runs response has an invalid shape")
+
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", fail_targeting)
+
+    def must_not_run(**kwargs):
+        raise AssertionError("silo scan must not run when targeting failed")
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", must_not_run)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["GitHub run targeting unavailable: ValueError"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=ValueError" in capsys.readouterr().out
+
+
+def test_history_loader_silo_empty_with_no_targeted_runs_skips_github_fallback(monkeypatch):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+
+    def must_not_run(**kwargs):
+        raise AssertionError("fallback must not run without targeted runs")
+
+    monkeypatch.setattr(AGG, "_fetch_github_terminal_history", must_not_run)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids, history.rows, history.incomplete_reasons) == ("available", (), [], [])
+
+
+def test_history_loader_budget_exhaustion_in_github_fallback_is_greppable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["history budget exhausted during targeted scan"],
+        ),
+    )
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["history budget exhausted"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_budget_exhausted" in capsys.readouterr().out
+
+
+def test_pr_target_run_ids_narrows_to_pr_branch(monkeypatch):
+    urls = []
+
+    def fake_github_json(*, token, url):
+        urls.append(url)
+        if "/pulls/42" in url:
+            return {"head": {"ref": "feature/分支"}}
+        return {"total_count": 2, "workflow_runs": [{"id": 7}, {"id": 3}, {"id": 7}, {"id": "bad"}, {"id": 0}, {}]}
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    run_ids = AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42)
+    assert run_ids == [7, 3]
+    assert sum("/pulls/42" in url for url in urls) == 1
+    assert any("branch=feature%2F%E5%88%86%E6%94%AF" in url for url in urls)
+    # terminal 记录只由 pull_request 触发的 gate run 产生（caller 模板 on: 仅
+    # pull_request），过滤掉 push/dispatch 类 run 既降噪又降低截断概率。
+    assert any("event=pull_request" in url for url in urls)
+
+
+def test_pr_target_run_ids_returns_none_when_more_runs_than_one_page(monkeypatch):
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "main"}}
+        return {
+            "total_count": 150,
+            "workflow_runs": [{"id": run_id} for run_id in range(2000, 2000 + 100)],
+        }
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
+
+
+def test_pr_target_run_ids_returns_none_when_page_full_without_total_count(monkeypatch):
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "main"}}
+        return {"workflow_runs": [{"id": run_id} for run_id in range(2000, 2000 + 100)]}
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
+
+
+def test_pr_target_run_ids_returns_none_when_targeted_cap_reached(monkeypatch):
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "main"}}
+        return {
+            "total_count": 60,
+            "workflow_runs": [{"id": run_id} for run_id in range(1000, 1000 + 60)],
+        }
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
+
+
+def test_history_loader_run_list_truncation_is_history_unavailable(monkeypatch, capsys):
+    """F1 / INV-A4 锁：runs 列表截断（total_count 超过本页，或超过定向 cap）时
+    不得返回部分列表少算 eligible_rounds，必须整体判 history_unavailable 且打
+    reason=history_truncated。红验：去掉 `_pr_target_run_ids` 的截断判定后，
+    本测试必须以断言失败转红（打桩无 sleep，不存在挂起）。"""
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "card/long-lived"}}
+        return {
+            "total_count": 150,
+            "workflow_runs": [{"id": run_id} for run_id in range(3000, 3000 + 100)],
+        }
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    silo_calls = []
+
+    def fake_silo(**kwargs):
+        silo_calls.append(kwargs)
+        return AGG.HistoryLoad()
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", fake_silo)
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["no terminal artifact matched run 3000"],
+        ),
+    )
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert silo_calls == []
+    assert history.incomplete_reasons == [
+        "history truncated: this PR's branch has more pull_request runs than one page or the targeted cap"
+    ]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_truncated" in capsys.readouterr().out
+
+
+def test_fetch_silo_terminal_history_downloads_only_targeted_runs(monkeypatch):
+    other_run_key = (
+        f"d30/{_CANARY_REPO_ID}/gate-terminal-v1-{_CANARY_REPO_ID}-"
+        f"{'9' * 40}-999-1/gate-terminal.json"
+    )
+    keys = [_CANARY_TERMINAL_KEY, other_run_key]
+    gets = []
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key in keys), stderr="",
+            )
+        gets.append(argv[argv.index("--key") + 1])
+        run_id = _CANARY_RUN_ID if len(gets) == 1 else 999
+        Path(argv[argv.index("--dest") + 1]).write_bytes(
+            _canary_terminal_bytes("pass", run_id=run_id)
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+    result = AGG._fetch_silo_terminal_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+        target_run_ids=[_CANARY_RUN_ID],
+    )
+    assert gets == [_CANARY_TERMINAL_KEY]
+    assert [(row["run_id"], row["gate_result"]) for row in result.rows] == [(_CANARY_RUN_ID, "pass")]
+    assert result.incomplete_reasons == []
+
+
+def _real_convergence_history_silo_objects():
+    fixture = json.loads(CONVERGENCE_HISTORY_FIXTURE.read_text(encoding="utf-8"))
+    objects = [
+        (key, json.dumps(record, sort_keys=True).encode("utf-8"))
+        for key, record in zip(fixture["source_keys"], fixture["terminal_envelopes"], strict=True)
+    ]
+    return fixture, objects
+
+
+def test_real_silo_d30_terminal_fixture_drives_terminal_row_and_history_loader(monkeypatch):
+    fixture, objects = _real_convergence_history_silo_objects()
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    targeted_ids = [record["run_id"] for record in fixture["terminal_envelopes"]]
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: targeted_ids)
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key, _body in objects), stderr="",
+            )
+        key = argv[argv.index("--key") + 1]
+        Path(argv[argv.index("--dest") + 1]).write_bytes(dict(objects)[key])
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+    rows = [
+        AGG._terminal_row(
+            record, repository=fixture["repository"], repository_id=fixture["repository_id"],
+            pr_number=fixture["pr_number"],
+        )
+        for record in fixture["terminal_envelopes"]
+    ]
+    status, run_ids, _history = AGG._load_pr_convergence_history(
+        repository=fixture["repository"], repository_id=fixture["repository_id"],
+        pr_number=fixture["pr_number"],
+    )
+    assert len(fixture["source_keys"]) >= 2
+    assert all("findings" not in record and "result" not in record for record in fixture["terminal_envelopes"])
+    assert all(row["_eligible_primary_round"] is True for row in rows)
+    assert (status, run_ids) == ("available", (35424466527, 35423752741))
+
+
+def test_mixed_legacy_and_new_terminal_history_prefers_explicit_eligibility(monkeypatch):
+    fixture, objects = _real_convergence_history_silo_objects()
+    new_terminal = dict(fixture["terminal_envelopes"][0])
+    new_terminal.update({
+        "run_id": 35429999999,
+        "head_sha": "f" * 40,
+        "convergence_shadow": {
+            "history_status": "available",
+            "eligible_rounds": 1,
+            "limit": 8,
+            "terminal_decision": "collecting",
+            "eligible_this_round": False,
+        },
+    })
+    new_name = (
+        f"gate-terminal-v1-{fixture['repository_id']}-{new_terminal['head_sha']}-"
+        f"{new_terminal['run_id']}-{new_terminal['run_attempt']}"
+    )
+    objects.append((
+        f"d30/{fixture['repository_id']}/{new_name}/gate-terminal.json",
+        json.dumps(new_terminal, sort_keys=True).encode("utf-8"),
+    ))
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    targeted_ids = [record["run_id"] for record in fixture["terminal_envelopes"]] + [new_terminal["run_id"]]
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: targeted_ids)
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key, _body in objects), stderr="",
+            )
+        key = argv[argv.index("--key") + 1]
+        Path(argv[argv.index("--dest") + 1]).write_bytes(dict(objects)[key])
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+    status, run_ids, _history = AGG._load_pr_convergence_history(
+        repository=fixture["repository"], repository_id=fixture["repository_id"],
+        pr_number=fixture["pr_number"],
+    )
+    assert (status, run_ids) == ("available", (35424466527, 35423752741))
+
+
+def test_one_gate_run_lists_terminal_silo_prefix_once_and_panel_reuses_cache(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_scoped_primary_record()))
+    terminal_path = tmp_path / "gate-terminal.json"
+    summary_path = tmp_path / "summary.md"
+    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_disposition_receipts", lambda **kwargs: ())
+    monkeypatch.setattr(
+        AGG, "load_previous_round_findings",
+        lambda **kwargs: {"available": False, "detail": "fixture", "findings": []},
+    )
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["no terminal artifact matched gate-terminal-v1-123-"],
+        ),
+    )
+    terminal_prefix_calls = []
+
+    def fake_silo_cli(argv, timeout_s):
+        prefix = argv[argv.index("--prefix") + 1]
+        if prefix.startswith("d30/123/gate-terminal-v1-123-"):
+            terminal_prefix_calls.append(prefix)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
+    cache_path = AGG._terminal_history_cache_path(terminal_path)
+    cache_bytes = cache_path.read_bytes()
+    assert cache_bytes.endswith(b"\n")
+    assert json.loads(cache_bytes) == {
+        "schema_version": AGG.TERMINAL_HISTORY_CACHE_SCHEMA_VERSION,
+        "rows": [],
+        "skipped_records": [],
+        "incomplete_reasons": [],
+    }
+
+    received = {}
+
+    def fake_panel_publish(**kwargs):
+        received["history"] = kwargs["silo_history"]
+        return "", {"delivery": "not_created", "reason_code": "test", "history_error": None}
+
+    monkeypatch.setattr(AGG, "_post_status_panel_fail_open", fake_panel_publish)
+    publish_args = _cli_args(audit_dir, summary_path, terminal_path=str(terminal_path)) + ["--publish-only"]
+    assert AGG.main(publish_args) == 0
+    assert isinstance(received["history"], AGG.HistoryLoad)
+    assert received["history"].rows == []
+    assert terminal_prefix_calls == ["d30/123/gate-terminal-v1-123-"]
 
 
 def _canary_receipt(reason="locked upstream behavior", finding_id="p1"):
@@ -3845,9 +4445,11 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
     recorded_calls = []
 
     dest_existed = []
+    recorded_timeouts = []
 
-    def fake_cli(argv):
+    def fake_cli(argv, timeout_s):
         recorded_calls.append(list(argv))
+        recorded_timeouts.append(timeout_s)
         assert "--dest" in argv
         dest_idx = argv.index("--dest")
         dest_dir = Path(argv[dest_idx + 1])
@@ -3864,7 +4466,7 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
         )
 
     monkeypatch.setattr(AGG, "_silo_cli", fake_cli)
-    objects = AGG._silo_objects_under(prefix)
+    objects = AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
 
     # 断言走 CLI 路径及 argv 形态
     assert len(recorded_calls) == 1
@@ -3872,12 +4474,13 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
     assert argv[0:3] == ["list", "--prefix", prefix]
     assert argv[3] == "--dest"
     assert dest_existed == [True]
+    assert recorded_timeouts == [AGG.SILO_CLI_CALL_TIMEOUT_SECONDS]
 
     # 断言 stdout 键解析与 (key, body) 返回
     assert objects == [(canonical_key, payload)]
 
     # 断言四段键校验
-    def bad_key_cli(argv):
+    def bad_key_cli(argv, timeout_s):
         return subprocess.CompletedProcess(
             args=argv,
             returncode=0,
@@ -3887,7 +4490,7 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
 
     monkeypatch.setattr(AGG, "_silo_cli", bad_key_cli)
     with pytest.raises(ValueError) as exc:
-        AGG._silo_objects_under(prefix)
+        AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
     assert "silo key is not tier/repo_id/artifact_name/path" in str(exc.value)
 
 
@@ -3902,7 +4505,7 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
     payload = b'{"receipt": true}'
     recorded_calls = []
 
-    def fake_cli(argv):
+    def fake_cli(argv, timeout_s):
         recorded_calls.append(list(argv))
         assert "--dest" in argv
         dest_dir = Path(argv[argv.index("--dest") + 1])
@@ -3913,7 +4516,7 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{canonical_key}\n", stderr="")
 
     monkeypatch.setattr(AGG, "_silo_cli", fake_cli)
-    objects = AGG._silo_objects_under(prefix)
+    objects = AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
     assert objects == [(canonical_key, payload)]
     assert len(recorded_calls) == 1
     assert recorded_calls[0][0:3] == ["list", "--prefix", prefix]
@@ -3921,7 +4524,8 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
 
 def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
     # 跨进程边界断言：聚合器实际发出的 argv 必须是 [解释器, 仓内脚本, ...]，
-    # 不得出现 uv/uvx/pip/npx。捕获真实 argv（不执行），本机有无 uv 结果一致。
+    # 不得出现 uv/uvx/pip/npx。每次调用必须带墙钟 timeout（gate#290 教训：
+    # 无界 Silo 子进程会拖死汇总 job），由调用点显式声明预算来源。
     recorded = []
 
     class _Proc:
@@ -3930,14 +4534,15 @@ def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
         stderr = ""
 
     def fake_run(argv, **kwargs):
-        recorded.append(list(argv))
+        recorded.append((list(argv), kwargs.copy()))
         return _Proc()
 
     monkeypatch.setattr(AGG.subprocess, "run", fake_run)
     monkeypatch.setenv("SILO_STORE", "/tmp/fake-silo-store.py")
-    AGG._silo_cli(["list", "--prefix", "d30/1/"])
+    AGG._silo_cli(["list", "--prefix", "d30/1/"], 30)
     assert len(recorded) == 1
-    argv = recorded[0]
+    argv, kwargs = recorded[0]
+    assert kwargs["timeout"] == 30
     assert argv[0] == sys.executable
     assert argv[1] == "/tmp/fake-silo-store.py"
     assert argv[2:] == ["list", "--prefix", "d30/1/"]
@@ -4193,6 +4798,60 @@ def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
     assert AGG.relate_findings([current], [same])[0]["relation_to_previous"] == "new"
 
 
+@pytest.mark.parametrize("case", ["pass", "fail", "manual_conflict"])
+def test_shadow_budget_preserves_existing_verdict_contract(case):
+    if case == "pass":
+        audit = _valid_scoped_primary_record(verdict="pass", result={"findings": []})
+        primary_result = "success"
+        previous_round = {"available": True, "findings": []}
+    elif case == "fail":
+        audit = _valid_scoped_primary_record(
+            verdict="fail",
+            result={"findings": [{
+                "id": "p1", "severity": "major", "trigger_kind": "inferred",
+                "file": "src/lock.py", "line": 12, "category": "correctness",
+            }]},
+        )
+        primary_result = "failure"
+        previous_round = {"available": True, "findings": []}
+    else:
+        current = {
+            "id": "round-b", "severity": "major", "file": "src/lock.py", "line": 12,
+            "category": "correctness", "issue": "must not advance the lease",
+            "acceptance": "leave the lease at evidence",
+        }
+        previous = {
+            "id": "round-a", "severity": "major", "file": "src/lock.py", "line": 12,
+            "category": "correctness", "issue": "must advance the lease",
+            "acceptance": "advance the lease to closed",
+        }
+        audit = _relation_audit(**current)
+        previous_round = {"available": True, "findings": [previous]}
+        primary_result = "success"
+
+    kwargs = _base_kwargs(
+        primary_result=primary_result,
+        audit=audit,
+        scope=_scope_for(audit),
+        audit_digest=_DIGEST_A,
+    )
+    baseline = AGG.evaluate(**kwargs)
+    shadow = AGG.evaluate(
+        **kwargs,
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    for outcome in (baseline, shadow):
+        findings = json.loads(json.dumps(audit["result"]["findings"]))
+        AGG.apply_finding_relation(outcome, findings, previous_round)
+    assert (shadow.ok, shadow.classification, shadow.reason_code, shadow.gate_result) == (
+        baseline.ok, baseline.classification, baseline.reason_code, baseline.gate_result,
+    )
+    assert shadow.convergence_shadow["terminal_decision"] == "arbitration_required"
+    if case == "manual_conflict":
+        assert shadow.finding_relation["review_terminal"] == "manual_required"
+
+
 def test_unknown_relation_value_is_rejected():
     with pytest.raises(AGG.FindingRelationError, match="GATE-FINDING-RELATION-UNKNOWN"):
         AGG.relate_findings([{"id": "a", "relation_to_previous": "maybe"}], [])
@@ -4237,7 +4896,7 @@ def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_
     monkeypatch.setattr(AGG, "_silo_configured", lambda: silo_configured)
     monkeypatch.setattr(
         AGG, "_silo_objects_under",
-        lambda prefix: [(key, raw) for key, raw in silo_objects if key.startswith(prefix)],
+        lambda prefix, timeout_s: [(key, raw) for key, raw in silo_objects if key.startswith(prefix)],
     )
     output = tmp_path / "previous-findings.json"
     rc = AGG.main([
@@ -4311,7 +4970,7 @@ def test_render_previous_context_rejects_output_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
     monkeypatch.setattr(
         AGG, "_silo_objects_under",
-        lambda prefix: [(key, raw) for key, raw in objects if key.startswith(prefix)],
+        lambda prefix, timeout_s: [(key, raw) for key, raw in objects if key.startswith(prefix)],
     )
     target = tmp_path / "x"
     with pytest.raises(SystemExit):

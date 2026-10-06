@@ -163,6 +163,7 @@ PANEL_DELIVERY_SCHEMA_VERSION = 1
 PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
 CONVERGENCE_ENVELOPE_SCHEMA_VERSION = 1
 CONVERGENCE_ENVELOPE_KIND = "gate_convergence_round"
+TERMINAL_HISTORY_CACHE_SCHEMA_VERSION = 1
 GITHUB_API_TIMEOUT_SECONDS = 15
 DEFAULT_PUBLISH_BUDGET_SECONDS = 120
 PUBLISH_BUDGET_ENV = "GATE_PUBLISH_BUDGET_SECONDS"
@@ -170,6 +171,12 @@ DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS = 45
 HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
 MAX_REPO_WIDE_HISTORY_PAGES = 5
 MAX_TARGETED_HISTORY_RUNS = 50
+# Wall-clock cap for one `_silo_cli` subprocess at call sites that sit outside
+# the HISTORY_RECONSTRUCTION deadline (ledger findings, disposition receipts).
+# Measured need: `_previous_findings_from_silo` takes ~15.8s to serially fetch
+# 100 Silo objects, so the cap must stay well above that; it only exists so a
+# hung Silo connection cannot stall the aggregate job indefinitely.
+SILO_CLI_CALL_TIMEOUT_SECONDS = 120
 MAX_HISTORY_WARNING_CHARS = 500
 DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v3-"
 SILO_TERMINAL_TIER = "d30"
@@ -301,6 +308,7 @@ class Outcome:
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
     convergence_envelope: Optional[dict[str, Any]] = None
+    convergence_shadow: Optional[dict[str, Any]] = None
     convergence_receipt: Optional[Any] = None
     recorded_disposition_claims: list[str] = field(default_factory=list)
     # Typed receipt audit is the only source for the terminal receipt record.
@@ -652,7 +660,7 @@ def _ledger_artifact_run(name: str, repository_id: int) -> Optional[tuple[int, i
 def _previous_findings_from_silo(*, repository_id: int, pr_number: int, run_id: int, run_attempt: int) -> list[Any]:
     prefix = f"{SILO_TERMINAL_TIER}/{repository_id}/{_LEDGER_ARTIFACT_PREFIX}{repository_id}-"
     best: Optional[tuple[tuple[int, int], list[Any]]] = None
-    for key, raw in _silo_objects_under(prefix):
+    for key, raw in _silo_objects_under(prefix, SILO_CLI_CALL_TIMEOUT_SECONDS):
         parts = key.split("/")
         if len(parts) < 3:
             continue
@@ -965,6 +973,8 @@ def build_terminal_envelope(
     }
     if outcome.recorded_disposition_claims:
         envelope["recorded_disposition_claims"] = list(outcome.recorded_disposition_claims)
+    if outcome.convergence_shadow is not None:
+        envelope["convergence_shadow"] = dict(outcome.convergence_shadow)
     if outcome.finding_relation is not None:
         envelope["finding_relation"] = outcome.finding_relation
     return envelope
@@ -1172,6 +1182,8 @@ def evaluate(
     caller_checks: str = "",
     preflight_result: str = "",
     repository: str | None = None,
+    prior_eligible_run_ids: Sequence[int] = (),
+    convergence_history_status: str = "history_unavailable",
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -1484,6 +1496,23 @@ def evaluate(
             outcome.gate_result = "pass"
             outcome.problems = [problem for problem in outcome.problems if problem != "primary review verdict is 'fail'"]
             outcome.notes.append("all current P1 findings are covered by active evidence-bound gate-disposition receipts")
+    if scope is not None:
+        eligible_this_round = (
+            audit_available
+            and audit_source is not None
+            and isinstance(audit, dict)
+            and audit.get("verdict") in ("pass", "fail")
+        )
+        outcome.convergence_shadow = {
+            **_CONVERGENCE.pr_round_budget(
+                prior_run_ids=prior_eligible_run_ids,
+                current_run_id=identity.run_id,
+                current_eligible=eligible_this_round,
+                tier=scope.tier,
+                history_status=convergence_history_status,
+            ),
+            "eligible_this_round": eligible_this_round,
+        }
     return outcome
 
 
@@ -1647,6 +1676,16 @@ def render_summary(
             f"Terminal state: classification=`{outcome.classification}`, "
             f"reason_code=`{outcome.reason_code}`, gate_result=`{outcome.gate_result}`"
         )
+    if outcome.convergence_shadow is not None:
+        shadow = outcome.convergence_shadow
+        if shadow["history_status"] == "history_unavailable":
+            lines.append("PR 累计主审轮（影子）：`history_unavailable`；未输出累计数，不改变 gate 结论。")
+        else:
+            lines.append(
+                "PR 累计主审轮（影子）："
+                f"`{shadow['eligible_rounds']}/{shadow['limit']}`，"
+                f"decision=`{shadow['terminal_decision']}`；不改变 gate 结论。"
+            )
     if primary_result == "failure" and outcome.reason_code in (
         "audit_missing", "audit_invalid", "audit_source_mismatch",
     ):
@@ -1813,6 +1852,16 @@ def render_status_panel(
         "",
         f"当前裁决：`{current['classification']}` / `{current['reason_code']}`",
     ])
+    current_shadow = current.get("convergence_shadow")
+    if isinstance(current_shadow, dict):
+        if current_shadow["history_status"] == "history_unavailable":
+            shadow_text = "history_unavailable（未估算累计轮数）"
+        else:
+            shadow_text = (
+                f"{current_shadow['eligible_rounds']}/{current_shadow['limit']} · "
+                f"{current_shadow['terminal_decision']}"
+            )
+        lines.extend(["", f"PR 累计主审轮（影子）：`{shadow_text}`"])
     warning_line = _bounded_history_warning(history_warning=history_warning, history_reasons=history_reasons)
     if warning_line:
         lines.extend(["", warning_line])
@@ -1850,15 +1899,22 @@ def render_status_panel(
         "",
         "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
         "",
-        "| Run | Attempt | Head | 状态 | 收件人动作 |",
-        "| ---: | ---: | :--- | :--- | :--- |",
+        "| Run | Attempt | Head | 状态 | PR 累计主审轮（影子） | 收件人动作 |",
+        "| ---: | ---: | :--- | :--- | :--- | :--- |",
     ])
     for row in ordered:
         short_sha = row["head_sha"][:7]
         run_link = f"[{row['run_id']}](https://github.com/{row['repository']}/actions/runs/{row['run_id']})"
+        shadow = row.get("convergence_shadow")
+        if not isinstance(shadow, dict):
+            shadow_text = "—"
+        elif shadow["history_status"] == "history_unavailable":
+            shadow_text = "history_unavailable"
+        else:
+            shadow_text = f"{shadow['eligible_rounds']}/{shadow['limit']} · {shadow['terminal_decision']}"
         lines.append(
             f"| {run_link} | {row['run_attempt']} | `{short_sha}` | "
-            f"`{row['gate_result']}` | {_panel_action(row)} |"
+            f"`{row['gate_result']}` | `{shadow_text}` | {_panel_action(row)} |"
         )
     lines.extend([
         "",
@@ -2031,6 +2087,20 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         raise ValueError("gate terminal gate_result is outside the finite domain")
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")
+    audit = record.get("audit")
+    shadow = record.get("convergence_shadow")
+    eligible_primary_round = (
+        isinstance(audit, dict)
+        and audit.get("available") is True
+        and record.get("primary_result") in ("success", "failure")
+        and record["gate_result"] in ("pass", "fail")
+    )
+    if shadow is not None:
+        if not isinstance(shadow, dict):
+            raise ValueError("gate terminal convergence_shadow is not an object")
+        if type(shadow.get("eligible_this_round")) is not bool:
+            raise ValueError("gate terminal convergence eligibility is invalid")
+        eligible_primary_round = shadow["eligible_this_round"]
     row = {
         "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
         "repository": repository,
@@ -2040,7 +2110,31 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "gate_result": record["gate_result"],
         "classification": record["classification"],
         "reason_code": record["reason_code"],
+        "_eligible_primary_round": eligible_primary_round,
     }
+    if shadow is not None:
+        history_status = shadow.get("history_status")
+        decision = shadow.get("terminal_decision")
+        if history_status not in ("available", "history_unavailable"):
+            raise ValueError("gate terminal convergence history_status is invalid")
+        if decision not in ("collecting", "arbitration_required", "history_unavailable"):
+            raise ValueError("gate terminal convergence terminal_decision is invalid")
+        if type(shadow.get("limit")) is not int or shadow["limit"] <= 0:
+            raise ValueError("gate terminal convergence limit is invalid")
+        projected_shadow = {
+            "history_status": history_status,
+            "terminal_decision": decision,
+            "limit": shadow["limit"],
+            "eligible_this_round": shadow["eligible_this_round"],
+        }
+        rounds = shadow.get("eligible_rounds")
+        if history_status == "available":
+            if type(rounds) is not int or rounds < 0:
+                raise ValueError("gate terminal convergence eligible_rounds is invalid")
+            projected_shadow["eligible_rounds"] = rounds
+        elif "eligible_rounds" in shadow:
+            raise ValueError("unavailable convergence history must not publish an eligible count")
+        row["convergence_shadow"] = projected_shadow
     recorded_claims = record.get("recorded_disposition_claims")
     if isinstance(recorded_claims, list) and all(isinstance(item, str) for item in recorded_claims) and recorded_claims:
         row["recorded_disposition_claims"] = list(recorded_claims)
@@ -2252,26 +2346,29 @@ def _silo_configured() -> bool:
     return bool((os.environ.get("SILO_ENDPOINT") or "").strip())
 
 
-def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
+def _silo_cli(argv: list[str], timeout_s: float = SILO_CLI_CALL_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
     # Silo 客户端是纯标准库（scripts/silo_store.py 自签 SigV4）：直接用当前
     # 解释器执行，禁止经由 uv/pip 在运行期取包。SILO_STORE 允许覆盖是为了
     # 让测试打桩与 job 稀疏检出能指向同一份仓内脚本，不接受仓外路径以外的
-    # 任何包管理器入口。
+    # 任何包管理器入口。仓内调用点必须显式传 timeout_s（deadline 剩余或
+    # SILO_CLI_CALL_TIMEOUT_SECONDS）；默认值只服务于仓外无超时语义的探针
+    # （tests/test_no_runtime_install.py），且本身就是有界的。
     store_path = os.environ.get("SILO_STORE") or str(GATE_ROOT / "scripts" / "silo_store.py")
     return subprocess.run(
         [sys.executable, store_path, *argv],
         capture_output=True,
         text=True,
         check=False,
+        timeout=timeout_s,
     )
 
 
-def _silo_objects_under(prefix: str) -> list[tuple[str, bytes]]:
+def _silo_objects_under(prefix: str, timeout_s: float) -> list[tuple[str, bytes]]:
     """Return (key, body) pairs under a Silo prefix. Raises on listing/get failure."""
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="silo-scan-") as dest:
-        proc = _silo_cli(["list", "--prefix", prefix, "--dest", dest])
+        proc = _silo_cli(["list", "--prefix", prefix, "--dest", dest], timeout_s)
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or "silo list failed").strip())
         keys = [line for line in proc.stdout.splitlines() if line.strip()]
@@ -2329,26 +2426,262 @@ def _fetch_silo_terminal_history(
     *, repository: str, repository_id: int, pr_number: int,
     target_run_ids: Optional[list[int]] = None,
 ) -> HistoryLoad:
+    """Fetch this PR's terminal records from the d30 Silo tier.
+
+    Two hard bounds apply: only objects whose artifact name decodes to a
+    targeted run id are ever downloaded (the artifact name does not carry the
+    PR number, so the run-id filter is what keeps a busy repo from pulling
+    every other PR's records), and each `_silo_cli` call runs against the
+    active HISTORY_RECONSTRUCTION deadline — or SILO_CLI_CALL_TIMEOUT_SECONDS
+    when no budget is active — so a slow Silo can never stall the job.
+    """
+    import tempfile
+
     prefix = f"{SILO_TERMINAL_TIER}/{repository_id}/gate-terminal-v1-{repository_id}-"
     result = HistoryLoad()
-    objects = _silo_objects_under(prefix)
+    budget = _ACTIVE_PUBLISH_BUDGET.get()
+    deadline = (
+        budget.operation_deadline
+        if budget is not None and budget.current_operation == "HISTORY_RECONSTRUCTION"
+        else None
+    )
+
+    def silo_timeout() -> float:
+        if deadline is None:
+            return SILO_CLI_CALL_TIMEOUT_SECONDS
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _PublishBudgetExhausted("HISTORY_RECONSTRUCTION")
+        return remaining
+
     allowed: Optional[set[int]] = None
     if target_run_ids is not None:
         unique_run_ids = list(dict.fromkeys(target_run_ids))
         if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
             unique_run_ids = unique_run_ids[:MAX_TARGETED_HISTORY_RUNS]
         allowed = set(unique_run_ids)
-    for key, raw in objects:
-        name = _silo_artifact_name(key)
-        if allowed is not None:
-            run_id = _terminal_artifact_run_id(name, repository_id)
-            if run_id is not None and run_id not in allowed:
-                continue
-        _consume_silo_terminal_json(
-            result, name=name, raw=raw, repository=repository,
-            repository_id=repository_id, pr_number=pr_number,
-        )
+    with tempfile.TemporaryDirectory(prefix="silo-terminal-") as dest:
+        proc = _silo_cli(["list", "--prefix", prefix], silo_timeout())
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "silo list failed").strip())
+        keys = [line for line in proc.stdout.splitlines() if line.strip()]
+        for key in keys:
+            if allowed is not None:
+                run_id = _terminal_artifact_run_id(_silo_artifact_name(key), repository_id)
+                if run_id is None or run_id not in allowed:
+                    continue
+            parts = key.split("/", 3)
+            if len(parts) != 4:
+                raise ValueError(f"silo key is not tier/repo_id/artifact_name/path: {key}")
+            target = Path(dest) / parts[2]
+            try:
+                proc = _silo_cli(["get", "--key", key, "--dest", str(target)], silo_timeout())
+            except subprocess.TimeoutExpired as exc:
+                if deadline is not None:
+                    raise _PublishBudgetExhausted("HISTORY_RECONSTRUCTION") from exc
+                raise
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    (proc.stderr or proc.stdout or f"silo get failed: {key}").strip()
+                )
+            _consume_silo_terminal_json(
+                result, name=_silo_artifact_name(key), raw=target.read_bytes(),
+                repository=repository, repository_id=repository_id, pr_number=pr_number,
+            )
+            target.unlink(missing_ok=True)
     return result
+
+
+def _pr_target_run_ids(*, token: str, repository: str, pr_number: int) -> Optional[list[int]]:
+    """Cheaply enumerate this PR's prior Actions runs so history reads can be
+    PR-targeted instead of repo-wide: the PR's head branch narrows the run
+    list, and the silo/GitHub artifact filters drop everything that is not a
+    gate terminal record. One page (newest first) is enough because
+    MAX_TARGETED_HISTORY_RUNS already caps the consumed set at 50.
+
+    Returns None instead of a partial list whenever the run list is known to
+    be incomplete — the API reports more runs than this page holds
+    (total_count, or a full page when total_count is absent), or the list
+    exceeds MAX_TARGETED_HISTORY_RUNS. INV-A4: a history that cannot be fully
+    listed must degrade to history_unavailable, never to a smaller count.
+    `event=pull_request` matches the only trigger the Required Gate caller
+    template declares (terminal records exist for pull_request runs only) and
+    keeps unrelated branch runs from triggering the truncation path.
+    """
+    pull = _github_json(token=token, url=f"https://api.github.com/repos/{repository}/pulls/{pr_number}")
+    if not isinstance(pull, dict) or not isinstance(pull.get("head"), dict):
+        raise ValueError("PR response has an invalid shape")
+    head_ref = pull["head"].get("ref")
+    if not isinstance(head_ref, str) or not head_ref:
+        raise ValueError("PR head branch is missing")
+    payload = _github_json(
+        token=token,
+        url=(
+            f"https://api.github.com/repos/{repository}/actions/runs"
+            f"?event=pull_request&branch={urllib.parse.quote(head_ref, safe='')}&per_page=100"
+        ),
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("workflow_runs"), list):
+        raise ValueError("Actions runs response has an invalid shape")
+    workflow_runs = payload["workflow_runs"]
+    total_count = payload.get("total_count")
+    if isinstance(total_count, int) and total_count > len(workflow_runs):
+        return None
+    if not isinstance(total_count, int) and len(workflow_runs) >= 100:
+        return None
+    run_ids = [
+        run["id"] for run in workflow_runs
+        if isinstance(run, dict) and _is_strict_int(run.get("id")) and run["id"] > 0
+    ]
+    unique_run_ids = list(dict.fromkeys(run_ids))
+    if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
+        return None
+    return unique_run_ids
+
+
+def _load_pr_convergence_history(
+    *, repository: str, repository_id: int, pr_number: int,
+) -> tuple[str, tuple[int, ...], HistoryLoad]:
+    """Load d30 terminal history once for both shadow count and panel cache.
+
+    The whole load — Silo reads plus the GitHub fallback — runs under one
+    HISTORY_RECONSTRUCTION deadline from `_PublishBudget` (45s by default, the
+    same knob the panel flow uses). gate#287 was reverted (gate#290) because an
+    unbounded Silo read plus a repo-wide GitHub scan pushed the aggregate job
+    past its `timeout-minutes`; the deadline turns any such stall into a fast
+    `history_unavailable` with a greppable reason instead.
+    """
+    history = HistoryLoad()
+    if not _silo_configured():
+        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured")
+        history.incomplete_reasons.append("Silo terminal history unavailable: not configured")
+        return "history_unavailable", (), history
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    if not token:
+        # Without a token the load cannot be PR-targeted; an untargeted read
+        # would download every terminal record on the repo (gate#290's revert
+        # reason), so it fails fast instead.
+        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_token_missing")
+        history.incomplete_reasons.append("history loader needs GITHUB_TOKEN to target this PR's runs")
+        return "history_unavailable", (), history
+    try:
+        budget = _PublishBudget.from_environment()
+    except ValueError as exc:
+        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=invalid_history_budget")
+        history.incomplete_reasons.append(f"invalid history budget configuration: {exc}")
+        return "history_unavailable", (), history
+    budget_context = _ACTIVE_PUBLISH_BUDGET.set(budget)
+    try:
+        budget.begin("HISTORY_RECONSTRUCTION")
+        try:
+            target_run_ids = _pr_target_run_ids(
+                token=token, repository=repository, pr_number=pr_number,
+            )
+        except _PublishBudgetExhausted:
+            raise
+        except Exception as exc:
+            print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
+            history.incomplete_reasons.append(f"GitHub run targeting unavailable: {type(exc).__name__}")
+            return "history_unavailable", (), history
+        if target_run_ids is None:
+            # INV-A4: a truncated run list must never shrink to a partial count.
+            print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_truncated")
+            history.incomplete_reasons.append(
+                "history truncated: this PR's branch has more pull_request runs than one page or the targeted cap"
+            )
+            return "history_unavailable", (), history
+        try:
+            history = _fetch_silo_terminal_history(
+                repository=repository, repository_id=repository_id, pr_number=pr_number,
+                target_run_ids=target_run_ids,
+            )
+        except _PublishBudgetExhausted:
+            raise
+        except Exception as exc:
+            print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
+            history.incomplete_reasons.append(f"Silo terminal history unavailable: {type(exc).__name__}")
+            return "history_unavailable", (), history
+        if history.incomplete_reasons:
+            print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history")
+            return "history_unavailable", (), history
+        if not history.rows and target_run_ids:
+            try:
+                github_history = _fetch_github_terminal_history(
+                    token=token,
+                    repository=repository,
+                    repository_id=repository_id,
+                    pr_number=pr_number,
+                    target_run_ids=target_run_ids,
+                )
+            except _PublishBudgetExhausted:
+                raise
+            except Exception as exc:
+                print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
+                history.incomplete_reasons.append(f"GitHub terminal history unavailable: {type(exc).__name__}")
+                return "history_unavailable", (), history
+            if github_history.rows:
+                print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_empty_but_github_has_terminal_history")
+                history.incomplete_reasons.append("Silo empty but GitHub has terminal history")
+                return "history_unavailable", (), history
+            budget_exhausted = [
+                reason for reason in github_history.incomplete_reasons
+                if "history budget exhausted" in reason
+            ]
+            unexpected_reasons = [
+                reason for reason in github_history.incomplete_reasons
+                if not reason.startswith("no terminal artifact matched run ")
+                and "history budget exhausted" not in reason
+            ]
+            if budget_exhausted:
+                raise _PublishBudgetExhausted("HISTORY_RECONSTRUCTION")
+            if unexpected_reasons:
+                print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_history_incomplete")
+                history.incomplete_reasons.append("GitHub terminal history incomplete")
+                return "history_unavailable", (), history
+    except _PublishBudgetExhausted:
+        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_budget_exhausted")
+        history.incomplete_reasons.append("history budget exhausted")
+        return "history_unavailable", (), history
+    finally:
+        _ACTIVE_PUBLISH_BUDGET.reset(budget_context)
+    return "available", tuple(
+        row["run_id"] for row in history.rows
+        if row.get("_eligible_primary_round") is True
+    ), history
+
+
+def _terminal_history_cache_path(terminal_path: str | Path) -> Path:
+    target = Path(terminal_path)
+    return target.with_name(target.name + ".history.json")
+
+
+def _write_terminal_history_cache(terminal_path: str | Path, history: HistoryLoad) -> None:
+    payload = {
+        "schema_version": TERMINAL_HISTORY_CACHE_SCHEMA_VERSION,
+        "rows": history.rows,
+        "skipped_records": history.skipped_records,
+        "incomplete_reasons": history.incomplete_reasons,
+    }
+    target = _terminal_history_cache_path(terminal_path)
+    temporary_path = target.with_name(f".{target.name}.tmp")
+    temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(target)
+
+
+def _read_terminal_history_cache(path: str | Path) -> HistoryLoad:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] != TERMINAL_HISTORY_CACHE_SCHEMA_VERSION:
+        raise ValueError("terminal history cache has an unsupported schema")
+    rows = payload.get("rows")
+    skipped_records = payload.get("skipped_records")
+    incomplete_reasons = payload.get("incomplete_reasons")
+    if (
+        not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+        or not isinstance(skipped_records, list) or any(not isinstance(row, dict) for row in skipped_records)
+        or not isinstance(incomplete_reasons, list) or any(not isinstance(reason, str) for reason in incomplete_reasons)
+    ):
+        raise ValueError("terminal history cache has an invalid payload")
+    return HistoryLoad(rows=rows, skipped_records=skipped_records, incomplete_reasons=incomplete_reasons)
 
 
 def _merge_history_loads(github: HistoryLoad, silo: HistoryLoad) -> HistoryLoad:
@@ -2367,6 +2700,7 @@ def _merge_history_loads(github: HistoryLoad, silo: HistoryLoad) -> HistoryLoad:
 def _fetch_terminal_history(
     *, token: str, repository: str, repository_id: int, pr_number: int,
     target_run_ids: Optional[list[int]] = None,
+    silo_history: Optional[HistoryLoad] = None,
 ) -> HistoryLoad:
     github = HistoryLoad()
     try:
@@ -2380,8 +2714,8 @@ def _fetch_terminal_history(
         github = HistoryLoad(
             incomplete_reasons=[f"GitHub terminal history unavailable: {type(exc).__name__}"],
         )
-    silo = HistoryLoad()
-    if _silo_configured():
+    silo = silo_history if silo_history is not None else HistoryLoad()
+    if silo_history is None and _silo_configured():
         try:
             silo = _fetch_silo_terminal_history(
                 repository=repository, repository_id=repository_id,
@@ -2412,7 +2746,7 @@ def _fetch_terminal_history(
 def _fetch_silo_disposition_receipts(*, repository_id: int, pr_number: int) -> tuple[Any, ...]:
     prefix = f"{SILO_DISPOSITION_TIER}/{repository_id}/{DISPOSITION_ARTIFACT_PREFIX}"
     try:
-        objects = _silo_objects_under(prefix)
+        objects = _silo_objects_under(prefix, SILO_CLI_CALL_TIMEOUT_SECONDS)
     except Exception as exc:
         print(
             f"::warning::Silo disposition receipt scan failed; "
@@ -2690,6 +3024,7 @@ def _publish_panel_patch(
 def _post_status_panel_fail_open_with_budget(
     *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
     pr_number: Optional[int], identity: Optional[Identity], budget: _PublishBudget,
+    silo_history: Optional[HistoryLoad] = None,
 ) -> tuple[str, dict[str, Any]]:
     """Publish the one marker-located status panel without affecting verdict."""
     body = scrub_for_publish(
@@ -2746,6 +3081,7 @@ def _post_status_panel_fail_open_with_budget(
             history = _fetch_terminal_history(
                 token=token, repository=repository, repository_id=repository_id or 0,
                 pr_number=pr_number, target_run_ids=target_run_ids,
+                silo_history=silo_history,
             )
             budget.complete("HISTORY_RECONSTRUCTION")
         except _PublishBudgetExhausted:
@@ -2923,6 +3259,7 @@ def _post_status_panel_fail_open_with_budget(
 def _post_status_panel_fail_open(
     *, current: dict[str, Any], repository: Optional[str], repository_id: Optional[int],
     pr_number: Optional[int], identity: Optional[Identity],
+    silo_history: Optional[HistoryLoad] = None,
 ) -> tuple[str, dict[str, Any]]:
     body = render_status_panel([current])
     try:
@@ -2941,6 +3278,7 @@ def _post_status_panel_fail_open(
         return _post_status_panel_fail_open_with_budget(
             current=current, repository=repository, repository_id=repository_id,
             pr_number=pr_number, identity=identity, budget=budget,
+            silo_history=silo_history,
         )
     finally:
         _ACTIVE_PUBLISH_BUDGET.reset(token)
@@ -3021,11 +3359,22 @@ def _publish_only(args: argparse.Namespace) -> int:
         pr=args.pr_number,
     )
     current: dict[str, Any]
+    silo_history: Optional[HistoryLoad] = None
     try:
         if not args.terminal_path:
             raise ValueError("terminal path is missing")
         record = json.loads(Path(args.terminal_path).read_text(encoding="utf-8"))
         current = _terminal_row(record, repository=args.repository, repository_id=args.repository_id, pr_number=args.pr_number)
+        history_cache_path = _terminal_history_cache_path(args.terminal_path)
+        if history_cache_path.is_file():
+            try:
+                silo_history = _read_terminal_history_cache(history_cache_path)
+            except (OSError, ValueError) as exc:
+                print(f"GATE-CONVERGENCE-HISTORY-CACHE-UNAVAILABLE reason={type(exc).__name__}")
+                silo_history = HistoryLoad(incomplete_reasons=["terminal history cache unavailable"])
+        elif record.get("convergence_shadow") is not None:
+            print("GATE-CONVERGENCE-HISTORY-CACHE-UNAVAILABLE reason=missing")
+            silo_history = HistoryLoad(incomplete_reasons=["terminal history cache missing"])
     except Exception as exc:
         current = _panel_current_row(
             outcome=Outcome(ok=False, classification="integration_error", reason_code="audit_invalid", gate_result="unavailable"),
@@ -3055,7 +3404,7 @@ def _publish_only(args: argparse.Namespace) -> int:
             current["primary_audit"] = primary_audit
         body, receipt = _post_status_panel_fail_open(
             current=current, repository=args.repository, repository_id=args.repository_id,
-            pr_number=args.pr_number, identity=identity,
+            pr_number=args.pr_number, identity=identity, silo_history=silo_history,
         )
     _append_panel_diagnostic(args.summary_path, receipt)
     if args.panel_delivery_path:
@@ -3317,6 +3666,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit_digest = legacy_raw_audit_digest
 
     waiver_receipts: tuple[Any, ...] = ()
+    prior_eligible_run_ids: tuple[int, ...] = ()
+    convergence_history_status = "history_unavailable"
+    silo_terminal_history: Optional[HistoryLoad] = None
+    if scope is not None:
+        convergence_history_status, prior_eligible_run_ids, silo_terminal_history = _load_pr_convergence_history(
+            repository=args.repository,
+            repository_id=identity.repository_id,
+            pr_number=identity.pr,
+        )
+        if args.terminal_path:
+            try:
+                _write_terminal_history_cache(args.terminal_path, silo_terminal_history)
+            except OSError as exc:
+                print(f"GATE-CONVERGENCE-HISTORY-CACHE-UNAVAILABLE reason={type(exc).__name__}")
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token and scope is not None and not (is_draft and args.primary_result == "skipped"):
         try:
@@ -3366,6 +3729,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         legacy_raw_audit_digest=legacy_raw_audit_digest,
         waiver_receipts=waiver_receipts,
         repository=args.repository,
+        prior_eligible_run_ids=prior_eligible_run_ids,
+        convergence_history_status=convergence_history_status,
     )
     apply_finding_relation(outcome, findings, previous_round)
 
