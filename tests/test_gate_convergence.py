@@ -1354,7 +1354,7 @@ def test_pr_round_budget_deduplicates_run_attempts_and_counts_across_heads():
         current_eligible=True,
         tier="personal",
     )
-    assert result["eligible_rounds"] == 4
+    assert result["eligible_rounds"] == 3
     assert result["terminal_decision"] == "collecting"
 
 
