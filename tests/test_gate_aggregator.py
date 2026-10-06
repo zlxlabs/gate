@@ -2019,11 +2019,15 @@ def test_publish_only_subprocess_writes_additive_delivery_receipt_bytes(monkeypa
         silo_store.write_text(
             "import pathlib, sys\n"
             "args = sys.argv[1:]\n"
-            "dest = pathlib.Path(args[args.index('--dest') + 1])\n"
             f"key = {key!r}\n"
-            "target = dest / key.split('/')[2] / key.split('/', 3)[3]\n"
-            "target.parent.mkdir(parents=True, exist_ok=True)\n"
-            f"target.write_bytes(pathlib.Path({str(terminal_path)!r}).read_bytes())\n"
+            f"body = pathlib.Path({str(terminal_path)!r}).read_bytes()\n"
+            "if args[0] == 'get':\n"
+            "    pathlib.Path(args[args.index('--dest') + 1]).write_bytes(body)\n"
+            "elif '--dest' in args:\n"
+            "    dest = pathlib.Path(args[args.index('--dest') + 1])\n"
+            "    target = dest / key.split('/')[2] / key.split('/', 3)[3]\n"
+            "    target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    target.write_bytes(body)\n"
             "print(key)\n",
             encoding="utf-8",
         )
@@ -3779,14 +3783,30 @@ def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_obje
     def fake_download(**kwargs):
         return github_blobs[kwargs["url"]]
 
-    def fake_silo(prefix):
+    def fake_silo(prefix, timeout_s):
         if silo_error is not None:
             raise silo_error
         return [(key, body) for key, body in silo_objects if key.startswith(prefix)]
 
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            prefix = argv[2]
+            keys = [key for key, _body in silo_objects if key.startswith(prefix)]
+            if silo_error is not None:
+                raise silo_error
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key in keys), stderr="",
+            )
+        key = argv[argv.index("--key") + 1]
+        body = dict(silo_objects)[key]
+        dest = argv[argv.index("--dest") + 1]
+        Path(dest).write_bytes(body)
+        return subprocess.CompletedProcess(argv, 0, stdout=dest, stderr="")
+
     monkeypatch.setattr(AGG, "_github_json", fake_github_json)
     monkeypatch.setattr(AGG, "_download_terminal_zip", fake_download)
     monkeypatch.setattr(AGG, "_silo_objects_under", fake_silo)
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
 
 
 def test_convergence_history_without_silo_configuration_is_greppable(monkeypatch, capsys):
@@ -3806,6 +3826,8 @@ def test_convergence_history_without_silo_configuration_is_greppable(monkeypatch
 )
 def test_convergence_history_silo_failure_is_greppable_and_unavailable(monkeypatch, capsys, error):
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
 
     def fail_listing(**kwargs):
         raise error
@@ -3825,6 +3847,8 @@ def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavail
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
     )
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [_CANARY_RUN_ID])
     monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
     monkeypatch.setattr(
         AGG, "_fetch_github_terminal_history",
@@ -3840,10 +3864,16 @@ def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavail
 
 def test_convergence_history_malformed_silo_terminal_is_unavailable(monkeypatch, capsys):
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setattr(
-        AGG, "_silo_objects_under",
-        lambda prefix: [(_CANARY_TERMINAL_KEY, b"{")],
-    )
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [_CANARY_RUN_ID])
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{_CANARY_TERMINAL_KEY}\n", stderr="")
+        Path(argv[argv.index("--dest") + 1]).write_bytes(b"{")
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
     status, run_ids, history = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
     )
@@ -3854,17 +3884,152 @@ def test_convergence_history_malformed_silo_terminal_is_unavailable(monkeypatch,
 
 def test_convergence_history_empty_first_run_is_available_zero(monkeypatch):
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
     monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
     monkeypatch.setattr(
         AGG, "_fetch_github_terminal_history",
         lambda **kwargs: AGG.HistoryLoad(
-            incomplete_reasons=["no terminal artifact matched gate-terminal-v1-1327629472-"],
+            incomplete_reasons=["no terminal artifact matched run 501"],
         ),
     )
     status, run_ids, history = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
     )
     assert (status, run_ids, history.rows, history.incomplete_reasons) == ("available", (), [], [])
+
+
+def test_history_loader_without_token_fails_fast_before_silo_scan(monkeypatch, capsys):
+    # gate#290 教训：没有 token 就无法按 PR 定向，无定向的 Silo/GitHub 全仓
+    # 下载正是拖垮汇总 job 的路径，必须 fail-fast 而不是退回全仓扫描。
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    def must_not_run(**kwargs):
+        raise AssertionError("untargeted silo scan must not run without a token")
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", must_not_run)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["history loader needs GITHUB_TOKEN to target this PR's runs"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_token_missing" in capsys.readouterr().out
+
+
+def test_history_loader_run_targeting_failure_is_greppable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+
+    def fail_targeting(**kwargs):
+        raise ValueError("Actions runs response has an invalid shape")
+
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", fail_targeting)
+
+    def must_not_run(**kwargs):
+        raise AssertionError("silo scan must not run when targeting failed")
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", must_not_run)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["GitHub run targeting unavailable: ValueError"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=ValueError" in capsys.readouterr().out
+
+
+def test_history_loader_silo_empty_with_no_targeted_runs_skips_github_fallback(monkeypatch):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+
+    def must_not_run(**kwargs):
+        raise AssertionError("fallback must not run without targeted runs")
+
+    monkeypatch.setattr(AGG, "_fetch_github_terminal_history", must_not_run)
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids, history.rows, history.incomplete_reasons) == ("available", (), [], [])
+
+
+def test_history_loader_budget_exhaustion_in_github_fallback_is_greppable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["history budget exhausted during targeted scan"],
+        ),
+    )
+    status, run_ids, history = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert history.incomplete_reasons == ["history budget exhausted"]
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_budget_exhausted" in capsys.readouterr().out
+
+
+def test_pr_target_run_ids_narrows_to_pr_branch(monkeypatch):
+    urls = []
+
+    def fake_github_json(*, token, url):
+        urls.append(url)
+        if "/pulls/42" in url:
+            return {"head": {"ref": "feature/分支"}}
+        return {"workflow_runs": [{"id": 7}, {"id": 3}, {"id": 7}, {"id": "bad"}, {"id": 0}, {}]}
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    run_ids = AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42)
+    assert run_ids == [7, 3]
+    assert sum("/pulls/42" in url for url in urls) == 1
+    assert any("branch=feature%2F%E5%88%86%E6%94%AF" in url for url in urls)
+
+
+def test_pr_target_run_ids_caps_at_targeted_history_run_limit(monkeypatch):
+    def fake_github_json(*, token, url):
+        if "/pulls/42" in url:
+            return {"head": {"ref": "main"}}
+        return {"workflow_runs": [{"id": run_id} for run_id in range(1000, 1000 + 60)]}
+
+    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
+    run_ids = AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42)
+    assert len(run_ids) == AGG.MAX_TARGETED_HISTORY_RUNS
+    assert run_ids == list(range(1000, 1000 + AGG.MAX_TARGETED_HISTORY_RUNS))
+
+
+def test_fetch_silo_terminal_history_downloads_only_targeted_runs(monkeypatch):
+    other_run_key = (
+        f"d30/{_CANARY_REPO_ID}/gate-terminal-v1-{_CANARY_REPO_ID}-"
+        f"{'9' * 40}-999-1/gate-terminal.json"
+    )
+    keys = [_CANARY_TERMINAL_KEY, other_run_key]
+    gets = []
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key in keys), stderr="",
+            )
+        gets.append(argv[argv.index("--key") + 1])
+        run_id = _CANARY_RUN_ID if len(gets) == 1 else 999
+        Path(argv[argv.index("--dest") + 1]).write_bytes(
+            _canary_terminal_bytes("pass", run_id=run_id)
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
+    result = AGG._fetch_silo_terminal_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+        target_run_ids=[_CANARY_RUN_ID],
+    )
+    assert gets == [_CANARY_TERMINAL_KEY]
+    assert [(row["run_id"], row["gate_result"]) for row in result.rows] == [(_CANARY_RUN_ID, "pass")]
+    assert result.incomplete_reasons == []
 
 
 def _real_convergence_history_silo_objects():
@@ -3879,7 +4044,20 @@ def _real_convergence_history_silo_objects():
 def test_real_silo_d30_terminal_fixture_drives_terminal_row_and_history_loader(monkeypatch):
     fixture, objects = _real_convergence_history_silo_objects()
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setattr(AGG, "_silo_objects_under", lambda prefix: objects)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    targeted_ids = [record["run_id"] for record in fixture["terminal_envelopes"]]
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: targeted_ids)
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key, _body in objects), stderr="",
+            )
+        key = argv[argv.index("--key") + 1]
+        Path(argv[argv.index("--dest") + 1]).write_bytes(dict(objects)[key])
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
     rows = [
         AGG._terminal_row(
             record, repository=fixture["repository"], repository_id=fixture["repository_id"],
@@ -3920,7 +4098,20 @@ def test_mixed_legacy_and_new_terminal_history_prefers_explicit_eligibility(monk
         json.dumps(new_terminal, sort_keys=True).encode("utf-8"),
     ))
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setattr(AGG, "_silo_objects_under", lambda prefix: objects)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    targeted_ids = [record["run_id"] for record in fixture["terminal_envelopes"]] + [new_terminal["run_id"]]
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: targeted_ids)
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="".join(f"{key}\n" for key, _body in objects), stderr="",
+            )
+        key = argv[argv.index("--key") + 1]
+        Path(argv[argv.index("--dest") + 1]).write_bytes(dict(objects)[key])
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
     status, run_ids, _history = AGG._load_pr_convergence_history(
         repository=fixture["repository"], repository_id=fixture["repository_id"],
         pr_number=fixture["pr_number"],
@@ -3935,8 +4126,9 @@ def test_one_gate_run_lists_terminal_silo_prefix_once_and_panel_reuses_cache(mon
     terminal_path = tmp_path / "gate-terminal.json"
     summary_path = tmp_path / "summary.md"
     monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_disposition_receipts", lambda **kwargs: ())
     monkeypatch.setattr(
         AGG, "load_previous_round_findings",
         lambda **kwargs: {"available": False, "detail": "fixture", "findings": []},
@@ -3949,7 +4141,7 @@ def test_one_gate_run_lists_terminal_silo_prefix_once_and_panel_reuses_cache(mon
     )
     terminal_prefix_calls = []
 
-    def fake_silo_cli(argv):
+    def fake_silo_cli(argv, timeout_s):
         prefix = argv[argv.index("--prefix") + 1]
         if prefix.startswith("d30/123/gate-terminal-v1-123-"):
             terminal_prefix_calls.append(prefix)
@@ -4186,9 +4378,11 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
     recorded_calls = []
 
     dest_existed = []
+    recorded_timeouts = []
 
-    def fake_cli(argv):
+    def fake_cli(argv, timeout_s):
         recorded_calls.append(list(argv))
+        recorded_timeouts.append(timeout_s)
         assert "--dest" in argv
         dest_idx = argv.index("--dest")
         dest_dir = Path(argv[dest_idx + 1])
@@ -4205,7 +4399,7 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
         )
 
     monkeypatch.setattr(AGG, "_silo_cli", fake_cli)
-    objects = AGG._silo_objects_under(prefix)
+    objects = AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
 
     # 断言走 CLI 路径及 argv 形态
     assert len(recorded_calls) == 1
@@ -4213,12 +4407,13 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
     assert argv[0:3] == ["list", "--prefix", prefix]
     assert argv[3] == "--dest"
     assert dest_existed == [True]
+    assert recorded_timeouts == [AGG.SILO_CLI_CALL_TIMEOUT_SECONDS]
 
     # 断言 stdout 键解析与 (key, body) 返回
     assert objects == [(canonical_key, payload)]
 
     # 断言四段键校验
-    def bad_key_cli(argv):
+    def bad_key_cli(argv, timeout_s):
         return subprocess.CompletedProcess(
             args=argv,
             returncode=0,
@@ -4228,7 +4423,7 @@ def test_silo_objects_under_cli_path_contract(monkeypatch):
 
     monkeypatch.setattr(AGG, "_silo_cli", bad_key_cli)
     with pytest.raises(ValueError) as exc:
-        AGG._silo_objects_under(prefix)
+        AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
     assert "silo key is not tier/repo_id/artifact_name/path" in str(exc.value)
 
 
@@ -4243,7 +4438,7 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
     payload = b'{"receipt": true}'
     recorded_calls = []
 
-    def fake_cli(argv):
+    def fake_cli(argv, timeout_s):
         recorded_calls.append(list(argv))
         assert "--dest" in argv
         dest_dir = Path(argv[argv.index("--dest") + 1])
@@ -4254,7 +4449,7 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{canonical_key}\n", stderr="")
 
     monkeypatch.setattr(AGG, "_silo_cli", fake_cli)
-    objects = AGG._silo_objects_under(prefix)
+    objects = AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
     assert objects == [(canonical_key, payload)]
     assert len(recorded_calls) == 1
     assert recorded_calls[0][0:3] == ["list", "--prefix", prefix]
@@ -4262,7 +4457,8 @@ def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
 
 def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
     # 跨进程边界断言：聚合器实际发出的 argv 必须是 [解释器, 仓内脚本, ...]，
-    # 不得出现 uv/uvx/pip/npx。Silo CLI 不加全局 timeout，避免截断历史扫描和旧 ledger 消费者。
+    # 不得出现 uv/uvx/pip/npx。每次调用必须带墙钟 timeout（gate#290 教训：
+    # 无界 Silo 子进程会拖死汇总 job），由调用点显式声明预算来源。
     recorded = []
 
     class _Proc:
@@ -4276,10 +4472,10 @@ def test_silo_cli_argv_uses_interpreter_without_package_manager(monkeypatch):
 
     monkeypatch.setattr(AGG.subprocess, "run", fake_run)
     monkeypatch.setenv("SILO_STORE", "/tmp/fake-silo-store.py")
-    AGG._silo_cli(["list", "--prefix", "d30/1/"])
+    AGG._silo_cli(["list", "--prefix", "d30/1/"], 30)
     assert len(recorded) == 1
     argv, kwargs = recorded[0]
-    assert "timeout" not in kwargs
+    assert kwargs["timeout"] == 30
     assert argv[0] == sys.executable
     assert argv[1] == "/tmp/fake-silo-store.py"
     assert argv[2:] == ["list", "--prefix", "d30/1/"]
@@ -4633,7 +4829,7 @@ def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_
     monkeypatch.setattr(AGG, "_silo_configured", lambda: silo_configured)
     monkeypatch.setattr(
         AGG, "_silo_objects_under",
-        lambda prefix: [(key, raw) for key, raw in silo_objects if key.startswith(prefix)],
+        lambda prefix, timeout_s: [(key, raw) for key, raw in silo_objects if key.startswith(prefix)],
     )
     output = tmp_path / "previous-findings.json"
     rc = AGG.main([
@@ -4707,7 +4903,7 @@ def test_render_previous_context_rejects_output_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
     monkeypatch.setattr(
         AGG, "_silo_objects_under",
-        lambda prefix: [(key, raw) for key, raw in objects if key.startswith(prefix)],
+        lambda prefix, timeout_s: [(key, raw) for key, raw in objects if key.startswith(prefix)],
     )
     target = tmp_path / "x"
     with pytest.raises(SystemExit):
