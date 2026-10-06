@@ -3788,14 +3788,23 @@ def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_obje
     monkeypatch.setattr(AGG, "_silo_objects_under", fake_silo)
 
 
-def test_convergence_history_silo_failure_is_greppable_and_unavailable(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("Silo list denied"), subprocess.TimeoutExpired(["silo_store.py", "list"], 15)],
+    ids=["listing-error", "listing-timeout"],
+)
+def test_convergence_history_silo_failure_is_greppable_and_unavailable(monkeypatch, capsys, error):
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: (_ for _ in ()).throw(TimeoutError()))
+
+    def fail_listing(**kwargs):
+        raise error
+
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", fail_listing)
     status, run_ids = AGG._load_pr_convergence_history(
         repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
     )
     assert (status, run_ids) == ("history_unavailable", ())
-    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=TimeoutError" in capsys.readouterr().out
+    assert f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(error).__name__}" in capsys.readouterr().out
 
 
 def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavailable(monkeypatch, capsys):
@@ -3814,6 +3823,19 @@ def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavail
     )
     assert (status, run_ids) == ("history_unavailable", ())
     assert "silo_empty_but_github_has_terminal_history" in capsys.readouterr().out
+
+
+def test_convergence_history_malformed_silo_terminal_is_unavailable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(
+        AGG, "_silo_objects_under",
+        lambda prefix: [(_CANARY_TERMINAL_KEY, b"{")],
+    )
+    status, run_ids = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history" in capsys.readouterr().out
 
 
 def test_convergence_history_empty_first_run_is_available_zero(monkeypatch):
@@ -4394,6 +4416,60 @@ def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
     assert "manual_required" in body and "round-a" in body
     same = dict(previous_finding, id="other", acceptance=current["acceptance"], issue=current["issue"])
     assert AGG.relate_findings([current], [same])[0]["relation_to_previous"] == "new"
+
+
+@pytest.mark.parametrize("case", ["pass", "fail", "manual_conflict"])
+def test_shadow_budget_preserves_existing_verdict_contract(case):
+    if case == "pass":
+        audit = _valid_scoped_primary_record(verdict="pass", result={"findings": []})
+        primary_result = "success"
+        previous_round = {"available": True, "findings": []}
+    elif case == "fail":
+        audit = _valid_scoped_primary_record(
+            verdict="fail",
+            result={"findings": [{
+                "id": "p1", "severity": "major", "trigger_kind": "inferred",
+                "file": "src/lock.py", "line": 12, "category": "correctness",
+            }]},
+        )
+        primary_result = "failure"
+        previous_round = {"available": True, "findings": []}
+    else:
+        current = {
+            "id": "round-b", "severity": "major", "file": "src/lock.py", "line": 12,
+            "category": "correctness", "issue": "must not advance the lease",
+            "acceptance": "leave the lease at evidence",
+        }
+        previous = {
+            "id": "round-a", "severity": "major", "file": "src/lock.py", "line": 12,
+            "category": "correctness", "issue": "must advance the lease",
+            "acceptance": "advance the lease to closed",
+        }
+        audit = _relation_audit(**current)
+        previous_round = {"available": True, "findings": [previous]}
+        primary_result = "success"
+
+    kwargs = _base_kwargs(
+        primary_result=primary_result,
+        audit=audit,
+        scope=_scope_for(audit),
+        audit_digest=_DIGEST_A,
+    )
+    baseline = AGG.evaluate(**kwargs)
+    shadow = AGG.evaluate(
+        **kwargs,
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    for outcome in (baseline, shadow):
+        findings = json.loads(json.dumps(audit["result"]["findings"]))
+        AGG.apply_finding_relation(outcome, findings, previous_round)
+    assert (shadow.ok, shadow.classification, shadow.reason_code, shadow.gate_result) == (
+        baseline.ok, baseline.classification, baseline.reason_code, baseline.gate_result,
+    )
+    assert shadow.convergence_shadow["terminal_decision"] == "arbitration_required"
+    if case == "manual_conflict":
+        assert shadow.finding_relation["review_terminal"] == "manual_required"
 
 
 def test_unknown_relation_value_is_rejected():
