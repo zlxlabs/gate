@@ -43,7 +43,6 @@ _POLICY_BY_TIER = {
     "internal": (2, 5),
     "saas": (2, 8),
 }
-_PR_ROUND_LIMIT_BY_TIER = {"personal": 5, "internal": 8, "saas": 12}
 
 
 class ConvergenceError(ValueError):
@@ -1115,51 +1114,6 @@ def policy_for(scope: Scope) -> Policy:
         max_rounds=maximum,
         unavailable_budget=maximum,
     )
-
-
-def pr_round_budget(
-    *,
-    prior_run_ids: Sequence[int],
-    current_run_id: int,
-    current_eligible: bool,
-    tier: str,
-    history_status: str = "available",
-) -> dict[str, Any]:
-    """Derive shadow-only eligible primary count across all PR heads.
-
-    A workflow rerun shares its run id with the original attempt, so run ids
-    are the counting unit. History unavailability is a third state, never a
-    zero-count alias. This projection does not alter the per-epoch reducer.
-    """
-    if tier not in _PR_ROUND_LIMIT_BY_TIER:
-        raise ConvergenceError(f"unsupported tier for PR round budget {tier!r}")
-    if history_status not in {"available", "history_unavailable"}:
-        raise ConvergenceError(f"invalid PR round history status {history_status!r}")
-    if type(current_run_id) is not int or current_run_id <= 0:
-        raise ConvergenceError("current_run_id must be a positive integer")
-    if type(current_eligible) is not bool:
-        raise ConvergenceError("current_eligible must be a boolean")
-    limit = _PR_ROUND_LIMIT_BY_TIER[tier]
-    if history_status == "history_unavailable":
-        return {
-            "history_status": "history_unavailable",
-            "limit": limit,
-            "terminal_decision": "history_unavailable",
-        }
-    run_ids: set[int] = set()
-    for run_id in prior_run_ids:
-        if type(run_id) is not int or run_id <= 0:
-            raise ConvergenceError("prior run ids must be positive integers")
-        run_ids.add(run_id)
-    if current_eligible:
-        run_ids.add(current_run_id)
-    eligible_rounds = len(run_ids)
-    return {
-        "history_status": "available",
-        "eligible_rounds": eligible_rounds,
-        "limit": limit,
-        "terminal_decision": "arbitration_required" if eligible_rounds >= limit else "collecting",
-    }
 
 
 def _empty_key_digest() -> str:
