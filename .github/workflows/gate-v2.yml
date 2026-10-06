@@ -613,12 +613,11 @@ jobs:
           echo "pnpm_config_store_dir=$cache_root/pnpm" >> "$GITHUB_ENV"
           echo "GOMODCACHE=$cache_root/go" >> "$GITHUB_ENV"
 
-      # D5 install-timing split — canary ring, personal tier only, same as
-      # legacy gate.yml (see that file's steps for the full historical
-      # rationale on ecosystem detection / continue-on-error / canary gating).
+      # Install dependencies for every tier in legacy mode; keep the step's
+      # existing continue-on-error behavior and report its structured result.
       - name: Install dependencies
         id: install
-        if: ${{ steps.quality-entry.outputs.mode == 'legacy' && inputs.tier == 'personal' }}
+        if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         continue-on-error: true
         env:
           UV_CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}

@@ -3143,6 +3143,20 @@ def test_quality_removes_gate_sources_before_any_caller_check():
         assert cleanup_index < names.index(name), f"gate source cleanup must precede {name}"
 
 
+def test_install_dependencies_and_tests_run_for_every_tier_in_legacy_mode():
+    raw, _ = _load_workflow()
+    steps = _quality_steps(raw)
+    install = next(step for step in steps if step.get("name") == "Install dependencies")
+    tests = next(step for step in steps if step.get("name") == "Tests")
+    install_if = str(install.get("if", ""))
+    tests_if = str(tests.get("if", ""))
+
+    assert "inputs.tier" not in install_if
+    assert "inputs.tier" not in tests_if
+    assert install_if == tests_if
+    assert f"{QUALITY_ENTRY_MODE} == 'legacy'" in install_if
+
+
 def test_v2_aggregator_jobs_do_not_execute_caller_quality_code():
     raw, _ = _load_workflow()
     caller_markers = (
