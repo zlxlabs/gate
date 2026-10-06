@@ -301,6 +301,7 @@ class Outcome:
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
     convergence_envelope: Optional[dict[str, Any]] = None
+    convergence_shadow: Optional[dict[str, Any]] = None
     convergence_receipt: Optional[Any] = None
     recorded_disposition_claims: list[str] = field(default_factory=list)
     # Typed receipt audit is the only source for the terminal receipt record.
@@ -965,6 +966,8 @@ def build_terminal_envelope(
     }
     if outcome.recorded_disposition_claims:
         envelope["recorded_disposition_claims"] = list(outcome.recorded_disposition_claims)
+    if outcome.convergence_shadow is not None:
+        envelope["convergence_shadow"] = dict(outcome.convergence_shadow)
     if outcome.finding_relation is not None:
         envelope["finding_relation"] = outcome.finding_relation
     return envelope
@@ -1172,6 +1175,8 @@ def evaluate(
     caller_checks: str = "",
     preflight_result: str = "",
     repository: str | None = None,
+    prior_eligible_run_ids: Sequence[int] = (),
+    convergence_history_status: str = "history_unavailable",
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -1484,6 +1489,23 @@ def evaluate(
             outcome.gate_result = "pass"
             outcome.problems = [problem for problem in outcome.problems if problem != "primary review verdict is 'fail'"]
             outcome.notes.append("all current P1 findings are covered by active evidence-bound gate-disposition receipts")
+    if scope is not None:
+        eligible_this_round = (
+            audit_available
+            and audit_source is not None
+            and isinstance(audit, dict)
+            and audit.get("verdict") in ("pass", "fail")
+        )
+        outcome.convergence_shadow = {
+            **_CONVERGENCE.pr_round_budget(
+                prior_run_ids=prior_eligible_run_ids,
+                current_run_id=identity.run_id,
+                current_eligible=eligible_this_round,
+                tier=scope.tier,
+                history_status=convergence_history_status,
+            ),
+            "eligible_this_round": eligible_this_round,
+        }
     return outcome
 
 
@@ -1647,6 +1669,16 @@ def render_summary(
             f"Terminal state: classification=`{outcome.classification}`, "
             f"reason_code=`{outcome.reason_code}`, gate_result=`{outcome.gate_result}`"
         )
+    if outcome.convergence_shadow is not None:
+        shadow = outcome.convergence_shadow
+        if shadow["history_status"] == "history_unavailable":
+            lines.append("PR 累计主审轮（影子）：`history_unavailable`；未输出累计数，不改变 gate 结论。")
+        else:
+            lines.append(
+                "PR 累计主审轮（影子）："
+                f"`{shadow['eligible_rounds']}/{shadow['limit']}`，"
+                f"decision=`{shadow['terminal_decision']}`；不改变 gate 结论。"
+            )
     if primary_result == "failure" and outcome.reason_code in (
         "audit_missing", "audit_invalid", "audit_source_mismatch",
     ):
@@ -1813,6 +1845,16 @@ def render_status_panel(
         "",
         f"当前裁决：`{current['classification']}` / `{current['reason_code']}`",
     ])
+    current_shadow = current.get("convergence_shadow")
+    if isinstance(current_shadow, dict):
+        if current_shadow["history_status"] == "history_unavailable":
+            shadow_text = "history_unavailable（未估算累计轮数）"
+        else:
+            shadow_text = (
+                f"{current_shadow['eligible_rounds']}/{current_shadow['limit']} · "
+                f"{current_shadow['terminal_decision']}"
+            )
+        lines.extend(["", f"PR 累计主审轮（影子）：`{shadow_text}`"])
     warning_line = _bounded_history_warning(history_warning=history_warning, history_reasons=history_reasons)
     if warning_line:
         lines.extend(["", warning_line])
@@ -1850,15 +1892,22 @@ def render_status_panel(
         "",
         "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
         "",
-        "| Run | Attempt | Head | 状态 | 收件人动作 |",
-        "| ---: | ---: | :--- | :--- | :--- |",
+        "| Run | Attempt | Head | 状态 | PR 累计主审轮（影子） | 收件人动作 |",
+        "| ---: | ---: | :--- | :--- | :--- | :--- |",
     ])
     for row in ordered:
         short_sha = row["head_sha"][:7]
         run_link = f"[{row['run_id']}](https://github.com/{row['repository']}/actions/runs/{row['run_id']})"
+        shadow = row.get("convergence_shadow")
+        if not isinstance(shadow, dict):
+            shadow_text = "—"
+        elif shadow["history_status"] == "history_unavailable":
+            shadow_text = "history_unavailable"
+        else:
+            shadow_text = f"{shadow['eligible_rounds']}/{shadow['limit']} · {shadow['terminal_decision']}"
         lines.append(
             f"| {run_link} | {row['run_attempt']} | `{short_sha}` | "
-            f"`{row['gate_result']}` | {_panel_action(row)} |"
+            f"`{row['gate_result']}` | `{shadow_text}` | {_panel_action(row)} |"
         )
     lines.extend([
         "",
@@ -2031,6 +2080,7 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         raise ValueError("gate terminal gate_result is outside the finite domain")
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")
+    audit = record.get("audit")
     row = {
         "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
         "repository": repository,
@@ -2040,7 +2090,41 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "gate_result": record["gate_result"],
         "classification": record["classification"],
         "reason_code": record["reason_code"],
+        "_eligible_primary_round": (
+            isinstance(audit, dict)
+            and audit.get("available") is True
+            and record.get("primary_result") in ("success", "failure")
+            and record["gate_result"] in ("pass", "fail")
+        ),
     }
+    shadow = record.get("convergence_shadow")
+    if shadow is not None:
+        if not isinstance(shadow, dict):
+            raise ValueError("gate terminal convergence_shadow is not an object")
+        history_status = shadow.get("history_status")
+        decision = shadow.get("terminal_decision")
+        if history_status not in ("available", "history_unavailable"):
+            raise ValueError("gate terminal convergence history_status is invalid")
+        if decision not in ("collecting", "arbitration_required", "history_unavailable"):
+            raise ValueError("gate terminal convergence terminal_decision is invalid")
+        if type(shadow.get("limit")) is not int or shadow["limit"] <= 0:
+            raise ValueError("gate terminal convergence limit is invalid")
+        if type(shadow.get("eligible_this_round")) is not bool:
+            raise ValueError("gate terminal convergence eligibility is invalid")
+        projected_shadow = {
+            "history_status": history_status,
+            "terminal_decision": decision,
+            "limit": shadow["limit"],
+            "eligible_this_round": shadow["eligible_this_round"],
+        }
+        rounds = shadow.get("eligible_rounds")
+        if history_status == "available":
+            if type(rounds) is not int or rounds < 0:
+                raise ValueError("gate terminal convergence eligible_rounds is invalid")
+            projected_shadow["eligible_rounds"] = rounds
+        elif "eligible_rounds" in shadow:
+            raise ValueError("unavailable convergence history must not publish an eligible count")
+        row["convergence_shadow"] = projected_shadow
     recorded_claims = record.get("recorded_disposition_claims")
     if isinstance(recorded_claims, list) and all(isinstance(item, str) for item in recorded_claims) and recorded_claims:
         row["recorded_disposition_claims"] = list(recorded_claims)
@@ -2263,6 +2347,7 @@ def _silo_cli(argv: list[str]) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         check=False,
+        timeout=GITHUB_API_TIMEOUT_SECONDS,
     )
 
 
@@ -2349,6 +2434,50 @@ def _fetch_silo_terminal_history(
             repository_id=repository_id, pr_number=pr_number,
         )
     return result
+
+
+def _load_pr_convergence_history(
+    *, repository: str, repository_id: int, pr_number: int,
+) -> tuple[str, tuple[int, ...]]:
+    """Load the PR's d30 terminal history for the shadow-only round count."""
+    if not _silo_configured():
+        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured")
+        return "history_unavailable", ()
+    try:
+        history = _fetch_silo_terminal_history(
+            repository=repository, repository_id=repository_id, pr_number=pr_number,
+        )
+    except Exception as exc:
+        print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
+        return "history_unavailable", ()
+    if history.incomplete_reasons:
+        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history")
+        return "history_unavailable", ()
+    if not history.rows:
+        try:
+            github_history = _fetch_github_terminal_history(
+                token=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "",
+                repository=repository,
+                repository_id=repository_id,
+                pr_number=pr_number,
+            )
+        except Exception as exc:
+            print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
+            return "history_unavailable", ()
+        if github_history.rows:
+            print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_empty_but_github_has_terminal_history")
+            return "history_unavailable", ()
+        unexpected_reasons = [
+            reason for reason in github_history.incomplete_reasons
+            if not reason.startswith("no terminal artifact matched gate-terminal-v1-")
+        ]
+        if unexpected_reasons:
+            print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_history_incomplete")
+            return "history_unavailable", ()
+    return "available", tuple(
+        row["run_id"] for row in history.rows
+        if row.get("_eligible_primary_round") is True
+    )
 
 
 def _merge_history_loads(github: HistoryLoad, silo: HistoryLoad) -> HistoryLoad:
@@ -3317,6 +3446,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         audit_digest = legacy_raw_audit_digest
 
     waiver_receipts: tuple[Any, ...] = ()
+    prior_eligible_run_ids: tuple[int, ...] = ()
+    convergence_history_status = "history_unavailable"
+    if scope is not None:
+        convergence_history_status, prior_eligible_run_ids = _load_pr_convergence_history(
+            repository=args.repository,
+            repository_id=identity.repository_id,
+            pr_number=identity.pr,
+        )
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token and scope is not None and not (is_draft and args.primary_result == "skipped"):
         try:
@@ -3366,6 +3503,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         legacy_raw_audit_digest=legacy_raw_audit_digest,
         waiver_receipts=waiver_receipts,
         repository=args.repository,
+        prior_eligible_run_ids=prior_eligible_run_ids,
+        convergence_history_status=convergence_history_status,
     )
     apply_finding_relation(outcome, findings, previous_round)
 

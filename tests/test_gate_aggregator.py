@@ -1199,6 +1199,42 @@ def test_terminal_envelope_bytes_unchanged_by_rendering_work():
     assert json.dumps(envelope, ensure_ascii=False, indent=2) + "\n" == _TERMINAL_GOLDEN
 
 
+def test_terminal_envelope_publishes_shadow_budget_bytes_without_changing_gate_result(tmp_path):
+    audit = _valid_scoped_primary_record()
+    terminal_path = tmp_path / "gate-terminal.json"
+    summary_path = tmp_path / "summary.md"
+    outcome = AGG.evaluate(
+        **_base_kwargs(
+            primary_result="success", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A,
+        ),
+        prior_eligible_run_ids=(101, 102, 103, 104),
+        convergence_history_status="available",
+    )
+    assert AGG._finish(
+        outcome, str(summary_path), terminal_path=str(terminal_path),
+        repository="zlxlabs/gate", identity=IDENTITY,
+        quality_result="success", primary_result="success", review_expected=True,
+        is_draft=False, runner="self", primary_audit=audit,
+    ) == 0
+    published = json.loads(terminal_path.read_bytes())
+    assert published["gate_result"] == "pass"
+    assert published["convergence_shadow"] == {
+        "history_status": "available",
+        "eligible_rounds": 5,
+        "limit": 5,
+        "terminal_decision": "arbitration_required",
+        "eligible_this_round": True,
+    }
+    summary = summary_path.read_text()
+    assert "5/5" in summary and "arbitration_required" in summary
+    row = AGG._terminal_row(
+        published, repository="zlxlabs/gate", repository_id=IDENTITY.repository_id,
+        pr_number=IDENTITY.pr,
+    )
+    panel = AGG.render_status_panel([row])
+    assert "5/5 · arbitration_required" in panel
+
+
 def _visible_scenario(tmp_path, overrides, audit_record="__default__"):
     audit_dir = tmp_path / "audit"
     if audit_record is not None:
@@ -1910,7 +1946,7 @@ def test_publish_only_consumes_the_real_terminal_producer_fixture_after_upload(m
 def test_publish_only_subprocess_writes_additive_delivery_receipt_bytes(monkeypatch, tmp_path):
     # Captured from base 85916ed's real _build_panel_delivery producer for this terminal row.
     old_receipt = {
-        "comment_body_sha256": "4762e9457a159bd48c303106f4194e3cf07ce65d49ab675f8b72388dab1ff0cd",
+        "comment_body_sha256": "e1eec6dfd3e6568367e09430ba0d4fd4f24924429ecfbe977fe448d6766cf370",
         "comment_created": True, "comment_expected": True,
         "completed_operations": ["IDENTITY", "COMMENT_LOOKUP", "HISTORY_RECONSTRUCTION", "COMMENT_PUBLISH", "POST_VERIFY"],
         "delivery": "created", "error_category": None, "head_sha": "a" * 40,
@@ -3716,6 +3752,8 @@ def _canary_terminal_bytes(gate_result="pass", *, run_id=_CANARY_RUN_ID, run_att
         "run_attempt": run_attempt,
         "head_sha": head_sha,
         "gate_result": gate_result,
+        "primary_result": "success" if gate_result == "pass" else "failure",
+        "audit": {"available": True, "source_attempt": 1, "artifact_name": "primary-audit-v2-canary"},
         "classification": "code_pass" if gate_result == "pass" else "code_fail",
         "reason_code": "primary_pass" if gate_result == "pass" else "primary_findings",
     }
@@ -3748,6 +3786,61 @@ def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_obje
     monkeypatch.setattr(AGG, "_github_json", fake_github_json)
     monkeypatch.setattr(AGG, "_download_terminal_zip", fake_download)
     monkeypatch.setattr(AGG, "_silo_objects_under", fake_silo)
+
+
+def test_convergence_history_silo_failure_is_greppable_and_unavailable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: (_ for _ in ()).throw(TimeoutError()))
+    status, run_ids = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=TimeoutError" in capsys.readouterr().out
+
+
+def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavailable(monkeypatch, capsys):
+    prior = AGG._terminal_row(
+        json.loads(_canary_terminal_bytes()),
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(rows=[prior]),
+    )
+    status, run_ids = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("history_unavailable", ())
+    assert "silo_empty_but_github_has_terminal_history" in capsys.readouterr().out
+
+
+def test_convergence_history_empty_first_run_is_available_zero(monkeypatch):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+    monkeypatch.setattr(
+        AGG, "_fetch_github_terminal_history",
+        lambda **kwargs: AGG.HistoryLoad(
+            incomplete_reasons=["no terminal artifact matched gate-terminal-v1-1327629472-"],
+        ),
+    )
+    assert AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    ) == ("available", ())
+
+
+def test_silo_terminal_history_projects_eligible_primary_rounds(monkeypatch):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    raw = _canary_terminal_bytes()
+    monkeypatch.setattr(
+        AGG, "_silo_objects_under",
+        lambda prefix: [(_CANARY_TERMINAL_KEY, raw)],
+    )
+    status, run_ids = AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+    assert (status, run_ids) == ("available", (_CANARY_RUN_ID,))
 
 
 def _canary_receipt(reason="locked upstream behavior", finding_id="p1"):
