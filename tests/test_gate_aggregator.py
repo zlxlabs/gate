@@ -3788,6 +3788,14 @@ def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_obje
     monkeypatch.setattr(AGG, "_silo_objects_under", fake_silo)
 
 
+def test_convergence_history_without_silo_configuration_is_greppable(monkeypatch, capsys):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: False)
+    assert AGG._load_pr_convergence_history(
+        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    ) == ("history_unavailable", ())
+    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "error",
     [RuntimeError("Silo list denied"), subprocess.TimeoutExpired(["silo_store.py", "list"], 15)],
