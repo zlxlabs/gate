@@ -1,0 +1,14 @@
+{
+  "base_commit": "21e32f82ddaba41814a9f365f8b026fd36d0a8b5",
+  "base_workflow": ".github/workflows/gate-v2.yml",
+  "jobs": {
+    "classify_pr_paths": "f3ae3676aff0b4b707f386e9f23faac3b6b7dbde41a78553f4749b6bf70d7abc",
+    "gate": "e37ad947fec8197075967914e83276e1bf2f48e15eaea8536c85f33881c3952b",
+    "ledger": "4014d9b9b2440329e542bcd31c9db2fa056b7527e165472307df65ca4d542d41",
+    "notify": "51805cd275da1abb053355157af39c66eb24aa1695f6eb3b534bb742ac994ed1",
+    "ocr": "252fee121424bc15e5ae6ea71b0a906ba6ce149b68b588ad44c73168ac6ef44c",
+    "primary": "8f218296aafff37ba7b514b34101fd70f921e4c15bdcb98748c95dbff7eb5695",
+    "quality": "e9b51031a706f7b28b2b93f904c893a4efb10167a91dcd1191726364f10ee5ba",
+    "resolve_advisory": "22fd659ae91ad11be396530613240ab9a457033bef170eeef212e7f09f0a1cd9"
+  }
+}

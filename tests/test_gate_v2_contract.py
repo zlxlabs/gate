@@ -579,7 +579,7 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
     raw, _ = _load_workflow()
     text = WORKFLOW.read_text(encoding="utf-8")
     assert text.count("100.100.100.100") >= 4
-    for job_name in ("primary", "ocr", "gate", "ledger"):
+    for job_name in ("primary", "arbiter", "ocr", "gate", "ledger"):
         steps = raw["jobs"][job_name]["steps"]
         names = [step.get("name") for step in steps]
         assert "Resolve Silo hostname via MagicDNS" in names
@@ -629,11 +629,12 @@ def test_silo_store_env_aligns_with_job_checkout_path():
     raw, _ = _load_workflow()
     checkout_dirs = {
         "primary": "_gate-silo-src",
+        "arbiter": "_gate-silo-src",
         "ocr": "_gate-silo-src",
         "gate": "_gate-aggregator-src",
         "ledger": "_gate-aggregator-src",
     }
-    for job_name in ("primary", "ocr", "gate", "ledger"):
+    for job_name in ("primary", "arbiter", "ocr", "gate", "ledger"):
         job = raw["jobs"][job_name]
         silo_store_env = job.get("env", {}).get("SILO_STORE", "")
         checkout_dir = checkout_dirs[job_name]
@@ -675,7 +676,7 @@ def test_control_runner_input_defaults_to_follow_runner():
 def test_all_required_jobs_present():
     raw, _ = _load_workflow()
     assert set(raw["jobs"].keys()) == {
-        "classify_pr_paths", "quality", "primary", "resolve_advisory", "ocr", "gate", "ledger", "notify",
+        "classify_pr_paths", "quality", "primary", "arbiter", "resolve_advisory", "ocr", "gate", "ledger", "notify",
     }
 
 
@@ -756,7 +757,7 @@ def test_workflow_sha_checkouts_use_centralized_bounded_retry():
                 assert_workflow_sha_checkout(step)
             if uses.startswith("actions/checkout"):
                 assert (step.get("with") or {}).get("ref") != "${{ job.workflow_sha }}"
-    assert len(sites) == 9
+    assert len(sites) == 10
     producer = next(
         step for step in disposition["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
@@ -1150,7 +1151,7 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     for copy in copies:
         assert copy == primary_if
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert workflow_text.count(CLASSIFY_GUARD) == 7
+    assert workflow_text.count(CLASSIFY_GUARD) == 8
     assert "outputs.review_expected == 'true'" not in workflow_text
     assert download_audit["if"] == (
         REVIEW_EXPECTED_IF[:-3] + " && "
@@ -2104,10 +2105,12 @@ def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
     )
 
 
-def test_only_ocr_and_ledger_jobs_have_continue_on_error():
+def test_only_ocr_ledger_and_the_shadow_arbiter_have_continue_on_error():
+    # ocr / ledger 是本仓既有的软失败 job；arbiter（C2b 影子期）是第三个，且它的
+    # 软失败是卡面锁定的不变式：影子 job 的成败不得改变 run 的结论。
     raw, _ = _load_workflow()
     jobs = raw["jobs"]
-    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger"}
+    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger", "arbiter"}
 
 
 def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
@@ -2966,7 +2969,7 @@ def test_non_quality_jobs_do_not_use_ci_pool_label():
     # uncredentialed CI pool. Assert on parsed fromJSON labels, not bare
     # substring match (would false-positive on words containing "ci").
     raw, _ = _load_workflow()
-    for job_name in ("gate", "ledger", "notify", "primary", "resolve_advisory", "ocr", "classify_pr_paths"):
+    for job_name in ("gate", "ledger", "notify", "primary", "arbiter", "resolve_advisory", "ocr", "classify_pr_paths"):
         runs_on = str(raw["jobs"][job_name]["runs-on"])
         for labels in _fromjson_label_sets(runs_on):
             assert "ci" not in labels, (
