@@ -1226,7 +1226,7 @@ def test_shadow_and_disposition_share_the_same_declaration_scripts(source_host):
 
 
 def test_every_workflow_bootstrap_shares_the_one_script():
-    for path, expected in ((WORKFLOW, 9), (DISPOSITION_WORKFLOW, 1)):
+    for path, expected in ((WORKFLOW, 10), (DISPOSITION_WORKFLOW, 1)):
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         runs = [
             step["run"] for job in raw["jobs"].values()

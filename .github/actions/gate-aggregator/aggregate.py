@@ -58,6 +58,14 @@ used to be left with nothing but a verdict line. It never judges anything, never
 exits non-zero, and a degraded render always leaves exactly one greppable
 `PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE reason=<type>` line behind.
 
+Round accounting (261006-review-precision C2b): `--prior-rounds` is the shadow
+arbiter job's read-only projection — this PR's eligible primary rounds across
+heads, EXCLUDING the current run id, plus this round's blocking-finding count.
+It reuses the very same `convergence.pr_round_budget` and the 45s-budgeted
+history loader the `gate` job runs, so the two sides cannot disagree about the
+count; an unavailable history stays `null`/`history_unavailable`, never 0. It
+changes no verdict and is not a gate input.
+
 Judgement responsibilities (see gate-v2.yml's `gate` job and this repo's
 tests/test_gate_aggregator.py for the full decision matrix):
   - `runner` must be a recognized value (`self`/`hosted`); anything else fails
@@ -796,6 +804,95 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     if isinstance(findings, list):
         apply_finding_relation(Outcome(ok=True), findings, previous)
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return 0
+
+
+def _prior_rounds_reason(history: HistoryLoad) -> str:
+    """One bounded text reason for an unavailable PR round history."""
+    reasons = [reason for reason in history.incomplete_reasons if reason]
+    if not reasons:
+        return "history_unavailable"
+    joined = "; ".join(reasons)
+    if len(joined) <= MAX_HISTORY_WARNING_CHARS:
+        return joined
+    return joined[:MAX_HISTORY_WARNING_CHARS] + "…"
+
+
+def _prior_rounds_audit_projection(audit_dir: Optional[Path]) -> dict[str, Any]:
+    """Count this round's blocking findings from the canonical primary audit.
+
+    Reuses `_canonical_p1_findings` — the same P1 projection the aggregator's own
+    convergence hand-off uses — so there is exactly ONE definition of "active
+    blocker/major" in this repo. A missing or malformed audit never counts as
+    "no blockers": it stays `None` and the caller (the arbiter job) does not run.
+    """
+    if audit_dir is None:
+        return {"blocking_findings": None, "audit_state": "not_checked"}
+    audit, error, _ = _read_audit_file(audit_dir)
+    if error is not None:
+        print(f"GATE-PRIOR-ROUNDS-AUDIT-UNAVAILABLE reason={error}")
+        return {"blocking_findings": None, "audit_state": "missing"}
+    p1_findings = _canonical_p1_findings(audit) if isinstance(audit, dict) else None
+    if p1_findings is None:
+        print("GATE-PRIOR-ROUNDS-AUDIT-UNAVAILABLE reason=audit_invalid")
+        return {"blocking_findings": None, "audit_state": "invalid"}
+    return {"blocking_findings": len(p1_findings), "audit_state": "available"}
+
+
+def _prior_rounds_cli(argv: list[str]) -> int:
+    """`--prior-rounds`: one round-accounting projection for the shadow arbiter job.
+
+    `prior_rounds` counts this PR's eligible primary rounds ACROSS heads but
+    EXCLUDES the current run id (a rerun shares its run id with the original
+    attempt, so counting it would make the projection attempt-dependent). It is
+    derived from the same `pr_round_budget` and the same 45s-budgeted history
+    loader the `gate` job uses, so both sides cannot disagree about the count.
+
+    `prior_rounds` is `null` — never 0 — when the history is unavailable: an
+    uncountable history is not an empty one (gate#290's revert reason).
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repository-id", required=True, type=int)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--pr-number", required=True, type=int)
+    parser.add_argument("--run-id", required=True, type=int)
+    parser.add_argument("--run-attempt", required=True, type=int)
+    parser.add_argument("--tier", required=True)
+    parser.add_argument(
+        "--audit-dir", type=Path, default=None,
+        help="canonical primary audit directory; adds blocking_findings/audit_state to the projection",
+    )
+    parser.add_argument("--out", required=True, type=Path)
+    args = parser.parse_args(argv)
+
+    history_status, eligible_run_ids, history = _load_pr_convergence_history(
+        repository=args.repository,
+        repository_id=args.repository_id,
+        pr_number=args.pr_number,
+    )
+    budget = _CONVERGENCE.pr_round_budget(
+        prior_run_ids=tuple(run_id for run_id in eligible_run_ids if run_id != args.run_id),
+        current_run_id=args.run_id,
+        current_eligible=False,
+        tier=args.tier,
+        history_status=history_status,
+    )
+    unavailable = budget["terminal_decision"] == "history_unavailable"
+    payload = {
+        "prior_rounds": None if unavailable else budget["eligible_rounds"],
+        "limit": budget["limit"],
+        "state": budget["terminal_decision"],
+        "reason": _prior_rounds_reason(history) if unavailable else "",
+        **_prior_rounds_audit_projection(args.audit_dir),
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"GATE-PRIOR-ROUNDS: repository_id={args.repository_id} pr_number={args.pr_number} "
+        f"run_id={args.run_id} run_attempt={args.run_attempt} prior_rounds={payload['prior_rounds']} "
+        f"limit={payload['limit']} state={payload['state']} "
+        f"blocking_findings={payload['blocking_findings']} audit_state={payload['audit_state']}"
+    )
     return 0
 
 
@@ -3546,6 +3643,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _annotate_primary_audit_cli(argv_list[1:])
     if argv_list[:1] == ["--render-findings-summary"]:
         return _render_findings_summary_cli(argv_list[1:])
+    if argv_list[:1] == ["--prior-rounds"]:
+        return _prior_rounds_cli(argv_list[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quality-result", required=True, help="needs.quality.result")
     parser.add_argument("--caller-checks", default="", help="needs.quality.outputs.caller_checks (not_started|passed|failed; empty when the evidence step never ran)")

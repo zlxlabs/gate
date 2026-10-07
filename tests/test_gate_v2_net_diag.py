@@ -50,7 +50,7 @@ def test_all_github_https_probes_use_the_same_unmetered_head_target():
         for steps in _diagnostics(workflow).values()
         for step in steps
     ]
-    assert len(runs) == 4
+    assert len(runs) == 5
     for run in runs:
         assert "https://api.github.com/zen" not in run
         assert "github_url=${GATE_NET_DIAG_GITHUB_URL:-https://github.com}" in run
