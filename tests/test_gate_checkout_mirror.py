@@ -3,6 +3,8 @@
 import json
 import os
 import random
+import shlex
+import shutil
 import socket
 import subprocess
 import time
@@ -385,13 +387,36 @@ def test_mirror_hit_localizes_checkout_and_sends_no_origin_pack(tmp_path, reques
     workspace = tmp_path / "primed"
     mirror_before = _mirror_signature(fixture["mirror_repo"])
     script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
-    prime = _run_mirror_script(script, fixture, workspace)
+    delayed_git = tmp_path / "bin/git"
+    delayed_git.parent.mkdir()
+    git_binary = shutil.which("git")
+    assert git_binary
+    delayed_git.write_text(
+        "#!/usr/bin/env bash\n"
+        'case " $* " in *" repack --no-local -a -d "*) sleep 0.5 ;; esac\n'
+        f"exec {shlex.quote(git_binary)} \"$@\"\n"
+    )
+    delayed_git.chmod(0o755)
+    prime = _run_mirror_script(
+        script,
+        fixture,
+        workspace,
+        script_env={"PATH": f"{delayed_git.parent}{os.pathsep}{os.environ['PATH']}"},
+    )
     assert prime.returncode == 0, f"mirror consumer failed: {prime.stderr}\n{prime.stdout}"
     result = _result_line(prime)
     assert result["hit"] == 1
     assert result["reason"] == "ok"
     assert result["origin_fetch_pack_bytes"] <= 64
     assert result["object_type"] == "commit"
+    timing_fields = (
+        "consume_lock_wait_ms",
+        "consume_lock_hold_ms",
+        "origin_fetch_ms",
+        "repack_ms",
+    )
+    assert all(type(result[field]) is int and result[field] >= 0 for field in timing_fields)
+    assert result["consume_lock_hold_ms"] >= result["origin_fetch_ms"] + result["repack_ms"]
     assert not (workspace / ".git/objects/info/alternates").exists()
     assert not _git("for-each-ref", "--format=%(refname)", "refs/remotes/mirror", cwd=workspace)
     assert _git("cat-file", "-t", fixture["sha"], cwd=workspace) == "commit"
@@ -407,6 +432,37 @@ def test_mirror_hit_localizes_checkout_and_sends_no_origin_pack(tmp_path, reques
     assert action_fetch_delta <= 64
     assert _pack_bytes(baseline) > result["origin_fetch_pack_bytes"]
     assert _tree_state(workspace) == _tree_state(baseline)
+
+
+def test_consume_lock_wait_reports_a_controlled_exclusive_lock_delay(tmp_path, request):
+    fixture = _fixture(tmp_path)
+    request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
+    lock_file = fixture["mirror_repo"] / "consume.lock"
+    ready = tmp_path / "exclusive-lock-ready"
+    holder = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            'exec 9<"$1"; flock --exclusive 9; : >"$2"; sleep 1.5',
+            "lock-holder",
+            str(lock_file),
+            str(ready),
+        ],
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            assert holder.poll() is None, "exclusive lock holder exited before acquiring the lock"
+            time.sleep(0.01)
+        assert ready.exists(), "exclusive lock holder did not acquire the lock"
+        script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
+        run = _run_mirror_script(script, fixture, tmp_path / "lock-wait")
+        assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
+        result = _result_line(run)
+        assert type(result["consume_lock_wait_ms"]) is int
+        assert result["consume_lock_wait_ms"] >= 900
+    finally:
+        holder.wait(timeout=5)
 
 
 def test_mirror_misses_report_reason_and_origin_checkout_succeeds(tmp_path, request):
@@ -444,11 +500,21 @@ def test_mirror_misses_report_reason_and_origin_checkout_succeeds(tmp_path, requ
     assert _pack_bytes(baseline) > result["origin_fetch_pack_bytes"]
 
 
-def _assert_failed_prefetch_then_plain_fetch(run, workspace, fixture, reason):
+def _assert_failed_prefetch_then_plain_fetch(run, workspace, fixture, reason, *, timing=False):
     assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
-    assert _result_line(run) == {
+    result = _result_line(run)
+    assert {key: result[key] for key in ("hit", "reason", "prepare", "prepare_ms")} == {
         "hit": 0, "reason": reason, "prepare": "skipped", "prepare_ms": 0,
     }
+    if timing:
+        assert reason in ("origin-fetch-failed", "consumer-error:update-ref")
+        assert type(result["consume_lock_wait_ms"]) is int and result["consume_lock_wait_ms"] >= 0
+        assert type(result["consume_lock_hold_ms"]) is int and result["consume_lock_hold_ms"] >= 0
+        if reason == "origin-fetch-failed":
+            assert type(result["origin_fetch_ms"]) is int and result["origin_fetch_ms"] >= 0
+        else:
+            assert "origin_fetch_ms" not in result
+        assert "repack_ms" not in result
     assert not (workspace / ".git").exists(), "partial .git left behind"
     _git("init", "--quiet", cwd=workspace)
     _git("remote", "add", "origin", fixture["origin_url"], cwd=workspace)
@@ -465,11 +531,13 @@ def test_prefetch_failures_clear_partial_git_and_exit_zero(tmp_path, request):
         dead_port = sock.getsockname()[1]
     dead_workspace = tmp_path / "dead-origin"
     dead = _run_mirror_script(script, fixture, dead_workspace, server_url=f"git://127.0.0.1:{dead_port}")
-    _assert_failed_prefetch_then_plain_fetch(dead, dead_workspace, fixture, "origin-fetch-failed")
+    _assert_failed_prefetch_then_plain_fetch(dead, dead_workspace, fixture, "origin-fetch-failed", timing=True)
     (fixture["mirror_repo"] / "refs/heads/dangling").write_text("b" * 40 + "\n")
     broken_workspace = tmp_path / "dangling-ref"
     broken = _run_mirror_script(script, fixture, broken_workspace)
-    _assert_failed_prefetch_then_plain_fetch(broken, broken_workspace, fixture, "consumer-error:update-ref")
+    _assert_failed_prefetch_then_plain_fetch(
+        broken, broken_workspace, fixture, "consumer-error:update-ref", timing=True,
+    )
 
 
 # ── W3c: the prime step asks the host client to prepare the sha first ─────────

@@ -90,9 +90,11 @@ caller checkout（quality / primary / ocr / classify / shadow）的 `actions/che
   （`mode`/`checkout`/`ensure`/`error`）、`source`（`hit`/`cold`/`present`）、
   `reason`、`repository`、`commit_sha`、`elapsed_ms`。
 * `GATE-CHECKOUT-MIRROR-V1` / `GATE-CHECKOUT-BYTES-V1`：caller checkout 的既有
-  遥测。W3c 只给 `GATE-CHECKOUT-MIRROR-V1` **追加**两个字段：`prepare`
-  （`hit`/`cold`/`skipped`）与 `prepare_ms`；`hit`、`reason`、
-  `origin_fetch_pack_bytes`、`object_type` 语义不变。
+  遥测。`GATE-CHECKOUT-MIRROR-V1` 附加报告 `prepare`（`hit`/`cold`/`skipped`）与
+  `prepare_ms`；另报告 `consume_lock_wait_ms`（等待共享锁）、`consume_lock_hold_ms`
+  （共享锁持有时长）、`origin_fetch_ms`（origin fetch 命令耗时）和 `repack_ms`
+  （repack 命令耗时）。后四项只在各自已测得时输出；失败路径不以 0 冒充未测值。
+  `hit`、`reason`、`origin_fetch_pack_bytes`、`object_type` 语义不变。
 
 ## 失败字面量
 
