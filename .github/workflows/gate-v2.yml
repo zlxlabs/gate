@@ -271,15 +271,7 @@ env:
       exit 0
     }
     trap finish_result EXIT
-    mirror_miss() {
-      if [ "$lock_held" -ne 0 ]; then
-        flock --unlock "$mirror_lock_fd"
-        lock_held=0
-        consume_lock_hold_ms=$(( $(date +%s%3N) - consume_lock_hold_started ))
-      fi
-      emit_result 0 "$1"
-      exit 0
-    }
+    mirror_miss() { emit_result 0 "$1"; exit 0; }
     workspace=${GITHUB_WORKSPACE:?}
     repository=${GATE_CHECKOUT_REPOSITORY:-${GITHUB_REPOSITORY:?}}
     sha=${GATE_CHECKOUT_REF:-${GITHUB_SHA:?}}

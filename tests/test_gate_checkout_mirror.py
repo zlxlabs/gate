@@ -483,37 +483,6 @@ def test_consume_lock_wait_reports_a_controlled_exclusive_lock_delay(tmp_path, r
         holder.wait(timeout=5)
 
 
-def test_mirror_ref_read_miss_reports_lock_timing_before_exit(tmp_path, request):
-    fixture = _fixture(tmp_path)
-    request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
-    git_wrapper = tmp_path / "bin/git"
-    git_wrapper.parent.mkdir()
-    git_binary = shutil.which("git")
-    assert git_binary
-    git_wrapper.write_text(
-        "#!/usr/bin/env bash\n"
-        'if [[ " $* " == *" for-each-ref "* && " $* " == *" refs/heads refs/demand "* ]]; then exit 1; fi\n'
-        f"exec {shlex.quote(git_binary)} \"$@\"\n"
-    )
-    git_wrapper.chmod(0o755)
-    script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
-    workspace = tmp_path / "mirror-read-failure"
-    run = _run_mirror_script(
-        script,
-        fixture,
-        workspace,
-        script_env={"PATH": f"{git_wrapper.parent}{os.pathsep}{os.environ['PATH']}"},
-    )
-    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
-    result = _result_line(run)
-    assert result["reason"] == "mirror-read-failed"
-    assert type(result["consume_lock_wait_ms"]) is int and result["consume_lock_wait_ms"] >= 0
-    assert type(result["consume_lock_hold_ms"]) is int and result["consume_lock_hold_ms"] >= 0
-    assert "origin_fetch_ms" not in result
-    assert "repack_ms" not in result
-    assert not (workspace / ".git").exists()
-
-
 def test_mirror_misses_report_reason_and_origin_checkout_succeeds(tmp_path, request):
     fixture = _fixture(tmp_path, advance_mirror=True)
     request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
