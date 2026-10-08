@@ -257,7 +257,7 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
     assert checkout_count == 3
 
 
-def test_shadow_checkouts_prime_from_the_same_script_and_keep_checkout_fallback():
+def test_shadow_checkouts_keep_the_mirror_contract_and_checkout_fallback():
     gate_workflow = _workflow()
     shadow_workflow = yaml.safe_load(SHADOW_WORKFLOW.read_text())
     script = gate_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
