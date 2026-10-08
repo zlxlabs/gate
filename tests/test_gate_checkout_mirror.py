@@ -411,7 +411,7 @@ def test_mirror_hit_localizes_checkout_and_sends_no_origin_pack(tmp_path, reques
     assert git_binary
     delayed_git.write_text(
         "#!/usr/bin/env bash\n"
-        'case " $* " in *" repack --no-local -a -d "*) sleep 0.05 ;; esac\n'
+        'case " $* " in *" repack --no-local -a -d "*) sleep 0.5 ;; esac\n'
         f"exec {shlex.quote(git_binary)} \"$@\"\n"
     )
     delayed_git.chmod(0o755)
