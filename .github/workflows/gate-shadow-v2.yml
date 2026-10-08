@@ -244,13 +244,26 @@ env:
     consumer_step=startup
     prepare_state=skipped
     prepare_ms=0
+    consume_lock_wait_ms=
+    consume_lock_hold_ms=
+    origin_fetch_ms=
+    repack_ms=
     emit_result() {
-      printf 'GATE-CHECKOUT-MIRROR-V1 {"hit":%s,"reason":"%s","prepare":"%s","prepare_ms":%s%s}\n' "$1" "$2" "$prepare_state" "$prepare_ms" "${3:-}"
+      local telemetry_fields=${3:-}
+      if [[ -n "$consume_lock_wait_ms" ]]; then telemetry_fields+=",\"consume_lock_wait_ms\":$consume_lock_wait_ms"; fi
+      if [[ -n "$consume_lock_hold_ms" ]]; then telemetry_fields+=",\"consume_lock_hold_ms\":$consume_lock_hold_ms"; fi
+      if [[ -n "$origin_fetch_ms" ]]; then telemetry_fields+=",\"origin_fetch_ms\":$origin_fetch_ms"; fi
+      if [[ -n "$repack_ms" ]]; then telemetry_fields+=",\"repack_ms\":$repack_ms"; fi
+      printf 'GATE-CHECKOUT-MIRROR-V1 {"hit":%s,"reason":"%s","prepare":"%s","prepare_ms":%s%s}\n' "$1" "$2" "$prepare_state" "$prepare_ms" "$telemetry_fields"
       result_emitted=1
     }
     fail_prefetch() {
       trap - EXIT; set +e
-      [ "$lock_held" -eq 0 ] || flock --unlock "$mirror_lock_fd"
+      if [ "$lock_held" -ne 0 ]; then
+        flock --unlock "$mirror_lock_fd"
+        lock_held=0
+        consume_lock_hold_ms=$(( $(date +%s%3N) - consume_lock_hold_started ))
+      fi
       rm -rf -- "$workspace/.git"
       emit_result 0 "$1"
       exit 0
@@ -306,7 +319,11 @@ env:
     lock_file="$mirror_repo/consume.lock"
     [[ -f "$lock_file" && -r "$lock_file" ]] || mirror_miss lock-unreadable
     exec {mirror_lock_fd}<"$lock_file" || mirror_miss lock-open-failed
+    consume_lock_wait_started=$(date +%s%3N)
     flock --shared "$mirror_lock_fd" || mirror_miss lock-failed
+    consume_lock_acquired=$(date +%s%3N)
+    consume_lock_wait_ms=$(( consume_lock_acquired - consume_lock_wait_started ))
+    consume_lock_hold_started=$consume_lock_acquired
     lock_held=1
     consumer_step=mirror-refs
     mirror_refs=$(git --git-dir="$mirror_repo" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/demand) || mirror_miss mirror-read-failed
@@ -331,12 +348,14 @@ env:
     }
     bytes_before=$(pack_bytes)
     fetch_status=0; consumer_step=fetch
+    origin_fetch_started=$(date +%s%3N)
     if [[ "$origin_url" == https://* || "$origin_url" == http://* ]]; then
       auth=$(printf 'x-access-token:%s' "${GATE_GITHUB_TOKEN:?}" | base64 | tr -d '\n')
       GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server_url/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" git -C "$workspace" -c protocol.version=2 fetch --no-tags --keep --depth=1 origin "$sha" || fetch_status=$?
     else
       git -C "$workspace" -c protocol.version=2 fetch --no-tags --keep --depth=1 origin "$sha" || fetch_status=$?
     fi
+    origin_fetch_ms=$(( $(date +%s%3N) - origin_fetch_started ))
     [ "$fetch_status" -eq 0 ] || fail_prefetch origin-fetch-failed
     bytes_after=$(pack_bytes)
     fetch_pack_bytes=$((bytes_after - bytes_before))
@@ -348,10 +367,11 @@ env:
         git -C "$workspace" update-ref -d "$installed_ref"
       done <<< "$installed_refs"
     fi
-    consumer_step=repack; git -C "$workspace" repack --no-local -a -d
+    consumer_step=repack; repack_started=$(date +%s%3N); git -C "$workspace" repack --no-local -a -d; repack_ms=$(( $(date +%s%3N) - repack_started ))
     rm -f -- "$alternates"
     flock --unlock "$mirror_lock_fd"
     lock_held=0
+    consume_lock_hold_ms=$(( $(date +%s%3N) - consume_lock_hold_started ))
     exec {mirror_lock_fd}<&-
     consumer_step=cat-file; object_type=$(git -C "$workspace" cat-file -t "$sha")
     consumer_step=checkout; git -C "$workspace" checkout --force --detach "$sha"

@@ -257,30 +257,12 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
     assert checkout_count == 3
 
 
-def test_shadow_checkouts_keep_the_mirror_contract_and_checkout_fallback():
+def test_shadow_checkouts_prime_from_the_same_script_and_keep_checkout_fallback():
     gate_workflow = _workflow()
     shadow_workflow = yaml.safe_load(SHADOW_WORKFLOW.read_text())
     script = gate_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
-    shadow_script = shadow_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
+    assert shadow_workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"] == script
     assert "GATE-CHECKOUT-MIRROR-V1" in script
-    assert "GATE-CHECKOUT-MIRROR-V1" in shadow_script
-    assert "flock --shared" in shadow_script
-    assert "refs/heads refs/demand" in shadow_script
-    assert 'exec {mirror_lock_fd}<"$lock_file"' in shadow_script
-    assert shadow_script.count('rm -rf -- "$workspace/.git"') == 1
-    assert "fail_prefetch origin-fetch-failed" in shadow_script
-    assert 'consumer-error:$consumer_step' in shadow_script
-    assert 'exit "$fetch_status"' not in shadow_script
-    assert shadow_script.index('printf \'%s\\n\' "$mirror_objects" > "$alternates"') < shadow_script.index(
-        'fetch --no-tags --keep --depth=1 origin "$sha"'
-    )
-    assert shadow_script.index('fetch --no-tags --keep --depth=1 origin "$sha"') < shadow_script.index(
-        "repack --no-local -a -d"
-    )
-    assert shadow_script.index("repack --no-local -a -d") < shadow_script.rindex(
-        'rm -f -- "$alternates"'
-    ) < shadow_script.rindex('flock --unlock "$mirror_lock_fd"')
-    assert "file://" not in shadow_script
 
     jobs = shadow_workflow["jobs"]
     for job_name in ("classify_pr_paths", "shadow"):
