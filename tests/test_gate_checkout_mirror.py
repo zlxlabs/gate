@@ -3,6 +3,8 @@
 import json
 import os
 import random
+import shlex
+import shutil
 import socket
 import subprocess
 import time
@@ -388,7 +390,22 @@ def test_mirror_hit_localizes_checkout_and_sends_no_origin_pack(tmp_path, reques
     workspace = tmp_path / "primed"
     mirror_before = _mirror_signature(fixture["mirror_repo"])
     script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
-    prime = _run_mirror_script(script, fixture, workspace)
+    delayed_git = tmp_path / "bin/git"
+    delayed_git.parent.mkdir()
+    git_binary = shutil.which("git")
+    assert git_binary
+    delayed_git.write_text(
+        "#!/usr/bin/env bash\n"
+        'case " $* " in *" repack --no-local -a -d "*) sleep 0.05 ;; esac\n'
+        f"exec {shlex.quote(git_binary)} \"$@\"\n"
+    )
+    delayed_git.chmod(0o755)
+    prime = _run_mirror_script(
+        script,
+        fixture,
+        workspace,
+        script_env={"PATH": f"{delayed_git.parent}{os.pathsep}{os.environ['PATH']}"},
+    )
     assert prime.returncode == 0, f"mirror consumer failed: {prime.stderr}\n{prime.stdout}"
     result = _result_line(prime)
     assert result["hit"] == 1
