@@ -393,7 +393,7 @@ permissions:
 # run existed for this PR at the same time. No extra logic is needed in this file for
 # that to work; it falls straight out of the concurrency group + the draft guard.
 concurrency:
-  group: gate-shadow-v2-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
+  group: gate-shadow-v2-${{ github.workflow }}-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:

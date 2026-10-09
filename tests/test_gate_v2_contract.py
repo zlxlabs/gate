@@ -1620,7 +1620,8 @@ def _assert_expensive_job_cancel_lock(job_name: str, concurrency: dict) -> None:
     # (PR number first, run_id last) is part of the contract.
     assert concurrency == {
         "group": (
-            f"gate-required-v2-{job_name}-${{{{ github.repository_id }}}}"
+            f"gate-required-v2-{job_name}-${{{{ github.workflow }}}}"
+            f"-${{{{ github.repository_id }}}}"
             f"-${{{{ github.event.pull_request.number || github.run_id }}}}"
         ),
         "cancel-in-progress": True,

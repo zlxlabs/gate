@@ -214,7 +214,12 @@ def test_concurrency_group_is_shadow_v2_and_defined_once_at_workflow_level():
     concurrency = raw.get("concurrency", {})
     assert concurrency.get("cancel-in-progress") is True
     group = str(concurrency.get("group", ""))
+    assert group == (
+        "gate-shadow-v2-${{ github.workflow }}-${{ github.repository_id }}-"
+        "${{ github.event.pull_request.number || github.run_id }}"
+    )
     assert group.startswith("gate-shadow-v2-")
+    assert "github.workflow" in group
     assert "github.repository_id" in group
     assert "github.event.pull_request.number" in group
     for job in raw["jobs"].values():
