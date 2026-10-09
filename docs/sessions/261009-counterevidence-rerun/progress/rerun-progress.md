@@ -27,3 +27,10 @@
 - 本段结论：契约写入 `docs/design/counterevidence-rerun.md`。红验把 `_counterevidence_reason` 的缺失 `gate_rerun` 判据改为 `return None` 后，`test_old_receipt_without_gate_rerun_is_counterevidence_not_rerun` 以 AssertionError 转红（`active_false_positive` != `counterevidence_not_rerun`），随后只还原该行。
 - 关键决策与已否决方案：无。
 - 下一步唯一动作：提交本段、跑 Accept-Check、push 本卡分支。
+
+## 里程碑 5：补漏列消费方测试夹具
+
+- 当前阶段：implementing
+- 本段结论：aggregator / convergence_artifact / review_ledger 的有效反证夹具补了合规 `gate_rerun`；走 producer 子进程的用例在 tmp_path 建真实 git 仓并传 `--repo-dir`。`test_legacy_raw_bytes_receipt_can_resolve_with_counterevidence` 改为断言 `counterevidence_not_rerun`。生产代码未改。
+- 关键决策与已否决方案：未改 production 来迁就旧夹具；pr1063 历史回执在加载时注入 `gate_rerun`，不改 fixtures 原文件。
+- 下一步唯一动作：跑全量 pytest 后提交并 push。
