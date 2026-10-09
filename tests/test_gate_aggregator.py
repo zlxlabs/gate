@@ -1510,6 +1510,156 @@ def _panel_terminal_row(run_id, attempt, gate_result, head_sha=None):
     return _panel_row(run_id, attempt, gate_result, head_sha=head_sha)
 
 
+def _publish_only_panel_body(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    audit_record: dict[str, object],
+    *,
+    remove_audit_before_publish: bool = False,
+) -> tuple[str, dict[str, object]]:
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    audit_path = audit_dir / "primary-review-audit.json"
+    audit_bytes = json.dumps(audit_record, ensure_ascii=False).encode("utf-8")
+    audit_path.write_bytes(audit_bytes)
+    summary_path = tmp_path / "summary.md"
+    terminal_path = tmp_path / "gate-terminal.json"
+    primary_result = "failure" if audit_record["verdict"] == "fail" else "success"
+    assert AGG.main(_cli_args(
+        audit_dir, summary_path, primary_result=primary_result, terminal_path=str(terminal_path),
+    )) == (1 if primary_result == "failure" else 0)
+    terminal_record = json.loads(terminal_path.read_bytes())
+    if remove_audit_before_publish:
+        audit_path.unlink()
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    owner = {"id": 99, "login": "workflow-bot"}
+    comments = []
+    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
+    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
+    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
+    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: comments.append(kwargs["body"]))
+    publish_args = _cli_args(
+        audit_dir, summary_path, primary_result=primary_result,
+        terminal_path=str(terminal_path), panel_delivery_path=str(tmp_path / "delivery.json"),
+    ) + ["--publish-only"]
+    assert AGG.main(publish_args) == 0
+    assert len(comments) == 1
+    if remove_audit_before_publish:
+        assert not audit_path.exists()
+    else:
+        assert audit_path.read_bytes() == audit_bytes
+    row = AGG._terminal_row(
+        terminal_record, repository="zlxlabs/gate",
+        repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
+    )
+    return comments[0], row
+
+
+def test_publish_only_status_panel_renders_bounded_scrubbed_primary_findings(monkeypatch, tmp_path):
+    title = "reviewer label\n::error:: token=ghp_" + "A" * 16 + " limit " + "z" * 230
+    findings = [{
+        "id": "correctness.data-loss",
+        "severity": "major",
+        "category": "correctness",
+        "file": "src/service.py",
+        "line": 17,
+        "trigger": "private reviewer trigger must not be published",
+        "evidence": "private reviewer evidence must not be published",
+        "issue": title,
+        "acceptance": "private reviewer acceptance must not be published",
+        "title": title,
+    }]
+    findings.extend({
+        "id": f"quality.other-{index}",
+        "severity": "minor",
+        "category": "quality",
+        "file": "src/other.py",
+        "line": index,
+        "trigger": "trigger",
+        "evidence": "evidence",
+        "issue": "Short title",
+        "acceptance": "acceptance",
+        "title": "Short title",
+    } for index in range(1, 51))
+    audit = _valid_primary_record(verdict="fail", result={"findings": findings})
+    assert not AGG.validate_audit_identity(audit, IDENTITY)
+    assert AGG._primary_findings_panel_lines(audit)
+
+    body, _ = _publish_only_panel_body(monkeypatch, tmp_path, audit)
+
+    assert "PRIMARY-FINDINGS" in body
+    assert "| major | correctness.data-loss | src/service.py:17 |" in body
+    assert "reviewer label :error: [REDACTED:TOKEN] limit" in body
+    assert "+1 more" in body
+    assert "::error::" not in body
+    assert "ghp_" not in body
+    assert "private reviewer trigger must not be published" not in body
+    assert "private reviewer evidence must not be published" not in body
+    assert "private reviewer acceptance must not be published" not in body
+    long_title_row = next(
+        line for line in body.splitlines()
+        if line.startswith("| major | correctness.data-loss | src/service.py:17 |")
+    )
+    title_cell = long_title_row.rsplit("|", 2)[1].strip()
+    assert len(title_cell) <= AGG.FINDING_SUMMARY_MAX_TITLE_CHARS
+
+
+def test_publish_only_status_panel_does_not_render_pass_audit_findings(monkeypatch, tmp_path):
+    audit = _valid_scoped_primary_record(
+        verdict="pass",
+        result={"findings": [{
+            "id": "quality.nonblocking",
+            "severity": "minor",
+            "category": "quality",
+            "file": "src/example.py",
+            "line": 4,
+            "trigger": "nonblocking trigger",
+            "evidence": "nonblocking evidence",
+            "issue": "nonblocking title",
+            "acceptance": "nonblocking acceptance",
+            "title": "nonblocking title",
+        }]},
+    )
+    body, row = _publish_only_panel_body(monkeypatch, tmp_path, audit)
+
+    assert "PRIMARY-FINDINGS" not in body
+    assert body == AGG.render_status_panel([row])
+
+
+def test_publish_only_status_panel_without_audit_keeps_existing_body(monkeypatch, tmp_path):
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        result={"findings": [{
+            "id": "correctness.data-loss",
+            "severity": "major",
+            "category": "correctness",
+            "file": "src/example.py",
+            "line": 8,
+            "trigger": "trigger",
+            "evidence": "evidence",
+            "issue": "title",
+            "acceptance": "acceptance",
+            "title": "title",
+        }]},
+    )
+    body, row = _publish_only_panel_body(
+        monkeypatch, tmp_path, audit, remove_audit_before_publish=True,
+    )
+
+    assert "PRIMARY-FINDINGS" not in body
+    assert body == AGG.render_status_panel([row])
+
+
+def test_status_panel_malformed_primary_findings_fail_loud():
+    row = _panel_terminal_row(1, 1, "fail", "a" * 40)
+    row["primary_audit"] = {"verdict": "fail", "result": {"findings": {}}}
+
+    with pytest.raises(ValueError, match="findings is not a list"):
+        AGG.render_status_panel([row])
+
+
 def test_status_panel_publisher_creates_once_then_patches(monkeypatch):
     current = _panel_terminal_row(5, 1, "pass", "e" * 40)
     history = [_panel_terminal_row(i, 1, result, chr(96 + i) * 40) for i, result in enumerate(

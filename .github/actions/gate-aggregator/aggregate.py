@@ -56,7 +56,7 @@ for every canonical-audit finding into the job log and the Step Summary, because
 a caller repo cannot read the canonical audit itself (no silo credentials) and
 used to be left with nothing but a verdict line. It never judges anything, never
 exits non-zero, and a degraded render always leaves exactly one greppable
-`PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE reason=<type>` line behind.
+`FINDING_SUMMARY_UNAVAILABLE reason=<type>` line behind.
 
 Judgement responsibilities (see gate-v2.yml's `gate` job and this repo's
 tests/test_gate_aggregator.py for the full decision matrix):
@@ -226,7 +226,8 @@ SYNTHETIC_STATUS_ARTIFACT_MISSING = "artifact_missing"
 # a reviewable batch, and a title is a one-line label, never the finding body.
 FINDING_SUMMARY_MAX_FINDINGS = 50
 FINDING_SUMMARY_MAX_TITLE_CHARS = 200
-FINDING_SUMMARY_UNAVAILABLE = "PRIMARY-FINDINGS-SUMMARY-UNAVAILABLE"
+PRIMARY_FINDINGS_PANEL_MARKER = "PRIMARY-FINDINGS"
+FINDING_SUMMARY_UNAVAILABLE = f"{PRIMARY_FINDINGS_PANEL_MARKER}-SUMMARY-UNAVAILABLE"
 # Column order of the published table; the log line is a key=value rendering of
 # the same four fields, so the two surfaces can never drift apart.
 _FINDING_SUMMARY_COLUMNS = ("severity", "id", "location", "title")
@@ -892,6 +893,52 @@ def _finding_summary_rows(findings: list[Any]) -> list[dict[str, str]]:
     return rows
 
 
+def _primary_findings_panel_lines(primary_audit: Any) -> list[str]:
+    """Project only bounded finding labels from the validated primary audit."""
+    if not isinstance(primary_audit, dict):
+        raise ValueError("primary findings panel audit is not an object")
+    verdict = primary_audit.get("verdict")
+    if verdict not in PRIMARY_VERDICT_DOMAIN:
+        raise ValueError(f"primary findings panel audit verdict is invalid: {verdict!r}")
+    if verdict != "fail":
+        return []
+    result = primary_audit.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("primary findings panel audit result is not an object")
+    findings = result.get("findings")
+    if not isinstance(findings, list):
+        raise ValueError("primary findings panel audit findings is not a list")
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            raise ValueError(f"primary findings panel finding {index} is not an object")
+        for field in ("id", "severity", "file"):
+            if not isinstance(finding.get(field), str) or not finding[field]:
+                raise ValueError(f"primary findings panel finding {index} has invalid {field}")
+        if "line" not in finding or (
+            finding["line"] is not None and not _is_strict_int(finding["line"])
+        ):
+            raise ValueError(f"primary findings panel finding {index} has invalid line")
+        if "title" in finding and not isinstance(finding["title"], str):
+            raise ValueError(f"primary findings panel finding {index} has invalid title")
+    if not findings:
+        return []
+
+    shown_rows = _finding_summary_rows(findings[:FINDING_SUMMARY_MAX_FINDINGS])
+    overflow = len(findings) - len(shown_rows)
+    lines = [
+        "",
+        f"#### {PRIMARY_FINDINGS_PANEL_MARKER} — 主审发现（{len(shown_rows)} / {len(findings)} 条）",
+        "",
+        "| severity | id | location | title |",
+        "| --- | --- | --- | --- |",
+    ]
+    for row in shown_rows:
+        lines.append("| " + " | ".join(_markdown_cell(row[key]) for key in _FINDING_SUMMARY_COLUMNS) + " |")
+    if overflow:
+        lines.extend(["", f"+{overflow} more"])
+    return lines
+
+
 def _render_findings_summary(audit_path: Path, summary_path: Optional[str]) -> None:
     """Print the finding summary to stdout and append it to the Step Summary."""
     try:
@@ -899,14 +946,14 @@ def _render_findings_summary(audit_path: Path, summary_path: Optional[str]) -> N
         shown = _finding_summary_rows(findings[:FINDING_SUMMARY_MAX_FINDINGS])
         overflow = len(findings) - len(shown)
         lines = [
-            f"PRIMARY-FINDINGS-SUMMARY verdict={verdict} findings={len(findings)} shown={len(shown)}"
+            f"{PRIMARY_FINDINGS_PANEL_MARKER}-SUMMARY verdict={verdict} findings={len(findings)} shown={len(shown)}"
         ]
         for row in shown:
             lines.append(
                 "PRIMARY-FINDING severity={severity} id={id} at={location} title={title}".format(**row)
             )
         if overflow:
-            lines.append(f"PRIMARY-FINDINGS-SUMMARY-OVERFLOW ... and {overflow} more")
+            lines.append(f"{PRIMARY_FINDINGS_PANEL_MARKER}-SUMMARY-OVERFLOW ... and {overflow} more")
         table = [
             f"## primary review findings (verdict {verdict}, {len(shown)} of {len(findings)} shown)",
             "",
@@ -1852,6 +1899,8 @@ def render_status_panel(
         "",
         f"当前裁决：`{current['classification']}` / `{current['reason_code']}`",
     ])
+    if current_result == "fail" and "primary_audit" in current:
+        lines.extend(_primary_findings_panel_lines(current["primary_audit"]))
     current_shadow = current.get("convergence_shadow")
     if isinstance(current_shadow, dict):
         if current_shadow["history_status"] == "history_unavailable":
