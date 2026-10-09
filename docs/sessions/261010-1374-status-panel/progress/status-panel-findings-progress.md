@@ -17,3 +17,9 @@
   ```
 
 - 下一步唯一动作：补 pass audit 与 publish 时 audit 缺失两条反例并运行聚合器测试。
+
+## 里程碑 2：反例与失败可见性测试
+- 当前阶段：反例测试完成，待全量验证。
+- 本段结论：pass audit（含 finding）与 `--publish-only` 时缺失 audit 均不渲染 findings，PR 评论 body 与无 audit 的既有投影逐字相同；fail audit 结构异常会以 `ValueError` fail loud。聚合器窄测 376 项全部通过。
+- 关键决策与已否决方案：不为 audit 缺失增加 fallback 文案或重解析日志；有效 audit 由既有发布路径注入，结构异常不吞错。
+- 下一步唯一动作：运行仓库全量验证命令并据结果提交最终里程碑。

@@ -1606,6 +1606,60 @@ def test_publish_only_status_panel_renders_bounded_scrubbed_primary_findings(mon
     assert len(title_cell) <= AGG.FINDING_SUMMARY_MAX_TITLE_CHARS
 
 
+def test_publish_only_status_panel_does_not_render_pass_audit_findings(monkeypatch, tmp_path):
+    audit = _valid_scoped_primary_record(
+        verdict="pass",
+        result={"findings": [{
+            "id": "quality.nonblocking",
+            "severity": "minor",
+            "category": "quality",
+            "file": "src/example.py",
+            "line": 4,
+            "trigger": "nonblocking trigger",
+            "evidence": "nonblocking evidence",
+            "issue": "nonblocking title",
+            "acceptance": "nonblocking acceptance",
+            "title": "nonblocking title",
+        }]},
+    )
+    body, row = _publish_only_panel_body(monkeypatch, tmp_path, audit)
+
+    assert "PRIMARY-FINDINGS" not in body
+    assert body == AGG.render_status_panel([row])
+
+
+def test_publish_only_status_panel_without_audit_keeps_existing_body(monkeypatch, tmp_path):
+    audit = _valid_scoped_primary_record(
+        verdict="fail",
+        result={"findings": [{
+            "id": "correctness.data-loss",
+            "severity": "major",
+            "category": "correctness",
+            "file": "src/example.py",
+            "line": 8,
+            "trigger": "trigger",
+            "evidence": "evidence",
+            "issue": "title",
+            "acceptance": "acceptance",
+            "title": "title",
+        }]},
+    )
+    body, row = _publish_only_panel_body(
+        monkeypatch, tmp_path, audit, remove_audit_before_publish=True,
+    )
+
+    assert "PRIMARY-FINDINGS" not in body
+    assert body == AGG.render_status_panel([row])
+
+
+def test_status_panel_malformed_primary_findings_fail_loud():
+    row = _panel_terminal_row(1, 1, "fail", "a" * 40)
+    row["primary_audit"] = {"verdict": "fail", "result": {"findings": {}}}
+
+    with pytest.raises(ValueError, match="findings is not a list"):
+        AGG.render_status_panel([row])
+
+
 def test_status_panel_publisher_creates_once_then_patches(monkeypatch):
     current = _panel_terminal_row(5, 1, "pass", "e" * 40)
     history = [_panel_terminal_row(i, 1, result, chr(96 + i) * 40) for i, result in enumerate(
