@@ -20,3 +20,10 @@
 - 本段结论：control 作业用 github.token 把调用方 head_sha fetch 到 `_gate-caller-head`，issue 步骤把该目录传给 producer。未新增第三方 action，permissions 仍是 contents: read。契约测试以 workflow 步骤原文跑 producer。
 - 关键决策与已否决方案：不复用 gate_bounded_retry 包 fetch，取仓失败直接失败、不得降级采信。http.extraheader 写入 caller clone，供 blob:none 懒取 blob。
 - 下一步唯一动作：写设计文档并做红验。
+
+## 里程碑 4：设计文档 + 红验
+
+- 当前阶段：implementing
+- 本段结论：契约写入 `docs/design/counterevidence-rerun.md`。红验把 `_counterevidence_reason` 的缺失 `gate_rerun` 判据改为 `return None` 后，`test_old_receipt_without_gate_rerun_is_counterevidence_not_rerun` 以 AssertionError 转红（`active_false_positive` != `counterevidence_not_rerun`），随后只还原该行。
+- 关键决策与已否决方案：无。
+- 下一步唯一动作：提交本段、跑 Accept-Check、push 本卡分支。
