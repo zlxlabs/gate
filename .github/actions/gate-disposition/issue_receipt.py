@@ -15,6 +15,8 @@ import importlib.util
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +43,50 @@ def _load_convergence():
 
 _CONVERGENCE = _load_convergence()
 SCHEMA_VERSION = _CONVERGENCE.DISPOSITION_RECEIPT_SCHEMA_VERSION
+_RERUN_EXCERPT_MAX = 2000
+
+
+def rerun_counterevidence(command: str, head_sha: str, repo_dir: Path) -> dict:
+    """Execute the allowlisted git-grep command against repo_dir.
+
+    Returns the gate_rerun object. Raises ValueError with a reason literal
+    when the command is not allowlisted, matches nothing, or fails.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError("counterevidence_command_not_allowlisted") from exc
+    reason = _CONVERGENCE.counterevidence_argv_reason(argv, head_sha)
+    if reason is not None:
+        raise ValueError(reason)
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repo_dir,
+            capture_output=True,
+            timeout=_CONVERGENCE.COUNTEREVIDENCE_RERUN_TIMEOUT_S,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise ValueError("counterevidence_rerun_failed") from exc
+    stdout = completed.stdout or b""
+    if completed.returncode == 1:
+        raise ValueError("counterevidence_rerun_no_match")
+    if completed.returncode != 0:
+        raise ValueError("counterevidence_rerun_failed")
+    lines = [line for line in stdout.splitlines() if line]
+    if len(lines) < 1:
+        raise ValueError("counterevidence_rerun_no_match")
+    excerpt = stdout.decode("utf-8", errors="replace")
+    if len(excerpt) > _RERUN_EXCERPT_MAX:
+        excerpt = excerpt[:_RERUN_EXCERPT_MAX]
+    return {
+        "argv": argv,
+        "exit_code": completed.returncode,
+        "match_count": len(lines),
+        "stdout_sha256": _sha256_bytes(stdout),
+        "excerpt": excerpt,
+    }
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -250,6 +296,18 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
             raise ValueError("counterevidence_required")
         if counterevidence["result"] != "refuted":
             raise ValueError("counterevidence_result_not_refuted")
+        try:
+            argv = shlex.split(counterevidence["command"])
+        except ValueError as exc:
+            raise ValueError("counterevidence_command_not_allowlisted") from exc
+        argv_reason = _CONVERGENCE.counterevidence_argv_reason(argv, head_sha)
+        if argv_reason is not None:
+            raise ValueError(argv_reason)
+        repo_dir = Path(_required(args, envelope, "repo_dir", "DISPOSITION_REPO_DIR"))
+        counterevidence = dict(counterevidence)
+        counterevidence["gate_rerun"] = rerun_counterevidence(
+            counterevidence["command"], head_sha, repo_dir,
+        )
     else:
         if not isinstance(tracking_issue, str):
             raise ValueError("tracking_issue_invalid")
@@ -343,6 +401,7 @@ def _parser() -> argparse.ArgumentParser:
         "repository-id", "pr-number", "head-sha", "finding-id", "scope-json",
         "approver", "approver-id", "approved-at", "triggering-actor",
         "repository", "disposition", "counterevidence-json", "tracking-issue",
+        "repo-dir",
     ):
         sub.add_argument(f"--{name}", dest=name.replace("-", "_"))
     return parser
