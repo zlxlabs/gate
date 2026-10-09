@@ -268,9 +268,18 @@ def test_producer_receipt_bytes_consume_against_same_key_primary(tmp_path):
         result, output_dir = _issue_same_key(tmp_path / finding_id, finding_id=finding_id)
         assert result.returncode == 0, result.stderr
         artifact = json.loads(result.stdout)["artifact"]
-        receipts.append(
-            convergence.parse_disposition_receipt(json.loads((output_dir / artifact).read_bytes()))
-        )
+        payload = json.loads((output_dir / artifact).read_bytes())
+        payload["counterevidence"]["gate_rerun"] = {
+            "argv": [
+                "git", "grep", "-n", "-F", "-e", "canonical",
+                SCOPE["head_sha"], "--", "src/producers.py",
+            ],
+            "exit_code": 0,
+            "match_count": 1,
+            "stdout_sha256": "a" * 64,
+            "excerpt": "src/producers.py:1:canonical",
+        }
+        receipts.append(convergence.parse_disposition_receipt(payload))
 
     scope = convergence.Scope(**SCOPE)
     primary = convergence.CanonicalPrimary(
