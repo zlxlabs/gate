@@ -13,3 +13,10 @@
 - 本段结论：false-positive 回执由门禁在调用方仓库 head_sha 上执行白名单 `git grep`；零命中/超时/非 0/1 退出都不写回执。提交方 `output` 保留但不参与判定。跨进程用真实 git 仓库断言 `gate_rerun` 字节。
 - 关键决策与已否决方案：白名单先于取仓校验，不合规命令无需 repo_dir；不把零命中当成「不存在」证据。
 - 下一步唯一动作：workflow 取调用方 head 对象，并把 `--repo-dir` 传入 issue 步骤，补契约测试。
+
+## 里程碑 3：workflow 取仓 + 契约测试
+
+- 当前阶段：implementing
+- 本段结论：control 作业用 github.token 把调用方 head_sha fetch 到 `_gate-caller-head`，issue 步骤把该目录传给 producer。未新增第三方 action，permissions 仍是 contents: read。契约测试以 workflow 步骤原文跑 producer。
+- 关键决策与已否决方案：不复用 gate_bounded_retry 包 fetch，取仓失败直接失败、不得降级采信。http.extraheader 写入 caller clone，供 blob:none 懒取 blob。
+- 下一步唯一动作：写设计文档并做红验。
