@@ -26,6 +26,43 @@ COUNTEREVIDENCE = {
 COUNTEREVIDENCE_JSON = json.dumps(COUNTEREVIDENCE, sort_keys=True)
 
 
+def _seed_caller_repo(root, *, relpath="src/lock.py", literal="locked-behavior"):
+    repo = Path(root) / "caller"
+    if (repo / ".git").exists():
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        return repo, sha, relpath, literal
+    (repo / relpath).parent.mkdir(parents=True, exist_ok=True)
+    (repo / relpath).write_text(f"{literal}\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "gate-test",
+        "GIT_AUTHOR_EMAIL": "gate-test@example.com",
+        "GIT_COMMITTER_NAME": "gate-test",
+        "GIT_COMMITTER_EMAIL": "gate-test@example.com",
+    }
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "config", "user.email", "gate-test@example.com"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "config", "user.name", "gate-test"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "add", relpath], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True, capture_output=True, env=env)
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, env=env).strip()
+    return repo, sha, relpath, literal
+
+
+def _allowlisted_ce(sha, *, relpath="src/lock.py", literal="locked-behavior"):
+    return {
+        "command": f"git grep -n -F -e {literal} {sha} -- {relpath}",
+        "output": "1 passed",
+        "result": "refuted",
+        "pointer": "tests/test_regression.py::test_regression",
+    }
+
+
+def _bind_head(tmp_path):
+    repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
+    return repo, sha, _scope(head_sha=sha), _allowlisted_ce(sha, relpath=relpath, literal=literal)
+
+
 def _aggregate():
     spec = importlib.util.spec_from_file_location("gate_aggregate_artifact", AGGREGATE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -276,13 +313,14 @@ def test_audit_digest_is_canonical_not_raw_bytes():
 
 
 def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_path):
+    repo, sha, scope, counterevidence = _bind_head(tmp_path)
     audit = {
         "kind": "primary_review", "schema_version": 1,
-        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
-        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
-        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
-        "tier": SCOPE.tier,
-        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "repository_id": 123, "pr": 42, "head_sha": sha,
+        "base_sha": scope.base_sha, "diff_digest": scope.diff_digest,
+        "policy_version": scope.policy_version, "policy_digest": scope.policy_digest,
+        "tier": scope.tier,
+        "caller_sha": scope.caller_sha, "reusable_workflow_sha": scope.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
         "result": {"findings": [{
             "id": "p1", "severity": "major", "trigger_kind": "inferred",
@@ -293,19 +331,20 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     audit_path = tmp_path / "canonical-audit.json"
     audit_path.write_bytes(audit_bytes)
     output_dir = tmp_path / "artifacts"
-    epoch = CONV.derive_epoch(SCOPE)
+    epoch = CONV.derive_epoch(scope)
     digest = CONV.canonical_audit_digest(audit)
     argv = [
         sys.executable, str(DISPOSITION_PRODUCER), "issue",
         "--output-dir", str(output_dir), "--audit-path", str(audit_path),
-        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", sha,
         "--finding-id", "p1",
-        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+        "--scope-json", json.dumps(scope.as_dict(), sort_keys=True),
         "--reason", "locked upstream behavior",
-        "--counterevidence-json", COUNTEREVIDENCE_JSON,
+        "--counterevidence-json", json.dumps(counterevidence),
         "--approver", "octocat",
         "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
+        "--repo-dir", str(repo),
     ]
     producer_env = _producer_env(GITHUB_RUN_ID="control-77", GITHUB_ACTOR="maintainer")
     first = subprocess.run(argv, check=True, capture_output=True, text=True, env=producer_env)
@@ -348,12 +387,12 @@ def test_disposition_producer_writes_minimal_receipt_bytes_from_raw_audit(tmp_pa
     assert artifact_path.read_bytes() == payload_bytes
     parsed = CONV.parse_disposition_receipt(json.loads(payload_bytes))
     primary = CONV.CanonicalPrimary(
-        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
-        head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
+        schema_version=1, repository_id=scope.repository_id, pr_number=scope.pr_number,
+        head_sha=sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
         p1_findings=(("p1", "major", "inferred", "src/lock.py", 12, "correctness"),),
     )
     status = CONV.validate_disposition_receipt(
-        parsed, scope=SCOPE, primary=primary, audit_digest=digest,
+        parsed, scope=scope, primary=primary, audit_digest=digest,
     )
     assert (status.active, status.reason) == (True, "active_false_positive")
     assert (parsed.approver, parsed.approver_id, parsed.approved_at) == (
@@ -383,6 +422,7 @@ def test_disposition_producer_rejects_non_p1_finding(tmp_path):
 
 
 def test_disposition_producer_resolves_stable_key_collision_by_exact_finding_id(tmp_path):
+    repo, sha, scope, counterevidence = _bind_head(tmp_path)
     findings = [
         {
             "id": "p1", "severity": "major", "trigger_kind": "inferred",
@@ -395,11 +435,11 @@ def test_disposition_producer_resolves_stable_key_collision_by_exact_finding_id(
     ]
     audit = {
         "kind": "primary_review", "schema_version": 1,
-        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
-        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
-        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
-        "tier": SCOPE.tier, "caller_sha": SCOPE.caller_sha,
-        "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "repository_id": 123, "pr": 42, "head_sha": sha,
+        "base_sha": scope.base_sha, "diff_digest": scope.diff_digest,
+        "policy_version": scope.policy_version, "policy_digest": scope.policy_digest,
+        "tier": scope.tier, "caller_sha": scope.caller_sha,
+        "reusable_workflow_sha": scope.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1, "result": {"findings": findings},
     }
     audit_path = tmp_path / "audit.json"
@@ -409,11 +449,12 @@ def test_disposition_producer_resolves_stable_key_collision_by_exact_finding_id(
         argv = [
             sys.executable, str(DISPOSITION_PRODUCER), "issue",
             "--output-dir", str(output_dir), "--audit-path", str(audit_path),
-            "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+            "--repository-id", "123", "--pr-number", "42", "--head-sha", sha,
             "--finding-id", finding_id, "--reason", "reason", "--approver", "octocat",
-            "--counterevidence-json", COUNTEREVIDENCE_JSON,
+            "--counterevidence-json", json.dumps(counterevidence),
             "--approver-id", "1", "--approved-at", "2026-08-30T12:00:00Z",
-            "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+            "--scope-json", json.dumps(scope.as_dict(), sort_keys=True),
+            "--repo-dir", str(repo),
         ]
         return subprocess.run(argv, capture_output=True, text=True, env=_producer_env())
 
@@ -478,13 +519,14 @@ def test_disposition_producer_rejects_id_and_different_key_collision(tmp_path):
 
 def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path, monkeypatch):
     monkeypatch.delenv("GITHUB_TRIGGERING_ACTOR", raising=False)
+    repo, sha, scope, counterevidence = _bind_head(tmp_path)
     audit = {
         "kind": "primary_review", "schema_version": 1,
-        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
-        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
-        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
-        "tier": SCOPE.tier,
-        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "repository_id": 123, "pr": 42, "head_sha": sha,
+        "base_sha": scope.base_sha, "diff_digest": scope.diff_digest,
+        "policy_version": scope.policy_version, "policy_digest": scope.policy_digest,
+        "tier": scope.tier,
+        "caller_sha": scope.caller_sha, "reusable_workflow_sha": scope.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
         "result": {"findings": [{
             "id": "p1", "severity": "major", "trigger_kind": "inferred",
@@ -503,15 +545,16 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path, monkeypat
         audit_path=str(audit_path),
         repository_id="123",
         pr_number="42",
-        head_sha=SCOPE.head_sha,
+        head_sha=sha,
         finding_id="p1",
         reason="locked upstream behavior",
         approver="octocat",
         approver_id="7",
         approved_at="2026-08-30T12:00:00Z",
         triggering_actor="octocat",
-        counterevidence_json=COUNTEREVIDENCE_JSON,
-        scope_json=json.dumps(SCOPE.as_dict(), sort_keys=True),
+        counterevidence_json=json.dumps(counterevidence),
+        scope_json=json.dumps(scope.as_dict(), sort_keys=True),
+        repo_dir=str(repo),
         input_stdin=False,
     )
     assert module.issue(args, {}) == 0
@@ -519,12 +562,12 @@ def test_issue_function_bytes_feed_parse_disposition_receipt(tmp_path, monkeypat
     payload = json.loads(produced.read_bytes())
     receipt = CONV.parse_disposition_receipt(payload)
     primary = CONV.CanonicalPrimary(
-        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
-        head_sha=SCOPE.head_sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
+        schema_version=1, repository_id=scope.repository_id, pr_number=scope.pr_number,
+        head_sha=sha, run_id=77, run_attempt=1, verdict="fail", p1_ids=("p1",),
         p1_findings=(("p1", "major", "inferred", "src/lock.py", 12, "correctness"),),
     )
     status = CONV.validate_disposition_receipt(
-        receipt, scope=SCOPE, primary=primary,
+        receipt, scope=scope, primary=primary,
         audit_digest=CONV.canonical_audit_digest(audit),
     )
     assert status.reason == "active_false_positive"
@@ -655,6 +698,7 @@ def test_disposition_producer_rejects_malformed_auth_fields(tmp_path, override, 
 
 
 def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="locked upstream behavior", trigger_kind="inferred"):
+    repo, sha, scope, counterevidence = _bind_head(tmp_path)
     finding = {
         "id": "p1", "severity": "major", "file": "src/lock.py", "line": 12,
         "category": "correctness",
@@ -663,11 +707,11 @@ def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="lock
         finding["trigger_kind"] = trigger_kind
     audit = {
         "kind": "primary_review", "schema_version": 1,
-        "repository_id": 123, "pr": 42, "head_sha": SCOPE.head_sha,
-        "base_sha": SCOPE.base_sha, "diff_digest": SCOPE.diff_digest,
-        "policy_version": SCOPE.policy_version, "policy_digest": SCOPE.policy_digest,
-        "tier": SCOPE.tier,
-        "caller_sha": SCOPE.caller_sha, "reusable_workflow_sha": SCOPE.reusable_workflow_sha,
+        "repository_id": 123, "pr": 42, "head_sha": sha,
+        "base_sha": scope.base_sha, "diff_digest": scope.diff_digest,
+        "policy_version": scope.policy_version, "policy_digest": scope.policy_digest,
+        "tier": scope.tier,
+        "caller_sha": scope.caller_sha, "reusable_workflow_sha": scope.reusable_workflow_sha,
         "run_id": 77, "run_attempt": 1,
         "result": {"findings": [finding]},
     }
@@ -676,14 +720,15 @@ def _p1_issue_argv(tmp_path, *, approved_at="2026-08-30T12:00:00Z", reason="lock
     argv = [
         sys.executable, str(DISPOSITION_PRODUCER), "issue",
         "--output-dir", str(tmp_path / "artifacts"), "--audit-path", str(audit_path),
-        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", sha,
         "--finding-id", "p1",
-        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+        "--scope-json", json.dumps(scope.as_dict(), sort_keys=True),
         "--reason", reason,
         "--approver", "octocat",
         "--approver-id", "1",
         "--approved-at", approved_at,
-        "--counterevidence-json", COUNTEREVIDENCE_JSON,
+        "--counterevidence-json", json.dumps(counterevidence),
+        "--repo-dir", str(repo),
     ]
     return argv, _producer_env()
 
@@ -760,7 +805,9 @@ def _failing_runtime_audit(*, duration_ms, run_attempt, findings=None):
 
 
 def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path):
+    repo, sha, scope, counterevidence = _bind_head(tmp_path)
     first = _failing_runtime_audit(duration_ms=11, run_attempt=2)
+    first["head_sha"] = sha
     second = _failing_runtime_audit(
         duration_ms=99, run_attempt=4,
         findings=[{
@@ -768,6 +815,7 @@ def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path
             "file": "lock.py", "line": 12, "category": "correctness",
         }],
     )
+    second["head_sha"] = sha
     assert CONV.canonical_audit_digest(first) == CONV.canonical_audit_digest(second)
     assert hashlib.sha256(json.dumps(first).encode()).hexdigest() != hashlib.sha256(
         json.dumps(second).encode()
@@ -777,29 +825,30 @@ def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path
     argv = [
         sys.executable, str(DISPOSITION_PRODUCER), "issue",
         "--output-dir", str(tmp_path / "out"), "--audit-path", str(audit_path),
-        "--repository-id", "123", "--pr-number", "42", "--head-sha", SCOPE.head_sha,
+        "--repository-id", "123", "--pr-number", "42", "--head-sha", sha,
         "--finding-id", "p1", "--reason", "locked upstream behavior",
-        "--counterevidence-json", COUNTEREVIDENCE_JSON,
+        "--counterevidence-json", json.dumps(counterevidence),
         "--approver", "octocat", "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
-        "--scope-json", json.dumps(SCOPE.as_dict(), sort_keys=True),
+        "--scope-json", json.dumps(scope.as_dict(), sort_keys=True),
+        "--repo-dir", str(repo),
     ]
     produced = subprocess.run(argv, check=True, capture_output=True, text=True, env=_producer_env())
     payload = json.loads(Path(json.loads(produced.stdout)["path"]).read_bytes())
     receipt = CONV.parse_disposition_receipt(payload)
     digest = CONV.canonical_audit_digest(second)
     primary = CONV.CanonicalPrimary(
-        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
-        head_sha=SCOPE.head_sha, run_id=77, run_attempt=4, verdict="fail",
+        schema_version=1, repository_id=scope.repository_id, pr_number=scope.pr_number,
+        head_sha=sha, run_id=77, run_attempt=4, verdict="fail",
         p1_ids=("model-renamed",),
         p1_findings=(("model-renamed", "major", "inferred", "lock.py", 12, "correctness"),),
     )
     status = CONV.validate_disposition_receipt(
-        receipt, scope=SCOPE, primary=primary, audit_digest=digest,
+        receipt, scope=scope, primary=primary, audit_digest=digest,
     )
     assert status.reason == "active_false_positive"
     recorded = CONV.record_dispositions(
-        primary.p1_ids, (receipt,), scope=SCOPE, primary=primary, audit_digest=digest,
+        primary.p1_ids, (receipt,), scope=scope, primary=primary, audit_digest=digest,
     )
     assert recorded.primary_p1_ids == primary.p1_ids
     assert recorded.recorded_finding_ids == ("model-renamed",)
@@ -810,14 +859,15 @@ def test_disposition_receipt_records_same_findings_across_runtime_bytes(tmp_path
             "file": "lock.py", "line": 13, "category": "correctness",
         }],
     )
+    other["head_sha"] = sha
     mismatched_primary = CONV.CanonicalPrimary(
-        schema_version=1, repository_id=SCOPE.repository_id, pr_number=SCOPE.pr_number,
-        head_sha=SCOPE.head_sha, run_id=77, run_attempt=4, verdict="fail",
+        schema_version=1, repository_id=scope.repository_id, pr_number=scope.pr_number,
+        head_sha=sha, run_id=77, run_attempt=4, verdict="fail",
         p1_ids=("p2",),
         p1_findings=(("p2", "major", "inferred", "lock.py", 13, "correctness"),),
     )
     mismatched = CONV.validate_disposition_receipt(
-        receipt, scope=SCOPE, primary=mismatched_primary,
+        receipt, scope=scope, primary=mismatched_primary,
         audit_digest=CONV.canonical_audit_digest(other),
     )
     assert mismatched.reason_code == "audit_digest_mismatch"
@@ -855,9 +905,14 @@ def test_legacy_raw_bytes_receipt_can_resolve_with_counterevidence():
     without_legacy = AGG.evaluate(**kwargs)
     with_legacy = AGG.evaluate(**kwargs, legacy_raw_audit_digest=legacy)
     assert without_legacy.gate_result == "fail"
-    assert with_legacy.gate_result == "pass"
-    assert with_legacy.disposition_audit.recorded_receipts == (receipt,)
-    assert with_legacy.reason_code == "disposition_resolved"
+    assert with_legacy.gate_result == "fail"
+    assert with_legacy.disposition_audit.recorded_receipts == ()
+    assert {reason for _receipt, reason in with_legacy.disposition_audit.rejected_receipts} == {
+        "counterevidence_not_rerun",
+    }
+    assert {reason for _receipt, reason in without_legacy.disposition_audit.rejected_receipts} == {
+        "counterevidence_not_rerun",
+    }
 
 
 def test_aggregate_envelope_preserves_scope_attempt_artifact_and_digest():

@@ -34,6 +34,7 @@ DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHE
 # tier — issuance and consumption share this single reason-code constant.
 DEFERRED_RECEIPT_REJECT_REASON = "deferred_not_allowed_for_tier"
 DISPOSITION_REASON_DISPLAY_MAX = 500
+COUNTEREVIDENCE_RERUN_TIMEOUT_S: int = 30
 
 # This is intentionally local to the public gate repository.  The private
 # policy source is represented only by Scope.policy_version/policy_digest in
@@ -963,7 +964,10 @@ def recorded_disposition_lines(audit: DispositionAudit) -> tuple[str, ...]:
             evidence = receipt.counterevidence or {}
             pointer = _bounded_disposition_text(evidence.get("pointer", ""))
             command = _bounded_disposition_text(evidence.get("command", ""))
-            output = _bounded_disposition_text(evidence.get("output", ""))
+            rerun = evidence.get("gate_rerun")
+            excerpt = rerun.get("excerpt") if isinstance(rerun, dict) else None
+            output_value = excerpt if isinstance(excerpt, str) and excerpt.strip() else evidence.get("output", "")
+            output = _bounded_disposition_text(output_value)
             evidence_text = f"pointer={pointer}; command={command}; output={output}"
         else:
             evidence_text = f"pointer={_bounded_disposition_text(receipt.tracking_issue or '')}"
@@ -1038,6 +1042,35 @@ def _approved_at_has_time(value: Any) -> bool:
     return True
 
 
+def counterevidence_argv_reason(argv: list[str], head_sha: str) -> str | None:
+    """Return a reject reason unless argv is the allowlisted git-grep form.
+
+    Allowlisted argv is exactly:
+    ["git", "grep", "-n", "-F", "-e", <literal>, <head_sha>, "--", <pathspec>]
+    None means the argv is compliant.
+    """
+    if not isinstance(head_sha, str) or not head_sha:
+        return "counterevidence_command_not_allowlisted"
+    if not isinstance(argv, list) or len(argv) != 9:
+        return "counterevidence_command_not_allowlisted"
+    if any(not isinstance(item, str) for item in argv):
+        return "counterevidence_command_not_allowlisted"
+    git, grep, flag_n, flag_f, flag_e, literal, sha, dash, pathspec = argv
+    if (git, grep, flag_n, flag_f, flag_e, dash) != ("git", "grep", "-n", "-F", "-e", "--"):
+        return "counterevidence_command_not_allowlisted"
+    if not literal or literal.startswith("-"):
+        return "counterevidence_command_not_allowlisted"
+    if sha != head_sha:
+        return "counterevidence_command_not_allowlisted"
+    if not pathspec or pathspec.startswith("-") or pathspec.startswith(":"):
+        return "counterevidence_command_not_allowlisted"
+    if pathspec.startswith("/"):
+        return "counterevidence_command_not_allowlisted"
+    if ".." in pathspec.split("/"):
+        return "counterevidence_command_not_allowlisted"
+    return None
+
+
 def _counterevidence_reason(receipt: DispositionReceipt) -> str | None:
     evidence = receipt.counterevidence
     if not isinstance(evidence, dict):
@@ -1047,6 +1080,18 @@ def _counterevidence_reason(receipt: DispositionReceipt) -> str | None:
         return "counterevidence_required"
     if evidence["result"] != "refuted":
         return "counterevidence_result_not_refuted"
+    rerun = evidence.get("gate_rerun")
+    if not isinstance(rerun, dict):
+        return "counterevidence_not_rerun"
+    argv = rerun.get("argv")
+    argv_reason = counterevidence_argv_reason(argv if isinstance(argv, list) else [], receipt.head_sha)
+    if argv_reason is not None:
+        return argv_reason
+    if type(rerun.get("exit_code")) is not int or rerun.get("exit_code") != 0:
+        return "counterevidence_not_rerun"
+    match_count = rerun.get("match_count")
+    if type(match_count) is not int or match_count < 1:
+        return "counterevidence_not_rerun"
     return None
 
 

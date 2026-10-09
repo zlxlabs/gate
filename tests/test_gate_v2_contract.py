@@ -331,6 +331,8 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert "--approver \"$DISPOSITION_APPROVER\"" in issue["run"]
     assert "--approver-id \"$DISPOSITION_APPROVER_ID\"" in issue["run"]
     assert "--approved-at \"$approved_at\"" in issue["run"]
+    assert "--repo-dir \"$CALLER_HEAD_DIR\"" in issue["run"]
+    assert 'test -n "$CALLER_HEAD_DIR"' in issue["run"]
     assert "inputs.approver" not in text
     assert "${{ github.actor }}" in text
     assert "${{ github.triggering_actor }}" not in text
@@ -341,6 +343,29 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert (
         f"python3 {DISPOSITION_CHECKOUT_SUBDIR}/.github/actions/gate-disposition/issue_receipt.py issue"
         in issue["run"]
+    )
+
+
+def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
+    raw, _ = _load_disposition_workflow()
+    control = raw["jobs"]["control"]
+    names = [step.get("name") for step in control["steps"]]
+    fetch = next(
+        step for step in control["steps"]
+        if step.get("name") == "Fetch caller head for counterevidence rerun"
+    )
+    assert "uses" not in fetch
+    assert fetch["env"]["GH_TOKEN"] == "${{ github.token }}"
+    run = fetch["run"]
+    assert "git -C \"$repo_dir\" init --quiet" in run
+    assert "fetch --depth 1 --filter=blob:none origin \"$CURRENT_HEAD_SHA\"" in run
+    assert "_gate-caller-head" in run
+    assert raw["permissions"]["contents"] == "read"
+    assert names.index("Resolve current PR head and canonical primary audit") < names.index(
+        "Fetch caller head for counterevidence rerun"
+    )
+    assert names.index("Fetch caller head for counterevidence rerun") < names.index(
+        "Issue immutable disposition artifact"
     )
 
 
@@ -840,6 +865,31 @@ def test_disposition_silo_and_script_consumers_read_from_the_checkout_subdirecto
         assert not (workspace / relative).exists()
 
 
+def _seed_caller_head(repo: Path, *, relpath="src/guard.py", literal="counterevidence-literal"):
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / relpath).parent.mkdir(parents=True, exist_ok=True)
+    (repo / relpath).write_text(f"{literal}\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "gate-test",
+        "GIT_AUTHOR_EMAIL": "gate-test@example.com",
+        "GIT_COMMITTER_NAME": "gate-test",
+        "GIT_COMMITTER_EMAIL": "gate-test@example.com",
+    }
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "config", "user.email", "gate-test@example.com"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "config", "user.name", "gate-test"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "add", relpath], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True, capture_output=True, env=env)
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, env=env).strip()
+    return sha, {
+        "command": f"git grep -n -F -e {literal} {sha} -- {relpath}",
+        "output": "forged",
+        "result": "refuted",
+        "pointer": relpath,
+    }
+
+
 def test_disposition_receipt_step_runs_the_producer_from_the_checkout_subdirectory(tmp_path):
     """Run the receipt step's own `run` body, from a checkout-shaped workspace,
     and check that it signs a real receipt from the producer the checkout left
@@ -849,10 +899,12 @@ def test_disposition_receipt_step_runs_the_producer_from_the_checkout_subdirecto
     subdir = _disposition_checkout_step()["env"]["GATE_CHECKOUT_PATH"]
     sparse = _sparse_env_paths(_disposition_checkout_step())
     workspace = _checkout_shaped_workspace(tmp_path, subdir, sparse)
+    caller_head = tmp_path / "caller-head"
+    head_sha, counterevidence = _seed_caller_head(caller_head)
 
     scope = {
         "repository_id": 123, "pr_number": 42, "base_sha": "b" * 40,
-        "head_sha": "a" * 40, "diff_digest": "d" * 64, "policy_version": "policy-v1",
+        "head_sha": head_sha, "diff_digest": "d" * 64, "policy_version": "policy-v1",
         "policy_digest": "p" * 64, "tier": "personal", "caller_sha": "c" * 40,
         "reusable_workflow_sha": "r" * 40,
     }
@@ -885,12 +937,8 @@ def test_disposition_receipt_step_runs_the_producer_from_the_checkout_subdirecto
         "FINDING_ID": "finding-one",
         "DISPOSITION_REASON": "canonical evidence reviewed",
         "DISPOSITION_KIND": "false-positive",
-        "DISPOSITION_COUNTEREVIDENCE_JSON": json.dumps({
-            "command": "pytest -q tests/test_regression.py",
-            "output": "1 passed",
-            "result": "refuted",
-            "pointer": "tests/test_regression.py::test_behavior",
-        }),
+        "DISPOSITION_COUNTEREVIDENCE_JSON": json.dumps(counterevidence),
+        "CALLER_HEAD_DIR": str(caller_head),
         "DISPOSITION_TRACKING_ISSUE": "",
         "DISPOSITION_APPROVER": "owner",
         "DISPOSITION_APPROVER_ID": "10",
@@ -929,12 +977,7 @@ EVIDENCE_INPUT_ENV = {
     "DISPOSITION_COUNTEREVIDENCE_JSON": "${{ inputs.counterevidence_json }}",
     "DISPOSITION_TRACKING_ISSUE": "${{ inputs.tracking_issue }}",
 }
-VALID_COUNTEREVIDENCE = {
-    "command": "pytest -q tests/test_regression.py",
-    "output": "1 passed",
-    "result": "refuted",
-    "pointer": "tests/test_regression.py::test_behavior",
-}
+VALID_COUNTEREVIDENCE = "ALLOWLISTED_GIT_GREP"
 # What a legacy five-input caller sends: every optional input absent/empty.
 LEGACY_FIVE_INPUTS = {
     "pr_number": "42", "primary_run_id": "7", "primary_run_attempt": "1",
@@ -972,9 +1015,14 @@ def _run_receipt_step(tmp_path, values: dict[str, str]) -> subprocess.CompletedP
     workspace = _checkout_shaped_workspace(
         tmp_path, checkout["env"]["GATE_CHECKOUT_PATH"], _sparse_env_paths(checkout)
     )
+    caller_head = tmp_path / "caller-head"
+    head_sha, seeded = _seed_caller_head(caller_head)
+    values = dict(values)
+    if values.get("counterevidence_json") == VALID_COUNTEREVIDENCE:
+        values["counterevidence_json"] = json.dumps(seeded)
     scope = {
         "repository_id": 123, "pr_number": 42, "base_sha": "b" * 40,
-        "head_sha": "a" * 40, "diff_digest": "d" * 64, "policy_version": "policy-v1",
+        "head_sha": head_sha, "diff_digest": "d" * 64, "policy_version": "policy-v1",
         "policy_digest": "p" * 64, "tier": "personal", "caller_sha": "c" * 40,
         "reusable_workflow_sha": "r" * 40,
     }
@@ -1012,6 +1060,7 @@ def _run_receipt_step(tmp_path, values: dict[str, str]) -> subprocess.CompletedP
         "GITHUB_TRIGGERING_ACTOR": "owner",
         "GITHUB_ENV": str(github_env),
         "GITHUB_OUTPUT": str(github_output),
+        "CALLER_HEAD_DIR": str(caller_head),
     }
     result = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
@@ -1061,9 +1110,9 @@ def test_disposition_preflight_reads_the_same_inputs_as_the_receipt_step():
         ({**LEGACY_FIVE_INPUTS, "disposition": "yes-please"}, 1, "disposition must be false-positive or deferred"),
         # The default empty disposition is the false-positive default, so it is
         # checked with counterevidence exactly as the receipt checks it.
-        ({**LEGACY_FIVE_INPUTS, "counterevidence_json": json.dumps(VALID_COUNTEREVIDENCE)}, 0, None),
+        ({**LEGACY_FIVE_INPUTS, "counterevidence_json": VALID_COUNTEREVIDENCE}, 0, None),
         ({**LEGACY_FIVE_INPUTS, "disposition": "false-positive",
-          "counterevidence_json": json.dumps(VALID_COUNTEREVIDENCE)}, 0, None),
+          "counterevidence_json": VALID_COUNTEREVIDENCE}, 0, None),
         # Deferred keeps its existing rejection boundary, untouched.
         ({**LEGACY_FIVE_INPUTS, "disposition": "deferred", "tracking_issue": "#12"}, 0,
          "deferred_not_allowed_for_tier"),

@@ -3086,14 +3086,29 @@ def _scope_for(audit):
     return scope
 
 
+def _gate_rerun(head_sha):
+    literal = "locked-behavior"
+    pathspec = "src/lock.py"
+    argv = ["git", "grep", "-n", "-F", "-e", literal, head_sha, "--", pathspec]
+    excerpt = f"{pathspec}:1:{literal}"
+    return {
+        "argv": argv,
+        "exit_code": 0,
+        "match_count": 1,
+        "stdout_sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+        "excerpt": excerpt,
+    }
+
+
 def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", **changes):
+    head_sha = changes.get("head_sha", IDENTITY.head_sha)
     fields = dict(
         schema_version=CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION,
         disposition="false-positive",
         repository_id=str(IDENTITY.repository_id),
         pr_number=IDENTITY.pr,
         epoch=CONV.derive_epoch(scope),
-        head_sha=IDENTITY.head_sha,
+        head_sha=head_sha,
         audit_digest=audit_digest,
         finding_id=finding_id,
         reason="locked upstream behavior",
@@ -3102,6 +3117,7 @@ def _false_positive_receipt(scope, *, audit_digest=_DIGEST_A, finding_id="p1", *
             "output": "1 passed",
             "result": "refuted",
             "pointer": "tests/test_regression.py::test_regression",
+            "gate_rerun": _gate_rerun(head_sha),
         },
         approver="octocat",
         approver_id=1,
@@ -5030,6 +5046,11 @@ def _previous_round_fixture_objects():
     receipt_path = ROOT / "tests/fixtures/previous-round-pr1063-disposition.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    evidence = dict(receipt.get("counterevidence") or {})
+    if evidence and "gate_rerun" not in evidence:
+        evidence["gate_rerun"] = _gate_rerun(receipt["head_sha"])
+        receipt["counterevidence"] = evidence
+    receipt_bytes = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     repository_id = ledger["primary_identity"]["repository_id"]
     ledger_name = (
         f"codex-review-ledger-v2-{repository_id}-{ledger['head_sha']}-"
@@ -5038,7 +5059,7 @@ def _previous_round_fixture_objects():
     ledger_key = f"d30/{repository_id}/{ledger_name}/ledger.json"
     receipt_name = CONV.disposition_receipt_artifact_name(CONV.parse_disposition_receipt(receipt))
     receipt_key = f"d30/{repository_id}/{receipt_name}/{receipt_name}.json"
-    return ledger, receipt, [(ledger_key, ledger_path.read_bytes()), (receipt_key, receipt_path.read_bytes())]
+    return ledger, receipt, [(ledger_key, ledger_path.read_bytes()), (receipt_key, receipt_bytes)]
 
 
 def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_configured=True, run_id=35989919390):

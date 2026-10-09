@@ -4,7 +4,9 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -823,6 +825,26 @@ def test_review_summary_invalid_trigger_kind_counts_as_unspecified():
     assert entry["review"]["trigger_kind_counts"] == {"unspecified": 2}
 
 
+def _seed_caller_repo(root, *, relpath="src/lock.py", literal="locked-behavior"):
+    repo = Path(root) / "caller"
+    (repo / relpath).parent.mkdir(parents=True, exist_ok=True)
+    (repo / relpath).write_text(f"{literal}\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "gate-test",
+        "GIT_AUTHOR_EMAIL": "gate-test@example.com",
+        "GIT_COMMITTER_NAME": "gate-test",
+        "GIT_COMMITTER_EMAIL": "gate-test@example.com",
+    }
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "config", "user.email", "gate-test@example.com"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "config", "user.name", "gate-test"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "add", relpath], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True, capture_output=True, env=env)
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, env=env).strip()
+    return repo, sha, relpath, literal
+
+
 def _aggregator():
     path = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
     spec = importlib.util.spec_from_file_location("gate_aggregate_for_ledger", path)
@@ -897,6 +919,16 @@ def _producer_terminal(*, receipts=(), run_attempt=1):
                 "output": "1 passed",
                 "result": "refuted",
                 "pointer": "tests/test_regression.py::test_regression",
+                "gate_rerun": {
+                    "argv": [
+                        "git", "grep", "-n", "-F", "-e", "locked-behavior",
+                        identity.head_sha, "--", "src/lock.py",
+                    ],
+                    "exit_code": 0,
+                    "match_count": 1,
+                    "stdout_sha256": hashlib.sha256(b"src/lock.py:1:locked-behavior").hexdigest(),
+                    "excerpt": "src/lock.py:1:locked-behavior",
+                },
             },
         )
         fields.update(changes)
@@ -1028,13 +1060,11 @@ def test_disposition_audit_stays_out_of_review_summary_and_compact_attempts():
 def test_real_disposition_producer_receipt_flows_through_ledger(
     tmp_path, extra_p1, expected_gate, remaining_p1,
 ):
-    import os
-    import subprocess
-
     agg = _aggregator()
     conv = agg._CONVERGENCE
+    repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
     identity = agg.Identity(
-        repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=1, pr=42,
+        repository_id=123, head_sha=sha, run_id=999, run_attempt=1, pr=42,
     )
     audit = {
         "kind": "primary_review",
@@ -1089,7 +1119,7 @@ def test_real_disposition_producer_receipt_flows_through_ledger(
         "--head-sha", identity.head_sha, "--finding-id", "p1",
         "--reason", "locked upstream behavior",
         "--counterevidence-json", json.dumps({
-            "command": "pytest -q tests/test_lock.py",
+            "command": f"git grep -n -F -e {literal} {sha} -- {relpath}",
             "output": "1 passed",
             "result": "refuted",
             "pointer": "tests/test_lock.py::test_lock_regression",
@@ -1097,6 +1127,7 @@ def test_real_disposition_producer_receipt_flows_through_ledger(
         "--approver", "octocat", "--approver-id", "1",
         "--approved-at", "2026-08-30T12:00:00Z",
         "--scope-json", json.dumps(scope.as_dict(), sort_keys=True),
+        "--repo-dir", str(repo),
     ]
     produced = subprocess.run(
         command,

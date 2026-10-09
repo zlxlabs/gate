@@ -138,6 +138,28 @@ def test_receipt_for_round_copies_decision_identity_and_validates():
     assert receipt.artifact_id == "artifact-123"
 
 
+def _allowlisted_counterevidence(head_sha, **changes):
+    literal = "locked-behavior"
+    pathspec = "src/lock.py"
+    argv = ["git", "grep", "-n", "-F", "-e", literal, head_sha, "--", pathspec]
+    excerpt = f"{pathspec}:1:{literal}"
+    evidence = {
+        "command": f"git grep -n -F -e {literal} {head_sha} -- {pathspec}",
+        "output": "1 passed",
+        "result": "refuted",
+        "pointer": "tests/test_example.py::test_regression",
+        "gate_rerun": {
+            "argv": argv,
+            "exit_code": 0,
+            "match_count": 1,
+            "stdout_sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+            "excerpt": excerpt,
+        },
+    }
+    evidence.update(changes)
+    return evidence
+
+
 def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
     primary = primary or _primary(scope, run_id=7, run_attempt=2, p1_ids=("p1",))
     audit_digest = audit_digest or "a" * 64
@@ -151,12 +173,7 @@ def _disposition(scope=SCOPE, *, primary=None, audit_digest=None, **changes):
         audit_digest=audit_digest,
         finding_id=primary.p1_ids[0],
         reason="locked upstream behavior",
-        counterevidence={
-            "command": "pytest -q tests/test_example.py",
-            "output": "1 passed",
-            "result": "refuted",
-            "pointer": "tests/test_example.py::test_regression",
-        },
+        counterevidence=_allowlisted_counterevidence(scope.head_sha),
         approver="octocat",
         approver_id=1,
         approved_at="2026-08-30T12:00:00Z",
@@ -200,12 +217,7 @@ def _stable_disposition(scope=SCOPE, *, primary=None, audit_digest=None, **chang
         finding_id=finding[0],
         finding_key=key,
         reason="locked upstream behavior",
-        counterevidence={
-            "command": "pytest -q tests/test_example.py",
-            "output": "1 passed",
-            "result": "refuted",
-            "pointer": "tests/test_example.py::test_regression",
-        },
+        counterevidence=_allowlisted_counterevidence(scope.head_sha),
         approver="octocat",
         approver_id=1,
         approved_at="2026-08-30T12:00:00Z",
@@ -506,9 +518,11 @@ def test_recorded_disposition_lines_label_claim_and_truncate_reason():
     assert audit.recorded_receipts == (receipt,)
     name = CONV.disposition_receipt_artifact_name(receipt)
     expected_reason = " ".join(reason.split())[:CONV.DISPOSITION_REASON_DISPLAY_MAX]
+    evidence = receipt.counterevidence
+    excerpt = evidence["gate_rerun"]["excerpt"]
     assert CONV.recorded_disposition_lines(audit) == (
-        "disposition=false-positive finding=p1 pointer=tests/test_example.py::test_regression; "
-        f"command=pytest -q tests/test_example.py; output=1 passed receipt={name} reason={expected_reason}",
+        f"disposition=false-positive finding=p1 pointer={evidence['pointer']}; "
+        f"command={evidence['command']}; output={excerpt} receipt={name} reason={expected_reason}",
     )
     assert "\n" not in CONV.recorded_disposition_lines(audit)[0]
     assert len(expected_reason) == CONV.DISPOSITION_REASON_DISPLAY_MAX
@@ -1380,3 +1394,93 @@ def test_pr_round_budget_unavailable_primary_does_not_increment():
     )
     assert result["eligible_rounds"] == 2
     assert result["terminal_decision"] == "collecting"
+
+
+_HEAD = "h" * 40
+_ALLOWLISTED_ARGV = ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"]
+
+
+def test_counterevidence_argv_reason_accepts_allowlisted_shape():
+    assert CONV.counterevidence_argv_reason(_ALLOWLISTED_ARGV, _HEAD) is None
+    assert CONV.COUNTEREVIDENCE_RERUN_TIMEOUT_S == 30
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", "b" * 40, "--", "src/lock.py"],
+            id="sha_not_equal_head_sha",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", "abc1234", "--", "src/lock.py"],
+            id="short_sha",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/lock.py", "extra"],
+            id="extra_argument",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--"],
+            id="missing_pathspec",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-P", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"],
+            id="other_flag_perl",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-E", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"],
+            id="other_flag_extended",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "-n", _HEAD, "--", "src/lock.py"],
+            id="literal_starting_with_dash",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/../lock.py"],
+            id="pathspec_contains_dotdot",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "/abs/lock.py"],
+            id="pathspec_absolute",
+        ),
+        pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", ":(literal)src/lock.py"],
+            id="pathspec_magic_colon",
+        ),
+    ],
+)
+def test_counterevidence_argv_reason_rejects_unallowlisted_shape(argv):
+    assert CONV.counterevidence_argv_reason(argv, _HEAD) == "counterevidence_command_not_allowlisted"
+
+
+def test_old_receipt_without_gate_rerun_is_counterevidence_not_rerun():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    evidence = dict(_allowlisted_counterevidence(SCOPE.head_sha))
+    evidence.pop("gate_rerun")
+    receipt = _disposition(primary=primary, counterevidence=evidence)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert status.reason == "counterevidence_not_rerun"
+    assert status.active is False
+
+
+def test_gate_rerun_argv_not_allowlisted_is_counterevidence_command_not_allowlisted():
+    primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    evidence = _allowlisted_counterevidence(
+        SCOPE.head_sha,
+        gate_rerun={
+            "argv": ["git", "grep", "-n", "-F", "-e", "locked-behavior", "b" * 40, "--", "src/lock.py"],
+            "exit_code": 0,
+            "match_count": 1,
+            "stdout_sha256": "a" * 64,
+            "excerpt": "src/lock.py:1:locked-behavior",
+        },
+    )
+    receipt = _disposition(primary=primary, counterevidence=evidence)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+    )
+    assert status.reason == "counterevidence_command_not_allowlisted"
+    assert status.active is False

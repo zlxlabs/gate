@@ -330,6 +330,25 @@ jobs:
           echo "CURRENT_SCOPE_JSON=$scope_json" >> "$GITHUB_ENV"
           echo "CURRENT_EPOCH=$epoch" >> "$GITHUB_ENV"
 
+      - name: Fetch caller head for counterevidence rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "${CURRENT_HEAD_SHA:-}"
+          test -n "${GH_TOKEN:-}"
+          test -n "${GITHUB_REPOSITORY:-}"
+          repo_dir="${GITHUB_WORKSPACE}/_gate-caller-head"
+          rm -rf "$repo_dir"
+          mkdir -p "$repo_dir"
+          git -C "$repo_dir" init --quiet
+          git -C "$repo_dir" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -C "$repo_dir" config http.extraheader "AUTHORIZATION: basic ${auth_header}"
+          git -C "$repo_dir" fetch --depth 1 --filter=blob:none origin "$CURRENT_HEAD_SHA"
+          git -C "$repo_dir" cat-file -e "$CURRENT_HEAD_SHA^{commit}"
+          echo "CALLER_HEAD_DIR=$repo_dir" >> "$GITHUB_ENV"
+
       - name: Issue immutable disposition artifact
         id: disposition
         env:
@@ -353,6 +372,7 @@ jobs:
           test -n "$CURRENT_EPOCH"
           test -n "$DISPOSITION_APPROVER"
           test -n "$DISPOSITION_APPROVER_ID"
+          test -n "$CALLER_HEAD_DIR"
           approved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           output="$(python3 _gate-disposition-src/.github/actions/gate-disposition/issue_receipt.py issue \
             --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
@@ -364,7 +384,8 @@ jobs:
             --tracking-issue "$DISPOSITION_TRACKING_ISSUE" \
             --approver "$DISPOSITION_APPROVER" \
             --approver-id "$DISPOSITION_APPROVER_ID" \
-            --approved-at "$approved_at")"
+            --approved-at "$approved_at" \
+            --repo-dir "$CALLER_HEAD_DIR")"
           artifact_name="$(printf '%s' "$output" | jq -r '.artifact')"
           test -n "$artifact_name" && echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
