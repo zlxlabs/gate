@@ -481,7 +481,7 @@ jobs:
     # + repository_id keep this out of other workflows' namespace
     # (zlxlabs/agent-config#68). Non-PR events fall back to run_id.
     concurrency:
-      group: gate-required-v2-quality-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
+      group: gate-required-v2-quality-${{ github.workflow }}-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
       cancel-in-progress: true
     steps:
       - name: Record network bytes before checkout (quality-1)
@@ -836,7 +836,7 @@ jobs:
     # Per-PR cancel of stale primary only. Own group (not shared with
     # quality) so one run's lint and review never queue or kill each other.
     concurrency:
-      group: gate-required-v2-primary-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
+      group: gate-required-v2-primary-${{ github.workflow }}-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
       cancel-in-progress: true
     steps:
       - name: Record network bytes before checkout (primary-1)
