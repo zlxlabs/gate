@@ -213,25 +213,38 @@ env:
         client="$source_root/git-source-prepare"
         [ -x "$client" ] || { echo "::error::SOURCE-CLIENT-MISSING: $client" >&2; exit 1; }
         client_raw=$("$client" --repository "$repository" --commit "$commit" --deadline-epoch "$deadline" 2>&1 >/dev/null) && client_status=0 || client_status=$?
-        if ! printf '%s\n' "$client_raw" | GATE_SOURCE_EXPECTED_REPOSITORY="$repository" GATE_SOURCE_EXPECTED_COMMIT="$commit" GATE_SOURCE_CLIENT_EXIT="$client_status" python3 -c '
-    import json, os, sys
+        # The exit code is the verdict.  A failed client is fatal with its exit
+        # code plus the raw protocol line (truncated to 512 chars) — the failure
+        # reply's fields belong to the producer, so this path never says
+        # SOURCE-CLIENT-CONTRACT.  A successful reply is checked only for what
+        # this repo consumes: exactly one protocol line, a JSON object, and
+        # `source` for telemetry; status/repository/commit_sha are the client's
+        # own contract, and fetching refs/demand/<sha> below is the real guard.
+        client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ' || true)
+        if [ "$client_status" -ne 0 ]; then
+          if [ -n "$client_line" ]; then
+            echo "::error::SOURCE-CLIENT-FAILED: exit=$client_status line=${client_line:0:512}" >&2
+          else
+            echo "::error::SOURCE-CLIENT-FAILED: exit=$client_status no GIT-SOURCE-PREPARE-V1 line" >&2
+          fi
+          exit 1
+        fi
+        if ! printf '%s\n' "$client_raw" | python3 -c '
+    import json, sys
     marker = "GIT-SOURCE-PREPARE-V1 "
     lines = [line[len(marker):] for line in sys.stdin.read().splitlines() if line.startswith(marker)]
     try:
         if len(lines) != 1:
             raise ValueError("expected exactly one protocol line")
         payload = json.loads(lines[0])
-        status = "ready" if os.environ["GATE_SOURCE_CLIENT_EXIT"] == "0" else "failed"
-        if not isinstance(payload, dict) or payload.get("status") != status or payload.get("repository") != os.environ["GATE_SOURCE_EXPECTED_REPOSITORY"] or payload.get("commit_sha") != os.environ["GATE_SOURCE_EXPECTED_COMMIT"] or payload.get("source") not in ("hit", "cold"):
-            raise ValueError("reply fields do not match the request")
+        if not isinstance(payload, dict) or payload.get("source") not in ("hit", "cold"):
+            raise ValueError("reply must be a JSON object with source hit or cold")
     except (json.JSONDecodeError, ValueError):
         raise SystemExit(1)
     ' ; then
           echo "::error::SOURCE-CLIENT-CONTRACT: invalid GIT-SOURCE-PREPARE-V1 reply" >&2
           exit 1
         fi
-        client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ')
-        [ "$client_status" -eq 0 ] || { echo "::error::SOURCE-CLIENT-FAILED: $client_line" >&2; exit 1; }
         # `source` for the caller's own telemetry.  Read from the one protocol
         # line the validator above already accepted, so this cannot disagree with
         # it: no second reply shape, no second verdict.
