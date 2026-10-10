@@ -48,7 +48,12 @@ GIT_ENV = {
 }
 
 CLIENT = '''#!/usr/bin/env python3
-"""Fake host source client (contract: gate-hub W1/W2 runner/git_source_prepare.py)."""
+"""Fake host source client (contract: gate-hub W1/W2 runner/git_source_prepare.py).
+
+Failure lines carry the real producer shape — status "error", source null, and
+a code from the real exit-code table (3 SERVICE-UNAVAILABLE, 4 PREPARE-FAILED,
+7 LOCK-TIMEOUT, 8 DEADLINE-EXCEEDED, 9 PROTOCOL-ERROR).  Never invent a failed
+status or a code the producer cannot send."""
 import json
 import os
 import subprocess
@@ -81,19 +86,37 @@ if mode == "garbage":
     sys.stderr.write("git-source-prepare: unparseable answer" + chr(10))
     sys.exit(0)
 if mode == "unready":
-    emit("garbage", "SOURCE-UNPARSEABLE")
+    # A producer breach: an error-shaped line but exit 0.  The consumer must
+    # reject it on `source` alone, without reading `status`.
+    emit("error", "SOURCE-PROTOCOL-ERROR", source=None)
     sys.exit(0)
+if mode == "crash":
+    sys.exit(1)
+if mode == "deadline":
+    emit("error", "SOURCE-DEADLINE-EXCEEDED", source=None)
+    sys.exit(8)
 if mode == "fail":
-    emit("failed", "SOURCE-COLD-FAILED")
+    # Byte-shape of a real producer failure (gate-hub runner/git_source_prepare.py).
+    emit("error", "SOURCE-SERVICE-UNAVAILABLE", source=None)
+    sys.exit(3)
+if mode == "long":
+    # Real failure shape plus one key the producer never sends: the extra key
+    # exercises "no field validation on failure" and the 512-char truncation.
+    payload = {
+        "status": "error", "code": "SOURCE-SERVICE-UNAVAILABLE",
+        "repository": repository, "commit_sha": commit, "source": None,
+        "elapsed_ms": 0, "detail": "p" * 600,
+    }
+    sys.stderr.write("GIT-SOURCE-PREPARE-V1 " + json.dumps(payload, sort_keys=True) + chr(10))
     sys.exit(3)
 reply = os.environ.get("GATE_FAKE_CLIENT_REPLY")
 if reply:
     payload = {
-        "status": "ready", "code": "OK", "repository": repository,
+        "status": "ready", "code": None, "repository": repository,
         "commit_sha": commit, "source": "cold", "elapsed_ms": 0,
     }
-    if reply == "failed-status":
-        payload["status"] = "failed"
+    if reply == "error-status":
+        payload["status"] = "error"
     elif reply == "wrong-repository":
         payload["repository"] = "zlxlabs/other"
     elif reply == "wrong-commit":
@@ -117,8 +140,8 @@ if os.environ.get("GATE_FAKE_CLIENT_PROBE_LOCK") == "1":
     try:
         fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        emit("failed", "SOURCE-MIRROR-LOCK-HELD")
-        sys.exit(5)
+        emit("error", "SOURCE-LOCK-TIMEOUT", source=None)
+        sys.exit(7)
     fcntl.flock(probe, fcntl.LOCK_UN)
     os.close(probe)
 refs = subprocess.run(
@@ -127,7 +150,7 @@ refs = subprocess.run(
     check=True, capture_output=True, text=True,
 ).stdout.split()
 if not refs:
-    emit("failed", "SOURCE-UNKNOWN-COMMIT")
+    emit("error", "SOURCE-PREPARE-FAILED", source=None)
     sys.exit(4)
 demand = "refs/demand/" + commit
 warm = subprocess.run(
@@ -139,7 +162,7 @@ subprocess.run(
      upstream, os.environ.get("GATE_FAKE_DEMAND_REF_TARGET", refs[0]) + ":" + demand],
     check=True, capture_output=True,
 )
-emit("ready", "OK", source="hit" if warm else "cold")
+emit("ready", None, source="hit" if warm else "cold")
 '''
 
 GIT_WRAPPER = '''#!/usr/bin/env python3
@@ -687,6 +710,9 @@ def test_service_mode_is_required_for_every_service_operation(source_host, monke
 
 
 def test_client_failure_is_fatal_and_never_reaches_origin(source_host):
+    """A failed client (rc!=0) is reported as CLIENT-FAILED with its real exit
+    code and the raw protocol line; the failure reply's own fields are the
+    producer's business, so no SOURCE-CLIENT-CONTRACT may appear."""
     env = _env(
         source_host, source_host["tmp_path"] / "workspace",
         GATE_FAKE_CLIENT="fail",
@@ -699,7 +725,9 @@ def test_client_failure_is_fatal_and_never_reaches_origin(source_host):
 
     assert run.returncode != 0
     assert gate_source.CLIENT_FAILED in run.stderr
-    assert "SOURCE-COLD-FAILED" in run.stderr
+    assert "exit=3" in run.stderr
+    assert "SOURCE-SERVICE-UNAVAILABLE" in run.stderr
+    assert gate_source.CLIENT_CONTRACT not in run.stderr
     assert _network_argv(source_host) == []
     assert not (source_host["runner_temp"] / "gate_source.py").exists()
     assert not (source_host["runner_temp"] / "gate_bounded_retry.py").exists()
@@ -720,9 +748,15 @@ def test_client_contract_violation_is_rejected(source_host):
     assert not (source_host["runner_temp"] / "gate_source.py").exists()
 
 
-BAD_CLIENT_REPLIES = (
-    "failed-status", "wrong-repository", "wrong-commit", "duplicate", "invalid-json", "invalid-source",
-)
+# Success-path (rc=0) replies this repo rejects: broken protocol framing or an
+# unusable `source`.  status/repository/commit_sha are NOT on the list — the
+# client verified them and the demand-ref fetch below is the real guard — so
+# those mismatches moved to the accepted-replies test.
+BAD_CLIENT_REPLIES = ("duplicate", "invalid-json", "invalid-source")
+
+# Producer breaches that the consumer deliberately does not police: the exit
+# code already said success and the consumer only reads `source`.
+UNCONSUMED_FIELD_REPLIES = ("error-status", "wrong-repository", "wrong-commit")
 
 
 @pytest.mark.parametrize("reply", BAD_CLIENT_REPLIES)
@@ -756,6 +790,42 @@ def test_python_client_reader_rejects_untrusted_success_replies(source_host, mon
         gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
 
     assert error.value.code == gate_source.CLIENT_CONTRACT
+
+
+@pytest.mark.parametrize("reply", UNCONSUMED_FIELD_REPLIES)
+def test_python_client_reader_ignores_fields_it_does_not_consume(source_host, monkeypatch, reply):
+    """rc=0 is the verdict: a contradictory `status` or an echo mismatch on
+    repository/commit_sha cannot turn a successful client into a failure."""
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT_REPLY=reply,
+    )
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    payload = gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
+
+    assert payload["source"] == "cold"
+
+
+@pytest.mark.parametrize("reply", UNCONSUMED_FIELD_REPLIES)
+def test_bootstrap_ignores_fields_it_does_not_consume(source_host, reply):
+    """The inline shell fragment is bound by the same consumer principle."""
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT_REPLY=reply,
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+
+    run = _run_bash(
+        'bash -euo pipefail -c \'eval "$GATE_SOURCE_DECIDE_SCRIPT"; '
+        'eval "$GATE_SOURCE_PREPARE_SCRIPT"; gate_source_prepare\'',
+        env,
+    )
+
+    assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
 
 
 def test_python_client_reader_ignores_nonprotocol_stderr(source_host, monkeypatch):
@@ -827,8 +897,9 @@ def test_consumer_never_calls_the_client_under_the_read_lock(source_host):
 
 
 def test_python_client_reader_rejects_an_unready_status(source_host, monkeypatch):
-    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
-    monkeypatch.setenv("GATE_FAKE_CLIENT", "unready")
+    env = _env(source_host, source_host["tmp_path"] / "workspace", GATE_FAKE_CLIENT="unready")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     with pytest.raises(gate_source.SourceError) as error:
         gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
     assert error.value.code == gate_source.CLIENT_CONTRACT
@@ -844,6 +915,94 @@ def test_unknown_commit_from_the_client_is_fatal(source_host):
 
     assert run.returncode != 0
     assert gate_source.CLIENT_FAILED in run.stderr
+    assert "exit=4" in run.stderr
+    assert "SOURCE-PREPARE-FAILED" in run.stderr
+    assert gate_source.CLIENT_CONTRACT not in run.stderr
+
+
+def test_client_crash_without_protocol_line_reports_exit_code(source_host):
+    """rc!=0 with no protocol line at all still names the exit code."""
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT="crash",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
+
+    assert run.returncode != 0
+    assert gate_source.CLIENT_FAILED in run.stderr
+    assert "exit=1" in run.stderr
+    assert "no GIT-SOURCE-PREPARE-V1 line" in run.stderr
+    assert gate_source.CLIENT_CONTRACT not in run.stderr
+
+
+def test_client_deadline_exceeded_reaches_the_annotation(source_host):
+    """The producer's real failure code (rc=8) must survive to the log."""
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT="deadline",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
+
+    assert run.returncode != 0
+    assert gate_source.CLIENT_FAILED in run.stderr
+    assert "exit=8" in run.stderr
+    assert "SOURCE-DEADLINE-EXCEEDED" in run.stderr
+    assert gate_source.CLIENT_CONTRACT not in run.stderr
+
+
+def test_bootstrap_truncates_long_failure_lines(source_host):
+    """The shell fragment truncates the raw protocol line to 512 chars and
+    never validates the failure reply's fields."""
+    env = _env(
+        source_host, source_host["tmp_path"] / "workspace",
+        GATE_FAKE_CLIENT="long",
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+    )
+    _script_env(env)
+
+    run = _run_bash('bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"', env)
+
+    assert run.returncode != 0
+    assert gate_source.CLIENT_FAILED in run.stderr
+    assert gate_source.CLIENT_CONTRACT not in run.stderr
+    failed = next(line for line in run.stderr.splitlines() if gate_source.CLIENT_FAILED in line)
+    line = failed.split("line=", 1)[1]
+    assert len(line) == 512
+    assert line.startswith("GIT-SOURCE-PREPARE-V1 {")
+
+
+def test_python_client_failure_carries_the_exit_code_and_raw_line(source_host, monkeypatch):
+    env = _env(source_host, source_host["tmp_path"] / "workspace", GATE_FAKE_CLIENT="fail")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(gate_source.SourceError) as error:
+        gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
+    assert error.value.code == gate_source.CLIENT_FAILED
+    assert "exit=3" in error.value.detail
+    assert "SOURCE-SERVICE-UNAVAILABLE" in error.value.detail
+
+
+def test_python_client_failure_truncates_long_protocol_lines(source_host, monkeypatch):
+    """A >512-char protocol line is truncated in the failure detail; the extra
+    unknown key is not validated, only printed."""
+    env = _env(source_host, source_host["tmp_path"] / "workspace", GATE_FAKE_CLIENT="long")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(gate_source.SourceError) as error:
+        gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
+    assert error.value.code == gate_source.CLIENT_FAILED
+    line = error.value.detail.split("line=", 1)[1]
+    assert len(line) == 512
+    assert line.startswith("GIT-SOURCE-PREPARE-V1 {")
 
 
 def _held_lock(source_host, repository: str) -> Path:

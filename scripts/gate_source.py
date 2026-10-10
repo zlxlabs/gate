@@ -40,6 +40,9 @@ MIRROR_DIR_ENV = "GATE_HUB_GIT_MIRROR_DIR"
 MODE_FILE_NAME = "SOURCE-MODE"
 CLIENT_NAME = "git-source-prepare"
 CLIENT_MARKER = "GIT-SOURCE-PREPARE-V1"
+# Failure annotations carry the raw protocol line only up to this many chars;
+# the line is evidence for the operator, not a field to parse.
+CLIENT_LINE_DETAIL_LIMIT = 512
 SOURCE_MARKER = "GATE-SOURCE-V1"
 LOCK_NAME = "consume.lock"
 DEMAND_REF = "refs/demand/{sha}"
@@ -174,7 +177,15 @@ def _git(args: Sequence[str], *, cwd: Path | None = None, code: str, timeout: in
     return completed.stdout.strip()
 
 
-def _client_line(stderr: str, repository: str, commit: str, exit_code: int) -> dict[str, Any]:
+def _client_line(stderr: str) -> dict[str, Any]:
+    """Parse the one protocol line a successful (rc=0) client reply must carry.
+
+    Only what this repo consumes is validated: exactly one protocol line, a JSON
+    object, and `source` (it feeds the caller's telemetry).  `status`,
+    `repository` and `commit_sha` are the client's own contract — it already
+    checked them before exiting 0, and fetching refs/demand/<sha> is the real
+    guard against a wrong or incomplete answer.
+    """
     lines = [line for line in stderr.splitlines() if line.startswith(f"{CLIENT_MARKER} ")]
     if len(lines) != 1:
         fail(CLIENT_CONTRACT, f"expected exactly one {CLIENT_MARKER} line, got {len(lines)}")
@@ -182,16 +193,10 @@ def _client_line(stderr: str, repository: str, commit: str, exit_code: int) -> d
         payload = json.loads(lines[0][len(CLIENT_MARKER) + 1 :])
     except json.JSONDecodeError as error:
         fail(CLIENT_CONTRACT, f"{error}")
-    expected_status = "ready" if exit_code == 0 else "failed"
     if not isinstance(payload, dict):
         fail(CLIENT_CONTRACT, "reply must be a JSON object")
-    if (
-        payload.get("status") != expected_status
-        or payload.get("repository") != repository
-        or payload.get("commit_sha") != commit
-        or payload.get("source") not in ("hit", "cold")
-    ):
-        fail(CLIENT_CONTRACT, "status, repository, commit_sha, or source does not match the request")
+    if payload.get("source") not in ("hit", "cold"):
+        fail(CLIENT_CONTRACT, "source is not hit or cold")
     return payload
 
 
@@ -209,7 +214,13 @@ def remaining(deadline_epoch: int) -> int:
 
 
 def run_client(repository: str, commit: str, deadline_epoch: int) -> dict[str, Any]:
-    """Prepare `commit` through the host service.  Never touches the network."""
+    """Prepare `commit` through the host service.  Never touches the network.
+
+    The exit code is the verdict: rc!=0 is CLIENT-FAILED with the exit code and
+    the truncated raw protocol line — the failure reply's fields belong to the
+    producer and are never validated.  rc=0 only checks what this repo consumes
+    (see `_client_line`).
+    """
     client = mirror_root() / CLIENT_NAME
     if not os.access(client, os.X_OK):
         fail(CLIENT_MISSING, str(client))
@@ -225,12 +236,14 @@ def run_client(repository: str, commit: str, deadline_epoch: int) -> dict[str, A
         )
     except subprocess.TimeoutExpired:
         fail(DEADLINE_EXCEEDED, f"client exceeded deadline {deadline_epoch}")
-    payload = _client_line(completed.stderr, repository, commit, completed.returncode)
     if completed.returncode != 0:
-        fail(CLIENT_FAILED, f"exit={completed.returncode} code={payload.get('code')!r}")
-    if payload.get("commit_sha") != commit or payload.get("repository") != repository:
-        fail(CLIENT_CONTRACT, f"client answered for {payload.get('repository')}@{payload.get('commit_sha')}")
-    return payload
+        lines = [line for line in completed.stderr.splitlines() if line.startswith(f"{CLIENT_MARKER} ")]
+        detail = (
+            f"exit={completed.returncode} line={lines[0][:CLIENT_LINE_DETAIL_LIMIT]}" if lines
+            else f"exit={completed.returncode} no {CLIENT_MARKER} line"
+        )
+        fail(CLIENT_FAILED, detail)
+    return _client_line(completed.stderr)
 
 
 @contextlib.contextmanager
