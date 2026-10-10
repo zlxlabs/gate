@@ -17,3 +17,9 @@
 - 本段结论：gate-v2 / gate-shadow-v2 / gate-v2-disposition 的内联片段改为同一结构——client_line 先提取（\|\| true），rc≠0 直接报 CLIENT-FAILED（exit=<N> + 512 字符截断行或 no line），rc=0 才进只校验一行/JSON/source 的 python 校验；内联 python 不再收 EXPECTED_*/CLIENT_EXIT 环境变量。两文件测试 113 全绿，全量 1464 绿，check_pinned_uses 绿。
 - 关键决策与已否决方案：rc=0 校验仍把整个 client_raw 管给 python 数协议行（而非只管提取出的单行），否则两行协议行的 framing 违约会漏检。
 - 下一步唯一动作：对截断断言做注入红验，然后写设计文档。
+
+## 里程碑 4：注入红验 + 设计文档
+- 当前阶段：verifying
+- 本段结论：注入红验通过——把 gate-v2.yml 截断改成 :0:4096 后 test_bootstrap_truncates_long_failure_lines 变红（AssertionError：814 == 512），还原后回绿；host-source-service.md 读取协议节补上消费原则（退出码唯一裁决 / rc=0 只校验消费字段 / 两个 CLIENT 字面量的语义边界）。全量 1464 绿 + check_pinned_uses 绿。
+- 关键决策与已否决方案：无
+- 下一步唯一动作：收尾自检（工作区干净、远端分支推送）并写报告。

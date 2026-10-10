@@ -43,6 +43,26 @@ gate 的三个共享工作流（`gate-v2.yml` / `gate-shadow-v2.yml` / `gate-v2-
    --repository <owner/repo> --commit <40hex> --deadline-epoch <int>`；
    stderr 恰一行 `GIT-SOURCE-PREPARE-V1 {...}`；exit 0 = ready（`source` 为
    `hit`/`cold`），2–9 = `SOURCE-*` 失败。**只接受 `zlxlabs/` 仓。**
+
+消费原则（2026-10 收窄，起因 zlxlabs/gate-hub#1426）：
+
+- **退出码是唯一裁决。** rc≠0 一律报 `SOURCE-CLIENT-FAILED`，注解带
+  `exit=<N>` 与截断到 512 字符的协议行原文（无协议行则写
+  `no GIT-SOURCE-PREPARE-V1 line`）；失败回复（`status:"error"`、
+  `source:null`、六键 `status/code/repository/commit_sha/source/elapsed_ms`）
+  是 producer 的内部契约，消费端**不做任何字段校验**——否则 producer
+  一改字段，一切真实失败（超时、服务不可用、取不到对象）都被吞成泛化的
+  `SOURCE-CLIENT-CONTRACT`，门禁卡死而无从定位。
+- **rc=0 只校验自己消费的东西**：恰一行协议行、是 JSON 对象、
+  `source∈{hit,cold}`（`source` 进 `prepare_source` / GATE-SOURCE-V1 遥测）。
+  `status`/`repository`/`commit_sha` 由客户端自行核对
+  （gate-hub `runner/git_source_prepare.py`），真正的防线是后续按
+  `<sha>` 取 `refs/demand/<sha>` 并核对解析结果
+  （`SOURCE-PIN-MISMATCH` / `SOURCE-DEMAND-REF-MISSING`）。
+- 两个字面量的语义边界由此收窄：`SOURCE-CLIENT-CONTRACT` 只用于
+  rc=0 的回复形状违约；`SOURCE-CLIENT-FAILED` 只用于 rc≠0。字面量
+  本身不改名（下游日志检索与 `test_failure_literals_are_stable_and_unique`
+  依赖）。
 2. **调完客户端之后**才对 `<镜像>/consume.lock` 取共享锁（有界等待到截止时间）。
    宿主写者需要同一把锁的排他侧，持锁调客户端会死锁。
 3. 持锁期间只从镜像**文件系统路径**取对象：
