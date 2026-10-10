@@ -34,6 +34,7 @@ jobs:
       guard_outcome: ${{ steps.collect.outputs.guard_outcome }}
       evidence_outcome: ${{ steps.collect.outputs.evidence_outcome }}
       monotonicity_outcome: ${{ steps.collect.outputs.monotonicity_outcome }}
+      probe_script: ${{ steps.probe-script.outputs.probe_script }}
     steps:
       - name: Check out full history and tags
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -111,6 +112,53 @@ jobs:
         if: steps.monotonicity.outputs.move == 'true'
         run: python3 -m pytest -q tests/test_gate_caller_contract_guard.py
 
+      # The self-hosted runner's python3 has no PyYAML, so the failure-path
+      # probe cannot parse gate-v2.yml itself.  Extract the candidate
+      # commit's env.GATE_SOURCE_PREPARE_SCRIPT here (PyYAML is installed
+      # above) and pass it down via the probe_script output (~2.8KB, far
+      # below the 1MB job-output limit).  This step runs only under the
+      # plain move=='true' condition, so a failed extraction fails the sync
+      # job, the probe never runs, and v2 stays on its old commit.
+      - name: Extract the source failure probe fragment from the candidate commit
+        id: probe-script
+        if: steps.monotonicity.outputs.move == 'true'
+        env:
+          TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          workflow_copy="${RUNNER_TEMP:-/tmp}/candidate-gate-v2.yml"
+          if ! git show "${TARGET_SHA}:.github/workflows/gate-v2.yml" > "$workflow_copy"; then
+            echo "::error::SOURCE-PROBE-SCRIPT-EXTRACT-FAILED: ${TARGET_SHA} does not contain .github/workflows/gate-v2.yml" >&2
+            exit 1
+          fi
+          fragment="$(python3 - "$workflow_copy" <<'PY'
+          import sys
+
+          import yaml
+
+          text = open(sys.argv[1], encoding="utf-8").read()
+          try:
+              env = (yaml.safe_load(text) or {}).get("env") or {}
+          except yaml.YAMLError as exc:
+              print(f"SOURCE-PROBE-SCRIPT-EXTRACT-FAILED: could not parse gate-v2.yml: {exc}", file=sys.stderr)
+              raise SystemExit(1)
+          script = env.get("GATE_SOURCE_PREPARE_SCRIPT")
+          if not isinstance(script, str) or not script.strip():
+              print("SOURCE-PROBE-SCRIPT-EXTRACT-FAILED: env.GATE_SOURCE_PREPARE_SCRIPT missing or empty in gate-v2.yml", file=sys.stderr)
+              raise SystemExit(1)
+          sys.stdout.write(script)
+          PY
+          )" || {
+            echo "::error::SOURCE-PROBE-SCRIPT-EXTRACT-FAILED: could not extract env.GATE_SOURCE_PREPARE_SCRIPT from ${TARGET_SHA}:.github/workflows/gate-v2.yml" >&2
+            exit 1
+          }
+          delimiter="GATE-PROBE-SCRIPT-$(openssl rand -hex 16)"
+          {
+            echo "probe_script<<${delimiter}"
+            printf '%s\n' "$fragment"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Record step outcomes for the publishing jobs
         id: collect
         if: always()
@@ -145,6 +193,8 @@ jobs:
           persist-credentials: false
 
       - name: Probe the failure path with the host-deployed client
+        env:
+          GATE_SOURCE_PREPARE_SCRIPT_FRAGMENT: ${{ needs.sync.outputs.probe_script }}
         run: bash scripts/v2_source_failure_probe.sh
 
   publish:
