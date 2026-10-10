@@ -633,7 +633,9 @@ def test_service_prepare_failure_is_fatal_and_never_reaches_origin(tmp_path, req
 
     assert run.returncode != 0, f"a failing client must not be swallowed: {run.stdout}"
     assert "SOURCE-CLIENT-FAILED" in run.stderr
-    assert "SOURCE-COLD-FAILED" in run.stderr
+    assert "exit=3" in run.stderr
+    assert "SOURCE-SERVICE-UNAVAILABLE" in run.stderr
+    assert "SOURCE-CLIENT-CONTRACT" not in run.stderr
     # Fatal, not a soft miss: no result line to read as "went to origin", no
     # half-built repository, and origin was never fetched at all.
     assert not [line for line in run.stdout.splitlines() if line.startswith("GATE-CHECKOUT-MIRROR-V1")]
