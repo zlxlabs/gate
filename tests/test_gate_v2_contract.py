@@ -2956,9 +2956,10 @@ def test_gate_job_publishes_the_durable_panel_delivery_diagnostic():
 
 def test_gate_job_timeout_matches_aggregate_publish_budget():
     raw, _ = _load_workflow()
-    assert raw["jobs"]["gate"]["timeout-minutes"] == 8
+    assert raw["jobs"]["gate"]["timeout-minutes"] == 15
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert "aggregation is seconds, publish is capped at <=2 minutes" in workflow_text
+    assert "15 minutes: observed slow-API aggregator wallclock reached 11m04" in workflow_text
+    assert "aggregation is seconds, publish is capped at <=2 minutes" not in workflow_text
 
 
 # ── primary job: draft/fork/hosted skip + fail-closed upload ─────────────────
