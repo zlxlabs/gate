@@ -897,8 +897,9 @@ def test_consumer_never_calls_the_client_under_the_read_lock(source_host):
 
 
 def test_python_client_reader_rejects_an_unready_status(source_host, monkeypatch):
-    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
-    monkeypatch.setenv("GATE_FAKE_CLIENT", "unready")
+    env = _env(source_host, source_host["tmp_path"] / "workspace", GATE_FAKE_CLIENT="unready")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     with pytest.raises(gate_source.SourceError) as error:
         gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
     assert error.value.code == gate_source.CLIENT_CONTRACT
@@ -980,8 +981,9 @@ def test_bootstrap_truncates_long_failure_lines(source_host):
 
 
 def test_python_client_failure_carries_the_exit_code_and_raw_line(source_host, monkeypatch):
-    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
-    monkeypatch.setenv("GATE_FAKE_CLIENT", "fail")
+    env = _env(source_host, source_host["tmp_path"] / "workspace", GATE_FAKE_CLIENT="fail")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     with pytest.raises(gate_source.SourceError) as error:
         gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
     assert error.value.code == gate_source.CLIENT_FAILED
@@ -992,8 +994,9 @@ def test_python_client_failure_carries_the_exit_code_and_raw_line(source_host, m
 def test_python_client_failure_truncates_long_protocol_lines(source_host, monkeypatch):
     """A >512-char protocol line is truncated in the failure detail; the extra
     unknown key is not validated, only printed."""
-    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
-    monkeypatch.setenv("GATE_FAKE_CLIENT", "long")
+    env = _env(source_host, source_host["tmp_path"] / "workspace", GATE_FAKE_CLIENT="long")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     with pytest.raises(gate_source.SourceError) as error:
         gate_source.run_client(GATE_REPOSITORY, source_host["gate_sha"], int(time.time()) + 60)
     assert error.value.code == gate_source.CLIENT_FAILED
