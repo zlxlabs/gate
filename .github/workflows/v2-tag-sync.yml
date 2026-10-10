@@ -27,6 +27,13 @@ jobs:
   sync:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      advance: ${{ steps.guard.outputs.advance }}
+      target_sha: ${{ steps.evidence.outputs.target_sha }}
+      move: ${{ steps.monotonicity.outputs.move }}
+      guard_outcome: ${{ steps.collect.outputs.guard_outcome }}
+      evidence_outcome: ${{ steps.collect.outputs.evidence_outcome }}
+      monotonicity_outcome: ${{ steps.collect.outputs.monotonicity_outcome }}
     steps:
       - name: Check out full history and tags
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -104,11 +111,57 @@ jobs:
         if: steps.monotonicity.outputs.move == 'true'
         run: python3 -m pytest -q tests/test_gate_caller_contract_guard.py
 
+      - name: Record step outcomes for the publishing jobs
+        id: collect
+        if: always()
+        env:
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          MONOTONICITY_OUTCOME: ${{ steps.monotonicity.outcome }}
+        run: |
+          {
+            echo "guard_outcome=${GUARD_OUTCOME}"
+            echo "evidence_outcome=${EVIDENCE_OUTCOME}"
+            echo "monotonicity_outcome=${MONOTONICITY_OUTCOME}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Failure-path probe (gate-hub#1426): the canary only exercises the success
+  # path, so a consumer that swallows every real error into
+  # SOURCE-CLIENT-CONTRACT still promotes.  Before the tag moves, run the
+  # candidate commit's own fragment (scripts/v2_source_failure_probe.sh from
+  # the checked-out tree) against the host-deployed client on the runner that
+  # actually carries it.  This job failing — or never reaching success —
+  # leaves v2 on its old commit.
+  failure-probe:
+    needs: sync
+    if: needs.sync.outputs.move == 'true'
+    runs-on: [self-hosted, linux, ci]
+    steps:
+      - name: Check out the selected candidate commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.sync.outputs.target_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Probe the failure path with the host-deployed client
+        run: bash scripts/v2_source_failure_probe.sh
+
+  publish:
+    needs: [sync, failure-probe]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history and tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
       - name: Move v2 to selected canary-verified main commit
         id: move
-        if: steps.monotonicity.outputs.move == 'true'
+        if: needs.sync.outputs.move == 'true' && needs['failure-probe'].result == 'success'
         env:
-          TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
+          TARGET_SHA: ${{ needs.sync.outputs.target_sha }}
         run: |
           set -euo pipefail
           intended_sha="${TARGET_SHA}"
@@ -136,13 +189,14 @@ jobs:
         if: always()
         env:
           ENABLED: ${{ vars.V2_TAG_SYNC_ENABLED }}
-          GUARD_OUTCOME: ${{ steps.guard.outcome }}
-          ADVANCE: ${{ steps.guard.outputs.advance }}
-          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
-          TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
-          MONOTONICITY_OUTCOME: ${{ steps.monotonicity.outcome }}
-          MOVE: ${{ steps.monotonicity.outputs.move }}
+          GUARD_OUTCOME: ${{ needs.sync.outputs.guard_outcome }}
+          ADVANCE: ${{ needs.sync.outputs.advance }}
+          EVIDENCE_OUTCOME: ${{ needs.sync.outputs.evidence_outcome }}
+          TARGET_SHA: ${{ needs.sync.outputs.target_sha }}
+          MONOTONICITY_OUTCOME: ${{ needs.sync.outputs.monotonicity_outcome }}
+          MOVE: ${{ needs.sync.outputs.move }}
           MOVE_OUTCOME: ${{ steps.move.outcome }}
+          PROBE_RESULT: ${{ needs['failure-probe'].result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -158,6 +212,8 @@ jobs:
             state="query_failed"
           elif [[ "${MOVE}" == "false" ]]; then
             state="already_current"
+          elif [[ "${PROBE_RESULT}" != "success" ]]; then
+            state="failure_probe_failed"
           elif [[ "${MOVE_OUTCOME}" == "success" ]]; then
             state="promoted"
           else
@@ -169,9 +225,9 @@ jobs:
 
       - name: Report v2 lag quadruplet
         id: lag
-        if: always() && steps.guard.outcome == 'success'
+        if: always() && needs.sync.outputs.guard_outcome == 'success'
         env:
-          TARGET_SHA: ${{ steps.evidence.outputs.target_sha }}
+          TARGET_SHA: ${{ needs.sync.outputs.target_sha }}
         shell: bash
         run: |
           set -euo pipefail

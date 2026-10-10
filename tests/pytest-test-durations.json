@@ -3,5 +3,7 @@
   "tests/test_classify_pr_reviewable_paths.py": 1.20,
   "tests/test_gate_bounded_retry.py": 1.50,
   "tests/test_v2_release_state.py": 1.45,
-  "tests/test_gate_redline_consumer_contract.py": 0.10
+  "tests/test_gate_redline_consumer_contract.py": 0.10,
+  "tests/test_v2_source_failure_probe.py": 1.19,
+  "tests/test_v2_tag_sync.py": 0.71
 }

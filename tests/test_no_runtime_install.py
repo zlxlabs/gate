@@ -73,6 +73,7 @@ ENTRY_FILES = {
     "scripts/v2_release_state.py": "发布状态入口",
     "scripts/v2_tag_guard.py": "tag 门禁入口",
     "scripts/v2_tag_promotion_evidence.py": "tag 晋升证据入口",
+    "scripts/v2_source_failure_probe.sh": "tag 同步自托管失败路径探针（v2 抬升前置，gate-hub#1426）",
 }
 
 # 运行期取包启动器（黑名单只锁 payload，白名单锁清单，见模块 docstring）。
