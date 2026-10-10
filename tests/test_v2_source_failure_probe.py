@@ -8,6 +8,7 @@ fragment (gate d88d62cd) fails the probe instead of sailing through.
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -77,14 +78,6 @@ def _write_fake_client(mirror: Path, *, exit_code: int, payload: dict | None) ->
     client.chmod(client.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _write_tree(tree: Path, fragment: str | None) -> None:
-    (tree / ".github" / "workflows").mkdir(parents=True)
-    env = {"GATE_SOURCE_PREPARE_SCRIPT": fragment} if fragment is not None else {}
-    (tree / ".github" / "workflows" / "gate-v2.yml").write_text(
-        yaml.safe_dump({"env": env}), encoding="utf-8"
-    )
-
-
 def _run_probe(
     tmp_path: Path,
     fragment: str | None,
@@ -94,6 +87,7 @@ def _run_probe(
     mirror_set: bool = True,
     client_present: bool = True,
     cwd: Path | None = None,
+    path_prepend: Path | None = None,
 ) -> subprocess.CompletedProcess:
     mirror = tmp_path / "mirror"
     mirror.mkdir()
@@ -111,12 +105,18 @@ def _run_probe(
         _write_fake_client(mirror, exit_code=client_exit, payload=payload)
     if cwd is None:
         cwd = tmp_path / "tree"
-        _write_tree(cwd, fragment)
+        cwd.mkdir()
     env = dict(os.environ)
     if mirror_set:
         env["GATE_HUB_GIT_MIRROR_DIR"] = str(mirror)
     else:
         env.pop("GATE_HUB_GIT_MIRROR_DIR", None)
+    if fragment is None:
+        env.pop("GATE_SOURCE_PREPARE_SCRIPT_FRAGMENT", None)
+    else:
+        env["GATE_SOURCE_PREPARE_SCRIPT_FRAGMENT"] = fragment
+    if path_prepend is not None:
+        env["PATH"] = f"{path_prepend}{os.pathsep}{env['PATH']}"
     return subprocess.run(
         ["bash", str(PROBE)], cwd=cwd, env=env, capture_output=True, text=True
     )
@@ -208,7 +208,47 @@ def test_probe_fails_loud_when_host_client_is_missing(tmp_path):
     assert "SOURCE-PROBE-CLIENT-MISSING" in result.stderr
 
 
-def test_probe_fails_loud_when_fragment_cannot_be_extracted(tmp_path):
+def test_probe_fails_loud_when_fragment_was_not_supplied(tmp_path):
+    # The fragment now travels from the sync job via env; the probe must
+    # fail loud when it never arrives (extraction failed upstream).
     result = _run_probe(tmp_path, None)
     assert result.returncode != 0
     assert "SOURCE-PROBE-SCRIPT-EXTRACT-FAILED" in result.stderr
+
+
+def _stdlib_only_python_shim(directory: Path) -> Path:
+    """A python3 that forwards to the real interpreter with -I -S, so
+    site-packages (PyYAML included) is never importable — the same
+    environment as the self-hosted runner's system python3."""
+    real = shutil.which("python3")
+    assert real, "python3 must be on PATH to build the stdlib-only shim"
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "python3"
+    shim.write_text(f'#!/bin/sh\nexec "{real}" -I -S "$@"\n')
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return shim
+
+
+def test_stdlib_only_shim_actually_hides_third_party_packages(tmp_path):
+    # Anchor for the guard below: prove the shim really hides PyYAML before
+    # trusting it to detect a third-party import inside the probe.
+    shim = _stdlib_only_python_shim(tmp_path / "shim")
+    hidden = subprocess.run(
+        [str(shim), "-c", "import yaml"], capture_output=True, text=True
+    )
+    assert hidden.returncode != 0
+    assert "ModuleNotFoundError" in hidden.stderr
+    stdlib = subprocess.run(
+        [str(shim), "-c", "import json, os, sys"], capture_output=True, text=True
+    )
+    assert stdlib.returncode == 0, stdlib.stderr
+
+
+def test_probe_passes_with_stdlib_only_python(tmp_path):
+    # The self-hosted runner's python3 has no PyYAML; the probe must not
+    # import any third-party module.  Running it behind the -I -S shim turns
+    # any such import into a ModuleNotFoundError and fails the probe.
+    shim = _stdlib_only_python_shim(tmp_path / "shim")
+    result = _run_probe(tmp_path, _current_fragment(), path_prepend=(tmp_path / "shim"))
+    assert result.returncode == 0, result.stderr
+    assert "SOURCE-PROBE-OK" in result.stdout

@@ -187,6 +187,48 @@ def test_failure_probe_failure_blocks_the_move():
     assert "needs.sync.outputs.move == 'true'" in move["if"]
 
 
+def test_sync_job_extracts_probe_fragment_from_target_sha_with_pyyaml():
+    """The fragment is extracted on the GitHub-hosted sync job (PyYAML is
+    installed there) from the candidate commit's gate-v2.yml, never on the
+    self-hosted runner.  A failed extraction must fail the sync job with
+    SOURCE-PROBE-SCRIPT-EXTRACT-FAILED; since the step runs under the plain
+    move=='true' condition (no always()), the sync job goes red and the
+    probe is skipped, so the move-if in test_failure_probe_failure_blocks
+    _the_move keeps the tag on its old commit."""
+    raw, _ = _load()
+    sync = raw["jobs"]["sync"]
+    assert sync["outputs"]["probe_script"] == "${{ steps.probe-script.outputs.probe_script }}"
+    steps = sync["steps"]
+    extract = next(step for step in steps if step.get("id") == "probe-script")
+    assert extract["if"] == "steps.monotonicity.outputs.move == 'true'"
+    assert "always()" not in extract["if"]
+    assert extract["env"]["TARGET_SHA"] == "${{ steps.evidence.outputs.target_sha }}"
+    run = extract["run"]
+    assert 'git show "${TARGET_SHA}:.github/workflows/gate-v2.yml"' in run
+    assert "GITHUB_SHA" not in run and "HEAD" not in run
+    assert "import yaml" in run
+    assert "GATE_SOURCE_PREPARE_SCRIPT" in run
+    assert "SOURCE-PROBE-SCRIPT-EXTRACT-FAILED" in run
+    assert re.search(r"(?m)^\s*exit 1\s*$", run)
+    # PyYAML must be installed before this step runs.
+    install = next(step for step in steps if step.get("name") == "Install contract-check dependencies")
+    assert steps.index(install) < steps.index(extract)
+    # The multi-line fragment travels via a randomized heredoc delimiter.
+    assert "GITHUB_OUTPUT" in run
+    assert re.search(r"openssl rand", run)
+
+
+def test_failure_probe_receives_the_extracted_fragment_as_env():
+    raw, _ = _load()
+    probe = raw["jobs"]["failure-probe"]
+    probe_step = probe["steps"][-1]
+    assert probe_step["run"].strip() == "bash scripts/v2_source_failure_probe.sh"
+    assert (
+        probe_step["env"]["GATE_SOURCE_PREPARE_SCRIPT_FRAGMENT"]
+        == "${{ needs.sync.outputs.probe_script }}"
+    )
+
+
 def test_breaker_marker_blocks_advancement(capsys):
     assert main(
         ["--enabled", "true", "--commit-message", f"fix caller {HOLD_MARKER}"]

@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Failure-path probe for the v2 promotion gate (gate-hub#1426).  Runs the
-# candidate commit's GATE_SOURCE_PREPARE_SCRIPT fragment (extracted from
-# .github/workflows/gate-v2.yml in the current working tree) against the
+# candidate commit's GATE_SOURCE_PREPARE_SCRIPT fragment against the
 # host-deployed client, asking for a commit that cannot exist.  The fragment
 # must surface the producer's real failure — a SOURCE-CLIENT-FAILED annotation
 # carrying exit= and a SOURCE-* error code — instead of the pre-fix blanket
 # SOURCE-CLIENT-CONTRACT.  Every probe-infrastructure problem is itself fatal
 # with a SOURCE-PROBE-* literal: a green probe is the only condition under
 # which v2-tag-sync moves the tag.
+#
+# The fragment is extracted from the candidate commit's gate-v2.yml by the
+# GitHub-hosted sync job (which installs PyYAML) and passed in via the
+# GATE_SOURCE_PREPARE_SCRIPT_FRAGMENT environment variable.  This script runs
+# on the self-hosted runner, whose system python3 has no PyYAML, so every
+# python here must import the standard library only.
 set -euo pipefail
 
 die() {
@@ -25,22 +30,9 @@ host_client="$GATE_HUB_GIT_MIRROR_DIR/git-source-prepare"
 [ -x "$host_client" ] ||
   die "SOURCE-PROBE-CLIENT-MISSING: $host_client is not an executable on this host"
 
-workflow=".github/workflows/gate-v2.yml"
-[ -f "$workflow" ] ||
-  die "SOURCE-PROBE-WORKFLOW-MISSING: $workflow not found in the candidate tree"
-
-fragment=$(python3 - "$workflow" <<'PY'
-import sys
-
-import yaml
-
-env = (yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}).get("env") or {}
-script = env.get("GATE_SOURCE_PREPARE_SCRIPT")
-sys.stdout.write(script if isinstance(script, str) else "")
-PY
-) || die "SOURCE-PROBE-SCRIPT-EXTRACT-FAILED: could not parse $workflow with PyYAML"
+fragment="${GATE_SOURCE_PREPARE_SCRIPT_FRAGMENT:-}"
 [ -n "$fragment" ] ||
-  die "SOURCE-PROBE-SCRIPT-EXTRACT-FAILED: env.GATE_SOURCE_PREPARE_SCRIPT missing or empty in $workflow"
+  die "SOURCE-PROBE-SCRIPT-EXTRACT-FAILED: probe fragment was not supplied (the sync job did not pass GATE_SOURCE_PREPARE_SCRIPT_FRAGMENT)"
 
 # --- ask the real pairing for a commit that cannot exist ---
 
