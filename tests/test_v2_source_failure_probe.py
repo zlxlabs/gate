@@ -169,6 +169,33 @@ def test_probe_fails_when_failure_carries_no_protocol_line(tmp_path):
     assert "SOURCE-PROBE-ASSERT-FAILED" in result.stderr
 
 
+def test_probe_rejects_contract_even_beside_a_real_failure_annotation(tmp_path):
+    # Isolates the SOURCE-CLIENT-CONTRACT ban: the other two assertions
+    # (FAILED exit=, SOURCE-* code) are satisfied, so only the ban can fail.
+    fragment = """gate_source_prepare() {
+    printf '%s\\n' '::error::SOURCE-CLIENT-FAILED: exit=4 line=GIT-SOURCE-PREPARE-V1 {"status":"error","code":"SOURCE-PREPARE-FAILED"}' >&2
+    printf '%s\\n' '::error::SOURCE-CLIENT-CONTRACT: stale blanket verdict' >&2
+    exit 1
+}"""
+    result = _run_probe(tmp_path, fragment)
+    assert result.returncode != 0
+    assert "SOURCE-PROBE-ASSERT-FAILED" in result.stderr
+    assert "SOURCE-CLIENT-CONTRACT" in result.stderr
+
+
+def test_probe_requires_the_failed_exit_annotation_not_just_a_code_line(tmp_path):
+    # Isolates the SOURCE-CLIENT-FAILED exit= requirement: a code-bearing
+    # line alone (the client "succeeding" on a commit that cannot exist)
+    # must not satisfy the probe.
+    fragment = """gate_source_prepare() {
+    printf '%s\\n' 'line=GIT-SOURCE-PREPARE-V1 {"status":"error","code":"SOURCE-SOMETHING"}' >&2
+    exit 0
+}"""
+    result = _run_probe(tmp_path, fragment)
+    assert result.returncode != 0
+    assert "SOURCE-PROBE-ASSERT-FAILED" in result.stderr
+
+
 def test_probe_fails_loud_when_mirror_env_is_unset(tmp_path):
     result = _run_probe(tmp_path, _current_fragment(), mirror_set=False, cwd=REPO_ROOT)
     assert result.returncode != 0
