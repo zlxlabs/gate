@@ -3331,6 +3331,47 @@ def test_every_scrub_import_has_checkout_coverage_for_action_and_module():
                         )
 
 
+def test_silo_src_aggregate_sparse_covers_load_time_neighbors():
+    # Derive load-time same-dir deps from aggregate.py (with_name("<file>.py")),
+    # then require every job that runs that script from _gate-silo-src to have
+    # checked those files out into that directory before the run.
+    deps = re.findall(r'with_name\("([^"]+\.py)"\)', AGGREGATOR_SCRIPT.read_text())
+    assert deps, "aggregate.py has no with_name(\"<file>.py\") load-time neighbors"
+    needle = "_gate-silo-src/.github/actions/gate-aggregator/aggregate.py"
+    raw, _ = _load_workflow()
+    jobs_that_run = []
+    for job_name, job in raw["jobs"].items():
+        steps = job.get("steps") or []
+        if not any(needle in str(step.get("run", "")) for step in steps):
+            continue
+        jobs_that_run.append(job_name)
+        last_silo_sparse = None
+        for step in steps:
+            env = step.get("env") or {}
+            if (
+                env.get("GATE_CHECKOUT_PATH") == "_gate-silo-src"
+                and env.get("GATE_CHECKOUT_SPARSE")
+            ):
+                last_silo_sparse = _sparse_env_paths(step)
+            if needle not in str(step.get("run", "")):
+                continue
+            assert last_silo_sparse is not None, (
+                f"{job_name}: runs {needle} without a prior "
+                "_gate-silo-src GATE_CHECKOUT_SPARSE"
+            )
+            for dep in deps:
+                rel = f".github/actions/gate-aggregator/{dep}"
+                covered = any(
+                    rel == prefix or rel.startswith(f"{prefix.rstrip('/')}/")
+                    for prefix in last_silo_sparse
+                )
+                assert covered, (
+                    f"{job_name}: _gate-silo-src sparse checkout missing "
+                    f"aggregate.py load-time neighbor {rel}"
+                )
+    assert jobs_that_run, f"no job runs {needle}"
+
+
 def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():
     raw, _ = _load_workflow()
     steps = raw["jobs"]["quality"]["steps"]
