@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
@@ -23,6 +23,18 @@ KNOWN_SEVERITIES = frozenset({"major", "blocker", "minor", "nit"})
 # Replay anchors (design §4.2): 187↔190 / 116↔118 / 37↔40. |Δline|<=4 covers
 # those pairs; |Δline|==5 must not match. Category is not part of neighbor identity.
 NEIGHBOR_LINE_TOLERANCE = 4
+# Strategy/identity fields that still bind a receipt across heads. Code-changing
+# Scope fields (base_sha, head_sha, diff_digest, caller_sha, reusable_workflow_sha)
+# are excluded: a new commit is gated by the anchor window and current-head
+# rerun, not by epoch (§8 revision 1: policy change voids a receipt, code change
+# does not).
+NEIGHBOR_POLICY_SCOPE_FIELDS = (
+    "repository_id",
+    "pr_number",
+    "policy_version",
+    "policy_digest",
+    "tier",
+)
 SEVERITY_P1 = P1_SEVERITIES
 SUPPORTED_TIERS = ("personal", "internal", "saas")
 PRIMARY_VERDICTS = frozenset({"pass", "fail", "unavailable"})
@@ -234,6 +246,7 @@ class NeighborEvidence:
     rerun_argv: list[str]
     rerun_exit_code: int
     rerun_match_count: int
+    receipt_scope: Scope
 
 
 @dataclass(frozen=True)
@@ -775,6 +788,20 @@ def _counterevidence_expired(receipt: DispositionReceipt) -> DispositionStatus:
     )
 
 
+def _neighbor_epoch_mismatch(receipt: DispositionReceipt, evidence: NeighborEvidence, scope: Scope) -> bool:
+    receipt_scope = evidence.receipt_scope
+    if not isinstance(receipt_scope, Scope) or _scope_errors(receipt_scope):
+        return True
+    if derive_epoch(receipt_scope) != receipt.epoch:
+        return True
+    if receipt_scope.head_sha != receipt.head_sha:
+        return True
+    return any(
+        getattr(receipt_scope, field) != getattr(scope, field)
+        for field in NEIGHBOR_POLICY_SCOPE_FIELDS
+    )
+
+
 def _neighbor_evidence_for(
     receipt: DispositionReceipt,
     neighbor_evidence: Mapping[str, NeighborEvidence] | None,
@@ -951,10 +978,7 @@ def validate_disposition_receipt(
     if head_ok and epoch_ok and digest_ok:
         pass
     elif evidence is not None:
-        # derive_epoch hashes the whole Scope, including head_sha. Neighbor
-        # consumption relaxes head_sha only, so restore the receipt head before
-        # the epoch equality gate; policy/tier/diff_digest still bind.
-        if receipt.epoch != derive_epoch(replace(scope, head_sha=receipt.head_sha)):
+        if _neighbor_epoch_mismatch(receipt, evidence, scope):
             return _disposition_status(
                 receipt, valid=False, active=False, reason="epoch_mismatch_stale",
                 message=_actionable_disposition_reason(

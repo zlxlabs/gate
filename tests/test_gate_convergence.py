@@ -1510,7 +1510,11 @@ def _six_primary(scope, findings):
 
 
 def _replay_pair(current_findings=_DRIFT_P1):
-    old_scope, new_scope = _scope(head_sha=_OLD_HEAD), _scope(head_sha=_NEW_HEAD)
+    old_scope = _scope(head_sha=_OLD_HEAD)
+    new_scope = _scope(
+        head_sha=_NEW_HEAD, base_sha="3" * 40, diff_digest="e" * 64,
+        caller_sha="4" * 40, reusable_workflow_sha="5" * 40,
+    )
     receipt = _stable_disposition(
         scope=old_scope, audit_digest=_OLD_DIGEST,
         primary=_six_primary(old_scope, (("old-id", "major", "inferred", _REPLAY_FILE, 187, "correctness"),)),
@@ -1524,6 +1528,7 @@ def _neighbor_evidence(scope, receipt, **changes):
     payload = dict(
         current_head_sha=scope.head_sha, anchor_line_current=187, anchor_window_touched=False,
         rerun_argv=argv, rerun_exit_code=0, rerun_match_count=1,
+        receipt_scope=_scope(head_sha=receipt.head_sha),
     )
     payload.update(changes)
     return CONV.NeighborEvidence(**payload)
@@ -1561,6 +1566,11 @@ def test_neighbor_finding_key_rejects_delta_5_null_line_minor_and_empty_file():
 
 def test_replay_neighbor_consumes_drifted_head_id_category_and_digest():
     new_scope, receipt, current, mapping, status = _replay_status()
+    issued = mapping[receipt.finding_key].receipt_scope
+    assert issued.base_sha != new_scope.base_sha
+    assert issued.head_sha != new_scope.head_sha
+    assert issued.diff_digest != new_scope.diff_digest
+    assert issued.caller_sha != new_scope.caller_sha
     assert (status.reason_code, status.matched_by, status.audit_digest_drift, status.matched_finding_id) == (
         "active_false_positive", "neighbor", True, "new-id",
     )
@@ -1688,6 +1698,49 @@ def test_neighbor_evidence_none_equals_omitted_status_fields(kind):
     explicit = CONV.validate_disposition_receipt(receipt, neighbor_evidence=None, **kwargs)
     assert omitted == explicit
     assert all(getattr(omitted, field.name) == getattr(explicit, field.name) for field in fields(omitted))
+
+
+def test_neighbor_receipt_scope_epoch_tamper_is_stale():
+    new_scope, receipt, current, _mapping, _status = _replay_status()
+    issued = replace(_scope(head_sha=receipt.head_sha), reusable_workflow_sha="z" * 40)
+    assert CONV.derive_epoch(issued) != receipt.epoch
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST,
+        neighbor_evidence={receipt.finding_key: _neighbor_evidence(new_scope, receipt, receipt_scope=issued)},
+    )
+    assert status.reason_code == "epoch_mismatch_stale"
+
+
+def test_neighbor_receipt_scope_head_mismatch_is_stale():
+    new_scope, receipt, current, _mapping, _status = _replay_status()
+    issued = replace(_scope(head_sha=receipt.head_sha), head_sha="9" * 40)
+    receipt = replace(receipt, epoch=CONV.derive_epoch(issued))
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST,
+        neighbor_evidence={receipt.finding_key: _neighbor_evidence(new_scope, receipt, receipt_scope=issued)},
+    )
+    assert status.reason_code == "epoch_mismatch_stale"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("repository_id", 999),
+        ("pr_number", 7),
+        ("policy_version", "policy-v2"),
+        ("policy_digest", "q" * 64),
+        ("tier", "saas"),
+    ],
+)
+def test_neighbor_policy_subset_mismatch_is_epoch_stale(field, value):
+    new_scope, receipt, current, _mapping, _status = _replay_status()
+    issued = replace(_scope(head_sha=receipt.head_sha), **{field: value})
+    receipt = replace(receipt, epoch=CONV.derive_epoch(issued))
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST,
+        neighbor_evidence={receipt.finding_key: _neighbor_evidence(new_scope, receipt, receipt_scope=issued)},
+    )
+    assert status.reason_code == "epoch_mismatch_stale"
 
 
 def test_same_head_digest_drift_still_neighbors_by_anchor_line():
