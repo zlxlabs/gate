@@ -46,19 +46,16 @@ SCHEMA_VERSION = _CONVERGENCE.DISPOSITION_RECEIPT_SCHEMA_VERSION
 _RERUN_EXCERPT_MAX = 2000
 
 
-def rerun_counterevidence(command: str, head_sha: str, repo_dir: Path) -> dict:
-    """Execute the allowlisted git-grep command against repo_dir.
+def _require_head_objects(head_sha: str, pathspec: str, repo_dir: Path) -> None:
+    """Reject repo_dir that cannot serve the allowlisted grep offline.
 
-    Returns the gate_rerun object. Raises ValueError with a reason literal
-    when the command is not allowlisted, matches nothing, or fails.
+    gate#302: a blob-filtered clone holds the commit but defers blobs to the
+    promisor remote, so git grep spends its whole budget on one network round
+    trip per blob and dies on the rerun timeout with no diagnosis. rev-list
+    --missing=print lists those objects instead of fetching them, so a partial
+    clone now fails fast with its own reason literal.
     """
-    try:
-        argv = shlex.split(command)
-    except ValueError as exc:
-        raise ValueError("counterevidence_command_not_allowlisted") from exc
-    reason = _CONVERGENCE.counterevidence_argv_reason(argv, head_sha)
-    if reason is not None:
-        raise ValueError(reason)
+    argv = ["git", "rev-list", "--objects", "--missing=print", head_sha, "--", pathspec]
     try:
         completed = subprocess.run(
             argv,
@@ -67,7 +64,42 @@ def rerun_counterevidence(command: str, head_sha: str, repo_dir: Path) -> dict:
             timeout=_CONVERGENCE.COUNTEREVIDENCE_RERUN_TIMEOUT_S,
             check=False,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("counterevidence_rerun_timeout") from exc
+    except OSError as exc:
+        raise ValueError("counterevidence_rerun_failed") from exc
+    if completed.returncode != 0 or any(
+        line.startswith(b"?") for line in (completed.stdout or b"").splitlines()
+    ):
+        raise ValueError("counterevidence_head_object_missing")
+
+
+def rerun_counterevidence(command: str, head_sha: str, repo_dir: Path) -> dict:
+    """Execute the allowlisted git-grep command against repo_dir.
+
+    Returns the gate_rerun object. Raises ValueError with a reason literal
+    when the command is not allowlisted, repo_dir lacks the head objects,
+    matches nothing, times out, or fails.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError("counterevidence_command_not_allowlisted") from exc
+    reason = _CONVERGENCE.counterevidence_argv_reason(argv, head_sha)
+    if reason is not None:
+        raise ValueError(reason)
+    _require_head_objects(head_sha, argv[-1], repo_dir)
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repo_dir,
+            capture_output=True,
+            timeout=_CONVERGENCE.COUNTEREVIDENCE_RERUN_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("counterevidence_rerun_timeout") from exc
+    except OSError as exc:
         raise ValueError("counterevidence_rerun_failed") from exc
     stdout = completed.stdout or b""
     if completed.returncode == 1:

@@ -358,8 +358,20 @@ jobs:
           git -C "$repo_dir" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           git -C "$repo_dir" config http.extraheader "AUTHORIZATION: basic ${auth_header}"
-          git -C "$repo_dir" fetch --depth 1 --filter=blob:none origin "$CURRENT_HEAD_SHA"
+          # gate#302: no blob filter. git grep has to read every blob under the
+          # counterevidence pathspec, and a --filter=blob:none clone serves them
+          # one promisor round trip at a time, which burned the 30s rerun budget.
+          if ! timeout 300 git -C "$repo_dir" fetch --depth 1 origin "$CURRENT_HEAD_SHA"; then
+            echo "::error::caller head $CURRENT_HEAD_SHA not fetchable for the counterevidence rerun" >&2
+            exit 1
+          fi
           git -C "$repo_dir" cat-file -e "$CURRENT_HEAD_SHA^{commit}"
+          missing="$(git -C "$repo_dir" rev-list --objects --missing=print "$CURRENT_HEAD_SHA" \
+            | grep -c '^?' || true)"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::caller head $CURRENT_HEAD_SHA is missing $missing objects; the rerun would fetch them one by one" >&2
+            exit 1
+          fi
           echo "CALLER_HEAD_DIR=$repo_dir" >> "$GITHUB_ENV"
 
       - name: Issue immutable disposition artifact

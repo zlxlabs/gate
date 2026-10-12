@@ -358,7 +358,12 @@ def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
     assert fetch["env"]["GH_TOKEN"] == "${{ github.token }}"
     run = fetch["run"]
     assert "git -C \"$repo_dir\" init --quiet" in run
-    assert "fetch --depth 1 --filter=blob:none origin \"$CURRENT_HEAD_SHA\"" in run
+    # gate#302: the caller head must arrive complete. A blob-filtered clone
+    # defers the pathspec blobs to per-object promisor fetches and the grep
+    # times out without saying why.
+    assert "timeout 300 git -C \"$repo_dir\" fetch --depth 1 origin \"$CURRENT_HEAD_SHA\"" in run
+    assert not [line for line in run.splitlines() if "fetch" in line and "--filter" in line]
+    assert "--missing=print" in run
     assert "_gate-caller-head" in run
     assert raw["permissions"]["contents"] == "read"
     assert names.index("Resolve current PR head and canonical primary audit") < names.index(

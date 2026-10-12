@@ -38,7 +38,9 @@ git grep -n -F -e <literal> <HEAD_SHA> -- <pathspec>
 |---|---|---|
 | 退出码 0 且 ≥1 行 | 成立 | 写入 `counterevidence.gate_rerun` |
 | 退出码 1（零命中） | `counterevidence_rerun_no_match` | 不写，步骤非零 |
-| 其它退出码 / 超时 / OSError | `counterevidence_rerun_failed` | 不写，步骤非零 |
+| head 对象（pathspec 下 blob）缺失 | `counterevidence_head_object_missing` | 不写，步骤非零 |
+| 超时 | `counterevidence_rerun_timeout` | 不写，步骤非零 |
+| 其它退出码 / OSError | `counterevidence_rerun_failed` | 不写，步骤非零 |
 | 命令不在白名单 | `counterevidence_command_not_allowlisted` | 不写，步骤非零 |
 
 取仓失败同样 fail-closed：不得降级为采信提交方文本。
