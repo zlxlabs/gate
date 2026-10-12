@@ -11,15 +11,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
 P1_SEVERITIES = frozenset({"major", "blocker"})
 KNOWN_SEVERITIES = frozenset({"major", "blocker", "minor", "nit"})
+# Replay anchors (design §4.2): 187↔190 / 116↔118 / 37↔40. |Δline|<=4 covers
+# those pairs; |Δline|==5 must not match. Category is not part of neighbor identity.
+NEIGHBOR_LINE_TOLERANCE = 4
 SEVERITY_P1 = P1_SEVERITIES
 SUPPORTED_TIERS = ("personal", "internal", "saas")
 PRIMARY_VERDICTS = frozenset({"pass", "fail", "unavailable"})
@@ -218,6 +221,22 @@ class DispositionReceipt:
 
 
 @dataclass(frozen=True)
+class NeighborEvidence:
+    """Caller-injected facts for neighbor consumption after head/digest drift.
+
+    Field names are a locked contract with the wiring card. This module never
+    collects these values; omitted evidence is a no-op (existing reasons).
+    """
+
+    current_head_sha: str
+    anchor_line_current: int
+    anchor_window_touched: bool
+    rerun_argv: list[str]
+    rerun_exit_code: int
+    rerun_match_count: int
+
+
+@dataclass(frozen=True)
 class DispositionStatus:
     """Receipt claim diagnostics; ``active`` means current-target match, never authorization."""
 
@@ -226,6 +245,9 @@ class DispositionStatus:
     active: bool
     reason: str
     reason_code: str = ""
+    matched_by: str = ""
+    audit_digest_drift: bool = False
+    matched_finding_id: str = ""
 
     @property
     def finding_id(self) -> str:
@@ -444,6 +466,54 @@ def canonical_finding_key(finding: Any) -> str:
     return _canonical_json(components).decode("utf-8")
 
 
+def neighbor_finding_key(finding: Any) -> tuple[str, int] | None:
+    """Return ``(file, line)`` when ``finding`` may join neighbor identity.
+
+    Two findings are neighbor-identical iff both yield a key, the files are
+    equal, and ``abs(Δline) <= NEIGHBOR_LINE_TOLERANCE``. Category is not
+    consulted. Non-int / missing / null ``line``, empty ``file``, or a
+    non-P1 severity make the finding ineligible (returns ``None``).
+    """
+
+    if not isinstance(finding, dict):
+        return None
+    file = finding.get("file")
+    line = finding.get("line")
+    if not isinstance(file, str) or not file:
+        return None
+    if type(line) is not int:
+        return None
+    if finding.get("severity") not in P1_SEVERITIES:
+        return None
+    return (file, line)
+
+
+def _decode_canonical_finding_key(finding_key: str) -> dict[str, Any] | None:
+    """Invert ``canonical_finding_key`` tagged JSON into a finding dict."""
+
+    try:
+        payload = json.loads(finding_key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    decoded: dict[str, Any] = {}
+    for field in CANONICAL_FINDING_KEY_FIELDS:
+        tagged = payload.get(field)
+        if not isinstance(tagged, list) or not tagged:
+            continue
+        tag = tagged[0]
+        if tag == "missing" and len(tagged) == 1:
+            continue
+        if tag == "null" and len(tagged) == 1:
+            decoded[field] = None
+        elif tag == "value" and len(tagged) == 2:
+            decoded[field] = tagged[1]
+        else:
+            return None
+    return decoded
+
+
 def _canonical_finding_sort_key(item: dict[str, Any]) -> str:
     return canonical_finding_key(item)
 
@@ -561,6 +631,26 @@ def _stable_primary_matches(
     return matches
 
 
+def _neighbor_primary_matches(
+    anchor_file: str,
+    anchor_line: int,
+    primary: CanonicalPrimary,
+) -> list[tuple[str, dict[str, Any]]]:
+    matches: list[tuple[str, dict[str, Any]]] = []
+    if not isinstance(primary.p1_findings, tuple):
+        return matches
+    for finding in primary.p1_findings:
+        record = _primary_finding_record(finding)
+        if record is None or len(finding) != 6:
+            continue
+        key = neighbor_finding_key(record)
+        if key is None:
+            continue
+        if key[0] == anchor_file and abs(key[1] - anchor_line) <= NEIGHBOR_LINE_TOLERANCE:
+            matches.append((record["id"], record))
+    return matches
+
+
 def narrow_stable_key_matches_by_id(
     matches: list[tuple[str, Any]],
     finding_id: str,
@@ -629,6 +719,9 @@ def _disposition_status(
     active: bool,
     reason: str,
     message: str | None = None,
+    matched_by: str = "",
+    audit_digest_drift: bool = False,
+    matched_finding_id: str = "",
 ) -> DispositionStatus:
     return DispositionStatus(
         receipt=receipt,
@@ -636,6 +729,9 @@ def _disposition_status(
         active=active,
         reason=reason if message is None else message,
         reason_code=reason,
+        matched_by=matched_by,
+        audit_digest_drift=audit_digest_drift,
+        matched_finding_id=matched_finding_id,
     )
 
 
@@ -660,6 +756,110 @@ def _ambiguous_finding_key_status(
             f"duplicate key is resolved. Current P1 keys: "
             f"{json.dumps(list(_current_p1_keys(primary)), ensure_ascii=False, separators=(",", ":"))}"
         ),
+    )
+
+
+def _argv_matches_except_head(left: Any, right: Any) -> bool:
+    """True when allowlisted git-grep argv pairs differ only at head (index 6)."""
+
+    if not isinstance(left, list) or not isinstance(right, list):
+        return False
+    if len(left) != 9 or len(right) != 9:
+        return False
+    return left[:6] == right[:6] and left[7:] == right[7:]
+
+
+def _counterevidence_expired(receipt: DispositionReceipt) -> DispositionStatus:
+    return _disposition_status(
+        receipt, valid=False, active=False, reason="counterevidence_expired",
+    )
+
+
+def _neighbor_evidence_for(
+    receipt: DispositionReceipt,
+    neighbor_evidence: Mapping[str, NeighborEvidence] | None,
+) -> NeighborEvidence | DispositionStatus | None:
+    if (
+        receipt.disposition != "false-positive"
+        or not receipt.finding_key
+        or neighbor_evidence is None
+        or receipt.finding_key not in neighbor_evidence
+    ):
+        return None
+    evidence = neighbor_evidence[receipt.finding_key]
+    if not isinstance(evidence, NeighborEvidence):
+        return _counterevidence_expired(receipt)
+    return evidence
+
+
+def _consume_neighbor_disposition(
+    receipt: DispositionReceipt,
+    *,
+    evidence: NeighborEvidence,
+    scope: Scope,
+    primary: CanonicalPrimary,
+    audit_digest: str,
+    digest_ok: bool,
+) -> DispositionStatus:
+    if evidence.current_head_sha != scope.head_sha:
+        return _counterevidence_expired(receipt)
+    if evidence.anchor_window_touched:
+        return _counterevidence_expired(receipt)
+    rerun_argv = evidence.rerun_argv if isinstance(evidence.rerun_argv, list) else []
+    if (
+        counterevidence_argv_reason(rerun_argv, scope.head_sha) is not None
+        or type(evidence.rerun_exit_code) is not int
+        or evidence.rerun_exit_code != 0
+        or type(evidence.rerun_match_count) is not int
+        or evidence.rerun_match_count < 1
+    ):
+        return _counterevidence_expired(receipt)
+    receipt_argv: Any = None
+    if isinstance(receipt.counterevidence, dict):
+        rerun = receipt.counterevidence.get("gate_rerun")
+        if isinstance(rerun, dict):
+            receipt_argv = rerun.get("argv")
+    if not _argv_matches_except_head(rerun_argv, receipt_argv):
+        return _counterevidence_expired(receipt)
+    decoded = _decode_canonical_finding_key(receipt.finding_key)
+    if decoded is None or neighbor_finding_key(decoded) is None:
+        matches: list[tuple[str, dict[str, Any]]] = []
+    else:
+        matches = _neighbor_primary_matches(
+            decoded["file"], evidence.anchor_line_current, primary,
+        )
+    if len(matches) == 0:
+        return _disposition_status(
+            receipt, valid=False, active=False,
+            reason="finding_not_current_p1",
+            message=_actionable_disposition_reason(
+                "finding_not_current_p1", receipt, scope=scope, primary=primary,
+                audit_digest=audit_digest,
+            ),
+        )
+    if len(matches) >= 2:
+        return _disposition_status(
+            receipt, valid=False, active=False,
+            reason="finding_key_neighbor_ambiguous",
+            message=(
+                f"finding_key_neighbor_ambiguous: finding key {receipt.finding_key!r} "
+                f"matches {len(matches)} current P1 findings within neighbor tolerance, "
+                f"so the disposition target cannot be determined; current head_sha "
+                f"{scope.head_sha!r}."
+            ),
+        )
+    match_id, finding = matches[0]
+    if finding.get("trigger_kind") != "inferred":
+        return _disposition_status(
+            receipt, valid=False, active=False,
+            reason="finding_trigger_not_inferred",
+        )
+    return _disposition_status(
+        receipt, valid=True, active=True,
+        reason=f"active_{receipt.disposition.replace('-', '_')}",
+        matched_by="neighbor",
+        audit_digest_drift=not digest_ok,
+        matched_finding_id=match_id,
     )
 
 
@@ -689,6 +889,7 @@ def validate_disposition_receipt(
     audit_digest: str,
     legacy_raw_audit_digest: str | None = None,
     repository: str | None = None,
+    neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
 ) -> DispositionStatus:
     """Validate one receipt against the current canonical audit round."""
 
@@ -738,7 +939,34 @@ def validate_disposition_receipt(
         return _disposition_status(receipt, valid=False, active=False, reason="repository_mismatch")
     if receipt.pr_number != scope.pr_number:
         return _disposition_status(receipt, valid=False, active=False, reason="pr_mismatch")
-    if receipt.head_sha != scope.head_sha:
+    head_ok = receipt.head_sha == scope.head_sha
+    expected_epoch = derive_epoch(scope)
+    epoch_ok = receipt.epoch == expected_epoch
+    digest_ok = _receipt_audit_digest_matches(
+        receipt.audit_digest, audit_digest, legacy_raw_audit_digest,
+    )
+    evidence = _neighbor_evidence_for(receipt, neighbor_evidence)
+    if isinstance(evidence, DispositionStatus):
+        return evidence
+    if head_ok and epoch_ok and digest_ok:
+        pass
+    elif evidence is not None:
+        # derive_epoch hashes the whole Scope, including head_sha. Neighbor
+        # consumption relaxes head_sha only, so restore the receipt head before
+        # the epoch equality gate; policy/tier/diff_digest still bind.
+        if receipt.epoch != derive_epoch(replace(scope, head_sha=receipt.head_sha)):
+            return _disposition_status(
+                receipt, valid=False, active=False, reason="epoch_mismatch_stale",
+                message=_actionable_disposition_reason(
+                    "epoch_mismatch_stale", receipt, scope=scope, primary=primary,
+                    audit_digest=audit_digest,
+                ),
+            )
+        return _consume_neighbor_disposition(
+            receipt, evidence=evidence, scope=scope, primary=primary,
+            audit_digest=audit_digest, digest_ok=digest_ok,
+        )
+    elif not head_ok:
         return _disposition_status(
             receipt, valid=False, active=False, reason="head_sha_mismatch",
             message=_actionable_disposition_reason(
@@ -746,8 +974,7 @@ def validate_disposition_receipt(
                 audit_digest=audit_digest,
             ),
         )
-    expected_epoch = derive_epoch(scope)
-    if receipt.epoch != expected_epoch:
+    elif not epoch_ok:
         return _disposition_status(
             receipt, valid=False, active=False, reason="epoch_mismatch_stale",
             message=_actionable_disposition_reason(
@@ -755,7 +982,7 @@ def validate_disposition_receipt(
                 audit_digest=audit_digest,
             ),
         )
-    if not _receipt_audit_digest_matches(receipt.audit_digest, audit_digest, legacy_raw_audit_digest):
+    else:
         return _disposition_status(
             receipt, valid=False, active=False, reason="audit_digest_mismatch",
             message=_actionable_disposition_reason(
@@ -848,6 +1075,7 @@ def disposition_status(
     audit_digest: str,
     legacy_raw_audit_digest: str | None = None,
     repository: str | None = None,
+    neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
 ) -> DispositionStatus:
     """Return the observational status view used by ledger/human summaries."""
 
@@ -858,6 +1086,7 @@ def disposition_status(
         audit_digest=audit_digest,
         legacy_raw_audit_digest=legacy_raw_audit_digest,
         repository=repository,
+        neighbor_evidence=neighbor_evidence,
     )
 
 
@@ -870,6 +1099,7 @@ def record_dispositions(
     audit_digest: str,
     legacy_raw_audit_digest: str | None = None,
     repository: str | None = None,
+    neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
 ) -> DispositionAudit:
     """Validate receipts and return the current P1s they cover exactly."""
 
@@ -890,6 +1120,7 @@ def record_dispositions(
                 receipt, scope=scope, primary=primary, audit_digest=audit_digest,
                 legacy_raw_audit_digest=legacy_raw_audit_digest,
                 repository=repository,
+                neighbor_evidence=neighbor_evidence,
             )
             statuses.append(status)
             rejected.append((status.receipt, status.reason_code))
@@ -901,6 +1132,7 @@ def record_dispositions(
             receipt, scope=scope, primary=primary, audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
             repository=repository,
+            neighbor_evidence=neighbor_evidence,
         )
         if status.active and status.valid:
             payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -911,7 +1143,9 @@ def record_dispositions(
         statuses.append(status)
         if status.active and status.valid:
             target_id = receipt.finding_id
-            if receipt.finding_key:
+            if status.matched_finding_id:
+                target_id = status.matched_finding_id
+            elif receipt.finding_key:
                 stable_matches = narrow_stable_key_matches_by_id(
                     _stable_primary_matches(receipt.finding_key, primary), receipt.finding_id,
                 )

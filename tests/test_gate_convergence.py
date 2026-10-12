@@ -12,7 +12,7 @@ import hashlib
 import importlib.util
 import json
 import sys
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -1484,3 +1484,220 @@ def test_gate_rerun_argv_not_allowlisted_is_counterevidence_command_not_allowlis
     )
     assert status.reason == "counterevidence_command_not_allowlisted"
     assert status.active is False
+
+
+_REPLAY_FILE = "accept_precheck_ci.py"
+_OLD_HEAD, _NEW_HEAD = "1" * 40, "2" * 40
+_OLD_DIGEST, _NEW_DIGEST = "a" * 64, "b" * 64
+_DRIFT_P1 = (("new-id", "major", "inferred", _REPLAY_FILE, 190, "compatibility"),)
+
+
+def _replay_finding(line, *, file=_REPLAY_FILE, severity="major", category="correctness"):
+    return {"file": file, "line": line, "severity": severity, "category": category}
+
+
+def _neighbor_same(left, right):
+    first, second = CONV.neighbor_finding_key(left), CONV.neighbor_finding_key(right)
+    return first and second and first[0] == second[0] and abs(first[1] - second[1]) <= CONV.NEIGHBOR_LINE_TOLERANCE
+
+
+def _six_primary(scope, findings):
+    return CONV.CanonicalPrimary(
+        schema_version=1, repository_id=scope.repository_id, pr_number=scope.pr_number,
+        head_sha=scope.head_sha, run_id=7, run_attempt=2, verdict="fail",
+        p1_ids=tuple(item[0] for item in findings), p1_findings=tuple(findings),
+    )
+
+
+def _replay_pair(current_findings=_DRIFT_P1):
+    old_scope, new_scope = _scope(head_sha=_OLD_HEAD), _scope(head_sha=_NEW_HEAD)
+    receipt = _stable_disposition(
+        scope=old_scope, audit_digest=_OLD_DIGEST,
+        primary=_six_primary(old_scope, (("old-id", "major", "inferred", _REPLAY_FILE, 187, "correctness"),)),
+    )
+    return new_scope, receipt, _six_primary(new_scope, current_findings)
+
+
+def _neighbor_evidence(scope, receipt, **changes):
+    argv = list(receipt.counterevidence["gate_rerun"]["argv"])
+    argv[6] = scope.head_sha
+    payload = dict(
+        current_head_sha=scope.head_sha, anchor_line_current=187, anchor_window_touched=False,
+        rerun_argv=argv, rerun_exit_code=0, rerun_match_count=1,
+    )
+    payload.update(changes)
+    return CONV.NeighborEvidence(**payload)
+
+
+def _replay_status(current_findings=_DRIFT_P1, *, receipt=None, digest=_NEW_DIGEST, evidence_changes=None):
+    new_scope, built, current = _replay_pair(current_findings)
+    receipt = built if receipt is None else receipt
+    mapping = {receipt.finding_key: _neighbor_evidence(new_scope, built, **(evidence_changes or {}))}
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=digest, neighbor_evidence=mapping,
+    )
+    return new_scope, receipt, current, mapping, status
+
+
+@pytest.mark.parametrize("left,right", [(187, 190), (116, 118), (37, 40), (187, 183), (187, 191)])
+def test_neighbor_finding_key_matches_replay_pairs_and_tolerance_edge(left, right):
+    assert CONV.NEIGHBOR_LINE_TOLERANCE == 4
+    assert _neighbor_same(_replay_finding(left), _replay_finding(right, category="compatibility", severity="blocker"))
+
+
+def test_neighbor_finding_key_rejects_delta_5_null_line_minor_and_empty_file():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert "187↔190" in source and "116↔118" in source and "37↔40" in source
+    encoded = CONV.canonical_finding_key(_replay_finding(187))
+    decoded = CONV._decode_canonical_finding_key(encoded)
+    assert decoded["file"] == _REPLAY_FILE and decoded["line"] == 187
+    assert not _neighbor_same(_replay_finding(187), _replay_finding(192))
+    assert CONV.neighbor_finding_key(_replay_finding(None)) is None
+    assert CONV.neighbor_finding_key({"file": _REPLAY_FILE, "severity": "major"}) is None
+    assert CONV.neighbor_finding_key(_replay_finding(190, severity="minor")) is None
+    assert CONV.neighbor_finding_key(_replay_finding(190, file="")) is None
+    assert not _neighbor_same(_replay_finding(187), _replay_finding(190, file="other.py"))
+
+
+def test_replay_neighbor_consumes_drifted_head_id_category_and_digest():
+    new_scope, receipt, current, mapping, status = _replay_status()
+    assert (status.reason_code, status.matched_by, status.audit_digest_drift, status.matched_finding_id) == (
+        "active_false_positive", "neighbor", True, "new-id",
+    )
+    recorded = CONV.record_dispositions(
+        current.p1_ids, (receipt,), scope=new_scope, primary=current,
+        audit_digest=_NEW_DIGEST, neighbor_evidence=mapping,
+    )
+    assert recorded.remaining_p1_ids == () and recorded.recorded_finding_ids == ("new-id",)
+    second = CONV.record_dispositions(
+        current.p1_ids, (receipt, replace(receipt, finding_id="also-old", reason="second")),
+        scope=new_scope, primary=current, audit_digest=_NEW_DIGEST, neighbor_evidence=mapping,
+    )
+    assert second.remaining_p1_ids == () and "new-id" in second.recorded_finding_ids
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"anchor_window_touched": True},
+        {"rerun_match_count": 0},
+        {"current_head_sha": "9" * 40},
+        {"rerun_exit_code": 1},
+    ],
+)
+def test_replay_neighbor_evidence_gates_expire(change):
+    *_rest, status = _replay_status(evidence_changes=change)
+    assert status.reason_code == "counterevidence_expired" and status.active is False
+
+
+def test_replay_epoch_stale_ambiguous_minor_null_and_argv_change():
+    new_scope, receipt, current, mapping, _status = _replay_status()
+    stale = CONV.validate_disposition_receipt(
+        replace(receipt, epoch="stale-epoch"), scope=new_scope, primary=current,
+        audit_digest=_NEW_DIGEST, neighbor_evidence=mapping,
+    )
+    assert stale.reason_code == "epoch_mismatch_stale"
+    two = _DRIFT_P1 + (("other-id", "major", "inferred", _REPLAY_FILE, 187, "correctness"),)
+    scope_a, receipt_a, current_a, mapping_a, ambiguous = _replay_status(two)
+    assert ambiguous.reason_code == "finding_key_neighbor_ambiguous"
+    recorded = CONV.record_dispositions(
+        current_a.p1_ids, (receipt_a,), scope=scope_a, primary=current_a,
+        audit_digest=_NEW_DIGEST, neighbor_evidence=mapping_a,
+    )
+    assert recorded.remaining_p1_ids == current_a.p1_ids
+    *_rest, minor_kept = _replay_status(_DRIFT_P1 + (("minor-id", "minor", "inferred", _REPLAY_FILE, 188, "correctness"),))
+    assert minor_kept.reason_code == "active_false_positive" and minor_kept.matched_finding_id == "new-id"
+    codes = {
+        _replay_status((("minor-id", "minor", "inferred", _REPLAY_FILE, 190, "compatibility"),))[-1].reason_code,
+        _replay_status((("null-id", "major", "inferred", _REPLAY_FILE, None, "compatibility"),))[-1].reason_code,
+        _replay_status((("old-id", "major", "inferred", "other.py", 187, "correctness"),))[-1].reason_code,
+    }
+    assert codes == {"finding_not_current_p1"}
+    evidence = _neighbor_evidence(new_scope, receipt)
+    argv = list(evidence.rerun_argv)
+    argv[5] = "different-literal"
+    argv_status = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST,
+        neighbor_evidence={receipt.finding_key: replace(evidence, rerun_argv=argv)},
+    )
+    assert argv_status.reason_code == "counterevidence_expired"
+
+
+def test_deferred_and_legacy_receipts_never_take_neighbor_path():
+    new_scope, fp_receipt, current, mapping, _status = _replay_status()
+    deferred = replace(fp_receipt, disposition="deferred", tracking_issue="#12", counterevidence=None)
+    deferred_status = CONV.validate_disposition_receipt(
+        deferred, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST, neighbor_evidence=mapping,
+    )
+    assert deferred_status.reason_code == CONV.DEFERRED_RECEIPT_REJECT_REASON
+    legacy = _disposition(
+        scope=_scope(head_sha=_OLD_HEAD), primary=_primary(p1_ids=("old-id",)),
+        finding_id="old-id", head_sha=_OLD_HEAD, audit_digest=_OLD_DIGEST,
+    )
+    legacy_status = CONV.validate_disposition_receipt(
+        legacy, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST, neighbor_evidence=mapping,
+    )
+    assert legacy_status.reason_code == "head_sha_mismatch"
+
+
+def test_head_mismatch_without_evidence_and_exact_path_ignore_injection():
+    new_scope, receipt, current, _mapping, _status = _replay_status()
+    omitted = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST,
+    )
+    empty = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST, neighbor_evidence={},
+    )
+    assert omitted.reason_code == "head_sha_mismatch" and omitted == empty
+    assert receipt.finding_key in omitted.reason and new_scope.head_sha in omitted.reason
+    primary = _stable_primary()
+    exact = _stable_disposition(primary=primary)
+    injected = CONV.validate_disposition_receipt(
+        exact, scope=SCOPE, primary=primary, audit_digest="a" * 64,
+        neighbor_evidence={exact.finding_key: _neighbor_evidence(SCOPE, exact, anchor_line_current=12)},
+    )
+    assert injected == CONV.validate_disposition_receipt(exact, scope=SCOPE, primary=primary, audit_digest="a" * 64)
+    assert injected.matched_by == "" and injected.matched_finding_id == ""
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["active_stable", "head_mismatch", "epoch_stale", "digest_mismatch", "deferred", "legacy_no_key", "not_current_p1"],
+)
+def test_neighbor_evidence_none_equals_omitted_status_fields(kind):
+    primary = _stable_primary()
+    receipt = _stable_disposition(primary=primary)
+    scope, digest = SCOPE, "a" * 64
+    if kind == "head_mismatch":
+        scope = replace(SCOPE, head_sha="x" * 40)
+        primary = replace(primary, head_sha=scope.head_sha)
+    elif kind == "epoch_stale":
+        receipt = replace(receipt, epoch="stale-epoch")
+    elif kind == "digest_mismatch":
+        digest = "b" * 64
+    elif kind == "deferred":
+        receipt = replace(receipt, disposition="deferred", tracking_issue="#12", counterevidence=None)
+    elif kind == "legacy_no_key":
+        receipt = _disposition(primary=primary)
+    elif kind == "not_current_p1":
+        receipt = replace(receipt, finding_key=CONV.canonical_finding_key(
+            {"file": "missing.py", "line": 1, "category": "correctness", "severity": "major"}
+        ))
+    kwargs = dict(scope=scope, primary=primary, audit_digest=digest)
+    omitted = CONV.validate_disposition_receipt(receipt, **kwargs)
+    explicit = CONV.validate_disposition_receipt(receipt, neighbor_evidence=None, **kwargs)
+    assert omitted == explicit
+    assert all(getattr(omitted, field.name) == getattr(explicit, field.name) for field in fields(omitted))
+
+
+def test_same_head_digest_drift_still_neighbors_by_anchor_line():
+    old_primary = _six_primary(SCOPE, (("old-id", "major", "inferred", _REPLAY_FILE, 187, "correctness"),))
+    receipt = _stable_disposition(scope=SCOPE, primary=old_primary, audit_digest=_OLD_DIGEST)
+    current = _six_primary(SCOPE, _DRIFT_P1)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=SCOPE, primary=current, audit_digest=_NEW_DIGEST,
+        neighbor_evidence={receipt.finding_key: _neighbor_evidence(SCOPE, receipt)},
+    )
+    assert (status.reason_code, status.matched_by, status.audit_digest_drift, status.matched_finding_id) == (
+        "active_false_positive", "neighbor", True, "new-id",
+    )
