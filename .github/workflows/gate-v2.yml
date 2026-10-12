@@ -968,6 +968,7 @@ jobs:
             scripts/scrub_outbound.py
             .github/actions/gate-aggregator/aggregate.py
             .github/actions/gate-aggregator/convergence.py
+            .github/actions/gate-aggregator/neighbor_evidence.py
           GATE_GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY_ID: ${{ github.repository_id }}
