@@ -2047,6 +2047,20 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "--tier d30" in upload["run"]
     assert "$SILO_EXEC" in upload["run"]
 
+    latest = next(step for step in steps if step.get("name") == "Upload v2 review effectiveness ledger latest pointer")
+    assert steps.index(latest) == upload_index + 1
+    assert "uses" not in latest
+    assert "continue-on-error" not in latest
+    assert latest["env"]["ARTIFACT_NAME"] == (
+        "codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}"
+    )
+    assert latest["env"]["LEDGER_PATH"] == upload["env"]["LEDGER_PATH"]
+    assert "--tier d30" in latest["run"]
+    assert "--name \"$ARTIFACT_NAME\"" in latest["run"]
+    assert "--file \"$LEDGER_PATH\"" in latest["run"]
+    assert "$SILO_EXEC" in latest["run"]
+    assert "list" not in latest["run"]
+
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:
     ledger = workflow["jobs"]["ledger"]
@@ -2096,6 +2110,7 @@ def test_ledger_steps_emit_start_progress_markers():
         "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger latest pointer",
     )
 
     assert len([step for step in steps if step.get("name") in names]) == len(names)
@@ -2852,6 +2867,7 @@ def test_ledger_persistence_steps_are_fail_closed():
         "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger latest pointer",
     ):
         step = next(s for s in ledger_steps if s.get("name") == name)
         assert "continue-on-error" not in step

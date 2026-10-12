@@ -183,10 +183,9 @@ HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
 MAX_REPO_WIDE_HISTORY_PAGES = 5
 MAX_TARGETED_HISTORY_RUNS = 50
 # Wall-clock cap for one `_silo_cli` subprocess at call sites that sit outside
-# the HISTORY_RECONSTRUCTION deadline (ledger findings, disposition receipts).
-# Measured need: `_previous_findings_from_silo` takes ~15.8s to serially fetch
-# 100 Silo objects, so the cap must stay well above that; it only exists so a
-# hung Silo connection cannot stall the aggregate job indefinitely.
+# the HISTORY_RECONSTRUCTION deadline (previous-round latest ledger GET,
+# disposition receipts). Previous-round findings are a single GET; the cap
+# exists so a hung Silo connection cannot stall the aggregate job indefinitely.
 SILO_CLI_CALL_TIMEOUT_SECONDS = 120
 MAX_HISTORY_WARNING_CHARS = 500
 DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v3-"
@@ -494,7 +493,13 @@ RELATION_UNKNOWN = "GATE-FINDING-RELATION-UNKNOWN"
 PREVIOUS_FINDING_LIMIT = 30
 FINDING_TEXT_MAX = 240
 _P1_RELATION_SEVERITIES = frozenset({"major", "blocker"})
-_LEDGER_ARTIFACT_PREFIX = "codex-review-ledger-v2-"
+_LEDGER_LATEST_PREFIX = "codex-review-ledger-latest-v1-"
+_LEDGER_LATEST_OBJECT = "ledger.jsonl"
+_LATEST_LEDGER_DEGRADE = frozenset({
+    "silo-ledger-latest-absent",
+    "silo-ledger-latest-not-prior",
+    "silo-ledger-latest-unreadable",
+})
 
 
 class FindingRelationError(ValueError):
@@ -659,39 +664,42 @@ def apply_finding_relation(outcome: Outcome, findings: list[Any], previous_round
         outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
 
 
-def _ledger_artifact_run(name: str, repository_id: int) -> Optional[tuple[int, int]]:
-    prefix = f"{_LEDGER_ARTIFACT_PREFIX}{repository_id}-"
-    if not name.startswith(prefix):
-        return None
-    sha, run_id_s, attempt_s = (name[len(prefix):].rsplit("-", 2) + ["", ""])[:3]
-    if len(sha) != 40 or not run_id_s.isdigit() or not attempt_s.isdigit():
-        return None
-    return int(run_id_s), int(attempt_s)
+def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
+    return (
+        f"{SILO_TERMINAL_TIER}/{repository_id}/"
+        f"{_LEDGER_LATEST_PREFIX}{repository_id}-pr{pr_number}/"
+        f"{_LEDGER_LATEST_OBJECT}"
+    )
 
 
 def _previous_findings_from_silo(*, repository_id: int, pr_number: int, run_id: int, run_attempt: int) -> list[Any]:
-    prefix = f"{SILO_TERMINAL_TIER}/{repository_id}/{_LEDGER_ARTIFACT_PREFIX}{repository_id}-"
-    best: Optional[tuple[tuple[int, int], list[Any]]] = None
-    for key, raw in _silo_objects_under(prefix, SILO_CLI_CALL_TIMEOUT_SECONDS):
-        parts = key.split("/")
-        if len(parts) < 3:
-            continue
-        parsed = _ledger_artifact_run(parts[2], repository_id)
-        if parsed is None or parsed >= (run_id, run_attempt):
-            continue
-        try:
-            entry = json.loads(raw.splitlines()[0])
-        except (IndexError, json.JSONDecodeError, UnicodeDecodeError):
-            continue
-        if not isinstance(entry, dict) or entry.get("pr_number") != pr_number:
-            continue
-        review = entry.get("review") if isinstance(entry.get("review"), dict) else {}
-        result = review.get("result") if isinstance(review.get("result"), dict) else {}
-        findings = result.get("findings") if isinstance(result.get("findings"), list) else []
-        chosen = [item for item in findings if isinstance(item, dict)][:PREVIOUS_FINDING_LIMIT]
-        if best is None or parsed > best[0]:
-            best = (parsed, chosen)
-    return [] if best is None else best[1]
+    import tempfile
+
+    key = _ledger_latest_key(repository_id, pr_number)
+    with tempfile.TemporaryDirectory(prefix="silo-ledger-latest-") as dest:
+        target = Path(dest) / _LEDGER_LATEST_OBJECT
+        proc = _silo_cli(["get", "--key", key, "--dest", str(target)], SILO_CLI_CALL_TIMEOUT_SECONDS)
+        if proc.returncode == 2:
+            raise RuntimeError("silo-ledger-latest-absent")
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or f"silo get failed: {key}").strip())
+        raw = target.read_text(encoding="utf-8")
+    try:
+        entry = json.loads(raw.splitlines()[0])
+    except (IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("silo-ledger-latest-unreadable") from exc
+    if not isinstance(entry, dict) or entry.get("pr_number") != pr_number:
+        raise RuntimeError("silo-ledger-latest-unreadable")
+    try:
+        parsed = (int(entry["run_id"]), int(entry["run_attempt"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("silo-ledger-latest-unreadable") from exc
+    if parsed >= (run_id, run_attempt):
+        raise RuntimeError("silo-ledger-latest-not-prior")
+    review = entry.get("review") if isinstance(entry.get("review"), dict) else {}
+    result = review.get("result") if isinstance(review.get("result"), dict) else {}
+    findings = result.get("findings") if isinstance(result.get("findings"), list) else []
+    return [item for item in findings if isinstance(item, dict)][:PREVIOUS_FINDING_LIMIT]
 
 
 def load_previous_round_findings(
@@ -718,6 +726,9 @@ def load_previous_round_findings(
             repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt,
         )
     except Exception as exc:
+        detail = str(exc)
+        if detail in _LATEST_LEDGER_DEGRADE:
+            return _degrade_previous_round(detail)
         return _degrade_previous_round(f"silo-ledger-unreadable:{type(exc).__name__}")
     return {"available": True, "detail": "", "findings": findings}
 

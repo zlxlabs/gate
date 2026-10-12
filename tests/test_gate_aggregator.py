@@ -5057,14 +5057,34 @@ def _previous_round_fixture_objects():
         f"{ledger['run_id']}-{ledger['run_attempt']}"
     )
     ledger_key = f"d30/{repository_id}/{ledger_name}/ledger.json"
+    latest_key = AGG._ledger_latest_key(repository_id, ledger["pr_number"])
     receipt_name = CONV.disposition_receipt_artifact_name(CONV.parse_disposition_receipt(receipt))
     receipt_key = f"d30/{repository_id}/{receipt_name}/{receipt_name}.json"
-    return ledger, receipt, [(ledger_key, ledger_path.read_bytes()), (receipt_key, receipt_bytes)]
+    ledger_bytes = ledger_path.read_bytes()
+    return ledger, receipt, [
+        (ledger_key, ledger_bytes),
+        (latest_key, ledger_bytes),
+        (receipt_key, receipt_bytes),
+    ]
 
 
 def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_configured=True, run_id=35989919390):
     ledger, _, _ = _previous_round_fixture_objects()
+    by_key = dict(silo_objects)
+
+    def fake_silo_cli(argv, timeout_s):
+        if argv[0] == "list":
+            raise AssertionError("previous-round findings must not list Silo objects")
+        key = argv[argv.index("--key") + 1]
+        dest = argv[argv.index("--dest") + 1]
+        body = by_key.get(key)
+        if body is None:
+            return subprocess.CompletedProcess(argv, 2, stdout="", stderr="Silo object not found")
+        Path(dest).write_bytes(body)
+        return subprocess.CompletedProcess(argv, 0, stdout=dest, stderr="")
+
     monkeypatch.setattr(AGG, "_silo_configured", lambda: silo_configured)
+    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
     monkeypatch.setattr(
         AGG, "_silo_objects_under",
         lambda prefix, timeout_s: [(key, raw) for key, raw in silo_objects if key.startswith(prefix)],
@@ -5184,7 +5204,7 @@ def test_render_previous_context_limits_dispositions_and_projects_deferred(tmp_p
             item.pop("counterevidence")
             item["tracking_issue"] = "#123"
         receipts.append((f"d30/{repo_id}/gate-disposition-receipt-v3-test-{index}/receipt.json", json.dumps(item).encode()))
-    ledger_objects = [pair for pair in objects if b"codex-review-ledger-v2-" in pair[0].encode()]
+    ledger_objects = [pair for pair in objects if "codex-review-ledger-" in pair[0]]
 
     _, payload = _render_previous_round_fixture(tmp_path, monkeypatch, ledger_objects + receipts)
     out = capsys.readouterr().out
@@ -5217,3 +5237,88 @@ def test_render_previous_context_silo_unconfigured_has_complete_empty_contract(t
     assert rc == 0
     assert payload == {"available": False, "detail": "silo-not-configured", "findings": [], "dispositions": []}
     assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-not-configured" in out
+
+
+def _latest_store(tmp_path, *, body):
+    argv_log = tmp_path / "silo-argv.jsonl"
+    body_path = tmp_path / "latest-body.jsonl"
+    if body is not None:
+        body_path.write_bytes(body)
+    store = tmp_path / "fake_silo.py"
+    store.write_text(
+        "import json, pathlib, sys\n"
+        f"log = pathlib.Path({str(argv_log)!r})\n"
+        "with log.open('a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(sys.argv[1:]) + chr(10))\n"
+        "args = sys.argv[1:]\n"
+        "if args[0] != 'get':\n"
+        "    raise SystemExit('list must not be called' if args[0] == 'list' else args[0])\n"
+        f"src = pathlib.Path({str(body_path)!r})\n"
+        "if not src.exists():\n"
+        "    raise SystemExit(2)\n"
+        "dest = pathlib.Path(args[args.index('--dest') + 1])\n"
+        "dest.parent.mkdir(parents=True, exist_ok=True)\n"
+        "dest.write_bytes(src.read_bytes())\n",
+        encoding="utf-8",
+    )
+    return store, argv_log
+
+
+def _assert_single_latest_get(argv_log, key):
+    argvs = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(argvs) == 1
+    argv = argvs[0]
+    assert argv[0] == "get"
+    assert argv[argv.index("--key") + 1] == key
+    assert "list" not in argv
+
+
+def test_previous_findings_get_latest_once_without_list(tmp_path, monkeypatch):
+    ledger, _, _ = _previous_round_fixture_objects()
+    repo_id = ledger["primary_identity"]["repository_id"]
+    key = AGG._ledger_latest_key(repo_id, ledger["pr_number"])
+    store, argv_log = _latest_store(tmp_path, body=(ROOT / "tests/fixtures/previous-round-pr1063-ledger.json").read_bytes())
+    monkeypatch.setenv("SILO_STORE", str(store))
+    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    findings = AGG._previous_findings_from_silo(
+        repository_id=repo_id, pr_number=ledger["pr_number"], run_id=35989919390, run_attempt=1,
+    )
+    assert any(item.get("id") == "reliability_alternates_survive_hard_kill" for item in findings)
+    _assert_single_latest_get(argv_log, key)
+
+
+def test_previous_findings_absent_latest_degrades_without_list(tmp_path, monkeypatch, capsys):
+    ledger, _, _ = _previous_round_fixture_objects()
+    repo_id = ledger["primary_identity"]["repository_id"]
+    key = AGG._ledger_latest_key(repo_id, ledger["pr_number"])
+    store, argv_log = _latest_store(tmp_path, body=None)
+    monkeypatch.setenv("SILO_STORE", str(store))
+    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    previous = AGG.load_previous_round_findings(
+        path=None, repository_id=repo_id, pr_number=ledger["pr_number"],
+        run_id=35989919390, run_attempt=1,
+    )
+    assert previous == {"available": False, "detail": "silo-ledger-latest-absent", "findings": []}
+    assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-ledger-latest-absent" in capsys.readouterr().out
+    _assert_single_latest_get(argv_log, key)
+
+
+def test_previous_findings_not_prior_latest_degrades_without_list(tmp_path, monkeypatch, capsys):
+    ledger, _, _ = _previous_round_fixture_objects()
+    repo_id = ledger["primary_identity"]["repository_id"]
+    key = AGG._ledger_latest_key(repo_id, ledger["pr_number"])
+    store, argv_log = _latest_store(
+        tmp_path, body=(ROOT / "tests/fixtures/previous-round-pr1063-ledger.json").read_bytes(),
+    )
+    monkeypatch.setenv("SILO_STORE", str(store))
+    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    previous = AGG.load_previous_round_findings(
+        path=None, repository_id=repo_id, pr_number=ledger["pr_number"],
+        run_id=ledger["run_id"], run_attempt=ledger["run_attempt"],
+    )
+    assert previous == {"available": False, "detail": "silo-ledger-latest-not-prior", "findings": []}
+    assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-ledger-latest-not-prior" in capsys.readouterr().out
+    _assert_single_latest_get(argv_log, key)
