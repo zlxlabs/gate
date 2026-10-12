@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 """Neighbor-evidence collection for drifted disposition receipts (gate#297).
 
-convergence.py implements the pure neighbor-consumption logic but owns no I/O
-(its module docstring forbids subprocess); this module is the gate-job side
-that collects the missing facts.  For each candidate receipt — a signed
-``false-positive`` receipt carrying a ``finding_key`` whose ``head_sha`` or
-``audit_digest`` no longer matches the current round — it:
+convergence.py implements the pure neighbor-consumption logic but owns no I/O;
+this module is the gate-job side that collects the missing facts for each
+candidate receipt (a signed ``false-positive`` with a ``finding_key`` whose
+``head_sha`` or ``audit_digest`` no longer matches the current round):
 
-  1. locates the issuing round in the already-loaded PR terminal history by
-     ``head_sha`` and pulls that round's canonical primary audit from Silo
-     (falling back to ``gh run download`` on Silo rc=2, the same two-level
-     contract the disposition issuance workflow uses),
-  2. keeps it only when exactly one fetched audit copy matches the receipt's
-     ``audit_digest`` (same canonical-or-legacy-raw equality rule as
-     ``_receipt_audit_digest_matches``), then projects the issuing Scope from
-     audit fields exactly like ``_convergence_scope_from_audit`` (with
-     ``head_sha`` bound to the receipt, ``base_sha`` taken from the audit),
-  3. shallow-fetches both the receipt head and the current head into a runner
-     temp git repo (no ``--filter=blob:none``, gate#302; 300s bounded, same as
-     issuance), reads the ``git diff --unified=0`` hunks for the anchored
-     file, decides ``anchor_window_touched`` / ``anchor_line_current``,
-  4. re-runs the receipt's allowlisted counterevidence git-grep with only
-     argv index 6 (the head) replaced by the current head, recording the real
-     exit code and match count (same counting rule as the issuance side).
+  1. locate the issuing round in the already-loaded PR terminal history by
+     ``head_sha`` and pull that round's canonical primary audit from Silo
+     (falling back to ``gh run download`` on rc=2, the issuance workflow's
+     two-level contract),
+  2. adopt it only when exactly one copy matches the receipt's
+     ``audit_digest`` (``_receipt_audit_digest_matches`` rule), then project
+     the issuing Scope exactly like ``_convergence_scope_from_audit``,
+  3. shallow-fetch both heads (no ``--filter``, gate#302, 300s bounded) and
+     read the real ``git diff --unified=0`` hunks for the anchored file,
+  4. re-run the allowlisted counterevidence grep with only argv index 6
+     (head) replaced by the current head; record real exit/match_count.
 
-Any failure at any step yields exactly one greppable
-``GATE-NEIGHBOR-EVIDENCE-UNAVAILABLE`` line and no evidence for that receipt,
-which keeps the consumer on its existing fail-closed reason codes
-(head_sha_mismatch etc.).  No retries, no alternate data sources, and failures
-are never swallowed into evidence.
+Any failure yields exactly one greppable GATE-NEIGHBOR-EVIDENCE-UNAVAILABLE
+line and no evidence, keeping the consumer on its fail-closed reason codes.
+No retries, no alternate sources; failures are never swallowed into evidence.
 """
 
 from __future__ import annotations
@@ -52,14 +44,11 @@ _CONVERGENCE_PATH = _MODULE_FILE.with_name("convergence.py")
 
 
 def _load_convergence():
-    """Reuse the host process's convergence module, or load our own.
+    """Reuse the host process's convergence module, or exec our own.
 
-    aggregate.py loads convergence.py first and passes its ``Scope`` instances
-    into :class:`_Collector`; convergence guards compare dataclass identity
-    (``isinstance``), so the NeighborEvidence payloads must carry the SAME
-    ``Scope`` class the consumer validates against.  If this module is used
-    standalone (tests, manual runs), no registered copy exists and we exec
-    our own.
+    aggregate.py loads convergence.py first; convergence guards compare
+    dataclass identity (``isinstance``), so NeighborEvidence payloads must
+    carry the SAME ``Scope`` class the consumer validates against.
     """
     for module in list(sys.modules.values()):
         module_file = getattr(module, "__file__", None)
@@ -98,12 +87,8 @@ _SCOPE_AUDIT_FIELDS = (
 
 
 def parse_unified_zero_hunks(diff_text: str) -> list[tuple[int, int, int, int]]:
-    """Parse ``git diff --unified=0`` hunk headers into integer tuples.
-
-    Returns ``(old_start, old_count, new_start, new_count)``; a missing count
-    (git writes ``@@ -5 +5 @@`` style heads) means 1, git's own unified-diff
-    convention.
-    """
+    """Parse hunk headers into (old_start, old_count, new_start, new_count);
+    a missing count (``@@ -5 +5 @@``) means 1, git's unified-diff convention."""
     hunks: list[tuple[int, int, int, int]] = []
     for match in _HUNK_RE.finditer(diff_text):
         old_start = int(match.group(1))
@@ -117,15 +102,10 @@ def parse_unified_zero_hunks(diff_text: str) -> list[tuple[int, int, int, int]]:
 def anchor_window_touched(
     hunks: Sequence[tuple[int, int, int, int]], old_line: int, tolerance: int,
 ) -> bool:
-    """Whether any hunk's old-side range intersects ``[old_line-t, old_line+t]``.
-
-    A range hunk covers old lines ``[old_start, old_start+old_count-1]``.  A
-    pure insertion (``old_count == 0``, i.e. ``-a,0``) lands between old line
-    ``a`` and ``a+1``; treated as the closed interval ``[a, a+1]`` it touches
-    the window when ``a >= lo-1 and a <= hi`` — deliberately conservative, so
-    a boundary-adjacent insertion voids the receipt instead of silently
-    re-anchoring.
-    """
+    """Whether any hunk's old side intersects ``[old_line-t, old_line+t]``.  A
+    pure insertion (``-a,0``) lands between old lines a and a+1; treated as
+    the closed interval [a, a+1] — conservative: a boundary-adjacent insertion
+    voids the receipt instead of silently re-anchoring."""
     lo = old_line - tolerance
     hi = old_line + tolerance
     for old_start, old_count, _new_start, _new_count in hunks:
@@ -140,12 +120,9 @@ def anchor_window_touched(
 def projected_anchor_line(
     hunks: Sequence[tuple[int, int, int, int]], old_line: int, tolerance: int,
 ) -> int:
-    """Map the receipt-head anchor line onto the current head.
-
-    Sums ``new_count - old_count`` over every hunk that lies entirely before
-    the window (its last old-side line is above ``old_line - tolerance``).
-    Only meaningful when ``anchor_window_touched`` is False.
-    """
+    """Map the receipt-head anchor line onto the current head: sum
+    ``new_count - old_count`` over hunks entirely before the window.  Only
+    meaningful when ``anchor_window_touched`` is False."""
     lo = old_line - tolerance
     delta = 0
     for old_start, old_count, _new_start, new_count in hunks:
@@ -172,12 +149,8 @@ def _run_git(
 
 
 def _silo_audit_get(key: str, timeout_s: float) -> Optional[bytes]:
-    """Fetch one silo object; ``None`` means silo reports it absent (rc=2).
-
-    Any other non-zero exit raises — the issuance workflow fails the step in
-    that case and this module inherits the same contract instead of
-    substituting a source.
-    """
+    """Fetch one silo object; ``None`` = absent (rc=2).  Any other non-zero
+    exit raises — same contract as the issuance workflow; no alternate source."""
     store = os.environ.get("SILO_STORE") or str(GATE_ROOT / "scripts" / "silo_store.py")
     with tempfile.TemporaryDirectory(prefix="gate-neighbor-silo-") as dest:
         proc = subprocess.run(
@@ -241,19 +214,14 @@ class _Collector:
         self._audit_cache: dict[tuple[str, int, int], Optional[bytes]] = {}
         self._fetched_heads: set[str] = set()
         self._caller_dir: Optional[Path] = None
-        # Candidate filtering needs the current round's digest pair; set via
-        # set_current_digests() right before collect().
-        self._audit_digest_for_candidates: str = ""
+        # Current-round digest pair for candidate filtering; set_current_digests().
+        self._audit_digest_for_candidates = ""
         self._legacy_raw_audit_digest_for_candidates: Optional[str] = None
 
     def collect(self, receipts: Sequence[Any]) -> dict[str, Any]:
-        """Collect evidence for every candidate receipt; ``{}`` when none.
-
-        Candidate = ``false-positive`` receipt with a ``finding_key`` whose
-        ``head_sha`` differs from the current head, or whose ``audit_digest``
-        no longer matches the current round (exact receipts stay on the
-        consumer's fast path).  No candidates → zero network/git/silo calls.
-        """
+        """Collect evidence per candidate; ``{}`` when none (then zero
+        network/git/silo calls).  Candidate = false-positive receipt with a
+        finding_key whose head_sha/digest no longer matches this round."""
         tolerance = _CONVERGENCE.NEIGHBOR_LINE_TOLERANCE
         candidates = [
             receipt for receipt in receipts
@@ -291,11 +259,9 @@ class _Collector:
                 shutil.rmtree(self._caller_dir, ignore_errors=True)
         return evidence
 
-    def set_current_digests(
-        self, audit_digest: str, legacy_raw_audit_digest: Optional[str],
-    ) -> None:
+    def set_current_digests(self, audit_digest: str, legacy: Optional[str]) -> None:
         self._audit_digest_for_candidates = audit_digest
-        self._legacy_raw_audit_digest_for_candidates = legacy_raw_audit_digest
+        self._legacy_raw_audit_digest_for_candidates = legacy
 
     def _fail(self, key_sha: str, reason: str) -> None:
         print(f"GATE-NEIGHBOR-EVIDENCE-UNAVAILABLE finding_key_sha={key_sha} reason={reason}")
@@ -371,10 +337,7 @@ class _Collector:
         audit, _row = matched[0]
 
         # -- project the issuing Scope exactly like _convergence_scope_from_audit --
-        if (
-            any(field not in audit for field in _SCOPE_AUDIT_FIELDS)
-            or audit.get("head_sha") != receipt.head_sha
-        ):
+        if any(f not in audit for f in _SCOPE_AUDIT_FIELDS) or audit.get("head_sha") != receipt.head_sha:
             self._fail(key_sha, "audit_scope_invalid")
             return None
         try:
@@ -409,7 +372,7 @@ class _Collector:
                 self._fail(key_sha, "git_fetch_failed")
                 return None
 
-        # -- anchor window against the real diff --------------------------------
+        # -- anchor window against the real diff --
         diff = _run_git(
             ["git", "-C", str(caller_dir), "diff", "--unified=0",
              receipt.head_sha, self._current_head_sha, "--", anchor_file],
@@ -419,15 +382,16 @@ class _Collector:
             self._fail(key_sha, "git_diff_failed")
             return None
         hunks = parse_unified_zero_hunks(diff.stdout.decode("utf-8", errors="replace"))
+        # A file deleted or renamed on the current head counts as touched.
         touched = not self._file_exists_in_head(
             caller_dir, self._current_head_sha, anchor_file,
         ) or anchor_window_touched(hunks, anchor_line, tolerance)
-        if touched:
-            line_current = anchor_line
-        else:
-            line_current = projected_anchor_line(hunks, anchor_line, tolerance)
+        line_current = (
+            anchor_line if touched
+            else projected_anchor_line(hunks, anchor_line, tolerance)
+        )
 
-        # -- rerun the allowlisted counterevidence against the current head -----
+        # -- rerun the allowlisted counterevidence against the current head --
         rerun_argv = list(receipt_argv)
         rerun_argv[6] = self._current_head_sha
         try:
@@ -505,16 +469,11 @@ class _Collector:
         self, *, head_sha: str, run_id: int, run_attempt: int,
         cache_key: tuple[str, int, int],
     ) -> Optional[bytes]:
-        """One audit copy via silo, falling back to ``gh run download`` on rc=2.
-
-        Negative results (absent everywhere, fetch error) are cached so a
-        second receipt bound to the same round does not retry the fetch.
-        """
+        """One audit copy via silo, gh download on rc=2; negatives are cached so
+        a second receipt bound to the same round never retries the fetch."""
         if cache_key in self._audit_cache:
             return self._audit_cache[cache_key]
-        artifact_name = (
-            f"primary-audit-v2-{self._repository_id}-{head_sha}-{run_id}-{run_attempt}"
-        )
+        artifact_name = f"primary-audit-v2-{self._repository_id}-{head_sha}-{run_id}-{run_attempt}"
         silo_key = f"d14/{self._repository_id}/{artifact_name}/{_AUDIT_BASENAME}"
         absent = False
         try:
