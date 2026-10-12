@@ -90,6 +90,8 @@ def test_evidence_selection_is_before_contract_and_move():
     assert "scripts/v2_tag_promotion_evidence.py" in evidence["run"]
     assert 'main_tip="$(git rev-parse refs/remotes/origin/main)"' in evidence["run"]
     assert '--main-tip "${main_tip}"' in evidence["run"]
+    assert '--event-name "${GITHUB_EVENT_NAME}"' in evidence["run"]
+    assert '--head-sha "${GITHUB_SHA}"' in evidence["run"]
     assert monotonicity["if"] == "steps.evidence.outputs.target_sha != ''"
     assert contract["if"] == "steps.monotonicity.outputs.move == 'true'"
     assert (

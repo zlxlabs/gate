@@ -85,7 +85,9 @@ jobs:
           target_sha="$(python3 scripts/v2_tag_promotion_evidence.py \
             "${candidate_args[@]}" \
             --main-tip "${main_tip}" \
-            --current-v2-commit-time "${current_v2_commit_time}")"
+            --current-v2-commit-time "${current_v2_commit_time}" \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --head-sha "${GITHUB_SHA}")"
           echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Verify v2 target only moves forward

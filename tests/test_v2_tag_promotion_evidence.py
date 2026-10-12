@@ -433,3 +433,120 @@ def test_v2_without_eligible_candidate_alerts_only_when_stale(
     output = capsys.readouterr().err
     assert ("::error::" in output) is expects_error
     assert expects_error or "no eligible canary-verified main commit" in output
+
+
+def _stale_v2_time():
+    return (
+        datetime.now(timezone.utc)
+        - timedelta(hours=evidence.NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS + 1)
+    ).isoformat()
+
+
+def test_push_event_without_canary_terminal_state_awaits_instead_of_failing(
+    monkeypatch, capsys
+):
+    api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
+    monkeypatch.setattr(evidence, "_api_json", api)
+    monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
+    assert evidence.main(
+        [
+            "--candidate",
+            SHA_A,
+            "--main-tip",
+            SHA_A,
+            "--current-v2-commit-time",
+            _stale_v2_time(),
+            "--event-name",
+            "push",
+            "--head-sha",
+            SHA_A,
+        ]
+    ) == 0
+    output = capsys.readouterr().err
+    assert "V2-TAG-SYNC-AWAITING-CANARY" in output
+    assert "::error::" not in output
+
+
+@pytest.mark.parametrize("event_name", ["schedule", "repository_dispatch"])
+def test_non_push_event_without_candidate_alerts_when_stale(
+    event_name, monkeypatch, capsys
+):
+    api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
+    monkeypatch.setattr(evidence, "_api_json", api)
+    monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
+    assert evidence.main(
+        [
+            "--candidate",
+            SHA_A,
+            "--main-tip",
+            SHA_A,
+            "--current-v2-commit-time",
+            _stale_v2_time(),
+            "--event-name",
+            event_name,
+            "--head-sha",
+            SHA_A,
+        ]
+    ) == 1
+    output = capsys.readouterr().err
+    assert "V2-TAG-SYNC-AWAITING-CANARY" not in output
+    assert (
+        "::error::no eligible canary-verified main commit after "
+        in output
+    )
+    assert (
+        f"current v2 commit is older than the "
+        f"{evidence.NO_ELIGIBLE_CANDIDATE_ALERT_AFTER_HOURS}h threshold"
+        in output
+    )
+
+
+def test_push_event_promotes_when_candidate_has_canary_success(monkeypatch, capsys):
+    api = FakeAPI(
+        [_run(1)],
+        {"1": _detail()},
+        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+    )
+    monkeypatch.setattr(evidence, "_api_json", api)
+    monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
+    assert evidence.main(
+        [
+            "--candidate",
+            SHA_A,
+            "--main-tip",
+            SHA_A,
+            "--current-v2-commit-time",
+            _stale_v2_time(),
+            "--event-name",
+            "push",
+            "--head-sha",
+            SHA_A,
+        ]
+    ) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == SHA_A
+    assert "V2-TAG-SYNC-AWAITING-CANARY" not in captured.err
+    assert "selected canary-verified main commit" in captured.err
+
+
+def test_push_event_with_failed_canary_still_alerts_when_stale(monkeypatch, capsys):
+    api = FakeAPI([_run(1)], {"1": _detail(conclusion="failure", gate_sha=SHA_A)})
+    monkeypatch.setattr(evidence, "_api_json", api)
+    monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
+    assert evidence.main(
+        [
+            "--candidate",
+            SHA_A,
+            "--main-tip",
+            SHA_A,
+            "--current-v2-commit-time",
+            _stale_v2_time(),
+            "--event-name",
+            "push",
+            "--head-sha",
+            SHA_A,
+        ]
+    ) == 1
+    output = capsys.readouterr().err
+    assert "V2-TAG-SYNC-AWAITING-CANARY" not in output
+    assert "::error::no eligible canary-verified main commit after " in output
