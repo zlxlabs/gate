@@ -199,6 +199,7 @@ class _Spies:
         self.git_argvs: list[list[str]] = []
         self.silo_mode = "ok"    # ok | absent | wrong | explode
         self.gh_mode = "absent"  # absent | ok
+        self.git_fail_mode = None  # None | fetch_timeout | diff_timeout | init_fail
         self._real_run_git = NEI._run_git
         monkeypatch.setattr(NEI, "_run_git", self._spy_run_git)
         monkeypatch.setattr(NEI, "_silo_audit_get", self._fake_silo_audit_get)
@@ -206,6 +207,14 @@ class _Spies:
 
     def _spy_run_git(self, argv, *, cwd=None, timeout_s):
         self.git_argvs.append(list(argv))
+        # Timeout/exit-code injection at the _run_git seam: the collector must
+        # convert these into fail enums, never let them escape to the caller.
+        if self.git_fail_mode == "fetch_timeout" and "fetch" in argv:
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+        if self.git_fail_mode == "diff_timeout" and "diff" in argv:
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+        if self.git_fail_mode == "init_fail" and "init" in argv:
+            return subprocess.CompletedProcess(argv, returncode=1)
         return self._real_run_git(argv, cwd=cwd, timeout_s=timeout_s)
 
     def _fake_silo_audit_get(self, key, timeout_s):
@@ -476,6 +485,53 @@ def test_unavailable_reasons_are_greppable_and_produce_no_evidence(caller_repo, 
     assert evidence_map == {}
     assert _unavailable_line(receipt, "receipt_head_not_in_history") in capsys.readouterr().out
     assert spy.silo_keys == [] and spy.gh_calls == [] and spy.fetch_argvs() == []
+
+
+# ── git subprocess timeouts / setup failures stay fail-closed (resume-1 P1) ──
+
+
+def test_fetch_timeout_yields_unavailable_line_and_head_sha_mismatch(caller_repo, monkeypatch, capsys):
+    sha_a, sha_b = caller_repo["sha_a"], caller_repo["sha_b"]
+    issued_audit = _audit(sha_a, [_finding_def("t-id", 187)])
+    spy = _Spies(monkeypatch, issued_audit=issued_audit)
+    spy.git_fail_mode = "fetch_timeout"
+    receipt = _receipt(sha_a, CONV.canonical_audit_digest(issued_audit))
+
+    # A timed-out fetch must not crash the gate job: {} plus one greppable line.
+    evidence_map, current_audit = _collect(spy, receipts=(receipt,), sha_a=sha_a, sha_b=sha_b)
+    assert evidence_map == {}
+    assert _unavailable_line(receipt, "git_fetch_timeout") in capsys.readouterr().out
+    # Through the production evaluate() path the conclusion keeps the existing
+    # fail-closed drift reason code.
+    outcome = _evaluate(current_audit, sha_b, receipt, evidence_map)
+    assert outcome.disposition_audit.statuses[0].reason_code == "head_sha_mismatch"
+    assert "t-id" in outcome.disposition_audit.remaining_p1_ids
+
+
+def test_diff_timeout_yields_unavailable_line_and_no_evidence(caller_repo, monkeypatch, capsys):
+    sha_a, sha_b = caller_repo["sha_a"], caller_repo["sha_b"]
+    issued_audit = _audit(sha_a, [_finding_def("t-id", 187)])
+    spy = _Spies(monkeypatch, issued_audit=issued_audit)
+    spy.git_fail_mode = "diff_timeout"
+    receipt = _receipt(sha_a, CONV.canonical_audit_digest(issued_audit))
+
+    evidence_map, _ = _collect(spy, receipts=(receipt,), sha_a=sha_a, sha_b=sha_b)
+    assert evidence_map == {}
+    assert _unavailable_line(receipt, "git_diff_timeout") in capsys.readouterr().out
+
+
+def test_git_init_nonzero_fails_before_any_fetch(caller_repo, monkeypatch, capsys):
+    sha_a, sha_b = caller_repo["sha_a"], caller_repo["sha_b"]
+    issued_audit = _audit(sha_a, [_finding_def("t-id", 187)])
+    spy = _Spies(monkeypatch, issued_audit=issued_audit)
+    spy.git_fail_mode = "init_fail"
+    receipt = _receipt(sha_a, CONV.canonical_audit_digest(issued_audit))
+
+    evidence_map, _ = _collect(spy, receipts=(receipt,), sha_a=sha_a, sha_b=sha_b)
+    assert evidence_map == {}
+    assert _unavailable_line(receipt, "git_fetch_failed") in capsys.readouterr().out
+    # Setup failed: the collector never reaches the network/fetch boundary.
+    assert spy.fetch_argvs() == []
 
 
 # ── production silo subprocess path (fake store script, real subprocess) ──

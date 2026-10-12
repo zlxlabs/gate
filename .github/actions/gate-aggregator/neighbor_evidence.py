@@ -20,7 +20,10 @@ candidate receipt (a signed ``false-positive`` with a ``finding_key`` whose
 
 Any failure yields exactly one greppable GATE-NEIGHBOR-EVIDENCE-UNAVAILABLE
 line and no evidence, keeping the consumer on its fail-closed reason codes.
-No retries, no alternate sources; failures are never swallowed into evidence.
+Every git subprocess is timeout-bounded; a timeout is just another
+unavailable reason (``git_fetch_timeout`` / ``git_diff_timeout``), never an
+exception escaping to the gate job.  No retries, no alternate sources;
+failures are never swallowed into evidence.
 """
 
 from __future__ import annotations
@@ -361,31 +364,51 @@ class _Collector:
         # -- shallow-fetch both heads into the shared caller repo --------------
         caller_dir = self._caller_dir
         if caller_dir is None:
-            caller_dir = self._init_caller_repo()
-            if caller_dir is None:
-                self._fail(key_sha, "git_fetch_failed")
+            setup_reason = self._init_caller_repo()
+            if setup_reason is not None:
+                self._fail(key_sha, setup_reason)
                 return None
+            caller_dir = self._caller_dir
+            assert caller_dir is not None
         for sha in (receipt.head_sha, self._current_head_sha):
             if sha in self._fetched_heads:
                 continue
-            if not self._fetch_commit_into(caller_dir, sha):
-                self._fail(key_sha, "git_fetch_failed")
+            fetch_reason = self._fetch_commit_into(caller_dir, sha)
+            if fetch_reason is not None:
+                self._fail(key_sha, fetch_reason)
                 return None
 
         # -- anchor window against the real diff --
-        diff = _run_git(
-            ["git", "-C", str(caller_dir), "diff", "--unified=0",
-             receipt.head_sha, self._current_head_sha, "--", anchor_file],
-            timeout_s=_GIT_DIFF_TIMEOUT_S,
-        )
+        try:
+            diff = _run_git(
+                ["git", "-C", str(caller_dir), "diff", "--unified=0",
+                 receipt.head_sha, self._current_head_sha, "--", anchor_file],
+                timeout_s=_GIT_DIFF_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            self._fail(key_sha, "git_diff_timeout")
+            return None
+        except OSError:
+            self._fail(key_sha, "git_diff_failed")
+            return None
         if diff.returncode != 0:
             self._fail(key_sha, "git_diff_failed")
             return None
         hunks = parse_unified_zero_hunks(diff.stdout.decode("utf-8", errors="replace"))
         # A file deleted or renamed on the current head counts as touched.
-        touched = not self._file_exists_in_head(
-            caller_dir, self._current_head_sha, anchor_file,
-        ) or anchor_window_touched(hunks, anchor_line, tolerance)
+        # _file_exists_in_head raises TimeoutExpired/OSError; the cat-file
+        # belongs to this diff step, so its timeout folds into git_diff_timeout.
+        try:
+            file_gone = not self._file_exists_in_head(
+                caller_dir, self._current_head_sha, anchor_file,
+            )
+        except subprocess.TimeoutExpired:
+            self._fail(key_sha, "git_diff_timeout")
+            return None
+        except OSError:
+            self._fail(key_sha, "git_diff_failed")
+            return None
+        touched = file_gone or anchor_window_touched(hunks, anchor_line, tolerance)
         line_current = (
             anchor_line if touched
             else projected_anchor_line(hunks, anchor_line, tolerance)
@@ -419,46 +442,63 @@ class _Collector:
             receipt_scope=receipt_scope,
         )
 
-    def _init_caller_repo(self) -> Optional[Path]:
+    def _init_caller_repo(self) -> Optional[str]:
+        """Set up the throwaway caller repo; ``None`` = ready to fetch, else
+        the fail enum for this receipt's UNAVAILABLE line."""
+        repo_dir: Optional[Path] = None
         try:
             repo_dir = Path(tempfile.mkdtemp(prefix="gate-neighbor-caller-"))
             auth = base64.b64encode(f"x-access-token:{self._token}".encode("utf-8")).decode("ascii")
-            _run_git(["git", "init", "--quiet"], cwd=repo_dir, timeout_s=_GIT_SETUP_TIMEOUT_S)
-            _run_git(
+            setup = [
+                ["git", "init", "--quiet"],
                 ["git", "-C", str(repo_dir), "remote", "add", "origin",
                  f"https://github.com/{self._repository}.git"],
-                timeout_s=_GIT_SETUP_TIMEOUT_S,
-            )
-            _run_git(
                 ["git", "-C", str(repo_dir), "config", "http.extraheader",
                  f"AUTHORIZATION: basic {auth}"],
+            ]
+            for argv in setup:
+                proc = _run_git(argv, cwd=repo_dir, timeout_s=_GIT_SETUP_TIMEOUT_S)
+                if proc.returncode != 0:
+                    shutil.rmtree(repo_dir, ignore_errors=True)
+                    return "git_fetch_failed"
+            self._caller_dir = repo_dir
+            return None
+        except (OSError, subprocess.SubprocessError):
+            if repo_dir is not None:
+                shutil.rmtree(repo_dir, ignore_errors=True)
+            return "git_fetch_failed"
+
+    def _fetch_commit_into(self, repo_dir: Path, sha: str) -> Optional[str]:
+        """Shallow-fetch one commit; ``None`` = fetched, else a fail enum
+        (timeout → git_fetch_timeout, including this step's cat-file check)."""
+        try:
+            proc = _run_git(
+                ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", sha],
+                timeout_s=GIT_FETCH_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return "git_fetch_timeout"
+        except OSError:
+            return "git_fetch_failed"
+        if proc.returncode != 0:
+            return "git_fetch_failed"
+        try:
+            check = _run_git(
+                ["git", "-C", str(repo_dir), "cat-file", "-e", f"{sha}^{{commit}}"],
                 timeout_s=_GIT_SETUP_TIMEOUT_S,
             )
-            self._caller_dir = repo_dir
-            return repo_dir
-        except (OSError, subprocess.SubprocessError):
-            if self._caller_dir is not None:
-                shutil.rmtree(self._caller_dir, ignore_errors=True)
-                self._caller_dir = None
-            return None
-
-    def _fetch_commit_into(self, repo_dir: Path, sha: str) -> bool:
-        proc = _run_git(
-            ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", sha],
-            timeout_s=GIT_FETCH_TIMEOUT_S,
-        )
-        if proc.returncode != 0:
-            return False
-        check = _run_git(
-            ["git", "-C", str(repo_dir), "cat-file", "-e", f"{sha}^{{commit}}"],
-            timeout_s=_GIT_SETUP_TIMEOUT_S,
-        )
+        except subprocess.TimeoutExpired:
+            return "git_fetch_timeout"
+        except OSError:
+            return "git_fetch_failed"
         if check.returncode != 0:
-            return False
+            return "git_fetch_failed"
         self._fetched_heads.add(sha)
-        return True
+        return None
 
     def _file_exists_in_head(self, repo_dir: Path, head_sha: str, path: str) -> bool:
+        """Raises TimeoutExpired/OSError through — the caller maps them onto
+        the diff step's fail enums."""
         proc = _run_git(
             ["git", "-C", str(repo_dir), "cat-file", "-e", f"{head_sha}:{path}"],
             timeout_s=_GIT_SETUP_TIMEOUT_S,
