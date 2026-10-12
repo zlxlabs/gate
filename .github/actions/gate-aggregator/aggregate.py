@@ -133,6 +133,17 @@ _CONVERGENCE = importlib.util.module_from_spec(_CONVERGENCE_SPEC)
 sys.modules[_CONVERGENCE_SPEC.name] = _CONVERGENCE
 _CONVERGENCE_SPEC.loader.exec_module(_CONVERGENCE)
 
+# gate#297: collector for NeighborEvidence (subprocess/git/silo I/O lives
+# there; this module and convergence.py stay out of that business).
+_NEIGHBOR_EVIDENCE_SPEC = importlib.util.spec_from_file_location(
+    "gate_neighbor_evidence_from_aggregate",
+    Path(__file__).with_name("neighbor_evidence.py"),
+)
+assert _NEIGHBOR_EVIDENCE_SPEC and _NEIGHBOR_EVIDENCE_SPEC.loader
+_NEIGHBOR_EVIDENCE = importlib.util.module_from_spec(_NEIGHBOR_EVIDENCE_SPEC)
+sys.modules[_NEIGHBOR_EVIDENCE_SPEC.name] = _NEIGHBOR_EVIDENCE
+_NEIGHBOR_EVIDENCE_SPEC.loader.exec_module(_NEIGHBOR_EVIDENCE)
+
 
 # Mirrors gate-hub's scripts/review/contracts.py PRIMARY_VERDICTS / IDENTITY_FIELDS
 # (see module docstring for why this is a hand-kept mirror, not an import).
@@ -1231,6 +1242,7 @@ def evaluate(
     repository: str | None = None,
     prior_eligible_run_ids: Sequence[int] = (),
     convergence_history_status: str = "history_unavailable",
+    neighbor_evidence: Optional[dict[str, Any]] = None,
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -1498,6 +1510,7 @@ def evaluate(
             audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
             repository=repository,
+            neighbor_evidence=neighbor_evidence,
         )
         outcome.disposition_audit = disposition_audit
         state = convergence_state or _CONVERGENCE.initial_state(scope)
@@ -3741,6 +3754,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             waiver_receipts = ()
 
+    # gate#297 wiring: collect NeighborEvidence for drifted candidate receipts
+    # BEFORE record_dispositions runs inside evaluate().  The collector itself
+    # returns {} (with zero network/git/silo calls) when no receipt is a
+    # neighbor candidate; any per-receipt failure prints one greppable
+    # GATE-NEIGHBOR-EVIDENCE-UNAVAILABLE line and stays fail-closed.
+    neighbor_evidence: Optional[dict[str, Any]] = {}
+    if token and scope is not None and waiver_receipts:
+        neighbor_evidence = _NEIGHBOR_EVIDENCE.collect_neighbor_evidence(
+            receipts=waiver_receipts,
+            repository=args.repository,
+            repository_id=identity.repository_id,
+            pr_number=identity.pr,
+            current_head_sha=identity.head_sha,
+            audit_digest=audit_digest if audit_digest is not None else "",
+            legacy_raw_audit_digest=legacy_raw_audit_digest,
+            terminal_history_rows=(
+                silo_terminal_history.rows if silo_terminal_history is not None else ()
+            ),
+            token=token,
+        )
+
     findings: list[Any] = []
     if isinstance(audit, dict):
         result = audit.get("result")
@@ -3780,6 +3814,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         repository=args.repository,
         prior_eligible_run_ids=prior_eligible_run_ids,
         convergence_history_status=convergence_history_status,
+        neighbor_evidence=neighbor_evidence,
     )
     apply_finding_relation(outcome, findings, previous_round)
 
