@@ -324,6 +324,52 @@ def select_latest_verified_commit(
     return PromotionResult(None, tuple(checked))
 
 
+def _candidate_has_terminal_canary(
+    candidate_sha: str, api_reader: ApiReader | None = None
+) -> bool:
+    """True when a canary run that references this SHA has a non-null conclusion."""
+
+    api_reader = api_reader or _api_json
+    runs = _load_runs(api_reader)
+    list_endpoint = (
+        f"repos/{CANARY_REPOSITORY}/actions/workflows/"
+        f"{CANARY_GATE_WORKFLOW_ID}/runs?per_page={RUNS_PAGE_SIZE}"
+    )
+    for run in runs:
+        listed_conclusion = _mapping(run, list_endpoint).get("conclusion")
+        run_id = _run_id(run, list_endpoint)
+        detail_endpoint = f"repos/{CANARY_REPOSITORY}/actions/runs/{run_id}"
+        detail = _mapping(api_reader(detail_endpoint), detail_endpoint)
+        conclusion = detail.get("conclusion")
+        if conclusion is None:
+            conclusion = listed_conclusion
+        if conclusion is None:
+            continue
+        gate_scan = _gate_shas(detail, detail_endpoint)
+        if gate_scan.shas and candidate_sha in gate_scan.shas:
+            return True
+    return False
+
+
+def _should_await_canary_on_push(
+    event_name: str,
+    head_sha: str,
+    main_tip: str,
+    result: PromotionResult,
+    api_reader: ApiReader | None = None,
+) -> bool:
+    """Push of the current main tip whose canary has not reached a terminal state."""
+
+    if event_name != "push" or not head_sha:
+        return False
+    head_sha = _validate_sha(head_sha, "head sha")
+    if head_sha != main_tip:
+        return False
+    if not any(candidate.sha == head_sha for candidate in result.checked):
+        return False
+    return not _candidate_has_terminal_canary(head_sha, api_reader)
+
+
 def is_descendant_or_equal(current_sha: str, target_sha: str) -> bool:
     """Return whether target is current or a descendant of current."""
 
@@ -344,6 +390,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--main-tip")
     parser.add_argument("--check-ancestor", nargs=2, metavar=("CURRENT", "TARGET"))
     parser.add_argument("--current-v2-commit-time")
+    parser.add_argument("--event-name", default="")
+    parser.add_argument("--head-sha", default="")
     args = parser.parse_args(argv)
     if args.check_ancestor is not None:
         try:
@@ -367,6 +415,19 @@ def main(argv: list[str] | None = None) -> int:
         state = "eligible" if candidate.eligible else "ineligible"
         print(f"candidate={candidate.sha} {state}: {candidate.reason}", file=sys.stderr)
     if result.selected_sha is None:
+        try:
+            awaiting = _should_await_canary_on_push(
+                args.event_name,
+                args.head_sha,
+                args.main_tip,
+                result,
+            )
+        except EvidenceQueryError as exc:
+            print(f"v2 promotion evidence query failed: {exc}", file=sys.stderr)
+            return 1
+        if awaiting:
+            print("V2-TAG-SYNC-AWAITING-CANARY", file=sys.stderr)
+            return 0
         if args.current_v2_commit_time is not None:
             try:
                 current_v2_commit_time = datetime.fromisoformat(
