@@ -24,3 +24,13 @@
 - 已否决：单独 `tests/test_gate_previous_round_latest.py`（模块加载样板把预算顶过 250）。
 
 **下一步唯一动作**：先 commit 真修复，再做红验（改回 list、去掉 run 序校验）。
+
+## 段 3 · 红验与收尾
+
+**当前阶段**：shipping
+
+**本段结论**：红验 (a) 注入 `list` 后 `len(argvs) == 1` 断言失败；(b) 去掉 run 序校验后 `available` 变成 True。两处均已按行还原。真修复在 `675f083`。
+
+**关键决策与已否决方案**：无新增。
+
+**下一步唯一动作**：push 并开 draft PR，写 delegate 报告。
