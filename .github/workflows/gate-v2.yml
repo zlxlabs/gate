@@ -2565,6 +2565,20 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --file "$LEDGER_PATH"
 
+      - name: Upload v2 review effectiveness ledger latest pointer
+        env:
+          ARTIFACT_NAME: codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}
+          LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
+        run: |
+          echo "::notice::step-start: Upload v2 review effectiveness ledger latest pointer"
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          "$SILO_EXEC" put \
+            --tier d30 \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$LEDGER_PATH"
+
       - name: Diagnose silo network after job failure
         if: failure()
         env:
