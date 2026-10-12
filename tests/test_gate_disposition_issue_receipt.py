@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -474,7 +475,7 @@ def test_false_positive_producer_rejects_forged_output_when_rerun_no_match(tmp_p
     assert not output_dir.exists()
 
 
-def test_false_positive_producer_rejects_rerun_failed_nonzero_exit(tmp_path):
+def test_false_positive_producer_rejects_head_object_missing(tmp_path):
     empty = tmp_path / "not-a-repo"
     empty.mkdir()
     sha = "a" * 40
@@ -484,16 +485,33 @@ def test_false_positive_producer_rejects_rerun_failed_nonzero_exit(tmp_path):
         counterevidence=counterevidence, head_sha=sha, repo_dir=empty,
     )
     assert result.returncode != 0
-    assert "counterevidence_rerun_failed" in result.stderr
+    assert "counterevidence_head_object_missing" in result.stderr
     assert not output_dir.exists()
 
 
-def test_rerun_timeout_is_counterevidence_rerun_failed(tmp_path, monkeypatch):
+def test_rerun_timeout_is_counterevidence_rerun_timeout(tmp_path, monkeypatch):
+    repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
+    module = _producer_module()
+    real_run = module.subprocess.run
+
+    def grep_only_times_out(argv, *_args, **_kwargs):
+        if argv[1] == "grep":
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
+        return real_run(argv, *_args, **_kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", grep_only_times_out)
+    with pytest.raises(ValueError, match="counterevidence_rerun_timeout"):
+        module.rerun_counterevidence(
+            f"git grep -n -F -e {literal} {sha} -- {relpath}", sha, repo,
+        )
+
+
+def test_rerun_spawn_failure_is_counterevidence_rerun_failed(tmp_path, monkeypatch):
     repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
     module = _producer_module()
 
     def boom(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(cmd=["git"], timeout=30)
+        raise OSError("git is not executable")
 
     monkeypatch.setattr(module.subprocess, "run", boom)
     with pytest.raises(ValueError, match="counterevidence_rerun_failed"):
@@ -544,3 +562,72 @@ def test_false_positive_producer_writes_gate_rerun_from_real_git_grep(tmp_path):
         audit_digest=convergence.canonical_audit_digest(_audit(head_sha=sha)),
     )
     assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+
+
+def _prepare_caller_head(origin: Path, root: Path, sha: str, *, blob_filter: bool) -> Path:
+    """Rebuild the disposition workflow's caller-head fetch against `origin`.
+
+    gate#302: the disposition step prepares repo_dir with `git init` plus a
+    depth-1 fetch of the PR head. A file:// origin has to opt into the two
+    server-side capabilities GitHub already grants its callers (fetch by sha,
+    blob filtering), otherwise the fetch quietly degrades and the fixture stops
+    reproducing the runner.
+    """
+    for capability in ("uploadpack.allowAnySHA1InWant", "uploadpack.allowFilter"):
+        subprocess.run(
+            ["git", "config", capability, "true"],
+            cwd=origin, check=True, capture_output=True,
+        )
+    target = root / "caller-head"
+    target.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=target, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", f"file://{origin}"],
+        cwd=target, check=True, capture_output=True,
+    )
+    argv = ["git", "-C", str(target), "fetch", "--depth", "1"]
+    if blob_filter:
+        argv.append("--filter=blob:none")
+    argv.extend(["origin", sha])
+    subprocess.run(argv, check=True, capture_output=True)
+    return target
+
+
+def test_blob_filtered_caller_head_reports_missing_head_object_not_timeout(tmp_path):
+    """gate#302: a partial clone used to burn the whole 30s budget on fetches."""
+    repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
+    partial = _prepare_caller_head(repo, tmp_path / "partial", sha, blob_filter=True)
+    inventory = subprocess.run(
+        ["git", "-C", str(partial), "rev-list", "--objects", "--missing=print", sha, "--", relpath],
+        check=True, capture_output=True,
+    ).stdout
+    assert any(line.startswith(b"?") for line in inventory.splitlines())
+
+    module = _producer_module()
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="counterevidence_head_object_missing"):
+        module.rerun_counterevidence(
+            f"git grep -n -F -e {literal} {sha} -- {relpath}", sha, partial,
+        )
+    assert time.monotonic() - started < 30
+
+
+def test_depth_one_caller_head_issues_receipt_from_real_git_grep(tmp_path):
+    repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
+    prepared = _prepare_caller_head(repo, tmp_path / "full", sha, blob_filter=False)
+    assert subprocess.run(
+        ["git", "-C", str(prepared), "rev-list", "--objects", "--missing=print", sha, "--", relpath],
+        check=True, capture_output=True,
+    ).stdout.count(b"?") == 0
+    counterevidence = _allowlisted_ce(sha, relpath=relpath, literal=literal, output="stale")
+    result, output_dir = _issue(
+        tmp_path / "issue", disposition="false-positive",
+        counterevidence=counterevidence, head_sha=sha, repo_dir=prepared,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads((output_dir / json.loads(result.stdout)["artifact"]).read_bytes())
+    rerun = payload["counterevidence"]["gate_rerun"]
+    actual = subprocess.run(rerun["argv"], cwd=prepared, capture_output=True, check=True)
+    assert rerun["exit_code"] == 0
+    assert rerun["match_count"] >= 1
+    assert actual.stdout.decode("utf-8") == rerun["excerpt"]
