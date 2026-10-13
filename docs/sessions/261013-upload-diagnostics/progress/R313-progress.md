@@ -28,3 +28,9 @@
 - 本段结论：H0 scratch 中真实 ThreadingHTTPServer 子进程探针用 503、无 Content-Length、缺失 request-id/id2，得到唯一 `phase=status` 事件，三个响应字段均为 null；cwd 为隔离 scratch，SHA 为 H0。
 - 关键决策/否决：这是确认字段缺失契约，不新增 finding；不扩大到线上端点。
 - 下一唯一动作：把补证写入 verdict/私有报告，再提交推送文档增量并核对远端 SHA。
+
+### 审查收口
+- 当前阶段：reviewing 完成；最终评审结论为 1 项 P2、非阻断，OCR 前置 skipped。
+- 本段结论：截至本段开始时，远端 ref 与本地审查提交 `0f98360f729acf25cdf0e40714c2b2a4f68be5c6` 一致；verdict 与 progress 已覆盖证据和剩余未知。
+- 关键决策/否决：只发布两份审查文档；不创建 PR、不改 issue、不运行 CI 或生产请求；不绕过 push hook。
+- 下一唯一动作：推送本收口记录并核对远端 SHA，然后交付摘要。
