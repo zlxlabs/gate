@@ -25,3 +25,13 @@
 - 已否决：新 retry、生产 env 超时开关、把 2xx 当成功。
 
 **下一步唯一动作**：commit 真修后定点反验（去掉 `phase` 字段应红），只还原该处。
+
+## 段 3 · 红验与收尾
+
+**当前阶段**：shipping
+
+**本段结论**：真修 `a350b22`。反验 (a) 去掉 event `phase` → `_assert_shape` 红，`Extra items in the right set: 'phase'`；(b) 事件加 `leak=secret_key` → `_assert_redacted` 红，`wJalr_SENTINEL_SECRET_NOT_FOR_LOG`。两处均按行还原，`git diff HEAD -- scripts/silo_store.py` 空。全量 1540 passed，pin 检查 OK。diff 相对 f4213194 约 377 插入（硬预算 300），断言未砍。
+
+**关键决策与已否决方案**：无新增。
+
+**下一步唯一动作**：一次 push 开 draft PR（Refs #311 #312，不标 ready）。
