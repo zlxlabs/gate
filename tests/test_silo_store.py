@@ -577,3 +577,263 @@ def test_live_fake_s3_put_list_round_trips_literal_percent_escape(monkeypatch, t
     finally:
         server.shutdown()
         server.server_close()
+
+
+import hashlib
+import http.client
+import json
+import os
+import subprocess
+import sys
+
+_STORE_PY = Path(__file__).resolve().parents[1] / "scripts" / "silo_store.py"
+_DIAG = "SILO-REQUEST-FAILED "
+_ACCESS, _SECRET = "AKIA_SENTINEL_ACCESS_NOT_FOR_LOG", "wJalr_SENTINEL_SECRET_NOT_FOR_LOG"
+_BODY_S, _MSG_S = "BODY_SENTINEL_PAYLOAD_NOT_FOR_LOG", "MSG_SENTINEL_XML_NOT_FOR_LOG"
+_HTML_S = "<html>HTML_SENTINEL_NOT_FOR_LOG</html>"
+_EVENT_KEYS = frozenset({
+    "event", "schema", "method", "phase", "body_len", "declared_content_length",
+    "request_send_completed", "elapsed_ms", "client_timeout_s", "http_status",
+    "s3_error_code", "exception_type", "resp_server", "resp_amz_request_id",
+    "resp_amz_id_2", "resp_content_length", "request_seq",
+})
+_INCOMPLETE_XML = (
+    b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>IncompleteBody</Code>'
+    b"<Message>" + _MSG_S.encode() + b" missing bytes</Message>"
+    b"<Resource>/ci-artifacts/d1/1/diag/secret.bin</Resource></Error>"
+)
+_WL = (("Server", "MinIO"), ("x-amz-request-id", "RID-WHITELIST"), ("x-amz-id-2", "ID2-WHITELIST"))
+
+
+def _events(stderr: str) -> list[dict]:
+    return [json.loads(line[len(_DIAG):]) for line in stderr.splitlines() if line.startswith(_DIAG)]
+
+
+def _run_store(args: list[str], endpoint: str) -> subprocess.CompletedProcess:
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AWS_ACCESS_KEY_ID": _ACCESS, "AWS_SECRET_ACCESS_KEY": _SECRET,
+        "SILO_ENDPOINT": endpoint, "SILO_BUCKET": "ci-artifacts",
+    }
+    return subprocess.run(
+        [sys.executable, str(_STORE_PY), *args], capture_output=True, text=True, env=env, check=False,
+    )
+
+
+def _put(endpoint: str, path: Path) -> subprocess.CompletedProcess:
+    return _run_store(["put", "--tier", "d1", "--repo-id", "1", "--name", "diag", "--file", str(path)], endpoint)
+
+
+def _get(endpoint: str, dest: Path) -> subprocess.CompletedProcess:
+    return _run_store(["get", "--key", "d1/1/diag/x.bin", "--dest", str(dest)], endpoint)
+
+
+def _assert_redacted(text: str) -> None:
+    for sentinel in (_ACCESS, _SECRET, _BODY_S, _MSG_S, _HTML_S, "AWS4-HMAC"):
+        assert sentinel not in text, sentinel
+
+
+def _assert_shape(event: dict) -> None:
+    assert set(event) == _EVENT_KEYS
+    assert event["event"] == "silo_request_failed" and event["schema"] == 1
+    assert isinstance(event["elapsed_ms"], int) and event["elapsed_ms"] >= 0
+    assert event["client_timeout_s"] == store.S3_TIMEOUT_SECONDS
+    assert isinstance(event["request_seq"], int) and event["request_seq"] >= 1
+    for key in ("resp_server", "resp_amz_request_id", "resp_amz_id_2", "resp_content_length", "s3_error_code"):
+        value = event[key]
+        if value is not None:
+            assert isinstance(value, str) and len(value) <= 128
+            assert all(32 <= ord(ch) <= 126 for ch in value)
+
+
+class _RecordHandler(BaseHTTPRequestHandler):
+    def _handle(self):
+        raw_cl = self.headers.get("Content-Length")
+        n = int(raw_cl) if raw_cl else 0
+        body = self.rfile.read(n) if n else b""
+        self.server.received.append({
+            "content_length_header": raw_cl,
+            "body_sha256": hashlib.sha256(body).hexdigest(),
+            "body_len": len(body),
+        })
+        if self.server.close_after_read:
+            self.close_connection = True
+            self.connection.close()
+            return
+        payload = self.server.body
+        self.send_response_only(self.server.status)
+        self.send_header("Content-Length", str(len(payload)))
+        for name, value in self.server.extra_headers:
+            self.send_header(name, value)
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
+    do_GET = _handle
+    do_PUT = _handle
+    def log_message(self, *args):
+        pass
+
+
+def _start_record_server(**attrs):
+    server = HTTPServer(("127.0.0.1", 0), _RecordHandler)
+    server.received, server.status, server.body = [], 200, b""
+    server.extra_headers, server.close_after_read = (), False
+    for key, value in attrs.items():
+        setattr(server, key, value)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.daemon = True
+    thread.start()
+    return server
+
+
+def test_cli_put_incomplete_body_emits_one_status_event(tmp_path):
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(_BODY_S.encode())
+    server = _start_record_server(status=400, body=_INCOMPLETE_XML, extra_headers=_WL)
+    try:
+        result = _put(f"http://127.0.0.1:{server.server_port}", payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode == store.EXIT_ERROR
+    _assert_redacted(result.stderr)
+    events = _events(result.stderr)
+    assert len(events) == 1
+    event, rec = events[0], server.received[0]
+    _assert_shape(event)
+    assert rec["content_length_header"] == str(len(_BODY_S))
+    assert rec["body_sha256"] == hashlib.sha256(_BODY_S.encode()).hexdigest()
+    assert rec["body_len"] == event["body_len"] == event["declared_content_length"] == len(_BODY_S)
+    assert event["method"] == "PUT" and event["phase"] == "status" and event["http_status"] == 400
+    assert event["s3_error_code"] == "IncompleteBody" and event["exception_type"] is None
+    assert event["request_send_completed"] is True and event["request_seq"] == 1
+    assert event["resp_server"] == "MinIO"
+    assert event["resp_amz_request_id"] == "RID-WHITELIST"
+    assert event["resp_amz_id_2"] == "ID2-WHITELIST"
+    assert event["resp_content_length"] == str(len(_INCOMPLETE_XML))
+    assert "Silo put failed: S3Error: 400 IncompleteBody" in result.stderr
+
+
+def test_cli_put_success_stdout_and_204_still_fails(tmp_path):
+    payload = tmp_path / "ok.bin"
+    payload.write_bytes(b"ok-bytes")
+    server = _start_record_server(status=200, body=b"")
+    try:
+        ok = _put(f"http://127.0.0.1:{server.server_port}", payload)
+        server.status = 204
+        twenty = _put(f"http://127.0.0.1:{server.server_port}", payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert ok.returncode == store.EXIT_OK
+    assert ok.stdout == "d1/1/diag/ok.bin\n"
+    assert "SILO-REQUEST-FAILED" not in ok.stderr
+    _assert_redacted(ok.stderr + ok.stdout)
+    assert twenty.returncode == store.EXIT_ERROR
+    events = _events(twenty.stderr)
+    assert len(events) == 1
+    assert events[0]["http_status"] == 204 and events[0]["phase"] == "status"
+
+
+def test_cli_get_close_after_read_is_recv_headers(tmp_path):
+    server = _start_record_server(close_after_read=True)
+    try:
+        result = _get(f"http://127.0.0.1:{server.server_port}", tmp_path / "out.bin")
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode == store.EXIT_ERROR and result.stdout == ""
+    events = _events(result.stderr)
+    assert len(events) == 1
+    event = events[0]
+    _assert_shape(event)
+    assert event["method"] == "GET" and event["phase"] == "recv_headers"
+    assert event["http_status"] is event["s3_error_code"] is None
+    assert event["exception_type"] and event["exception_type"].isidentifier()
+    assert event["request_send_completed"] is True
+    assert event["declared_content_length"] is None and event["body_len"] == 0
+    human = [line for line in result.stderr.splitlines() if not line.startswith(_DIAG)]
+    assert human == [f"Silo request failed: {event['exception_type']}"]
+    _assert_redacted(result.stderr)
+
+
+def test_cli_get_html_502_and_long_server_are_redacted(tmp_path):
+    long_server = "A\x00B\x01" + ("C" * 996)
+    assert len(long_server) == 1000
+    extra = (("Server", long_server), ("x-amz-request-id", "RID-HTML"), ("x-amz-id-2", "ID2-HTML"))
+    server = _start_record_server(status=502, body=_HTML_S.encode(), extra_headers=extra)
+    try:
+        result = _get(f"http://127.0.0.1:{server.server_port}", tmp_path / "out.bin")
+        empty = tmp_path / "empty.bin"
+        empty.write_bytes(b"")
+        empty_result = _put(f"http://127.0.0.1:{server.server_port}", empty)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode == store.EXIT_ERROR
+    events = _events(result.stderr)
+    assert len(events) == 1
+    event = events[0]
+    _assert_shape(event)
+    assert event["http_status"] == 502 and event["s3_error_code"] is None and event["phase"] == "status"
+    assert event["declared_content_length"] is None and event["body_len"] == 0
+    assert server.received[0]["content_length_header"] in (None, "0")
+    assert event["resp_server"] and len(event["resp_server"]) <= 128
+    assert all(32 <= ord(ch) <= 126 for ch in event["resp_server"])
+    assert long_server not in result.stderr
+    _assert_redacted(result.stderr)
+    empty_events = _events(empty_result.stderr)
+    assert len(empty_events) == 1
+    assert empty_events[0]["declared_content_length"] is None and empty_events[0]["body_len"] == 0
+    assert server.received[1]["content_length_header"] in (None, "0")
+
+
+def test_request_send_and_recv_body_exceptions(monkeypatch, capsys):
+    client = store.S3Client("http://127.0.0.1:9", "ak", "sk")
+
+    def install(fail_at, exc):
+        class _Resp:
+            status = 200
+            def getheader(self, name, default=None):
+                return default
+            def read(self):
+                if fail_at == "recv_body":
+                    raise exc
+                return b"ok"
+        class _Conn:
+            def __init__(self, *a, **k):
+                pass
+            def request(self, *a, **k):
+                if fail_at == "send":
+                    raise exc
+            def getresponse(self):
+                if fail_at == "recv_headers":
+                    raise exc
+                return _Resp()
+            def close(self):
+                pass
+        monkeypatch.setattr(http.client, "HTTPConnection", _Conn)
+
+    cases = (
+        ("send", OSError("send-secret-boom"), "send", False, None),
+        ("recv_headers", TimeoutError("wait-secret-boom"), "recv_headers", True, None),
+        ("recv_body", http.client.IncompleteRead(b"", 4), "recv_body", True, 200),
+    )
+    for fail_at, exc, phase, sent, status in cases:
+        install(fail_at, exc)
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as caught:
+            client._request("PUT", "/ci-artifacts/k", [], b"xx")
+        assert caught.value.code == store.EXIT_ERROR
+        err = capsys.readouterr().err
+        events = _events(err)
+        assert len(events) == 1, err
+        event = events[0]
+        _assert_shape(event)
+        assert event["phase"] == phase
+        assert event["request_send_completed"] is sent
+        assert event["exception_type"] == type(exc).__name__
+        assert event["http_status"] == status
+        assert event["declared_content_length"] == event["body_len"] == 2
+        assert f"Silo request failed: {type(exc).__name__}" in err
+        assert str(exc) not in err
