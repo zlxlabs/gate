@@ -22,3 +22,9 @@
 - 本段结论：首次普通 push 被 pre-push public-scan 拒绝，原因是仓内 verdict 含本机绝对路径/用户名；失败后 `git ls-remote` 未返回该分支 ref，本地 `HEAD` 仍在，主 checkout 状态干净。
 - 关键决策/否决：不绕过钩子；完整命令与实际 cwd 保留在派发报告，仓内 verdict 仅保留相对命令、SHA 与摘要。
 - 下一唯一动作：amend 尚未发布的本地提交，复查两份文档无本机路径，再正常 push 并核远端 SHA。
+
+### 缺失响应头探针补证
+- 当前阶段：reviewing；之前审查结论仍为 1 项 P2、非阻断。
+- 本段结论：H0 scratch 中真实 ThreadingHTTPServer 子进程探针用 503、无 Content-Length、缺失 request-id/id2，得到唯一 `phase=status` 事件，三个响应字段均为 null；cwd 为隔离 scratch，SHA 为 H0。
+- 关键决策/否决：这是确认字段缺失契约，不新增 finding；不扩大到线上端点。
+- 下一唯一动作：把补证写入 verdict/私有报告，再提交推送文档增量并核对远端 SHA。
