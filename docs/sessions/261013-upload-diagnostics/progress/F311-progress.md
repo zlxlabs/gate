@@ -12,3 +12,16 @@
 - 空 body 的 declared_content_length 记 null，不把 http.client 补 0 伪报成客户端显式头。
 
 **下一步唯一动作**：先写 `tests/test_silo_store.py` 新断言并在未改生产码时拿到 AssertionError 红，再改 `_request`。
+
+## 段 2 · TDD 红与实现
+
+**当前阶段**：verifying
+
+**本段结论**：未改生产码时新测 5 红 1 绿（成功路径本就无诊断）。红因是 AssertionError：缺 `SILO-REQUEST-FAILED` 或 stderr 含 `MSG_SENTINEL_XML_NOT_FOR_LOG`，不是 ImportError。实现后 `tests/test_silo_store.py` 34 passed。
+
+**关键决策与已否决方案**：
+- 观测点=既有 `finally`；非 200 仍 `return status, body`，成功仍仅 200。
+- 失败文案收紧：`Silo request failed: {type}: {err}` → 只留类名；`S3Error` 字符串 `{code}: {message}` → `{status} {code}`。旧文案示例：`Silo put failed: S3Error: IncompleteBody: MSG_SENTINEL_XML_NOT_FOR_LOG missing bytes`；`Silo request failed: OSError: send-secret-boom`。
+- 已否决：新 retry、生产 env 超时开关、把 2xx 当成功。
+
+**下一步唯一动作**：commit 真修后定点反验（去掉 `phase` 字段应红），只还原该处。

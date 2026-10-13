@@ -13,9 +13,11 @@ import argparse
 import hashlib
 import hmac
 import http.client
+import json
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
@@ -105,9 +107,36 @@ class S3Error(Exception):
     NoSuchKey/404/NoSuchBucket miss-mapping in cmd_get/cmd_list keeps working."""
 
     def __init__(self, code: str, message: str = "", status: int = 0):
-        super().__init__(f"{code}: {message}" if message else code)
+        super().__init__(f"{status} {code}" if status else code)
         self.response = {"Error": {"Code": code, "Message": message}}
         self.status = status
+
+
+_REQUEST_SEQ = 0
+
+
+def _diag_ascii(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = "".join(ch for ch in value if 32 <= ord(ch) <= 126)
+    return cleaned[:128] if cleaned else None
+
+
+def _s3_error_code_from_body(data: bytes) -> str | None:
+    try:
+        codes = _xml_local_texts(ET.fromstring(data), "Code") if data else []
+    except ET.ParseError:
+        return None
+    return _diag_ascii(codes[0].strip()) if codes else None
+
+
+def _emit_silo_request_failed(event: dict, response) -> None:
+    getter = response.getheader if response is not None else lambda *_a, **_k: None
+    event["resp_server"] = _diag_ascii(getter("Server"))
+    event["resp_amz_request_id"] = _diag_ascii(getter("x-amz-request-id"))
+    event["resp_amz_id_2"] = _diag_ascii(getter("x-amz-id-2"))
+    event["resp_content_length"] = _diag_ascii(getter("Content-Length"))
+    print(f"SILO-REQUEST-FAILED {json.dumps(event, separators=(',', ':'))}", file=sys.stderr)
 
 
 def sha256_hex(data: bytes) -> str:
@@ -258,17 +287,53 @@ class S3Client:
         }
         if body:
             headers["Content-Length"] = str(len(body))  # explicit; MinIO closes keep-alive otherwise
+        declared_content_length = (
+            int(headers["Content-Length"]) if "Content-Length" in headers else None
+        )
+        global _REQUEST_SEQ
+        _REQUEST_SEQ += 1
+        request_seq = _REQUEST_SEQ
+        phase = "send"
+        request_send_completed = False
+        http_status = None
+        response = None
+        payload = b""
+        exception_type = None
+        started = time.monotonic()
         connection = (http.client.HTTPSConnection if self.tls else http.client.HTTPConnection)(
             self.host, self.port, timeout=S3_TIMEOUT_SECONDS)
         try:
             connection.request(method, target, body=body or None, headers=headers)
+            request_send_completed = True
+            phase = "recv_headers"
             response = connection.getresponse()
-            return response.status, response.read()
+            http_status = response.status
+            phase = "recv_body"
+            payload = response.read()
+            phase = "status"
+            return http_status, payload
         except Exception as err:  # noqa: BLE001 — surfaced as exit 1 by callers
-            fail(f"Silo request failed: {type(err).__name__}: {err}")
+            exception_type = type(err).__name__
+            fail(f"Silo request failed: {exception_type}")
             raise AssertionError("unreachable")
         finally:
             connection.close()
+            if exception_type is not None or http_status != 200:
+                _emit_silo_request_failed({
+                    "event": "silo_request_failed",
+                    "schema": 1,
+                    "method": method,
+                    "phase": phase,
+                    "body_len": len(body),
+                    "declared_content_length": declared_content_length,
+                    "request_send_completed": request_send_completed,
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                    "client_timeout_s": S3_TIMEOUT_SECONDS,
+                    "http_status": http_status,
+                    "s3_error_code": _s3_error_code_from_body(payload),
+                    "exception_type": exception_type,
+                    "request_seq": request_seq,
+                }, response)
 
     @staticmethod
     def _raise_for_status(status: int, data: bytes) -> S3Error:
