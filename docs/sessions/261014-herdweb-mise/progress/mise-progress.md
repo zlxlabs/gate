@@ -37,3 +37,14 @@
   收敛时先查解析器再查断言。
 - durations 基线：仅追加 tests/test_gate_quality_mise.py: 0.05，存量键未动。
 - 下一步唯一动作：push + 开 draft PR，等本轮 CI 终态（不连推，避免同 PR 互相取消）。
+
+## 2026-10-14 PR CI 终态 + 收尾
+
+- 阶段： awaiting review（执行器不合并、不标 ready，merge 由主脑）。
+- draft PR：zlxlabs/gate#315，分支 card/gate-20261014-41-quality-mise，
+  head 50149d7（base 05389f4，merge commit 方式，不 rebase）。
+- CI run 38527922201：conclusion=success；actionlint SUCCESS（真实执行 5s，
+  非 SKIPPED）；test SUCCESS。diff 322 行（target 350 内）。
+- 未做：herdweb 真实 consumer opt-in 与自托管执行（发布后由其 owner 验收；
+  issue #314 不自动关单，旧 TLS 事项不在本卡宣称范围）。
+- 下一步唯一动作：主脑 review / 标 ready / merge，v2 远端发布核验后通知 herdweb owner。
