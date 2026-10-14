@@ -52,6 +52,21 @@ gate checkout 后从仓库根目录以独立进程执行 `./scripts/gate-quality
 执行会立即失败且不会回退。入口可执行后，legacy 的 install/lint/duplicate/test 猜测
 步骤全部跳过。未迁移仓库应尽快补上入口，避免依赖兼容路径。
 
+入口进程假定仓库自选的工具链已就绪；如果它用 [mise](https://mise.jdx.dev) 管理工具
+（如 `mise trust && mise install` 风格的入口脚本），在 caller 的 `with:` 里显式传
+`quality_prepare_mise: true`，quality job 会在真实入口检测之后、执行入口之前用官方
+[`jdx/mise-action@v3`](https://github.com/jdx/mise-action)（`install: false`）准备
+mise 管理器本身：
+
+```yaml
+    with:
+      quality_prepare_mise: true
+```
+
+该开关默认关闭，且只在入口模式生效：gate 只装 mise 管理器，不装任何项目工具或
+依赖（`mise trust`、工具安装、锁文件校验全部仍由业务入口拥有）；准备失败会直接
+阻断 quality，不会带着缺失的工具链进入入口。legacy 自动探测路径不受此开关影响。
+
 ## Required Gate v2 + Shadow Calibration v2
 
 当前 Required Gate caller 使用 `gate-v2.yml@v2`。`shadow-review-independence` 计划
@@ -84,6 +99,7 @@ PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式�
 | `timeout_minutes` | `45` | 仅 `quality` job 的硬超时 |
 | `primary_timeout_minutes` | `25` | `primary` job 自己的超时预算，与 `timeout_minutes` 解耦——需要给 `review-primary` 留出「GitHub 硬 SIGKILL 前写完并上传 canonical audit」的收尾余量 |
 | `control_runner` | `""` | `gate` 聚合器与 `notify` 的 runner 池：留空（默认）跟随 `runner` 走自建（gate#27 起，取整税修复）；`github-hosted` 把控制面钉回 hosted，是单仓回滚逃生舱；遗留值 `self-hosted-control` 等价于留空 |
+| `quality_prepare_mise` | `false` | 仅质量 job：`true` 且仓库存在可执行的 `scripts/gate-quality` 入口时，用 `jdx/mise-action@v3`（`install: false`）准备 mise 管理器本身供入口使用；不装项目工具/依赖，业务入口保留全部所有权；legacy 路径与不传该 input 的 caller 行为不变 |
 
 ### `gate-shadow-v2.yml` inputs(`workflow_call`)
 
