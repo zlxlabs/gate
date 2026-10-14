@@ -99,6 +99,13 @@ on:
       # `docs/**` (directory prefix) or an exact file path. Empty = fleet
       # default only. Any illegal entry voids the whole declaration (still review).
       review_exempt_paths: { type: string, default: "" }
+      # gate#314: opt-in only. When true AND the caller repo has a real
+      # scripts/gate-quality entry, the quality job prepares the mise tool
+      # manager (jdx/mise-action@v3, install: false — the mise binary only).
+      # The business entry still owns mise trust, tool installs and every
+      # project dependency; legacy auto-detection never touches mise. Callers
+      # that omit this input keep today's behavior exactly.
+      quality_prepare_mise: { type: boolean, default: false }
     secrets:
       FEISHU_CI_WEBHOOK:
         # Optional: public repos MUST pass this as a repo SECRET (fork PR runs
@@ -561,6 +568,30 @@ jobs:
             echo "::warning::DEPRECATION: scripts/gate-quality is missing; using legacy quality auto-detection"
             echo "mode=legacy" >> "$GITHUB_OUTPUT"
           fi
+
+      # gate#314: entry-mode callers (e.g. zlxlabs/herdweb) assume the mise
+      # tool manager exists.
+      # A workflow_call caller cannot inject steps into this job, so the
+      # opt-in input above drives this bootstrap instead. install: false keeps
+      # dependency install owned by the business entry (no duplicate
+      # preparation); env: false + add_shims_to_path: false keep caller mise
+      # env vars and shims out of the platform checkout / PR preflight steps
+      # below (the mise binary itself stays on PATH — the entry still runs
+      # `mise trust && mise install`); working_directory keeps the mise
+      # subprocess cwd outside the caller checkout so `mise ls` never reads
+      # caller config. Upstream still auto-trusts the workspace
+      # (MISE_TRUSTED_CONFIG_PATHS) and may restore its default cache — both
+      # are official upstream behaviors, disclosed in README, not disabled
+      # here. A failed run of the action fails the step outright and blocks
+      # quality before the entry — no continue-on-error, no fallback.
+      - name: Prepare mise tool manager (quality entry opt-in)
+        if: ${{ steps.quality-entry.outputs.mode == 'entry' && inputs.quality_prepare_mise }}
+        uses: jdx/mise-action@v3
+        with:
+          install: false
+          env: false
+          add_shims_to_path: false
+          working_directory: ${{ runner.temp }}
 
       # `uses:` cannot take an expression. Check out this reusable workflow's own
       # source at the exact commit selected by the caller, then invoke the action

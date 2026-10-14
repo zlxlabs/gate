@@ -746,6 +746,7 @@ def test_workflow_call_inputs_include_review_exempt_paths():
         "primary_timeout_minutes",
         "control_runner",
         "review_exempt_paths",
+        "quality_prepare_mise",
     }
     declared = trigger["workflow_call"]["inputs"]["review_exempt_paths"]
     assert declared["type"] == "string"

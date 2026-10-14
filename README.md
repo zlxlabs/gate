@@ -52,6 +52,29 @@ gate checkout 后从仓库根目录以独立进程执行 `./scripts/gate-quality
 执行会立即失败且不会回退。入口可执行后，legacy 的 install/lint/duplicate/test 猜测
 步骤全部跳过。未迁移仓库应尽快补上入口，避免依赖兼容路径。
 
+入口进程假定仓库自选的工具链已就绪；如果它用 [mise](https://mise.jdx.dev) 管理工具
+（如 `mise trust && mise install` 风格的入口脚本），在 caller 的 `with:` 里显式传
+`quality_prepare_mise: true`，quality job 会在真实入口检测之后、执行入口之前用官方
+[`jdx/mise-action@v3`](https://github.com/jdx/mise-action) 准备 mise 管理器本身：
+
+```yaml
+    with:
+      quality_prepare_mise: true
+```
+
+该开关默认关闭，且只在入口模式生效。准备步骤保持上游默认「只装管理器、不跑
+`mise install`」（`install: false`），另锁两个导出口：`env: false`、
+`add_shims_to_path: false` 不把 caller 项目 env/shims 导出给后续平台 checkout/PR
+预检（`mise` 本体二进制仍在 PATH，入口脚本照常跑 `mise trust && mise install`）；
+`working_directory: runner.temp` 把 mise 子进程 cwd 留在 caller checkout 之外，
+`mise ls` 不再读 caller 配置。准备失败会直接阻断 quality，不会带着缺失的工具链
+进入入口。legacy 自动探测路径不受此开关影响。
+
+两个上游行为不由本开关禁止，仍会照常发生，如实声明：官方 action 会把 caller
+workspace 写入 `MISE_TRUSTED_CONFIG_PATHS`（项目 mise 配置仍被上游自动信任），
+默认缓存仍可能被读取（`install: false` 下不写缓存）。`mise trust`/`mise install`
+与项目依赖检查的显式执行仍由业务入口负责，gate 不代跑。
+
 ## Required Gate v2 + Shadow Calibration v2
 
 当前 Required Gate caller 使用 `gate-v2.yml@v2`。`shadow-review-independence` 计划
@@ -84,6 +107,7 @@ PR1 的 `REVIEW_RUN_MODE` 由两个 reusable 的实际 review entry step 显式�
 | `timeout_minutes` | `45` | 仅 `quality` job 的硬超时 |
 | `primary_timeout_minutes` | `25` | `primary` job 自己的超时预算，与 `timeout_minutes` 解耦——需要给 `review-primary` 留出「GitHub 硬 SIGKILL 前写完并上传 canonical audit」的收尾余量 |
 | `control_runner` | `""` | `gate` 聚合器与 `notify` 的 runner 池：留空（默认）跟随 `runner` 走自建（gate#27 起，取整税修复）；`github-hosted` 把控制面钉回 hosted，是单仓回滚逃生舱；遗留值 `self-hosted-control` 等价于留空 |
+| `quality_prepare_mise` | `false` | 仅质量 job：`true` 且仓库存在可执行的 `scripts/gate-quality` 入口时，用 `jdx/mise-action@v3` 准备 mise 管理器本身供入口使用（`install: false` 不跑 `mise install`；`env`/`add_shims_to_path: false` 不导出项目 env/shims；cwd 在项目外）；不装项目工具/依赖；上游 auto-trust 与缓存读取仍可能发生（详见质量入口段）；legacy 路径与不传该 input 的 caller 行为不变 |
 
 ### `gate-shadow-v2.yml` inputs(`workflow_call`)
 
