@@ -9,8 +9,11 @@ hand-written fixture.
 
 改坏 .github/workflows/gate-v2.yml（input 缺失/类型/默认值漂移、entry guard 移除、
 install 漂移、步骤换位、吞错、legacy 路径误触）会红；对应卡面不变式：仅 entry
-模式 + caller 显式 opt-in 才准备 mise；gate 只引导管理器本身（install: false）；
-准备失败直接阻断业务入口。
+模式 + caller 显式 opt-in 才准备 mise；gate 只引导管理器本身（install: false），
+且不把 caller 项目 env/shims 导出给后续平台 checkout/PR 预检（env: false、
+add_shims_to_path: false），mise 子进程 cwd 留在 caller checkout 之外
+（working_directory: runner.temp）；上游仍 auto-trust workspace/默认缓存为官方
+既有行为，由 README 如实披露，不由本步骤禁止；准备失败直接阻断业务入口。
 """
 import re
 from pathlib import Path
@@ -124,9 +127,17 @@ def test_quality_mise_bootstrap_uses_official_action_and_never_installs_project_
         f"{MISE_STEP_NAME} must use the official jdx/mise-action@v3, "
         f"got: {step.get('uses')!r}"
     )
-    assert step.get("with") == {"install": False}, (
-        f"{MISE_STEP_NAME} with must be exactly install: false — gate prepares "
-        f"the tool manager only; got: {step.get('with')!r}"
+    assert step.get("with") == {
+        "install": False,
+        "env": False,
+        "add_shims_to_path": False,
+        "working_directory": "${{ runner.temp }}",
+    }, (
+        f"{MISE_STEP_NAME} with must be exactly install: false (no mise install) "
+        "+ env: false + add_shims_to_path: false (no caller mise env/shims "
+        "leak into the platform checkout/PR preflight) + working_directory "
+        "outside the caller checkout (mise ls must not read caller config); "
+        f"got: {step.get('with')!r}"
     )
     assert not str(step.get("run", "")).strip(), (
         f"{MISE_STEP_NAME} must be a pure action step: no inline installer script"
