@@ -107,10 +107,15 @@ command -v pnpm >/dev/null 2>&1 \
 echo "GATE315-PROBE fact=pnpm_present result=true"
 negative_dir=$(mktemp -d)
 trap 'rm -rf -- "$negative_dir"' EXIT
-# Real install command, isolated empty dir, --offline: fails fast with
-# ERR_PNPM_NO_PKG_MANIFEST, touches no network, writes no host cache.
+# Real install command in an isolated dir that must deterministically fail:
+# a file: dependency pointing at a nonexistent local directory (first probe
+# round used --offline --frozen-lockfile on an empty dir, but the runner's
+# pnpm v12.11.2 treats that as a no-op success — "Already up to date"; the
+# missing link target fails on every pnpm major). --offline guarantees no
+# network; nothing outside negative_dir is touched.
+printf '{"name":"gate315-negative-probe","private":true,"dependencies":{"gate315-probe-missing-local":"file:./missing-pkg-dir"}}\n' > "$negative_dir/package.json"
 echo "GATE315-PROBE fact=pnpm_install_start result=true"
-pnpm install --offline --frozen-lockfile --dir "$negative_dir"
+pnpm install --offline --dir "$negative_dir"
 # Unreachable under set -eu: the install above must exit non-zero and abort
 # this step. GATE315-PROBE-UNREACHABLE must therefore never appear in the log.
 echo "GATE315-PROBE-UNREACHABLE round=negative"
