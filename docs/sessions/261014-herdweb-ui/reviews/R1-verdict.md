@@ -5,7 +5,7 @@
 ## 范围与结论
 
 - 冻结审查范围：`008170e11a949c77029d1dbb658e36554b2c8b7b..9d05e7d64311c4dc1a5387606cb96b5247d16678`；8 个 diff 文件均已审。
-- `failure-visibility: p2-only`
+failure-visibility: p2-only
 - 评审结论：1 项 P2 测试覆盖缺口；无确认的 P1。
 - 严重度：P2。交付阻断：否；当前 POST 错误实际仍以非零退出，但对应测试没有走到 POST 分支。
 
