@@ -2,16 +2,22 @@
 # TEMPORARY probe entry — gate-20261014-45 / dispatch dlg-20261014-082805-ee0909.
 # Fixture scripts/gate-quality for the gate315-mise probe branch. Never merge.
 #
+# NEGATIVE round: identical asserts as the positive round, then ONE explicit,
+# deterministic, real dependency-install call that must fail (pnpm install in
+# an isolated dir with no package.json, --offline so nothing is fetched). With
+# set -eu the failed install must abort this step; the GATE315-PROBE-UNREACHABLE
+# sentinel at the end must therefore never appear in the step log. A red run
+# here is the expected experimental signal, not a regression.
+#
 # Runs inside the gate-v2 quality job as the business entry, after the mise
 # bootstrap (jdx/mise-action@v3 with install:false / env:false /
 # add_shims_to_path:false / working_directory:runner.temp) and after the
 # platform python3 steps (gate-actions checkout, PR size preflight).
-# set -eu: any failed assert aborts this step and fails the job. Output is
-# strictly whitelisted: fixed GATE315-PROBE lines with booleans — never raw
-# PATH, absolute host paths, env dumps or secret values.
+# Output is strictly whitelisted: fixed GATE315-PROBE lines with booleans —
+# never raw PATH, absolute host paths, env dumps or secret values.
 set -euo pipefail
 
-echo "GATE315-PROBE entry=scripts/gate-quality round=positive"
+echo "GATE315-PROBE entry=scripts/gate-quality round=negative"
 
 fail() { echo "::error::GATE315-PROBE-ASSERT-FAILED: $1"; exit 1; }
 
@@ -89,6 +95,22 @@ else
   echo "GATE315-PROBE fact=mise_yes_present result=false"
 fi
 
-# Positive-round sentinel, written LAST: its presence in the step log proves
-# every assert above ran to completion on the real self-hosted runner.
-echo "GATE315-PROBE-OK round=positive"
+# Round sentinel, written after the asserts: its presence in the step log
+# proves every assert above ran to completion on the real self-hosted runner.
+echo "GATE315-PROBE-OK round=negative"
+
+# ── negative round: explicit, deterministic dependency-prep failure ──────
+# pnpm presence is checked FIRST so a missing binary classifies as
+# environment-blocked instead of being mistaken for the target signal.
+command -v pnpm >/dev/null 2>&1 \
+  || fail "pnpm not found on runner: environment-blocked, negative signal not exercised"
+echo "GATE315-PROBE fact=pnpm_present result=true"
+negative_dir=$(mktemp -d)
+trap 'rm -rf -- "$negative_dir"' EXIT
+# Real install command, isolated empty dir, --offline: fails fast with
+# ERR_PNPM_NO_PKG_MANIFEST, touches no network, writes no host cache.
+echo "GATE315-PROBE fact=pnpm_install_start result=true"
+pnpm install --offline --frozen-lockfile --dir "$negative_dir"
+# Unreachable under set -eu: the install above must exit non-zero and abort
+# this step. GATE315-PROBE-UNREACHABLE must therefore never appear in the log.
+echo "GATE315-PROBE-UNREACHABLE round=negative"
