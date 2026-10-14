@@ -31,6 +31,12 @@ jobs:
     with:
       tier: personal
       runner: self
+      # TEMPORARY (gate-20261014-46): Default org runner group admits gate-v2.yml
+      # only at main/@v2 refs, never this probe branch ref, so codex-pool control
+      # jobs can't be admitted and the run never reaches terminal state. Existing
+      # production escape hatch routes them to hosted; the measured quality job
+      # stays on the unchanged runner: self.
+      control_runner: github-hosted
       quality_prepare_mise: true
     secrets:
       SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
