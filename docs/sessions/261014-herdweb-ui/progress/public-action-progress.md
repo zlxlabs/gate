@@ -15,7 +15,10 @@
 - 下一步唯一动作：push + draft PR + 等 CI 终态。
 
 ## M3 发布边界（阶段：review-waiting）
-- 本段结论：见下方 push/PR 记录；远端 v2 抬升含本 action 前，B 卡不得开工、README uses@v2 未生效。
+- 本段结论：draft PR zlxlabs/gate#317（head 4c0809da889b446cc567915b1e622e159a54be19）；
+  PR CI run 38553441773：test conclusion=SUCCESS（2m41s，实际执行非 skip）、actionlint
+  conclusion=SUCCESS；分支远端实际输出见报告 ls-remote 段。远端 v2 抬升含本 action 前，
+  B 卡不得开工、README uses@v2 未生效。
 - 外部时变证据快照（原输出 + sha256(evidence-snapshot.txt)=74c02755909773444864bd014230042a10e045b4c1ed77c5deefe87ebe2fb75e，副本在 /tmp/herdweb-public-ui-48/）：
   - `gh repo view zlxlabs/gate --json visibility` → `{"visibility":"PUBLIC"}`
   - `gh api repos/zlxlabs/herdweb/actions/jobs/115400951529`（白名单字段）→
