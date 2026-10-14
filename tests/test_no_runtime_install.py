@@ -54,6 +54,10 @@ ENTRY_FILES = {
     # quality 槽：仅调 git，无网络取包。
     ".github/actions/pr-size-preflight/preflight.py": "quality 槽 preflight 本体",
     ".github/actions/pr-size-preflight/action.yml": "quality 槽 preflight 包装器",
+    # public ui-evidence 评论 action（gate#314，gate-20261014-48）：private 版移植，
+    # 纯评论发布，非门禁必经路径。
+    ".github/actions/ui-evidence-publish/action.yml": "public ui-evidence 评论包装器",
+    ".github/actions/ui-evidence-publish/sticky-comment.sh": "public ui-evidence 评论发布脚本",
     # ledger 槽。
     ".github/actions/review-ledger/build_ledger.py": "ledger 槽本体",
     ".github/actions/review-ledger/action.yml": "ledger 槽包装器",
@@ -101,6 +105,8 @@ def _discover_entries() -> set[str]:
     for pattern in (
         ".github/actions/**/*.py",
         ".github/actions/*/action.yml",
+        # gate-20261014-48：actions 目录下的 bash 入口也属闭集（当前仅 ui-evidence-publish 一处）。
+        ".github/actions/*/*.sh",
         "scripts/*.py",
         "scripts/*.sh",
     ):
