@@ -99,6 +99,26 @@ fi
 # proves every assert above ran to completion on the real self-hosted runner.
 echo "GATE315-PROBE-OK round=negative"
 
+# ── known-bad round: the absence predicate must reject a real leak ────────
+# ONE subprocess only, env scoped to this single command (never exported to
+# the rest of the job): same python3 the platform steps run, fixture PYTHONPATH
+# on it → sitecustomize must create the marker; assert 3's absence predicate
+# must then REJECT this known-bad state. No marker here means the predicate
+# would pass vacuously on a real platform leak (sitecustomize write failed or
+# was swallowed by site's import guard) — fail loud, never degrade to green.
+PYTHONPATH="$fixture_dir/python" python3 -c 'pass' >/dev/null 2>&1
+[ -e "$leak_marker" ] \
+  || fail "known-bad: fixture PYTHONPATH subprocess produced no leak marker — absence predicate is vacuous"
+echo "GATE315-PROBE known_bad=fixture_pythonpath_subprocess result=true"
+echo "GATE315-PROBE-KNOWN-BAD-REJECTED round=negative"
+# Remove exactly the one marker this test created (nothing else is touched);
+# workspace must be back to the asserted-absent state before the install
+# failure injection below.
+rm -- "$leak_marker"
+[ ! -e "$leak_marker" ] \
+  || fail "known-bad cleanup: marker still present after removing the one this test created"
+echo "GATE315-PROBE known_bad=marker_cleanup result=true"
+
 # ── negative round: explicit, deterministic dependency-prep failure ──────
 # pnpm presence is checked FIRST so a missing binary classifies as
 # environment-blocked instead of being mistaken for the target signal.

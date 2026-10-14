@@ -11,6 +11,11 @@ On import it writes one boolean marker file into the workspace. Nothing else:
 no network, no system mutation, no subprocess. Outside a platform step (no
 GITHUB_WORKSPACE) it is inert. The marker file is asserted ABSENT by
 scripts/gate-quality.
+
+The write deliberately has NO try/except: a swallowed OSError here would make
+the absence assertion pass vacuously on a real leak (gate-20261014-46). The
+write must fail loud; the known-bad round in scripts/gate-quality proves the
+predicate rejects a state where this file did create the marker.
 """
 
 import os
@@ -22,15 +27,8 @@ def _write_marker() -> None:
     if not workspace:
         return
     marker = pathlib.Path(workspace) / ".gate315-probe" / "platform-leak.marker"
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("platform python inherited fixture PYTHONPATH\n", encoding="utf-8")
-    except OSError:
-        # Observability only: a write failure must never break the step we are
-        # leaking into. The assert on the marker's absence would then pass
-        # vacuously, which the marker's own mtime/absence cannot distinguish —
-        # accepted limitation of a one-shot fixture.
-        pass
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("platform python inherited fixture PYTHONPATH\n", encoding="utf-8")
 
 
 _write_marker()
