@@ -256,6 +256,20 @@ Codex finding disposition: correctness.example-id = false-positive — 说明证
 当前契约。gate-hub#810 的身份顾虑仍成立：回执不证明人工审批，但 owner 已裁决接受身份不可证，改用证据约束和留痕；
 不会恢复标签豁免，也不要求管理员绕过。
 
+## UI 证据评论 action（public uses）
+
+`.github/actions/ui-evidence-publish/`：e2e 状态 → PR 粘性评论（证据站搜索深链），
+不产出/搬运任何文件。从 private gate-hub 同名 action 移植，供 public 仓直接
+`uses: zlxlabs/gate/.github/actions/ui-evidence-publish@v2` 引用（发布状态以远端
+`refs/tags/v2` 是否包含引入提交为准，见 `git ls-remote`）。caller 前置：runner 预装
+bash/gh/jq；job 需 `pull-requests: write`；报告**已上传成功后**才调用本 action；
+仅 PR 事件生效。inputs：`e2e-status`（required，上游 e2e 步骤 outcome）、
+`head-sha`（required，完整 40 位 SHA，与上传报告 title 同一表达式）、
+`evidence-base-url`（required，无默认，caller 显式传证据站 URL）、`subject`
+（默认 `UI`，同一 PR 多界面各占一条评论互不覆盖）、`github-token`（默认
+github.token）。评论按 subject marker 单值更新；URL 缺失时在任何 API 请求前失败
+（`UI-EVIDENCE-URL-MISSING`）。
+
 ## 公开仓安全模型（四层）
 
 1. **PR 作者与 fork 防护写在 reusable workflow 本体**：只有同仓、合法非空人类作者的

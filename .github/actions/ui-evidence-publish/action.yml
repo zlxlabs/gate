@@ -1,0 +1,43 @@
+# 录屏走查的「轻量发布半」——public 仓可加载的评论 action（gate#314）。
+# 从 private gate-hub 同名 action 只读移植：分页/subject marker/单值 PATCH、
+# full-SHA 深链与 fail-loud 语义不变；差异只有：evidence-base-url 必须由 caller
+# 显式传入（private 版默认值是内网地址，public 包不能内置任何默认主机），并去除
+# private 部署专属的 footer 与文档引用。本 action **不产出/不搬运任何文件**——
+# report 已由 caller workflow 直接上传到证据服务器，这里只在 PR 上发/更新一条
+# 粘性评论：如实反映 e2e 成败（不掩盖失败）+ 深链到证据服务器按 commit SHA 的
+# 搜索结果。caller runner 需预装 bash/gh/jq。
+name: "UI evidence publish"
+description: "e2e 状态 → PR 粘性评论（证据站搜索深链）。不产出/搬运任何文件。"
+
+inputs:
+  e2e-status:
+    description: "上游跑 e2e 那一步的 outcome(success/failure/…);评论据此如实反映,不掩盖失败。"
+    required: true
+  subject:
+    description: "被走查界面的名字,进评论标题/文案(如 Reader、后台看板)。也用作粘性评论的 marker → 同一 PR 多个界面各自更新、不互相覆盖。"
+    default: "UI"
+  head-sha:
+    description: "证据报告 title 里用的完整 40 位 head SHA,必须与 caller 上传报告时同一个表达式(通常是 github.event.pull_request.head.sha 或 github.sha)——两处不一致会导致评论里的搜索深链命中错误。"
+    required: true
+  evidence-base-url:
+    description: "证据服务器 base URL(如 https://host:8443),无默认值,由 caller 显式传入;缺省时评论步骤会在任何 API 请求前失败。"
+    required: true
+  github-token:
+    description: "发 PR 评论用的 token,默认 github.token(需 caller 授予 pull-requests: write)。"
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: PR 粘性评论(e2e 状态 + 证据深链)
+      if: ${{ github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        E2E_STATUS: ${{ inputs.e2e-status }}
+        SUBJECT: ${{ inputs.subject }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        EVIDENCE_BASE_URL: ${{ inputs.evidence-base-url }}
+      run: bash "${{ github.action_path }}/sticky-comment.sh"
