@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# TEMPORARY probe entry — gate-20261014-45 / dispatch dlg-20261014-082805-ee0909.
+# Fixture scripts/gate-quality for the gate315-mise probe branch. Never merge.
+#
+# Runs inside the gate-v2 quality job as the business entry, after the mise
+# bootstrap (jdx/mise-action@v3 with install:false / env:false /
+# add_shims_to_path:false / working_directory:runner.temp) and after the
+# platform python3 steps (gate-actions checkout, PR size preflight).
+# set -eu: any failed assert aborts this step and fails the job. Output is
+# strictly whitelisted: fixed GATE315-PROBE lines with booleans — never raw
+# PATH, absolute host paths, env dumps or secret values.
+set -euo pipefail
+
+echo "GATE315-PROBE entry=scripts/gate-quality round=positive"
+
+fail() { echo "::error::GATE315-PROBE-ASSERT-FAILED: $1"; exit 1; }
+
+workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE missing}"
+fixture_dir="$workspace/.gate315-probe"
+leak_marker="$fixture_dir/platform-leak.marker"
+
+# 1. mise project env must NOT be active in this process: gate-v2 and the
+#    mise action never export it (env:false); activation is the business
+#    entry's own decision and this fixture deliberately does not activate.
+[ -z "${GATE315_PROJECT_ENV:-}" ] \
+  || fail "GATE315_PROJECT_ENV exported: mise project env active without explicit activation"
+echo "GATE315-PROBE assert=project_env_not_exported result=true"
+
+# 2. The fixture PYTHONPATH must NOT be inherited by this entry process.
+case ":${PYTHONPATH:-}:" in
+  *":$fixture_dir/python:"*) fail "fixture .gate315-probe/python on inherited PYTHONPATH" ;;
+esac
+echo "GATE315-PROBE assert=fixture_pythonpath_not_inherited result=true"
+
+# 3. The platform-leak marker must not exist: sitecustomize.py writes it iff
+#    any platform python3 process after the mise action inherited the fixture
+#    PYTHONPATH (covers the gate-actions bootstrap python3 and the PR size
+#    preflight python3).
+[ ! -e "$leak_marker" ] \
+  || fail "platform-leak marker exists: a platform python3 process inherited the fixture PYTHONPATH"
+echo "GATE315-PROBE assert=no_platform_leak_marker result=true"
+
+# 4. mise action shims must NOT be on PATH. Resolve the mise data dir with the
+#    same precedence chain upstream jdx/mise-action@v3 miseDir() uses (the
+#    caller leaves the mise_dir input unset):
+#    MISE_DATA_DIR || XDG_DATA_HOME/mise || $HOME/.local/share/mise.
+#    Compare PATH entries exactly (entry-wise, no substring guessing).
+#    ${data}/bin on PATH is the EXPECTED bootstrap outcome (upstream adds the
+#    binary dir unconditionally); ${data}/shims must be absent (upstream adds
+#    it only with add_shims_to_path=true). A host-level mise on the runner is
+#    distinguishable only by this exact-dir comparison, not by substring.
+mise_data_dir=${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}
+shims_dir="$mise_data_dir/shims"
+bin_dir="$mise_data_dir/bin"
+path_has_entry() {
+  local needle=$1
+  printf '%s\n' "$PATH" | tr ':' '\n' | grep -Fqx -- "$needle"
+}
+if path_has_entry "$shims_dir"; then
+  fail "mise shims dir on PATH (add_shims_to_path leak): shims dir of the mise data dir"
+fi
+echo "GATE315-PROBE assert=mise_shims_not_on_path result=true"
+if path_has_entry "$bin_dir"; then
+  echo "GATE315-PROBE fact=mise_bin_dir_on_path result=true"
+else
+  echo "GATE315-PROBE fact=mise_bin_dir_on_path result=false"
+fi
+
+# 5. Manager reachable and runnable: boolean only — no absolute host path and
+#    no version string is echoed.
+command -v mise >/dev/null 2>&1 || fail "mise not found on PATH"
+if mise --version >/dev/null 2>&1; then
+  echo "GATE315-PROBE assert=mise_version_runs result=true"
+else
+  fail "mise --version exited non-zero"
+fi
+
+# 6. Upstream auto-trust / MISE_YES are disclosed upstream behaviors (see
+#    gate-v2.yml's mise step comment and this repo's README); their presence
+#    is recorded as a fact, never treated as an error.
+if [ -n "${MISE_TRUSTED_CONFIG_PATHS:-}" ]; then
+  echo "GATE315-PROBE fact=mise_trusted_config_paths_present result=true"
+else
+  echo "GATE315-PROBE fact=mise_trusted_config_paths_present result=false"
+fi
+if [ -n "${MISE_YES:-}" ]; then
+  echo "GATE315-PROBE fact=mise_yes_present result=true"
+else
+  echo "GATE315-PROBE fact=mise_yes_present result=false"
+fi
+
+# Positive-round sentinel, written LAST: its presence in the step log proves
+# every assert above ran to completion on the real self-hosted runner.
+echo "GATE315-PROBE-OK round=positive"

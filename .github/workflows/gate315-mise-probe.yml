@@ -1,0 +1,37 @@
+# TEMPORARY PROBE — gate-20261014-45 / dispatch dlg-20261014-082805-ee0909.
+# One-shot fixture branch: real GitHub Actions caller probe for the frozen
+# production gate-v2.yml at 7c2ef54f9e505bc84222bcc7142fa96741c97b36 (H1).
+# MUST NEVER BE MERGED and MUST NOT land on main: this workflow exists only to
+# drive the reusable gate through this probe branch so the quality job's mise
+# bootstrap and environment boundary are observed on a real self-hosted run.
+# Positive round: asserts below must hold and GATE315-PROBE-OK must appear.
+# Negative round: scripts/gate-quality deliberately fails a real dependency
+# install; the run must go red at that step (expected experiment, not a
+# regression).
+name: gate315-mise-probe
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Same union gate-v2.yml requires of every caller (see its top-level
+# permissions comment): actions for the Jobs API, pull-requests for the
+# preflight/ledger comment paths, contents for checkout.
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  probe:
+    # Workspace-relative reuse (check_pinned_uses contract): this resolves to
+    # this branch's own gate-v2.yml, whose bytes are pinned identical to H1 by
+    # the probe branch contract (git diff H1..probe -- gate-v2.yml is empty).
+    uses: ./.github/workflows/gate-v2.yml
+    with:
+      tier: personal
+      runner: self
+      quality_prepare_mise: true
+    secrets:
+      SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
+      SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}

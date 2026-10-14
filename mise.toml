@@ -1,0 +1,8 @@
+# TEMPORARY probe fixture — gate-20261014-45. [env] only, deliberately no
+# [tools]: the probe asserts the gate-v2 platform steps do NOT inherit this
+# env and that the business entry decides activation itself. Never merge.
+# Template syntax verified against mise 2026.10.8 (`mise env` resolves
+# {{ config_root }} to the absolute directory of this file).
+[env]
+GATE315_PROJECT_ENV = "mise-project-env-active"
+PYTHONPATH = "{{ config_root }}/.gate315-probe/python"
