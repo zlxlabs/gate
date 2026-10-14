@@ -1,19 +1,11 @@
-"""public ui-evidence-publish（gate-20261014-48，fixes gate#314）契约与行为测试。
+"""public ui-evidence-publish（gate-20261014-48，refs gate#314）契约与行为测试。
 
-private action 无法被 public 仓 `uses:` 加载，public gate 需要自己的 action 本体
-（gate-hub 同名 action 的只读移植，去内网默认/私有痕迹）。本文件锁定移植不变量：
-
-- manifest 契约：inputs required/default、输入描述无可求值表达式、PR guard、
-  env 映射与 github.action_path 解析脚本；
-- 空 URL 在任何 gh 请求前失败（UI-EVIDENCE-URL-MISSING），无 fallback；
-- 分页流（gh --paginate 裸拼接的多页数组）经真实 jq slurp 合并，重复 marker
-  只取首个 id 单值 PATCH，无匹配 POST；
-- API 错误非零上抛不写成功；正文如实反映 success/failure/unknown；
-  深链含完整 40 位 SHA；末尾斜杠归一化；subject 引号/反斜杠不破坏 jq。
-
-E2E：生产 sticky-comment.sh 在真实 bash 子进程 + 系统 jq 下消费保留的多页 GH
-JSON fixture；假 gh 只观察并记录实际 argv（含 `-f body=` bytes）与白名单 env，
-显式假 token，绝不连真实 GitHub。
+锁定不变量：manifest 契约（inputs/PR guard/env 映射/action_path）；空 URL 在任何
+gh 请求前失败；分页流经真实 jq slurp 合并、重复 marker 只取首个 id PATCH；无匹配
+POST；API 错误非零上抛；正文如实反映 success/failure/unknown；深链含完整 40 位
+SHA；末尾斜杠归一化；subject 引号/反斜杠不破坏 jq。E2E：生产脚本真实 bash 子进程
++ 系统 jq 消费保留的多页 GH JSON fixture；假 gh 只记录实际 argv（含 `-f body=`
+bytes），显式假 token，绝不连真实 GitHub。
 """
 from __future__ import annotations
 

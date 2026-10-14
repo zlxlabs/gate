@@ -10,8 +10,7 @@
 ## M2 实现绿 + 红验（阶段：implementing）
 - 本段结论：18 passed（本卡 12 + 闭集 6）；全量 1563 passed exit=0（165s，
   /tmp/herdweb-public-ui-48/full-verify.log）；两条红验均 AssertionError 后仅恢复变异行：
-  ①移除 `:?` URL 校验 → stderr 缺 `UI-EVIDENCE-URL-MISSING` 红；
-  ②去 `jq -s` slurp → 脚本 returncode 5（jq 报错）红。
+  ①移除 `:?` URL 校验 → stderr 缺 `UI-EVIDENCE-URL-MISSING` 红；②去 `jq -s` → returncode 5 红。
 - 关键决策：闭集测试精确扩 `.github/actions/*/*.sh` 发现并登记两入口；durations 仅加本卡键 0.30。
 - 下一步唯一动作：push + draft PR + 等 CI 终态。
 
