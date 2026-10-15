@@ -55,8 +55,11 @@ LEDGER_ENTRY_REQUIRED_FIELDS = (
 )
 LEDGER_ENTRY_OPTIONAL_FIELDS = (
     "disposition_receipt_consumption", "terminal_source_attempt", "finding_relation",
+    "incremental_blocking_shadow",
 )
 _RELATION_VALUES = frozenset({"new", "repeat", "conflict"})
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+_HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
 LEDGER_ENTRY_FIELDS = LEDGER_ENTRY_REQUIRED_FIELDS + LEDGER_ENTRY_OPTIONAL_FIELDS
 
 
@@ -532,6 +535,94 @@ def _validate_finding_relation(block: Any) -> dict[str, Any]:
     return block
 
 
+def _validate_incremental_blocking_shadow(block: Any) -> dict[str, Any]:
+    """Validate the gate-v2 ledger job's incremental blocking shadow payload
+    (§5.1 of gate-hub docs/designs/convergence-incremental-blocking-shadow.md;
+    produced by .github/actions/gate-aggregator/incremental_shadow_io.py).
+    Raises ValueError on any shape/domain violation — the caller drops the
+    field and prints one GATE-INCREMENTAL-SHADOW-UNAVAILABLE line instead of
+    failing the row (the shadow is observational, card G2)."""
+    if not isinstance(block, dict) or block.get("schema_version") != 1:
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: block schema")
+    status = block.get("status")
+    if status not in ("computed", "skipped", "degraded"):
+        raise ValueError(f"GATE-INCREMENTAL-SHADOW-INVALID: status {status!r}")
+    skip_reason, degrade_reason = block.get("skip_reason"), block.get("degrade_reason")
+    if not isinstance(skip_reason, str) or not isinstance(degrade_reason, str):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: reason fields must be strings")
+    if status == "skipped" and (skip_reason not in {
+        "review_not_expected", "no_prior_distinct_head", "history_truncated", "audit_absent",
+    } or degrade_reason != ""):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: skipped reason set")
+    if status == "degraded" and (degrade_reason not in {
+        "silo_list_failed", "runs_list_failed", "silo_archives_partial",
+        "diff_fetch_timeout", "diff_failed", "budget_exhausted", "internal_error",
+    } or skip_reason != ""):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: degraded reason set")
+    if status == "computed" and (skip_reason != "" or degrade_reason != ""):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: computed must not carry reasons")
+    for field in ("head_sha", "prev_head_sha"):
+        value = block.get(field)
+        if not isinstance(value, str) or not (value == "" or _SHA40_RE.fullmatch(value)):
+            raise ValueError(f"GATE-INCREMENTAL-SHADOW-INVALID: {field}")
+    for field in ("canonical_round", "prior_rounds_used"):
+        if not _strict_int(block.get(field)) or block[field] < 0:
+            raise ValueError(f"GATE-INCREMENTAL-SHADOW-INVALID: {field}")
+    # §5.1: canonical_round >= 2 is where classification exists at all — a
+    # hard floor only for computed payloads; degraded rows that never got
+    # history honestly report 0 (no classification happened).
+    if status == "computed" and block["canonical_round"] < 2:
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: canonical_round below the first classifiable round")
+    if status == "computed" and block["prev_head_sha"] == "":
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: computed without prev_head_sha")
+    diff_status = block.get("diff_status")
+    if diff_status not in ("ok", "unavailable"):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: diff_status")
+    if status == "computed" and diff_status != "ok":
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: computed must have the diff")
+    findings = block.get("findings")
+    if not isinstance(findings, list) or len(findings) > 50:
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: findings")
+    for item in findings:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "severity", "file", "line", "class", "match_round", "match_line", "text_digest",
+        }:
+            raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: finding shape")
+        for field in ("id", "severity"):
+            if not isinstance(item[field], str) or not item[field]:
+                raise ValueError(f"GATE-INCREMENTAL-SHADOW-INVALID: finding {field}")
+        if item["severity"] not in ("blocker", "major"):
+            raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: finding severity")
+        if item["file"] is not None and not isinstance(item["file"], str):
+            raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: finding file")
+        if item["line"] is not None and not _strict_int(item["line"]):
+            raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: finding line")
+        if item["class"] not in ("no_anchor", "duplicate", "diff_unavailable", "on_diff", "neither"):
+            raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: finding class")
+        for field in ("match_round", "match_line"):
+            if item[field] is not None and not _strict_int(item[field]):
+                raise ValueError(f"GATE-INCREMENTAL-SHADOW-INVALID: finding {field}")
+        if (item["class"] == "duplicate") != (item["match_round"] is not None and item["match_line"] is not None):
+            raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: match fields only on duplicate")
+        if not isinstance(item["text_digest"], str) or not _HEX16_RE.fullmatch(item["text_digest"]):
+            raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: text_digest")
+    if type(block.get("truncated")) is not bool:
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: truncated")
+    counts = block.get("class_counts")
+    if not isinstance(counts, dict) or set(counts) != {
+        "no_anchor", "duplicate", "diff_unavailable", "on_diff", "neither",
+    } or any(not _strict_int(value) or value < 0 for value in counts.values()):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: class_counts")
+    total = sum(counts.values())
+    if block["truncated"] and total <= len(findings):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: truncated flag contradicts counts")
+    if not block["truncated"] and total != len(findings):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: counts do not match findings")
+    if block.get("counterfactual") not in ("block", "pass", "unclassified", "not_applicable"):
+        raise ValueError("GATE-INCREMENTAL-SHADOW-INVALID: counterfactual")
+    return block
+
+
 def _disposition_receipt_consumption_from_terminal(
     envelope: dict[str, Any], *, repository: str, pr_number: int,
     run_id: int, run_attempt: int, head_sha: str,
@@ -560,6 +651,20 @@ def _disposition_receipt_consumption_from_terminal(
     return validate_disposition_receipt_audit(envelope["disposition_receipt_consumption"])
 
 
+def _load_shadow_payload(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """Read the io script's shadow.json; (None, reason) when missing/empty or
+    unparseable — the row survives without the field (card G2 fail-open)."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return None, "shadow_missing"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None, "invalid_json"
+    if not isinstance(payload, dict):
+        return None, "invalid_json"
+    return payload, ""
+
+
 def build_entry(
     *,
     repository: str,
@@ -573,6 +678,7 @@ def build_entry(
     install: dict[str, Any] | None = None,
     fallback_status: str = "not_run",
     terminal_envelope: dict[str, Any] | None = None,
+    shadow_payload: dict[str, Any] | None = None,
     input_short_circuited: bool = False,
     disposition_status: str = "success",
 ) -> dict[str, Any]:
@@ -619,6 +725,14 @@ def build_entry(
             entry["terminal_source_attempt"] = source_attempt
         if "finding_relation" in terminal_envelope:
             entry["finding_relation"] = _validate_finding_relation(terminal_envelope["finding_relation"])
+    if shadow_payload is not None:
+        # Observational field (card G2): a rejected payload degrades to the
+        # row without it — never a row failure, never a second field.
+        try:
+            entry["incremental_blocking_shadow"] = _validate_incremental_blocking_shadow(shadow_payload)
+        except ValueError as exc:
+            print("GATE-INCREMENTAL-SHADOW-UNAVAILABLE: reason=invalid_payload")
+            print(f"incremental shadow payload rejected: {exc}", file=sys.stderr)
     return entry
 
 
@@ -675,6 +789,10 @@ def main() -> int:
     parser.add_argument("--preflight-path", required=True, type=Path)
     parser.add_argument("--install-path", required=True, type=Path)
     parser.add_argument("--terminal-path", default="")
+    # Optional incremental blocking shadow payload (card G2). Callers that
+    # omit it keep the older ledger shape; an unreadable payload is dropped
+    # with one GATE-INCREMENTAL-SHADOW-UNAVAILABLE line.
+    parser.add_argument("--shadow-path", default="")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", required=True, type=int)
@@ -702,6 +820,12 @@ def main() -> int:
     install = _load_json(args.install_path)
     terminal_raw = args.terminal_path.strip() if isinstance(args.terminal_path, str) else str(args.terminal_path or "").strip()
     terminal = load_gate_terminal_envelope(Path(terminal_raw)) if terminal_raw else None
+    shadow_raw = args.shadow_path.strip() if isinstance(args.shadow_path, str) else str(args.shadow_path or "").strip()
+    shadow_payload: dict[str, Any] | None = None
+    if shadow_raw:
+        shadow_payload, shadow_error = _load_shadow_payload(Path(shadow_raw))
+        if shadow_payload is None:
+            print(f"GATE-INCREMENTAL-SHADOW-UNAVAILABLE: reason={shadow_error}")
     if not preflight.get("reviewable", True):
         fallback = "blocked_by_size"
     elif _truthy(args.codex_waived):
@@ -728,6 +852,7 @@ def main() -> int:
         install=install,
         fallback_status=fallback,
         terminal_envelope=terminal,
+        shadow_payload=shadow_payload,
         input_short_circuited=input_short_circuited,
     )
     write_ledger(args.output, entry)

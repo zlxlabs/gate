@@ -8,5 +8,6 @@
   "tests/test_v2_tag_sync.py": 0.71,
   "tests/test_gate_quality_mise.py": 0.05,
   "tests/test_ui_evidence_publish.py": 0.3,
-  "tests/test_incremental_shadow.py": 0.1
+  "tests/test_incremental_shadow.py": 0.1,
+  "tests/test_incremental_shadow_wiring.py": 6.9
 }
