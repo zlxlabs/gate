@@ -171,7 +171,10 @@ def test_creates_comment_when_no_marker_on_any_page(tmp_path):
     assert len(posts) == 1
     assert posts[0][:4] == [b"api", b"--method", b"POST",
                             f"repos/{REPO}/issues/7/comments".encode()]
-    assert b"<!-- ui-evidence-bot:UI -->" in _body(posts[0])
+    body = _body(posts[0]).decode("utf-8")
+    assert "<!-- ui-evidence-bot:UI -->" in body
+    assert "不进 branch protection" not in body
+    assert "不阻断合并" not in body
 
 
 @pytest.mark.parametrize("status,expected,forbidden", [
@@ -217,3 +220,31 @@ def test_api_error_exits_nonzero_without_success_output(tmp_path, fail):
     proc, rec = _run(tmp_path, page1=page1, page2="[]", fail=fail)
     assert proc.returncode != 0, f"fail={fail} 却退出 0"
     assert "updated comment" not in proc.stdout and "created comment" not in proc.stdout
+
+
+def test_post_api_error_without_marker_exits_nonzero(tmp_path):
+    """无 marker 夹具时实际走 GET→POST；POST 失败须非零上抛且错误可见，不得误走 PATCH。"""
+    proc, rec = _run(
+        tmp_path,
+        page1=json.dumps([{"id": 11, "body": "普通评论"}]),
+        page2="[]",
+        fail="post",
+    )
+    assert proc.returncode != 0, f"POST 失败却退出 0: {proc.stderr!r}"
+    assert "updated comment" not in proc.stdout and "created comment" not in proc.stdout
+    assert "gh: fake API error" in proc.stderr
+    calls = _calls(rec)
+    kinds = []
+    for call in calls:
+        if b"--paginate" in call:
+            kinds.append("GET")
+        elif b"POST" in call:
+            kinds.append("POST")
+        elif b"PATCH" in call:
+            kinds.append("PATCH")
+        else:
+            kinds.append("OTHER")
+    assert kinds == ["GET", "POST"], f"请求序列应为 GET→POST 而非 PATCH: {calls!r}"
+    assert calls[0][:3] == [b"api", b"--paginate", f"repos/{REPO}/issues/7/comments".encode()]
+    assert calls[1][:4] == [b"api", b"--method", b"POST",
+                            f"repos/{REPO}/issues/7/comments".encode()]
