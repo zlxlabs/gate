@@ -48,6 +48,8 @@ ENTRY_FILES = {
     ".github/actions/gate-aggregator/neighbor_evidence.py": "gate#297 邻域证据采集（subprocess/git/silo I/O 槽）",
     # ledger 槽：增量阻断影子分类（G2 由 ledger job 载入；纯函数，无 I/O）。
     ".github/actions/gate-aggregator/incremental_shadow.py": "ledger 槽增量阻断影子分类（纯函数，无 I/O）",
+    # ledger 槽：增量阻断影子 I/O 装配（G2，subprocess/git/silo/gh API I/O 槽）。
+    ".github/actions/gate-aggregator/incremental_shadow_io.py": "ledger 槽增量阻断影子 I/O 装配（subprocess/git/silo/gh API）",
     # quality 槽：非门禁 advisory（缺包时退化，不取包）。
     ".github/actions/diff-coverage-advisory/advisory.py": "quality 槽 advisory 本体",
     ".github/actions/diff-coverage-advisory/action.yml": "quality 槽 advisory 包装器",
@@ -99,7 +101,9 @@ BANNED_LAUNCHERS = (
 )
 
 # 标准库白名单 = 运行解释器自带的模块名全集 + 仓内包 + __future__。
-IMPORT_ALLOWLIST_EXTRA = frozenset({"__future__", "scripts"})
+# incremental_shadow：incremental_shadow_io.py（G2 装配层）导入的同目录仓内
+# 纯分类模块（G1），与 scripts 包同一信任级。
+IMPORT_ALLOWLIST_EXTRA = frozenset({"__future__", "scripts", "incremental_shadow"})
 
 
 def _discover_entries() -> set[str]:
