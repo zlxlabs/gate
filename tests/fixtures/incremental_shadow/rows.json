@@ -1,0 +1,28 @@
+{
+ "repository": "zlxlabs/gate-hub",
+ "source": "gate-hub silo ledger rows (premise cache), redacted",
+ "diffs": {
+  "c58425e7261f838589bc6fed802aa113de084853..3cd42c1efbfbdd3b441e959ed32bdd40f9cc5d2d": "diff-c58425e7-3cd42c1e.txt",
+  "58867216afd2a7878ff04cfec492dc24ec140a38..339807e2dbdbde961b82fd18976ed2c0c947ba41": "diff-58867216-339807e2.txt",
+  "a702784fca7001f3918c9499ca9c6e5b3c35ab4c..4034cae77d0c3aae3b4bd2e1946ea27c143f9520": "diff-a702784f-4034cae7.txt",
+  "4034cae77d0c3aae3b4bd2e1946ea27c143f9520..5ca15031f592f1565e07499a9235232ce9be3720": "diff-4034cae7-5ca15031.txt"
+ },
+ "pulls": {
+  "1446": [
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1446, "run_id": 38036339354, "run_attempt": 1, "recorded_at": "2026-10-10T08:08:55.753690+00:00", "head_sha": "c58425e7261f838589bc6fed802aa113de084853", "review": {"status": "fail", "result": {"findings": [{"id": "correctness-nonzero-client-exit-still-parsed", "severity": "major", "file": "scripts/ci/canary-checkout-prewarm.sh", "line": 92, "category": "correctness", "issue": "<redacted>"}]}}},
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1446, "run_id": 38037617399, "run_attempt": 1, "recorded_at": "2026-10-10T08:38:51.544370+00:00", "head_sha": "3cd42c1efbfbdd3b441e959ed32bdd40f9cc5d2d", "review": {"status": "fail", "result": {"findings": [{"id": "correctness-failure-state-overwritten", "severity": "major", "file": "scripts/ci/canary-checkout-prewarm.sh", "line": 98, "category": "correctness", "issue": "<redacted>"}, {"id": "compatibility-test-fixture-signature-change", "severity": "minor", "file": "tests/test_canary_checkout_prewarm.py", "line": 97, "category": "compatibility", "issue": "<redacted>"}]}}},
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1446, "run_id": 38039509268, "run_attempt": 1, "recorded_at": "2026-10-10T09:05:07.184761+00:00", "head_sha": "507811bffbe2c649fe10cdaffaf4c1c797e479fc", "review": {"status": "pass", "result": {"findings": [{"id": "correctness-failure-diagnostic-dropped", "severity": "minor", "file": "scripts/ci/canary-checkout-prewarm.sh", "line": 91, "category": "correctness", "issue": "<redacted>"}, {"id": "compatibility-test-fixture-signature-change", "severity": "minor", "file": "tests/test_canary_checkout_prewarm.py", "line": 97, "category": "compatibility", "issue": "<redacted>"}]}}}
+  ],
+  "1441": [
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1441, "run_id": 38026528394, "run_attempt": 1, "recorded_at": "2026-10-10T05:27:21.682523+00:00", "head_sha": "58867216afd2a7878ff04cfec492dc24ec140a38", "review": {"status": "pass", "result": {"findings": [{"id": "correctness-dry-run-creates-lock", "severity": "minor", "file": "scripts/review/eval/precision/reclaim.py", "line": 124, "category": "correctness", "issue": "<redacted>"}]}}},
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1441, "run_id": 38029666866, "run_attempt": 1, "recorded_at": "2026-10-10T06:15:47.289752+00:00", "head_sha": "339807e2dbdbde961b82fd18976ed2c0c947ba41", "review": {"status": "fail", "result": {"findings": [{"id": "correctness-removes-attached-worktree", "severity": "major", "file": "scripts/review/eval/precision/reclaim.py", "line": 69, "category": "correctness", "issue": "<redacted>"}, {"id": "correctness-dry-run-creates-lock", "severity": "minor", "file": "scripts/review/eval/precision/reclaim.py", "line": 125, "category": "correctness", "issue": "<redacted>"}]}}},
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1441, "run_id": 38030300921, "run_attempt": 1, "recorded_at": "2026-10-10T06:25:17.887302+00:00", "head_sha": "d759159a573fb6e1f01a03599cd450db138f87f7", "review": {"status": "pass", "result": {"findings": []}}}
+  ],
+  "1447": [
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1447, "run_id": 38036581042, "run_attempt": 1, "recorded_at": "2026-10-10T08:13:41.011383+00:00", "head_sha": "a702784fca7001f3918c9499ca9c6e5b3c35ab4c", "review": {"status": "fail", "result": {"findings": [{"id": "correctness_success_verdict_ignores_exit_status", "severity": "major", "file": "scripts/ci/source_prepare_joint.py", "line": null, "category": "correctness", "issue": "<redacted>"}, {"id": "correctness_success_protocol_fields_unvalidated", "severity": "major", "file": "scripts/ci/source_prepare_joint.py", "line": null, "category": "testing", "issue": "<redacted>"}]}}},
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1447, "run_id": 38037935976, "run_attempt": 1, "recorded_at": "2026-10-10T08:42:55.655524+00:00", "head_sha": "4034cae77d0c3aae3b4bd2e1946ea27c143f9520", "review": {"status": "fail", "result": {"findings": [{"id": "correctness_success_protocol_fields_unvalidated", "severity": "major", "file": "scripts/ci/source_prepare_joint.py", "line": null, "category": "correctness", "issue": "<redacted>"}]}}},
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1447, "run_id": 38039096490, "run_attempt": 1, "recorded_at": "2026-10-10T09:05:11.739224+00:00", "head_sha": "5ca15031f592f1565e07499a9235232ce9be3720", "review": {"status": "fail", "result": {"findings": [{"id": "correctness_failure_protocol_fields_unvalidated", "severity": "major", "file": "scripts/ci/source_prepare_joint.py", "line": null, "category": "correctness", "issue": "<redacted>"}]}}},
+   {"repository": "zlxlabs/gate-hub", "pr_number": 1447, "run_id": 38043840562, "run_attempt": 1, "recorded_at": "2026-10-10T10:17:03.611116+00:00", "head_sha": "2d93fab057680fc9af131d82539c6da944d6a873", "review": {"status": "pass", "result": {"findings": []}}}
+  ]
+ }
+}

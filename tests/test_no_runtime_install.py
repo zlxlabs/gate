@@ -46,6 +46,8 @@ ENTRY_FILES = {
     ".github/actions/gate-aggregator/aggregate.py": "gate 槽聚合器",
     ".github/actions/gate-aggregator/convergence.py": "被聚合器载入的同目录模块",
     ".github/actions/gate-aggregator/neighbor_evidence.py": "gate#297 邻域证据采集（subprocess/git/silo I/O 槽）",
+    # ledger 槽：增量阻断影子分类（G2 由 ledger job 载入；纯函数，无 I/O）。
+    ".github/actions/gate-aggregator/incremental_shadow.py": "ledger 槽增量阻断影子分类（纯函数，无 I/O）",
     # quality 槽：非门禁 advisory（缺包时退化，不取包）。
     ".github/actions/diff-coverage-advisory/advisory.py": "quality 槽 advisory 本体",
     ".github/actions/diff-coverage-advisory/action.yml": "quality 槽 advisory 包装器",
