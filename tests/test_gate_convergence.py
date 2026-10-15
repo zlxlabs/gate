@@ -1398,6 +1398,12 @@ def test_pr_round_budget_unavailable_primary_does_not_increment():
 
 _HEAD = "h" * 40
 _ALLOWLISTED_ARGV = ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"]
+_ARGV_REJECT_CODE = "counterevidence_command_not_allowlisted"
+_ARGV_TEMPLATE_LITERAL = (
+    'expected allowlisted argv is exactly 9 items: '
+    '["git", "grep", "-n", "-F", "-e", <literal>, <head_sha>, "--", <pathspec>] '
+    '(head_sha at index 6)'
+)
 
 
 def test_counterevidence_argv_reason_accepts_allowlisted_shape():
@@ -1405,53 +1411,105 @@ def test_counterevidence_argv_reason_accepts_allowlisted_shape():
     assert CONV.COUNTEREVIDENCE_RERUN_TIMEOUT_S == 30
 
 
+def test_counterevidence_argv_template_constant_matches_literal():
+    assert CONV.COUNTEREVIDENCE_ARGV_TEMPLATE == _ARGV_TEMPLATE_LITERAL
+
+
 @pytest.mark.parametrize(
-    "argv",
+    "argv, head_sha, detail",
     [
         pytest.param(
+            ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--"],
+            _HEAD,
+            "argv length is not 9",
+            id="length_not_9",
+        ),
+        pytest.param(
+            ["hg", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"],
+            _HEAD,
+            "argv[0] is not git",
+            id="not_git",
+        ),
+        pytest.param(
+            ["git", "log", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"],
+            _HEAD,
+            "argv[1] is not grep",
+            id="wrong_subcommand",
+        ),
+        pytest.param(
             ["git", "grep", "-n", "-F", "-e", "locked-behavior", "b" * 40, "--", "src/lock.py"],
-            id="sha_not_equal_head_sha",
+            _HEAD,
+            "argv[6] is not the current head_sha",
+            id="head_not_at_index_6",
         ),
         pytest.param(
             ["git", "grep", "-n", "-F", "-e", "locked-behavior", "abc1234", "--", "src/lock.py"],
+            _HEAD,
+            "argv[6] is not the current head_sha",
             id="short_sha",
         ),
         pytest.param(
             ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/lock.py", "extra"],
+            _HEAD,
+            "argv length is not 9",
             id="extra_argument",
         ),
         pytest.param(
-            ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--"],
-            id="missing_pathspec",
-        ),
-        pytest.param(
             ["git", "grep", "-n", "-P", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"],
+            _HEAD,
+            "argv flags must be -n -F -e with -- at index 7",
             id="other_flag_perl",
         ),
         pytest.param(
             ["git", "grep", "-n", "-E", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"],
+            _HEAD,
+            "argv flags must be -n -F -e with -- at index 7",
             id="other_flag_extended",
         ),
         pytest.param(
             ["git", "grep", "-n", "-F", "-e", "-n", _HEAD, "--", "src/lock.py"],
+            _HEAD,
+            "argv[5] literal is empty or starts with -",
             id="literal_starting_with_dash",
         ),
         pytest.param(
             ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/../lock.py"],
+            _HEAD,
+            "argv[8] pathspec must not contain ..",
             id="pathspec_contains_dotdot",
         ),
         pytest.param(
             ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "/abs/lock.py"],
+            _HEAD,
+            "argv[8] pathspec must be relative, not absolute",
             id="pathspec_absolute",
         ),
         pytest.param(
             ["git", "grep", "-n", "-F", "-e", "locked-behavior", _HEAD, "--", ":(literal)src/lock.py"],
+            _HEAD,
+            "argv[8] pathspec is empty or starts with - or :",
             id="pathspec_magic_colon",
+        ),
+        pytest.param(
+            ["git", 1, "-n", "-F", "-e", "locked-behavior", _HEAD, "--", "src/lock.py"],
+            _HEAD,
+            "argv items must be strings",
+            id="non_string_item",
+        ),
+        pytest.param(
+            _ALLOWLISTED_ARGV,
+            "",
+            "head_sha is missing",
+            id="missing_head_sha",
         ),
     ],
 )
-def test_counterevidence_argv_reason_rejects_unallowlisted_shape(argv):
-    assert CONV.counterevidence_argv_reason(argv, _HEAD) == "counterevidence_command_not_allowlisted"
+def test_counterevidence_argv_reason_rejects_unallowlisted_shape(argv, head_sha, detail):
+    got = CONV.counterevidence_argv_reason(argv, head_sha)
+    assert got is not None
+    assert got.startswith(_ARGV_REJECT_CODE + ":")
+    assert detail in got
+    assert _ARGV_TEMPLATE_LITERAL in got
 
 
 def test_old_receipt_without_gate_rerun_is_counterevidence_not_rerun():
@@ -1468,10 +1526,11 @@ def test_old_receipt_without_gate_rerun_is_counterevidence_not_rerun():
 
 def test_gate_rerun_argv_not_allowlisted_is_counterevidence_command_not_allowlisted():
     primary = _primary(run_id=7, run_attempt=2, p1_ids=("p1",))
+    argv = ["git", "grep", "-n", "-F", "-e", "locked-behavior", "b" * 40, "--", "src/lock.py"]
     evidence = _allowlisted_counterevidence(
         SCOPE.head_sha,
         gate_rerun={
-            "argv": ["git", "grep", "-n", "-F", "-e", "locked-behavior", "b" * 40, "--", "src/lock.py"],
+            "argv": argv,
             "exit_code": 0,
             "match_count": 1,
             "stdout_sha256": "a" * 64,
@@ -1482,8 +1541,10 @@ def test_gate_rerun_argv_not_allowlisted_is_counterevidence_command_not_allowlis
     status = CONV.validate_disposition_receipt(
         receipt, scope=SCOPE, primary=primary, audit_digest="a" * 64,
     )
-    assert status.reason == "counterevidence_command_not_allowlisted"
-    assert status.active is False
+    assert (status.valid, status.active, status.reason_code) == (
+        False, False, _ARGV_REJECT_CODE,
+    )
+    assert _ARGV_TEMPLATE_LITERAL in status.reason
 
 
 _REPLAY_FILE = "accept_precheck_ci.py"
