@@ -1,0 +1,87 @@
+diff --git a/scripts/ci/source_prepare_joint.py b/scripts/ci/source_prepare_joint.py
++++ b/scripts/ci/source_prepare_joint.py
+@@ -246,1 +246,1 @@
++<redacted>
+@@ -257,2 +257,2 @@
++<redacted>
++<redacted>
+@@ -276,1 +276,1 @@
++<redacted>
+@@ -284,1 +284,1 @@
++<redacted>
+@@ -290,1 +290,1 @@
++<redacted>
+@@ -296,9 +296,9 @@
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
+@@ -315,3 +315,3 @@
++<redacted>
++<redacted>
++<redacted>
+@@ -330,3 +330,3 @@
++<redacted>
++<redacted>
++<redacted>
+@@ -342,36 +342,36 @@
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
+@@ -418,1 +418,1 @@
++<redacted>
+@@ -422,1 +422,1 @@
++<redacted>
+@@ -426,1 +426,1 @@
++<redacted>
+@@ -429,1 +429,1 @@
++<redacted>
+@@ -431,10 +431,10 @@
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
++<redacted>
