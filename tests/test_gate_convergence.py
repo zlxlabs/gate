@@ -20,10 +20,18 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "convergence.py"
+# Must match aggregate.py's spec name. neighbor_evidence.py reuses the first
+# sys.modules entry whose __file__ is convergence.py so Scope dataclass
+# identity matches end to end (gate#297 / gate#321). A second name here
+# leaves two copies in one process and breaks that identity assert.
+_CONV_MODULE_NAME = "gate_convergence_from_aggregate"
 
 
 def _module():
-    spec = importlib.util.spec_from_file_location("gate_convergence", MODULE_PATH)
+    existing = sys.modules.get(_CONV_MODULE_NAME)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(_CONV_MODULE_NAME, MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader
     sys.modules[spec.name] = module
