@@ -33,7 +33,7 @@ esac
 body="$MARKER
 ### 🎬 ${SUBJECT} 走查证据
 
-- e2e 状态:**${STATUS_ICON}**(check 如实反映;不进 branch protection,不阻断合并)
+- e2e 状态:**${STATUS_ICON}**(check 如实反映本次走查结果)
 - 🔎 证据站:[按本次 commit 搜索 ↗](${EVIDENCE_SEARCH_URL}) —— 报告 title 含完整 SHA;搜不到就手动到 Reports 页粘贴 SHA:\`${SHORT_SHA}\`"
 
 # 已有粘性评论则 PATCH,否则新建。
