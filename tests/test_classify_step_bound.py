@@ -43,6 +43,13 @@ SLACK_SECONDS = 15
 # regression (boundary removed) must turn the assertion red, not hang CI.
 CAP_MARGIN_SECONDS = 30
 
+# The shipped boundary, as a contract. The behaviour tests below hold THIS
+# expectation (not whatever the step's text happens to parse to), so deleting
+# `-k` from the workflow turns the timing assertion red instead of quietly
+# re-deriving a looser bound from the broken text; `test_both_external_calls_
+# declare_a_hard_boundary` separately pins the workflow literal to it.
+EXPECTED_BOUND = {"gh": (5, 30), "python3": (5, 20)}  # command -> (SIGKILL grace, limit)
+
 _BOUND = re.compile(r"timeout -k (\d+)s --foreground (\d+)s (gh|python3)\b")
 
 # gate-hub#1547's hang: answers nothing, not even SIGTERM.
@@ -154,16 +161,15 @@ def _probe_step(
     )
 
 
-def _bound_for(workflow: Path, command: str) -> tuple[int, int]:
-    bounds = _bounds(_classify_run(workflow))
-    assert command in bounds, f"{workflow.name}: no `timeout -k` boundary on {command}"
-    return bounds[command]
+def _bound_for(command: str) -> tuple[int, int]:
+    assert command in EXPECTED_BOUND, f"no declared boundary for {command}"
+    return EXPECTED_BOUND[command]
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)
 def test_both_external_calls_declare_a_hard_boundary(workflow):
     bounds = _bounds(_classify_run(workflow))
-    assert set(bounds) == {"gh", "python3"}
+    assert bounds == EXPECTED_BOUND, f"{workflow.name}: boundary drifted from the contract"
     for command, (grace, limit) in bounds.items():
         assert grace > 0, f"{workflow.name}: {command} declares no SIGKILL grace (-k {grace}s)"
     worst_case = sum(limit + grace for grace, limit in bounds.values())
@@ -177,7 +183,7 @@ def test_both_external_calls_declare_a_hard_boundary(workflow):
 
 def test_stubborn_gh_is_killed_and_the_step_stays_fail_open(tmp_path):
     run = _classify_run(WORKFLOWS[0])
-    grace, limit = _bound_for(WORKFLOWS[0], "gh")
+    grace, limit = _bound_for("gh")
     probe = _probe_step(
         tmp_path,
         run,
@@ -200,7 +206,7 @@ def test_stubborn_gh_is_killed_and_the_step_stays_fail_open(tmp_path):
 
 def test_stubborn_classifier_is_killed_and_the_step_stays_fail_open(tmp_path):
     run = _classify_run(WORKFLOWS[0])
-    grace, limit = _bound_for(WORKFLOWS[0], "python3")
+    grace, limit = _bound_for("python3")
     probe = _probe_step(
         tmp_path,
         run,
