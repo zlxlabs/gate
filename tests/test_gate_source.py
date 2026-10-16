@@ -649,6 +649,72 @@ def test_advisory_service_pulls_base_into_a_shallow_checkout(source_host):
     assert _network_argv(source_host) == []
 
 
+def test_ensure_commits_borrows_mirror_objects_without_a_fetch(source_host, monkeypatch):
+    """ensure_commits borrows the mirror's objects through alternates instead of
+    fetching (gate-hub#1422 G1): a local fetch's cost is upload-pack re-deltaing
+    the whole closure when the checkout shares no history.  Locked here: both
+    endpoints resolvable and the diff matches upstream, the workspace is not
+    shallow, the removed production fetch's argv fingerprint is gone, and the
+    alternates line stays a single idempotent entry across repeated calls."""
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    _git("init", "-q", cwd=workspace)
+    _git("remote", "add", "origin", str(source_host["caller_bare"]), cwd=workspace)
+    _git("fetch", "--no-tags", str(source_host["caller_bare"]),
+         f"{source_host['merge_sha']}:refs/demand/merge", cwd=workspace)
+    _git("checkout", "-q", "--force", "FETCH_HEAD", cwd=workspace)
+    assert not (workspace / ".git/shallow").exists()
+    env = _env(source_host, workspace, GITHUB_REPOSITORY=REPOSITORY)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    gate_source.ensure_commits(
+        workspace, REPOSITORY, source_host["base_sha"], source_host["sibling_sha"]
+    )
+    gate_source.ensure_commits(
+        workspace, REPOSITORY, source_host["base_sha"], source_host["sibling_sha"]
+    )
+
+    alternates_path = workspace / ".git/objects/info/alternates"
+    alternates = alternates_path.read_text(encoding="utf-8") if alternates_path.exists() else ""
+    mirror_objects = str(source_host["mirror_root"] / f"{REPOSITORY}.git" / "objects")
+    assert alternates.splitlines().count(mirror_objects) == 1
+    for sha in (source_host["base_sha"], source_host["sibling_sha"]):
+        _git("cat-file", "-e", f"{sha}^{{commit}}", cwd=workspace)
+    names = _git("diff", "--name-only", source_host["base_sha"],
+                 source_host["sibling_sha"], cwd=workspace).splitlines()
+    upstream = subprocess.run(
+        ["git", "--git-dir", str(source_host["caller_bare"]), "diff", "--name-only",
+         source_host["base_sha"], source_host["sibling_sha"]],
+        env={**os.environ, **GIT_ENV}, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert names == upstream
+    assert _git("rev-parse", "--is-shallow-repository", cwd=workspace) == "false"
+    assert not any(
+        "fetch --no-tags --no-recurse-submodules" in line for line in _argv(source_host)
+    )
+    assert _network_argv(source_host) == []
+
+
+def test_ensure_commits_fails_loud_when_mirror_objects_cannot_be_borrowed(source_host, monkeypatch):
+    """An unwritable alternates path is FETCH_FAILED, not a silent half-success."""
+    workspace = source_host["tmp_path"] / "workspace"
+    workspace.mkdir()
+    _git("init", "-q", cwd=workspace)
+    (workspace / ".git/objects/info/alternates").mkdir(parents=True)
+    env = _env(source_host, workspace, GITHUB_REPOSITORY=REPOSITORY)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(gate_source.SourceError) as error:
+        gate_source.ensure_commits(
+            workspace, REPOSITORY, source_host["base_sha"], source_host["sibling_sha"]
+        )
+
+    assert error.value.code == gate_source.FETCH_FAILED
+    assert _network_argv(source_host) == []
+
+
 def test_preflight_action_uses_the_service_for_an_absent_base(source_host, monkeypatch):
     workspace = source_host["tmp_path"] / "workspace"
     workspace.mkdir()
