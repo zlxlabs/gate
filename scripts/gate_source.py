@@ -384,19 +384,64 @@ def has_commit(repo: Path, sha: str) -> bool:
     ).returncode == 0
 
 
+def _borrow_mirror_objects(repo: Path, mirror_repo: Path) -> None:
+    """Point the job repository's object database at the mirror's objects.
+
+    A local fetch's cost is upload-pack re-deltaing the whole reachable closure
+    when the job checkout shares no commit with the demand ref (measured on an
+    agent-config-scale mirror: negotiation 3ms of 12.7s wall, gate-hub#1422),
+    while the mirror retains every prepared SHA's ref — and therefore its
+    objects — for DEMAND_RETENTION_SECONDS (604800), far beyond any job.  The
+    alternates line is deduped so repeated ensure_commits calls are idempotent.
+    """
+    alternates = repo / ".git" / "objects" / "info" / "alternates"
+    line = str(mirror_repo / "objects")
+    try:
+        existing = alternates.read_bytes() if alternates.exists() else b""
+        if line in existing.decode("utf-8", "surrogateescape").splitlines():
+            return
+        separator = "" if not existing or existing.endswith(b"\n") else "\n"
+        with open(alternates, "a", encoding="utf-8") as handle:
+            handle.write(f"{separator}{line}\n")
+    except OSError as error:
+        fail(FETCH_FAILED, f"borrow {mirror_repo} objects into {alternates}: {error}")
+
+
 def ensure_commits(
     repo: Path, repository: str, base_sha: str, head_sha: str, *, timeout: int | None = None
 ) -> None:
-    """Make base/head available in the job repository from the mirror."""
+    """Make base/head available in the job repository from the mirror.
+
+    Objects are borrowed in place through `objects/info/alternates` under the
+    shared consume lock instead of being fetched: the mirror pins each demand
+    ref for DEMAND_RETENTION_SECONDS, and a workspace-side resolution check
+    after the borrow fails loudly if the closure is not readable.  Repeated
+    calls skip SHAs the repository already resolves, as before.
+    """
     require_service_mode()
     budget = budget_secs() if timeout is None else timeout
     deadline = int(time.time()) + budget
     started = time.monotonic()
-    for sha in (base_sha, head_sha):
-        if has_commit(repo, sha):
-            continue
-        mirror_repo, _ = prepare(repository, sha, deadline)
-        fetch_demand_ref(repo, mirror_repo, sha, deadline_epoch=deadline)
+    missing = [sha for sha in (base_sha, head_sha) if not has_commit(repo, sha)]
+    if missing:
+        prepared_repos = []
+        for sha in missing:
+            mirror_repo, _ = prepare(repository, sha, deadline)
+            prepared_repos.append(mirror_repo)
+        with shared_consume_lock(prepared_repos[0], deadline):
+            for sha, mirror_repo in zip(missing, prepared_repos):
+                demand_ref = DEMAND_REF.format(sha=sha)
+                resolved = _git(
+                    ["--git-dir", str(mirror_repo), "rev-parse", "--verify", "--quiet", f"{demand_ref}^{{commit}}"],
+                    code=DEMAND_REF_MISSING,
+                    timeout=remaining(deadline),
+                )
+                if resolved != sha:
+                    fail(PIN_MISMATCH, f"{mirror_repo}:{demand_ref} resolves to {resolved}, expected {sha}")
+            _borrow_mirror_objects(repo, prepared_repos[0])
+            for sha in missing:
+                if not has_commit(repo, sha):
+                    fail(FETCH_FAILED, f"{sha} unresolvable after borrowing {prepared_repos[0]} objects")
     emit({
         "mode": MODE_SERVICE,
         "step": "ensure",
