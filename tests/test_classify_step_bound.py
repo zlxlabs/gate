@@ -73,6 +73,7 @@ cat <<'JSON'
 @dataclass
 class _Probe:
     elapsed: float
+    finished: bool
     returncode: int | None
     stdout: str
     stderr: str
@@ -138,11 +139,14 @@ def _probe_step(
     )
     try:
         stdout, stderr = proc.communicate(timeout=hard_cap)
+        finished = True
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
         stdout, stderr = proc.communicate()
+        finished = False
     return _Probe(
         elapsed=time.monotonic() - started,
+        finished=finished,
         returncode=proc.returncode,
         stdout=stdout,
         stderr=stderr,
@@ -181,7 +185,7 @@ def test_stubborn_gh_is_killed_and_the_step_stays_fail_open(tmp_path):
         classifier_body=REAL_CLASSIFIER.read_text(encoding="utf-8"),
         hard_cap=limit + grace + CAP_MARGIN_SECONDS,
     )
-    assert probe.returncode is not None, (
+    assert probe.finished, (
         f"step never finished within {limit + grace + CAP_MARGIN_SECONDS}s: the `gh` "
         "boundary does not hold a SIGTERM-ignoring child"
     )
@@ -204,7 +208,7 @@ def test_stubborn_classifier_is_killed_and_the_step_stays_fail_open(tmp_path):
         classifier_body=_STUBBORN_CLASSIFIER,
         hard_cap=limit + grace + CAP_MARGIN_SECONDS,
     )
-    assert probe.returncode is not None, (
+    assert probe.finished, (
         f"step never finished within {limit + grace + CAP_MARGIN_SECONDS}s: the "
         "classifier boundary does not hold a SIGTERM-ignoring child"
     )
