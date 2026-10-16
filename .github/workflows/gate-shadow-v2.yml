@@ -470,20 +470,38 @@ jobs:
         run: |
           set -euo pipefail
           echo "review_expected=true" >> "$GITHUB_OUTPUT"
+          # Both external calls below carry a HARD boundary (`-k`), not just an
+          # upper limit: plain `timeout` sends SIGTERM at the limit and then
+          # waits forever if the child ignores it, which is exactly how this
+          # step once burned the whole 5-minute job budget and lost its
+          # outputs (gate-hub#1547). Budget: 30+5 (gh) + 20+5 (classifier) =
+          # 60s worst case, plus checkout — far under timeout-minutes: 5.
+          # step-start / step-end notices bracket every exit path (including
+          # the fail-open ones below) so a future hang is locatable to a
+          # sub-second window in the job log.
+          stamp() { date -u +%Y-%m-%dT%H:%M:%S.%NZ; }
+          listing=""
+          echo "::notice::classify_pr_paths: step-start ts=$(stamp)"
+          finish() {
+            local rc=$?
+            echo "::notice::classify_pr_paths: step-end ts=$(stamp) rc=${rc}"
+            if [ -n "$listing" ]; then rm -f "$listing" || true; fi
+            exit "$rc"
+          }
+          trap finish EXIT
           if [ -z "${BASE_SHA}" ] || [ -z "${HEAD_SHA}" ]; then
             echo "::notice::classify_pr_paths: no compare shas; review remains expected"
             exit 0
           fi
           listing="$(mktemp)"
-          trap 'rm -f "$listing"' EXIT
           compare_api="repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}"
           rc=0
-          timeout --foreground 30s gh api "$compare_api" > "$listing" 2>/dev/null || rc=$?
+          timeout -k 5s --foreground 30s gh api "$compare_api" > "$listing" 2>/dev/null || rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "::notice::classify_pr_paths: listing PR files failed (exit=${rc}); review remains expected"
             exit 0
           fi
-          if ! python3 "_gate-classify-src/scripts/classify_pr_reviewable_paths.py" \
+          if ! timeout -k 5s --foreground 20s python3 "_gate-classify-src/scripts/classify_pr_reviewable_paths.py" \
             --github-output "$GITHUB_OUTPUT" \
             "$listing"
           then
