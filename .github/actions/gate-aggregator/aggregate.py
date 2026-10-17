@@ -145,8 +145,12 @@ sys.modules[_NEIGHBOR_EVIDENCE_SPEC.name] = _NEIGHBOR_EVIDENCE
 _NEIGHBOR_EVIDENCE_SPEC.loader.exec_module(_NEIGHBOR_EVIDENCE)
 
 
-# Terminal transport includes only primary outcomes the gate may trust.
-PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable")
+# The audit schema's complete verdict domain, including states not_expected
+# and waived that this canary evaluator currently rejects at the policy layer.
+PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable", "not_expected", "waived")
+# Terminal history transports only actual review outcomes; skip/policy states
+# remain described by the terminal's existing result and skip_reason fields.
+TERMINAL_PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable")
 IDENTITY_QUINTUPLE = ("repository_id", "head_sha", "run_id", "run_attempt", "pr")
 _IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
 
@@ -1022,7 +1026,7 @@ def build_terminal_envelope(
         raise ValueError("terminal field is outside the finite domain")
     if outcome.skip_reason not in (None,) + PRIMARY_SKIP_REASON_DOMAIN:
         raise ValueError("primary skip reason is outside the finite domain")
-    if outcome.primary_verdict is not None and outcome.primary_verdict not in PRIMARY_VERDICT_DOMAIN:
+    if outcome.primary_verdict is not None and outcome.primary_verdict not in TERMINAL_PRIMARY_VERDICT_DOMAIN:
         raise ValueError("terminal primary_verdict is outside the finite domain")
     envelope = {
         "schema_version": 1, "kind": "gate_terminal", "repository": repository,
@@ -1167,8 +1171,8 @@ def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
         errors.append(f"schema_version must be exactly int 1 or 2, got {schema_version!r}")
 
     verdict = record.get("verdict")
-    if verdict not in PRIMARY_VERDICT_DOMAIN + ("not_expected", "waived"):
-        errors.append(f"verdict {verdict!r} is not in the accepted audit domain")
+    if verdict not in PRIMARY_VERDICT_DOMAIN:
+        errors.append(f"verdict {verdict!r} is not in the accepted domain {PRIMARY_VERDICT_DOMAIN!r}")
 
     expected = identity.as_dict()
     for key in IDENTITY_QUINTUPLE:
@@ -2168,7 +2172,7 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
     if record.get("gate_result") not in GATE_RESULT_DOMAIN:
         raise ValueError("gate terminal gate_result is outside the finite domain")
     primary_verdict = record.get("primary_verdict")
-    if primary_verdict is not None and primary_verdict not in PRIMARY_VERDICT_DOMAIN:
+    if primary_verdict is not None and primary_verdict not in TERMINAL_PRIMARY_VERDICT_DOMAIN:
         raise ValueError("gate terminal primary_verdict is outside the finite domain")
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")

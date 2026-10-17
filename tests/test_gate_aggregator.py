@@ -331,6 +331,17 @@ def test_validate_audit_identity_directly_on_non_dict_payloads():
         assert errors, f"{bogus!r} should have produced at least one error"
 
 
+@pytest.mark.parametrize(
+    "verdict,reviewer",
+    [("pass", "reviewer"), ("fail", "reviewer"), ("unavailable", "reviewer"),
+     ("not_expected", None), ("waived", None)],
+)
+def test_audit_identity_accepts_every_primary_verdict_domain_value(verdict, reviewer):
+    audit = _valid_primary_record(verdict=verdict, reviewer=reviewer)
+
+    assert not AGG.validate_audit_identity(audit, IDENTITY)
+
+
 @pytest.mark.parametrize("verdict", ["pass", "fail", "unavailable"])
 def test_reviewer_required_non_empty_string_for_verdict_bearing_records(verdict):
     for bogus_reviewer in (None, "", 123, True):
@@ -1656,6 +1667,21 @@ def _publish_only_panel_body(
         repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
     )
     return comments[0], row
+
+
+@pytest.mark.parametrize(
+    "verdict,findings",
+    [("pass", None), ("fail", [{"id": "x", "severity": "major", "file": "a.py", "line": 1, "title": "t"}]),
+     ("unavailable", None), ("not_expected", None), ("waived", None)],
+)
+def test_primary_findings_panel_accepts_every_audit_verdict_domain_value(verdict, findings):
+    audit = _valid_primary_record(verdict=verdict)
+    if findings is not None:
+        audit["result"] = {"findings": findings}
+
+    lines = AGG._primary_findings_panel_lines(audit)
+
+    assert bool(lines) is (verdict == "fail")
 
 
 def test_publish_only_status_panel_renders_bounded_scrubbed_primary_findings(monkeypatch, tmp_path):
