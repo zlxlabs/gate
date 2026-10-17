@@ -2252,11 +2252,12 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
 def _compute_pr_primary_convergence(
     history: HistoryLoad, *, identity: Identity, primary_result: str, outcome: Outcome,
 ) -> tuple[Optional[int], Optional[bool]]:
-    """Count distinct primary failures; missing history or verdicts stay unknown.
+    """Count distinct primary failures across all heads in one PR.
 
     A known no-review skip contributes zero. The current verdict comes only
     from the validated audit in `Outcome`, even while its run is in progress.
-    Old-head runs fill run-list coverage but never enter this head's count.
+    `run_id` deduplicates runs; `head_sha` identifies a row but does not partition
+    PR-wide convergence history.
     """
     target_run_ids = history.target_run_ids
     target_ids = set(target_run_ids or ())
@@ -2271,10 +2272,8 @@ def _compute_pr_primary_convergence(
             complete = False
             continue
         observed_run_ids.add(run_id)
-        if row.get("head_sha") != identity.head_sha:
-            if run_id == identity.run_id:
-                complete = False
-            continue
+        if row.get("head_sha") != identity.head_sha and run_id == identity.run_id:
+            complete = False
         rows_by_run.setdefault(run_id, []).append(row)
     if target_run_ids is not None:
         for run_id in target_ids:

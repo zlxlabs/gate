@@ -4105,18 +4105,24 @@ def _run_pr_convergence_cli(tmp_path, monkeypatch, *, audit_verdict, primary_res
     return exit_code, json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
 
 
-def test_cli_convergence_counts_latest_actual_attempt_per_run_and_known_skips(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "run_504_head", ("b" * 40, IDENTITY.head_sha),
+    ids=["old-pr-head-failure-counts", "same-pr-head-failure-counts"],
+)
+def test_cli_convergence_counts_latest_actual_attempt_per_run_and_known_skips(
+    monkeypatch, tmp_path, run_504_head,
+):
     history = _primary_convergence_history((501, 502, 503, 504, IDENTITY.run_id), [
         _primary_convergence_row(501, 1, "fail"), _primary_convergence_row(501, 2, "unavailable"),
         _primary_convergence_row(502, 1, "fail"), _primary_convergence_row(502, 2, "pass"),
         _primary_convergence_row(503, 1, None, primary_result="skipped", skip_reason="draft"),
-        _primary_convergence_row(504, 1, "fail", head_sha="b" * 40),
+        _primary_convergence_row(504, 1, "fail", head_sha=run_504_head),
     ])
     exit_code, terminal = _run_pr_convergence_cli(
         tmp_path, monkeypatch, history=history, audit_verdict="fail", primary_result="failure",
     )
     assert exit_code == 1
-    assert terminal.get("convergence") == {"fail_count": 2, "reconsider": False}
+    assert terminal.get("convergence") == {"fail_count": 3, "reconsider": True}
 
 
 @pytest.mark.parametrize(
