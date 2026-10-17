@@ -2627,6 +2627,7 @@ jobs:
         run: 'echo "::notice::step-start: Build v2 review effectiveness ledger"'
 
       - name: Build v2 review effectiveness ledger
+        id: build-review-ledger
         timeout-minutes: 1
         uses: ./_gate-aggregator-src/.github/actions/review-ledger
         with:
@@ -2670,6 +2671,35 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$LEDGER_PATH"
+
+      - name: Upload v2 raw review ledger to permanent archive
+        if: always() && steps.build-review-ledger.outcome == 'success'
+        env:
+          ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
+          ARCHIVE_READBACK_PATH: ${{ runner.temp }}/review-ledger/archive-readback.jsonl
+        run: |
+          echo "::notice::step-start: Upload v2 raw review ledger to permanent archive"
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          if ! "$SILO_EXEC" put \
+            --tier archive \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$LEDGER_PATH"; then
+            echo "::error::Permanent review ledger archive upload failed" >&2
+            exit 1
+          fi
+          if ! "$SILO_EXEC" get --key \
+            "archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl" \
+            --dest "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent review ledger archive readback failed" >&2
+            exit 1
+          fi
+          if ! cmp -s "$LEDGER_PATH" "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent review ledger archive readback bytes do not match" >&2
+            exit 1
+          fi
 
       - name: Diagnose silo network after job failure
         if: failure()

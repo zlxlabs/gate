@@ -159,6 +159,13 @@ artifact。Caller 必须透传两个 org 级 secret（`workflow_call.secrets` �
 fleet 正常拓扑是全 self-hosted；`runner: hosted` 或控制面落到 GitHub-hosted 时，
 fleet 正常拓扑是全 self-hosted；Silo hostname 解析依赖 tailnet DNS。直接运行 `scripts/gate_bounded_retry.py magicdns` 时，必须从环境变量 `SILO_NAMESERVER` 提供 nameserver；缺失时命令 fail-loud。当前 reusable workflows 通过显式参数传入 resolver；若要移除共享 workflow 中的内嵌值，应由主脑统一决定使用 org 级 Variable 还是 caller input。GitHub-hosted 没有 tailnet DNS，Silo 步骤会失败，不做 artifact fallback。
 
+每轮 `codex-review-ledger-v2` 的原始 `ledger.jsonl` 同时写入 `d30/<repo_id>/<artifact_name>/ledger.jsonl`
+和永久前缀 `archive/<repo_id>/<artifact_name>/ledger.jsonl`；`artifact_name` 带仓库 ID、head SHA、run ID
+和 attempt。`archive` tier 仅接受这种单文件 raw ledger，按每轮独立 key 写入，不覆盖其他 run；归档写入失败会在
+ledger job 标成失败步骤并输出 error 注解。过渡期间保留 d30 副本，按 PR 更新的 `codex-review-ledger-latest-v1`
+仍只写 d30，行为不变。archive step 会用同一 CI 身份读取刚写入的精确 key 并逐字节比对；读取失败或字节不一致都会显式报错。永久前缀没有自动到期规则。它与一次性历史副本
+`archive/review-ledger/v1/<repo_id>/...` 是两个独立 key 空间；两者都必须永久保留。
+
 Silo 推广已完成，`.github/v2-tag-sync.hold` 熔断文件已移除，`v2` 移动 tag 随主干前移。
 下游 caller 仍必须透传 `SILO_ACCESS_KEY` 与 `SILO_SECRET_KEY`（不传则 S3 步骤红）。
 

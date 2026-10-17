@@ -8,6 +8,7 @@ import struct
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import silo_store as store
 
@@ -74,6 +75,50 @@ def test_build_key_joins_tier_repo_name_and_relative_path():
     assert caught.value.code == store.EXIT_ERROR
     with pytest.raises(SystemExit):
         store.build_key("d1", "1", "name", "../escape")
+
+
+def test_archive_key_is_limited_to_raw_per_run_review_ledgers():
+    repo_id = "1326603956"
+    artifact_name = f"codex-review-ledger-v2-{repo_id}-{'a' * 40}-32446501755-1"
+    assert store.build_key("archive", repo_id, artifact_name, "ledger.jsonl") == (
+        f"archive/{repo_id}/{artifact_name}/ledger.jsonl"
+    )
+
+    for name, relative_path in (
+        (f"primary-audit-v2-{repo_id}-{'a' * 40}-32446501755-1", "ledger.jsonl"),
+        (f"codex-review-ledger-v2-999-{'a' * 40}-32446501755-1", "ledger.jsonl"),
+        (artifact_name, "nested/ledger.jsonl"),
+    ):
+        with pytest.raises(SystemExit) as caught:
+            store.build_key("archive", repo_id, name, relative_path)
+        assert caught.value.code == store.EXIT_ERROR
+
+
+def test_archive_tier_rejects_directory_and_multi_file_writes(tmp_path, monkeypatch, capsys):
+    fake = FakeS3()
+    _use(monkeypatch, fake)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_bytes(b'{"run_id":1}\n')
+    extra = tmp_path / "extra.json"
+    extra.write_bytes(b"{}")
+    artifact_name = f"codex-review-ledger-v2-1326603956-{'a' * 40}-1-1"
+
+    with pytest.raises(SystemExit) as multi_file:
+        store.main([
+            "put", "--tier", "archive", "--repo-id", "1326603956", "--name", artifact_name,
+            "--file", str(ledger), "--file", str(extra),
+        ])
+    assert multi_file.value.code == store.EXIT_ERROR
+    assert "archive tier put requires exactly one raw review ledger file" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as directory:
+        store.main([
+            "put-dir", "--tier", "archive", "--repo-id", "1326603956", "--name", artifact_name,
+            "--dir", str(tmp_path),
+        ])
+    assert directory.value.code == store.EXIT_ERROR
+    assert "archive tier put-dir is unsupported" in capsys.readouterr().err
+    assert fake.puts == []
 
 
 def test_select_attempt_picks_max_at_or_below_current():
@@ -587,6 +632,7 @@ import subprocess
 import sys
 
 _STORE_PY = Path(__file__).resolve().parents[1] / "scripts" / "silo_store.py"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 _DIAG = "SILO-REQUEST-FAILED "
 _ACCESS, _SECRET = "AKIA_SENTINEL_ACCESS_NOT_FOR_LOG", "wJalr_SENTINEL_SECRET_NOT_FOR_LOG"
 _BODY_S, _MSG_S = "BODY_SENTINEL_PAYLOAD_NOT_FOR_LOG", "MSG_SENTINEL_XML_NOT_FOR_LOG"
@@ -652,7 +698,10 @@ class _RecordHandler(BaseHTTPRequestHandler):
         n = int(raw_cl) if raw_cl else 0
         body = self.rfile.read(n) if n else b""
         self.server.received.append({
+            "method": self.command,
+            "path": self.path,
             "content_length_header": raw_cl,
+            "body": body,
             "body_sha256": hashlib.sha256(body).hexdigest(),
             "body_len": len(body),
         })
@@ -660,8 +709,15 @@ class _RecordHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.connection.close()
             return
+        if self.command == "PUT" and self.server.status < 400:
+            self.server.objects[self.path] = body
+        status = self.server.get_status if self.command == "GET" and self.server.get_status else self.server.status
         payload = self.server.body
-        self.send_response_only(self.server.status)
+        if self.command == "GET":
+            payload = self.server.objects.get(self.path, payload)
+        if self.command == "GET" and self.server.corrupt_get and self.path in self.server.objects:
+            payload += b"readback-mismatch"
+        self.send_response_only(status)
         self.send_header("Content-Length", str(len(payload)))
         for name, value in self.server.extra_headers:
             self.send_header(name, value)
@@ -677,6 +733,7 @@ class _RecordHandler(BaseHTTPRequestHandler):
 def _start_record_server(**attrs):
     server = HTTPServer(("127.0.0.1", 0), _RecordHandler)
     server.received, server.status, server.body = [], 200, b""
+    server.objects, server.get_status, server.corrupt_get = {}, None, False
     server.extra_headers, server.close_after_read = (), False
     for key, value in attrs.items():
         setattr(server, key, value)
@@ -684,6 +741,102 @@ def _start_record_server(**attrs):
     thread.daemon = True
     thread.start()
     return server
+
+
+def test_gate_workflow_dual_writes_the_real_ledger_bytes_to_d30_and_archive(tmp_path):
+    workflow = yaml.safe_load((_REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
+    steps = workflow["jobs"]["ledger"]["steps"]
+    d30_step = next(step for step in steps if step.get("name") == "Upload v2 review effectiveness ledger")
+    archive_steps = [
+        step for step in steps if step.get("name") == "Upload v2 raw review ledger to permanent archive"
+    ]
+    assert len(archive_steps) == 1, "the ledger workflow must have one permanent raw ledger writer"
+    archive_step = archive_steps[0]
+
+    audit_path = _REPO_ROOT / "tests/data/primary_review_v2_with_tier.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    ledger_path = tmp_path / "review-ledger/ledger.jsonl"
+    ledger_path.parent.mkdir(parents=True)
+    producer = _REPO_ROOT / ".github/actions/review-ledger/build_ledger.py"
+    producer_args = [
+        sys.executable, str(producer),
+        "--audit-path", str(audit_path),
+        "--preflight-path", str(_REPO_ROOT / "tests/fixtures/quality-ledger-input/pr-size-preflight.json"),
+        "--install-path", str(_REPO_ROOT / "tests/fixtures/quality-ledger-input/install-result.json"),
+        "--output", str(ledger_path),
+        "--repository", audit["repository"],
+        "--pr-number", str(audit["pr"]),
+        "--run-id", str(audit["run_id"]),
+        "--run-attempt", str(audit["run_attempt"]),
+        "--head-sha", audit["head_sha"],
+        "--expected-repository-id", str(audit["repository_id"]),
+        "--expected-base-sha", audit["base_sha"],
+        "--expected-caller-sha", audit["caller_sha"],
+        "--expected-reusable-workflow-sha", audit["reusable_workflow_sha"],
+        "--codex-expected", "true",
+        "--codex-waived", "false",
+        "--input-short-circuited", "false",
+    ]
+    subprocess.run(producer_args, check=True, capture_output=True, text=True)
+    ledger_bytes = ledger_path.read_bytes()
+
+    repo_id = str(audit["repository_id"])
+    artifact_name = (
+        f"codex-review-ledger-v2-{repo_id}-{audit['head_sha']}-"
+        f"{audit['run_id']}-{audit['run_attempt']}"
+    )
+    server = _start_record_server()
+    upload_results = []
+    try:
+        for step in (d30_step, archive_step):
+            step_env = {
+                "ARTIFACT_NAME": step["env"]["ARTIFACT_NAME"]
+                    .replace("${{ github.repository_id }}", repo_id)
+                    .replace("${{ github.event.pull_request.head.sha }}", audit["head_sha"])
+                    .replace("${{ github.run_id }}", str(audit["run_id"]))
+                    .replace("${{ github.run_attempt }}", str(audit["run_attempt"])),
+                "LEDGER_PATH": str(ledger_path),
+                "ARCHIVE_READBACK_PATH": str(tmp_path / "review-ledger/archive-readback.jsonl"),
+            }
+            run = step["run"].replace("${{ github.repository_id }}", repo_id)
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "AWS_ACCESS_KEY_ID": _ACCESS,
+                "AWS_SECRET_ACCESS_KEY": _SECRET,
+                "SILO_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
+                "SILO_BUCKET": "ci-artifacts",
+                "SILO_EXEC": str(_REPO_ROOT / "scripts/silo_exec.sh"),
+                "SILO_STORE": str(_STORE_PY),
+                "RUNNER_TEMP": str(tmp_path),
+                **step_env,
+            }
+            upload_results.append(
+                subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", run],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+            )
+        assert [result.returncode for result in upload_results] == [0, 0]
+        assert (tmp_path / "review-ledger/archive-readback.jsonl").read_bytes() == ledger_bytes
+        archive_run = ["bash", "-euo", "pipefail", "-c", run]
+        for status, corrupt, message in ((403, False, "failed"), (200, True, "bytes do not match")):
+            server.get_status, server.corrupt_get = status, corrupt
+            failed = subprocess.run(archive_run, capture_output=True, text=True, env=env, check=False)
+            assert failed.returncode != 0 and f"Permanent review ledger archive readback {message}" in failed.stderr
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [record["path"] for record in server.received[:2]] == [
+        f"/ci-artifacts/d30/{repo_id}/{artifact_name}/ledger.jsonl",
+        f"/ci-artifacts/archive/{repo_id}/{artifact_name}/ledger.jsonl",
+    ]
+    expected_get = ("GET", f"/ci-artifacts/archive/{repo_id}/{artifact_name}/ledger.jsonl")
+    assert (server.received[2]["method"], server.received[2]["path"]) == expected_get
+    assert [record["body"] for record in server.received[:2]] == [ledger_bytes, ledger_bytes]
 
 
 def test_cli_put_incomplete_body_emits_one_status_event(tmp_path):
