@@ -753,7 +753,7 @@ def _start_record_server(**attrs):
     return server
 
 
-def _run_gate_archive_step(
+def _run_gate_silo_step(
     step: dict,
     *,
     tmp_path: Path,
@@ -762,7 +762,6 @@ def _run_gate_archive_step(
     repo_id: str,
     source_env_name: str,
     source_path: Path,
-    current_attempt: int,
 ) -> subprocess.CompletedProcess:
     step_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -774,13 +773,14 @@ def _run_gate_archive_step(
         "SILO_STORE": str(_STORE_PY),
         "RUNNER_TEMP": str(tmp_path),
         "ARTIFACT_PREFIX": artifact_prefix,
+        "ARTIFACT_NAME": artifact_prefix.rsplit("/", 1)[-1],
         "REPO_ID": repo_id,
-        "CURRENT_ATTEMPT": str(current_attempt),
         "ARCHIVE_READBACK_PATH": str(tmp_path / f"{source_env_name}-archive-readback.json"),
         source_env_name: str(source_path),
     }
+    run = step["run"].replace("${{ github.repository_id }}", repo_id)
     return subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        ["bash", "-euo", "pipefail", "-c", run],
         capture_output=True,
         text=True,
         env=step_env,
@@ -892,8 +892,11 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
     download_terminal = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
     archive_terminal = next(step for step in steps if step.get("name") == "Archive gate terminal envelope permanently")
     build_ledger = next(step for step in steps if step.get("name") == "Build v2 review effectiveness ledger")
-    assert steps.index(download_audit) < steps.index(archive_audit) < steps.index(download_terminal)
-    assert steps.index(download_terminal) < steps.index(archive_terminal) < steps.index(build_ledger)
+    archive_ledger = next(step for step in steps if step.get("name") == "Upload v2 raw review ledger to permanent archive")
+    assert steps.index(download_audit) < steps.index(download_terminal) < steps.index(build_ledger)
+    assert steps.index(build_ledger) < steps.index(archive_ledger) < steps.index(archive_audit) < steps.index(archive_terminal)
+    assert download_terminal["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
+    assert archive_ledger["if"] == "always() && steps.build-review-ledger.outcome == 'success'"
     assert archive_audit["if"] == "always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != ''"
     assert archive_terminal["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
     assert archive_audit["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}"
@@ -946,6 +949,10 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
         text=True,
     )
     terminal_bytes = terminal_path.read_bytes()
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_path.write_bytes(b'{"source":"ledger"}\n')
+    ledger_artifact_name = (f"codex-review-ledger-v2-{audit['repository_id']}-{audit['head_sha']}-"
+                            f"{audit['run_id']}-{current_attempt}")
 
     server = _start_record_server()
     archive_cases = (
@@ -953,10 +960,19 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
         (archive_terminal, "TERMINAL_PATH", terminal_path, terminal_name, terminal_bytes),
     )
     try:
+        ledger_archive = _run_gate_silo_step(
+            archive_ledger, tmp_path=tmp_path, server=server, artifact_prefix=ledger_artifact_name,
+            repo_id=str(audit["repository_id"]), source_env_name="LEDGER_PATH", source_path=ledger_path,
+        )
+        assert ledger_archive.returncode == 0, ledger_archive.stderr + ledger_archive.stdout
+        assert server.objects[
+            f"/ci-artifacts/archive/{audit['repository_id']}/{ledger_artifact_name}/ledger.jsonl"
+        ] == (tmp_path / "LEDGER_PATH-archive-readback.json").read_bytes() == ledger_path.read_bytes()
+
         for step, source_env_name, source_path, artifact_name, expected_bytes in archive_cases:
             artifact_tier = "d14" if source_env_name == "AUDIT_PATH" else "d30"
             artifact_prefix = f"{artifact_tier}/{audit['repository_id']}/{artifact_name}"
-            result = _run_gate_archive_step(
+            result = _run_gate_silo_step(
                 step,
                 tmp_path=tmp_path,
                 server=server,
@@ -964,7 +980,6 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
                 repo_id=str(audit["repository_id"]),
                 source_env_name=source_env_name,
                 source_path=source_path,
-                current_attempt=current_attempt,
             )
             expected_key = f"archive/{audit['repository_id']}/{artifact_name}/{source_path.name}"
             assert result.returncode == 0, result.stderr + result.stdout
@@ -972,8 +987,11 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
             assert (tmp_path / f"{source_env_name}-archive-readback.json").read_bytes() == expected_bytes
 
         put_records = [record for record in server.received if record["method"] == "PUT"]
-        assert [record["body"] for record in put_records] == [audit_bytes, terminal_bytes]
+        assert [record["body"] for record in put_records[:3]] == [
+            ledger_path.read_bytes(), audit_bytes, terminal_bytes,
+        ]
         assert [record["path"] for record in put_records] == [
+            f"/ci-artifacts/archive/{audit['repository_id']}/{ledger_artifact_name}/ledger.jsonl",
             f"/ci-artifacts/archive/{audit['repository_id']}/{source_audit_name}/primary-review-audit.json",
             f"/ci-artifacts/archive/{audit['repository_id']}/{terminal_name}/gate-terminal.json",
         ]
@@ -982,7 +1000,7 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
             artifact_tier = "d14" if source_env_name == "AUDIT_PATH" else "d30"
             artifact_prefix = f"{artifact_tier}/{audit['repository_id']}/{artifact_name}"
             server.get_status = 403
-            failed_get = _run_gate_archive_step(
+            failed_get = _run_gate_silo_step(
                 step,
                 tmp_path=tmp_path,
                 server=server,
@@ -990,14 +1008,13 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
                 repo_id=str(audit["repository_id"]),
                 source_env_name=source_env_name,
                 source_path=source_path,
-                current_attempt=current_attempt,
             )
             assert failed_get.returncode != 0
             assert f"Permanent {'primary audit' if source_env_name == 'AUDIT_PATH' else 'gate terminal'} archive readback failed" in failed_get.stderr
 
             server.get_status = None
             server.corrupt_get = True
-            mismatched_get = _run_gate_archive_step(
+            mismatched_get = _run_gate_silo_step(
                 step,
                 tmp_path=tmp_path,
                 server=server,
@@ -1005,13 +1022,12 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
                 repo_id=str(audit["repository_id"]),
                 source_env_name=source_env_name,
                 source_path=source_path,
-                current_attempt=current_attempt,
             )
             assert mismatched_get.returncode != 0
             assert "archive readback bytes do not match" in mismatched_get.stderr
 
             server.corrupt_get = False
-            missing_source = _run_gate_archive_step(
+            missing_source = _run_gate_silo_step(
                 step,
                 tmp_path=tmp_path,
                 server=server,
@@ -1019,15 +1035,33 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
                 repo_id=str(audit["repository_id"]),
                 source_env_name=source_env_name,
                 source_path=tmp_path / f"missing-{source_env_name}.json",
-                current_attempt=current_attempt,
             )
             assert missing_source.returncode != 0
             assert "archive upload failed" in missing_source.stderr
+
+        server.get_status = 403
+        failed_audit_archive = _run_gate_silo_step(
+            archive_audit, tmp_path=tmp_path, server=server,
+            artifact_prefix=f"d14/{audit['repository_id']}/{source_audit_name}",
+            repo_id=str(audit["repository_id"]), source_env_name="AUDIT_PATH",
+            source_path=audit_dir / "primary-review-audit.json",
+        )
+        assert failed_audit_archive.returncode != 0
+        assert "Permanent primary audit archive readback failed" in failed_audit_archive.stderr
+
+        server.get_status = None
+        terminal_after_audit_failure = _run_gate_silo_step(
+            archive_terminal, tmp_path=tmp_path, server=server,
+            artifact_prefix=f"d30/{audit['repository_id']}/{terminal_name}",
+            repo_id=str(audit["repository_id"]), source_env_name="TERMINAL_PATH",
+            source_path=terminal_path,
+        )
+        assert terminal_after_audit_failure.returncode == 0, terminal_after_audit_failure.stderr
+        assert server.objects[f"/ci-artifacts/archive/{audit['repository_id']}/{terminal_name}/gate-terminal.json"] == terminal_bytes
     finally:
         server.shutdown()
         server.server_close()
 
-    assert current_attempt != audit_source_attempt
     assert all(
         artifact_name.endswith(f"-{audit_source_attempt}")
         and not artifact_name.endswith(f"-{current_attempt}")
@@ -1081,7 +1115,7 @@ def test_skipped_gate_archives_terminal_without_fabricating_audit(tmp_path):
 
     server = _start_record_server()
     try:
-        result = _run_gate_archive_step(
+        result = _run_gate_silo_step(
             archive_terminal,
             tmp_path=tmp_path,
             server=server,
@@ -1089,7 +1123,6 @@ def test_skipped_gate_archives_terminal_without_fabricating_audit(tmp_path):
             repo_id=repo_id,
             source_env_name="TERMINAL_PATH",
             source_path=terminal_path,
-            current_attempt=source_attempt + 1,
         )
     finally:
         server.shutdown()

@@ -2024,7 +2024,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
     assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
     assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
-    assert terminal_download["if"] == "steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
+    assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
     assert "continue-on-error" not in terminal_download
     build = steps[build_index]
     assert build["id"] == "build-review-ledger"
@@ -2728,7 +2728,7 @@ def test_ledger_resolver_step_env_and_download_guard_literals():
     download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
     assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
     terminal_download = next(s for s in ledger_steps if s.get("name") == "Download gate terminal envelope for ledger")
-    assert terminal_download["if"] == "steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
+    assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
 
 
 def test_ledger_build_step_forwards_input_short_circuited():
