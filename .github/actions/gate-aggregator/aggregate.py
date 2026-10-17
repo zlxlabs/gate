@@ -320,6 +320,7 @@ class Outcome:
     skip_reason: Optional[str] = None
     audit_available: bool = False
     primary_verdict: Optional[str] = None
+    convergence: Optional[dict[str, int | bool | None]] = None
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
     convergence_envelope: Optional[dict[str, Any]] = None
@@ -338,6 +339,7 @@ class HistoryLoad:
     rows: list[dict[str, Any]] = field(default_factory=list)
     skipped_records: list[dict[str, str]] = field(default_factory=list)
     incomplete_reasons: list[str] = field(default_factory=list)
+    target_run_ids: Optional[tuple[int, ...]] = None
 
 
 class _PublishBudgetExhausted(Exception):
@@ -1048,6 +1050,8 @@ def build_terminal_envelope(
     }
     if outcome.primary_verdict is not None:
         envelope["primary_verdict"] = outcome.primary_verdict
+    if outcome.convergence is not None:
+        envelope["convergence"] = dict(outcome.convergence)
     if outcome.recorded_disposition_claims:
         envelope["recorded_disposition_claims"] = list(outcome.recorded_disposition_claims)
     if outcome.convergence_shadow is not None:
@@ -2177,6 +2181,11 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")
     audit = record.get("audit")
+    known_primary_skip = (
+        record.get("primary_result") == "skipped"
+        and record.get("skip_reason") in PRIMARY_SKIP_REASON_DOMAIN
+        and not (isinstance(audit, dict) and audit.get("available") is True)
+    )
     shadow = record.get("convergence_shadow")
     eligible_primary_round = (
         isinstance(audit, dict)
@@ -2198,6 +2207,7 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "head_sha": record["head_sha"],
         "gate_result": record["gate_result"],
         "primary_verdict": primary_verdict,
+        "_known_primary_skip": known_primary_skip,
         "classification": record["classification"],
         "reason_code": record["reason_code"],
         "_eligible_primary_round": eligible_primary_round,
@@ -2237,6 +2247,72 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         except FindingRelationError as exc:
             raise ValueError(str(exc)) from exc
     return row
+
+
+def _compute_pr_primary_convergence(
+    history: HistoryLoad, *, identity: Identity, primary_result: str, outcome: Outcome,
+) -> tuple[Optional[int], Optional[bool]]:
+    """Count distinct primary failures across all heads in one PR.
+
+    A known no-review skip contributes zero. The current verdict comes only
+    from the validated audit in `Outcome`, even while its run is in progress.
+    `run_id` deduplicates runs; `head_sha` identifies a row but does not partition
+    PR-wide convergence history.
+    """
+    target_run_ids = history.target_run_ids
+    target_ids = set(target_run_ids or ())
+    complete = target_run_ids is not None and not history.incomplete_reasons
+    rows_by_run: dict[int, list[dict[str, Any]]] = {}
+    observed_run_ids: set[int] = set()
+    for row in history.rows:
+        run_id = row.get("run_id")
+        if not _is_strict_int(run_id) or (
+            target_run_ids is not None and run_id not in target_ids and run_id != identity.run_id
+        ):
+            complete = False
+            continue
+        observed_run_ids.add(run_id)
+        if row.get("head_sha") != identity.head_sha and run_id == identity.run_id:
+            complete = False
+        rows_by_run.setdefault(run_id, []).append(row)
+    if target_run_ids is not None:
+        for run_id in target_ids:
+            if run_id != identity.run_id and run_id not in observed_run_ids:
+                complete = False
+    rows_by_run.setdefault(identity.run_id, []).append({
+        "run_attempt": identity.run_attempt,
+        "primary_verdict": outcome.primary_verdict,
+        "_known_primary_skip": (
+            primary_result == "skipped"
+            and outcome.skip_reason in PRIMARY_SKIP_REASON_DOMAIN
+            and not outcome.audit_available
+        ),
+        "primary_result": primary_result,
+        "audit_available": outcome.audit_available,
+    })
+    failed_run_ids: set[int] = set()
+    for run_id, attempts in rows_by_run.items():
+        actual_attempts = []
+        for attempt in attempts:
+            verdict = attempt.get("primary_verdict")
+            if verdict in ("pass", "fail"):
+                actual_attempts.append(attempt)
+            elif verdict in ("unavailable", "not_expected", "waived") or attempt.get("_known_primary_skip") is True:
+                continue
+            else:
+                complete = False
+        if actual_attempts and max(actual_attempts, key=lambda row: row["run_attempt"])["primary_verdict"] == "fail":
+            failed_run_ids.add(run_id)
+    fail_count = len(failed_run_ids) if complete else None
+    if outcome.primary_verdict == "pass" or (
+        primary_result == "skipped" and outcome.skip_reason in PRIMARY_SKIP_REASON_DOMAIN
+    ):
+        reconsider: Optional[bool] = False
+    elif outcome.primary_verdict == "fail":
+        reconsider = True if len(failed_run_ids) >= 3 else (False if complete else None)
+    else:
+        reconsider = None
+    return fail_count, reconsider
 
 
 def _read_terminal_zip(raw: bytes) -> dict[str, Any]:
@@ -2680,11 +2756,13 @@ def _load_pr_convergence_history(
                 "history truncated: this PR's branch has more pull_request runs than one page or the targeted cap"
             )
             return "history_unavailable", (), history
+        history.target_run_ids = tuple(target_run_ids)
         try:
             history = _fetch_silo_terminal_history(
                 repository=repository, repository_id=repository_id, pr_number=pr_number,
                 target_run_ids=target_run_ids,
             )
+            history.target_run_ids = tuple(target_run_ids)
         except _PublishBudgetExhausted:
             raise
         except Exception as exc:
@@ -3845,6 +3923,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         neighbor_evidence=neighbor_evidence,
     )
     apply_finding_relation(outcome, findings, previous_round)
+    fail_count, reconsider = _compute_pr_primary_convergence(
+        silo_terminal_history if silo_terminal_history is not None else HistoryLoad(),
+        identity=identity, primary_result=args.primary_result, outcome=outcome,
+    )
+    outcome.convergence = {"fail_count": fail_count, "reconsider": reconsider}
 
     return _finish(
         outcome,
