@@ -5188,11 +5188,12 @@ def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
         str(audit_dir / "primary-review-audit.json"), "--previous-findings-path", str(previous),
     ]) == 0
     summary = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(audit_dir, summary))
+    receipt = tmp_path / "convergence-receipt.json"
+    rc = AGG.main(_cli_args(audit_dir, summary, convergence_receipt_path=str(receipt)))
     terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
     relation = terminal["finding_relation"]
-    assert rc == 0
-    assert terminal["gate_result"] == "pass"
+    assert rc == 1
+    assert terminal["gate_result"] != "pass"
     assert relation["review_terminal"] == "manual_required"
     assert relation["counts"]["conflict"] == 1
     assert relation["items"][0]["relation_to_previous"] == "conflict"
@@ -5201,6 +5202,7 @@ def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
         terminal, repository="zlxlabs/gate", repository_id=123, pr_number=42,
     )])
     assert "manual_required" in body and "round-a" in body
+    assert json.loads(receipt.read_text())["decision"] != "converged"
     same = dict(previous_finding, id="other", acceptance=current["acceptance"], issue=current["issue"])
     assert AGG.relate_findings([current], [same])[0]["relation_to_previous"] == "new"
 
@@ -5259,9 +5261,19 @@ def test_shadow_budget_preserves_existing_verdict_contract(case):
         assert shadow.finding_relation["review_terminal"] == "manual_required"
 
 
-def test_unknown_relation_value_is_rejected():
-    with pytest.raises(AGG.FindingRelationError, match="GATE-FINDING-RELATION-UNKNOWN"):
-        AGG.relate_findings([{"id": "a", "relation_to_previous": "maybe"}], [])
+def test_cli_rejects_present_null_finding_relation(tmp_path):
+    audit_dir = _write_relation_audit(tmp_path, {"id": "a"})
+    audit_path = audit_dir / "primary-review-audit.json"
+    audit = json.loads(audit_path.read_text())
+    audit["finding_relation"] = None
+    audit_path.write_text(json.dumps(audit))
+    result = subprocess.run(
+        [sys.executable, str(MODULE_PATH), *_cli_args(audit_dir, tmp_path / "summary.md")],
+        cwd=ROOT, env={**os.environ, "SILO_ENDPOINT": "", "SILO_STORE": "", "GITHUB_TOKEN": "", "GH_TOKEN": ""},
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "GATE-FINDING-RELATION-UNKNOWN: block schema" in result.stderr
 
 
 def test_missing_previous_ledger_marks_new_and_job_succeeds(tmp_path, capsys):

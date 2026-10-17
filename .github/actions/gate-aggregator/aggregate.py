@@ -3969,12 +3969,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         neighbor_evidence=neighbor_evidence,
     )
     if isinstance(audit, dict):
-        relation = audit.get("finding_relation")
-        try:
-            if relation is None:
-                raise FindingRelationError(f"{RELATION_UNKNOWN}: block missing")
-            outcome.finding_relation = validate_finding_relation_block(relation)
-        except FindingRelationError:
+        if "finding_relation" in audit:
+            relation = validate_finding_relation_block(audit["finding_relation"])
+        else:
             print("GATE-FINDING-RELATION-DEGRADED: source=primary-audit detail=unknown")
             current_findings = [
                 {key: value for key, value in item.items()
@@ -3984,7 +3981,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             ]
             relation = build_finding_relation(current_findings, {"available": False})
             relation["history_status"] = "unknown"
-            outcome.finding_relation = validate_finding_relation_block(relation)
+            relation = validate_finding_relation_block(relation)
+        outcome.finding_relation = relation
+        if relation["counts"]["conflict"] and outcome.gate_result == "pass":
+            (outcome.ok, outcome.gate_result, outcome.classification, outcome.reason_code) = (
+                False, "fail", "code_fail", "primary_findings",
+            )
+            outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
     fail_count, reconsider = _compute_pr_primary_convergence(
         silo_terminal_history if silo_terminal_history is not None else HistoryLoad(),
         identity=identity, primary_result=args.primary_result, outcome=outcome,
