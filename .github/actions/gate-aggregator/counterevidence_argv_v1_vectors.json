@@ -41,6 +41,12 @@
       "reason_detail": "argv length is not 9"
     },
     {
+      "id": "two_pathspecs",
+      "argv": ["git", "grep", "-n", "-F", "-e", "locked-behavior",
+                "0123456789abcdef0123456789abcdef01234567", "--", "src/lock.py", "README.md"],
+      "reason_detail": "argv length is not 9"
+    },
+    {
       "id": "argv_item_not_string",
       "argv": ["git", "grep", "-n", "-F", "-e", "locked-behavior",
                 "0123456789abcdef0123456789abcdef01234567", "--", 1],

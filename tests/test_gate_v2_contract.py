@@ -484,6 +484,7 @@ def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(t
     # only copy in existence has to be the one a sparse checkout leaves there.
     workspace = _checkout_shaped_workspace(tmp_path, DISPOSITION_CHECKOUT_SUBDIR, [
         ".github/actions/gate-aggregator/convergence.py",
+        ".github/actions/gate-aggregator/counterevidence_argv.py",
     ])
     result = subprocess.run(
         [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
