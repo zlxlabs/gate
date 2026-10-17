@@ -5305,7 +5305,10 @@ def _previous_round_fixture_objects():
     ]
 
 
-def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_configured=True, run_id=35989919390):
+def _render_previous_round_fixture(
+    tmp_path, monkeypatch, silo_objects, *, silo_configured=True,
+    run_id=35989919390, run_attempt=1,
+):
     ledger, _, _ = _previous_round_fixture_objects()
     by_key = dict(silo_objects)
 
@@ -5332,7 +5335,7 @@ def _render_previous_round_fixture(tmp_path, monkeypatch, silo_objects, *, silo_
         "--repository-id", str(ledger["primary_identity"]["repository_id"]),
         "--pr-number", str(ledger["pr_number"]),
         "--run-id", str(run_id),
-        "--run-attempt", "1",
+        "--run-attempt", str(run_attempt),
         "--previous-json", str(output),
     ])
     return rc, json.loads(output.read_text(encoding="utf-8"))
@@ -5344,8 +5347,9 @@ def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert set(payload) == {"available", "detail", "findings", "dispositions"}
+    assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions"}
     assert payload["available"] is True
+    assert payload["head_sha"] == ledger["head_sha"]
     assert payload["findings"] and any(
         finding.get("id") == "reliability_alternates_survive_hard_kill"
         for finding in payload["findings"]
@@ -5361,6 +5365,142 @@ def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp
         "finding_id", "disposition", "head_sha", "approved_at", "reason", "counterevidence", "tracking_issue",
     }
     assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=0" in out
+
+
+def test_render_previous_context_preserves_full_findings_and_prior_head(tmp_path, monkeypatch):
+    ledger, _, objects = _previous_round_fixture_objects()
+    expected_findings = list(ledger["review"]["result"]["findings"])
+    template = expected_findings[-1]
+    for index in range(31 - len(expected_findings)):
+        finding = dict(template)
+        finding.update(
+            id=f"prior-finding-{index:02}",
+            severity="minor",
+            file=f"src/prior-{index}.py",
+            line=index + 1,
+            issue=f"prior issue {index}",
+            acceptance=f"prior acceptance {index}",
+        )
+        expected_findings.append(finding)
+    expected_findings[-1].update(
+        id="prior-major-after-limit",
+        severity="major",
+        file="src/last-major.py",
+        line=91,
+        issue="last major finding",
+        acceptance="keep the complete old machine fact",
+        quote='raw quote with "quotes" and a newline\nthat must survive',
+        anchor={"path": "src/last-major.py", "line": 91, "range": [91, 92]},
+    )
+
+    latest_key = AGG._ledger_latest_key(
+        ledger["primary_identity"]["repository_id"], ledger["pr_number"],
+    )
+    expanded_objects = []
+    for key, raw in objects:
+        if key == latest_key:
+            entry = json.loads(raw)
+            entry["review"]["result"]["findings"] = expected_findings
+            raw = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+        expanded_objects.append((key, raw))
+
+    rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, expanded_objects)
+    output_path = tmp_path / "previous-findings.json"
+    written_payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert rc == 0
+    assert written_payload["findings"] == expected_findings
+    assert written_payload.get("head_sha") == ledger["head_sha"]
+    assert payload["findings"][-1]["severity"] == "major"
+    assert payload["findings"][-1]["quote"] == expected_findings[-1]["quote"]
+    assert payload["findings"][-1]["anchor"] == expected_findings[-1]["anchor"]
+
+    loaded = AGG.load_previous_round_findings(
+        path=str(output_path), repository_id=ledger["primary_identity"]["repository_id"],
+        pr_number=ledger["pr_number"], run_id=35989919390, run_attempt=1,
+    )
+    assert loaded["head_sha"] == ledger["head_sha"]
+    assert loaded["findings"] == expected_findings
+    tail = expected_findings[-1]
+    current = {
+        field: tail[field]
+        for field in ("id", "severity", "file", "line", "category", "issue", "acceptance")
+    }
+    relation = AGG.build_finding_relation([current], loaded)
+    assert relation["items"][0]["relation_to_previous"] == "repeat"
+    assert relation["items"][0]["previous_finding_id"] == "prior-major-after-limit"
+
+
+def test_render_previous_context_keeps_same_head_older_attempt(tmp_path, monkeypatch):
+    ledger, _, objects = _previous_round_fixture_objects()
+    rc, payload = _render_previous_round_fixture(
+        tmp_path, monkeypatch, objects,
+        run_id=ledger["run_id"], run_attempt=ledger["run_attempt"] + 1,
+    )
+
+    assert rc == 0
+    assert payload["available"] is True
+    assert payload.get("head_sha") == ledger["head_sha"]
+    assert payload["findings"] == ledger["review"]["result"]["findings"]
+
+
+@pytest.mark.parametrize("latest_state", ["same-attempt", "future-attempt"])
+def test_render_previous_context_degrades_current_or_future_attempt(tmp_path, monkeypatch, capsys, latest_state):
+    ledger, _, objects = _previous_round_fixture_objects()
+    run_attempt = ledger["run_attempt"]
+    if latest_state == "future-attempt":
+        latest_key = AGG._ledger_latest_key(ledger["primary_identity"]["repository_id"], ledger["pr_number"])
+        future_objects = []
+        for key, raw in objects:
+            if key == latest_key:
+                entry = json.loads(raw)
+                entry["run_attempt"] += 1
+                entry["primary_identity"]["run_attempt"] += 1
+                raw = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+            future_objects.append((key, raw))
+        objects = future_objects
+    rc, payload = _render_previous_round_fixture(
+        tmp_path, monkeypatch, objects, run_id=ledger["run_id"], run_attempt=run_attempt,
+    )
+
+    assert rc == 0
+    assert payload == {
+        "available": False, "detail": "silo-ledger-latest-not-prior", "head_sha": None,
+        "findings": [], "dispositions": [],
+    }
+    assert (
+        "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger "
+        "detail=silo-ledger-latest-not-prior"
+    ) in capsys.readouterr().out
+
+
+def test_render_previous_context_keeps_missing_prior_head_unknown(tmp_path, monkeypatch):
+    ledger, _, objects = _previous_round_fixture_objects()
+    latest_key = AGG._ledger_latest_key(
+        ledger["primary_identity"]["repository_id"], ledger["pr_number"],
+    )
+    no_head_objects = []
+    for key, raw in objects:
+        if key == latest_key:
+            entry = json.loads(raw)
+            entry.pop("head_sha")
+            raw = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+        no_head_objects.append((key, raw))
+
+    rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, no_head_objects)
+    output_path = tmp_path / "previous-findings.json"
+    loaded = AGG.load_previous_round_findings(
+        path=str(output_path), repository_id=ledger["primary_identity"]["repository_id"],
+        pr_number=ledger["pr_number"], run_id=35989919390, run_attempt=1,
+    )
+
+    assert rc == 0
+    assert ledger["primary_identity"]["head_sha"]
+    assert "head_sha" in payload
+    assert payload["head_sha"] is None
+    assert "head_sha" in loaded
+    assert loaded["head_sha"] is None
+    assert loaded["findings"] == ledger["review"]["result"]["findings"]
 
 
 def test_render_previous_context_drops_invalid_dispositions_and_reports_count(tmp_path, monkeypatch, capsys):
@@ -5389,7 +5529,7 @@ def test_render_previous_context_writes_only_previous_findings_json(tmp_path, mo
     before = {path.name for path in tmp_path.iterdir()}
     rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, objects)
     assert rc == 0
-    assert set(payload) == {"available", "detail", "findings", "dispositions"}
+    assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions"}
     assert {path.name for path in tmp_path.iterdir()} - before == {"previous-findings.json"}
 
 
@@ -5472,7 +5612,10 @@ def test_render_previous_context_silo_unconfigured_has_complete_empty_contract(t
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert payload == {"available": False, "detail": "silo-not-configured", "findings": [], "dispositions": []}
+    assert payload == {
+        "available": False, "detail": "silo-not-configured", "head_sha": None,
+        "findings": [], "dispositions": [],
+    }
     assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-not-configured" in out
 
 
@@ -5518,9 +5661,10 @@ def test_previous_findings_get_latest_once_without_list(tmp_path, monkeypatch):
     monkeypatch.setenv("SILO_STORE", str(store))
     monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    findings = AGG._previous_findings_from_silo(
+    head_sha, findings = AGG._previous_findings_from_silo(
         repository_id=repo_id, pr_number=ledger["pr_number"], run_id=35989919390, run_attempt=1,
     )
+    assert head_sha == ledger["head_sha"]
     assert any(item.get("id") == "reliability_alternates_survive_hard_kill" for item in findings)
     _assert_single_latest_get(argv_log, key)
 
@@ -5537,7 +5681,9 @@ def test_previous_findings_absent_latest_degrades_without_list(tmp_path, monkeyp
         path=None, repository_id=repo_id, pr_number=ledger["pr_number"],
         run_id=35989919390, run_attempt=1,
     )
-    assert previous == {"available": False, "detail": "silo-ledger-latest-absent", "findings": []}
+    assert previous == {
+        "available": False, "detail": "silo-ledger-latest-absent", "head_sha": None, "findings": [],
+    }
     assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-ledger-latest-absent" in capsys.readouterr().out
     _assert_single_latest_get(argv_log, key)
 
@@ -5556,6 +5702,8 @@ def test_previous_findings_not_prior_latest_degrades_without_list(tmp_path, monk
         path=None, repository_id=repo_id, pr_number=ledger["pr_number"],
         run_id=ledger["run_id"], run_attempt=ledger["run_attempt"],
     )
-    assert previous == {"available": False, "detail": "silo-ledger-latest-not-prior", "findings": []}
+    assert previous == {
+        "available": False, "detail": "silo-ledger-latest-not-prior", "head_sha": None, "findings": [],
+    }
     assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-ledger-latest-not-prior" in capsys.readouterr().out
     _assert_single_latest_get(argv_log, key)
