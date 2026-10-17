@@ -762,6 +762,139 @@ def build_entry(
     return entry
 
 
+def build_live_review_record(
+    entry: dict[str, Any], *, repository_id: int,
+    terminal_envelope: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Project one live ledger row to review-record/v1 without guessing missing provenance."""
+    review = entry["review"]
+    primary = entry.get("primary_identity") or {}
+    if not isinstance(primary, dict):
+        raise ValueError("live review record primary_identity must be an object or null")
+    preflight = entry.get("preflight") or {}
+    if not isinstance(preflight, dict):
+        raise ValueError("live review record preflight must be an object or null")
+    unknown: dict[str, str] = {}
+
+    def project(source: dict[str, Any], field: str, unknown_key: str, reason: str) -> Any:
+        value = source.get(field)
+        if value is None:
+            unknown[unknown_key] = reason
+        return value
+
+    result = review.get("result")
+    if result is not None and not isinstance(result, dict):
+        raise ValueError("live review record result must be an object or null")
+    source_findings = [] if result is None else result.get("findings", [])
+    if not isinstance(source_findings, list) or any(not isinstance(item, dict) for item in source_findings):
+        raise ValueError("live review record findings must be an object list")
+    if len(source_findings) != review["finding_count"]:
+        raise ValueError("live review record findings count disagrees with review.finding_count")
+    findings = []
+    for index, source_finding in enumerate(source_findings):
+        finding = dict(source_finding)
+        for field in (
+            "introduced", "changed_since_prev_round", "exposed_by_this_pr", "class", "fingerprint",
+        ):
+            value = finding.setdefault(field, None)
+            if value is None:
+                unknown[f"findings[{index}].{field}"] = "live primary audit has no value for this C3 field"
+        findings.append(finding)
+
+    base_sha = primary.get("base_sha")
+    if base_sha is None:
+        base_sha = project(preflight, "base_sha", "base_sha", "neither primary audit nor preflight has a base SHA")
+    merge_base_sha = project(primary, "merge_base_sha", "merge_base_sha", "primary audit has no merge-base SHA")
+    convergence_fields = {"fail_count": None, "reconsider": None}
+    terminal_identity = {
+        "repository_id": repository_id, "repository": entry["repository"],
+        "pr_number": entry["pr_number"], "run_id": entry["run_id"],
+        "run_attempt": entry["run_attempt"], "head_sha": entry["head_sha"],
+    }
+    terminal_matches = terminal_envelope is not None and (
+        terminal_envelope.get("schema_version") == 1
+        and terminal_envelope.get("kind") == "gate_terminal"
+        and all(type(terminal_envelope.get(key)) is type(value) and terminal_envelope.get(key) == value
+                for key, value in terminal_identity.items())
+    )
+    if terminal_envelope is None:
+        terminal_reason = "same-run gate terminal artifact is unavailable"
+    elif not terminal_matches:
+        terminal_reason = "gate terminal identity does not match this ledger run"
+    else:
+        terminal_reason = "same-run gate terminal does not contain this value"
+        convergence_source = terminal_envelope.get("convergence")
+        if convergence_source is not None and not isinstance(convergence_source, dict):
+            raise ValueError("same-run gate terminal convergence must be an object")
+        if convergence_source is not None:
+            for field in convergence_fields:
+                convergence_fields[field] = project(
+                    convergence_source, field, field,
+                    f"same-run gate terminal convergence has no {field} value",
+                )
+        else:
+            unknown["fail_count"] = terminal_reason
+            unknown["reconsider"] = terminal_reason
+
+    if not terminal_matches:
+        unknown.setdefault("fail_count", terminal_reason)
+        unknown.setdefault("reconsider", terminal_reason)
+
+    skip_reason = None
+    if terminal_matches:
+        if "skip_reason" not in terminal_envelope:
+            unknown["skip.reason"] = terminal_reason
+        else:
+            skip_reason = terminal_envelope["skip_reason"]
+            if skip_reason is not None and skip_reason not in ("draft", "fork", "hosted_runner", "review_exempt"):
+                raise ValueError("same-run gate terminal skip_reason is invalid")
+    else:
+        unknown["skip.reason"] = terminal_reason
+
+    risk_source = entry.get("risk") or {}
+    if not isinstance(risk_source, dict):
+        raise ValueError("live review record risk must be an object or absent")
+    risk = {
+        field: project(risk_source, field, field, f"live primary audit has no risk.{field} value")
+        for field in (
+            "declared_tier", "effective_tier", "rule_hits", "rules_version",
+            "human_required", "security_pass",
+        )
+    }
+    finding_dispositions = project(
+        result or {}, "finding_dispositions", "finding_dispositions",
+        "live primary audit has no finding dispositions",
+    )
+    reviewer_id = review.get("reviewer")
+    if reviewer_id is None:
+        unknown["reviewer_id"] = "live ledger has no reviewer identifier"
+    for field in ("round_index", "gate_hub_commit", "prompt_digest", "model_used", "profile"):
+        unknown[field] = "live ledger producer has no exact value for this field"
+
+    if type(repository_id) is not int or repository_id <= 0:
+        raise ValueError("live review record repository_id must be a positive integer")
+    artifact_name = (
+        f"codex-review-ledger-v2-{repository_id}-{entry['head_sha']}-"
+        f"{entry['run_id']}-{entry['run_attempt']}"
+    )
+    record = {
+        "schema_version": "review-record/v1", "source": "ci", "repo": entry["repository"],
+        "pr": entry["pr_number"], "base_sha": base_sha, "merge_base_sha": merge_base_sha,
+        "head_sha": entry["head_sha"], "run_id": entry["run_id"], "attempt": entry["run_attempt"],
+        "round_index": None, "gate_hub_commit": None, "prompt_digest": None,
+        "model_used": None, "profile": None, "reviewer_id": reviewer_id,
+        "verdict": review.get("verdict"), "findings": findings,
+        "finding_dispositions": finding_dispositions, "convergence": convergence_fields,
+        "risk": risk, "skip": {"reason": skip_reason}, "recorded_at": entry["recorded_at"],
+        "provenance": {"origin": "gate-live-review-ledger-v2",
+                       "source_key": f"silo/ci-artifacts/d30/{repository_id}/{artifact_name}/ledger.jsonl",
+                       "unknown_fields": unknown},
+    }
+    if "finding_dispositions" in entry:
+        record["legacy_finding_dispositions"] = entry["finding_dispositions"]
+    return record
+
+
 def write_ledger(path: Path, entry: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
@@ -820,6 +953,7 @@ def main() -> int:
     # with one GATE-INCREMENTAL-SHADOW-UNAVAILABLE line.
     parser.add_argument("--shadow-path", default="")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--record-output", default=None, type=Path)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", required=True, type=int)
     parser.add_argument("--run-id", required=True, type=int)
@@ -882,6 +1016,10 @@ def main() -> int:
         input_short_circuited=input_short_circuited,
     )
     write_ledger(args.output, entry)
+    if args.record_output is not None:
+        write_ledger(args.record_output, build_live_review_record(
+            entry, repository_id=args.expected_repository_id, terminal_envelope=terminal,
+        ))
     print(json.dumps(entry, ensure_ascii=False))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         _append_summary(entry, os.environ["GITHUB_STEP_SUMMARY"])

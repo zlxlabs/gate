@@ -421,6 +421,166 @@ def _run_ledger_main(
     return rc, output, audit
 
 
+def _live_record_audit() -> dict:
+    return {
+        "kind": "primary_review", "schema_version": 1,
+        "repository_id": 123, "repository": "zlxlabs/gate", "pr": 42,
+        "base_sha": "b" * 40, "head_sha": "a" * 40, "diff_digest": "d" * 64,
+        "policy_version": "policy-v1", "policy_digest": "e" * 64,
+        "registry_commit": "r" * 40, "caller_sha": "c" * 40,
+        "reusable_workflow_sha": "w" * 40, "run_id": 999, "run_attempt": 1,
+        "job_id": 99, "reviewer": "codex-sub", "verdict": "fail",
+        "merge_base_sha": "9" * 40, "candidate_commit_sha": "f" * 40,
+        "candidate_tree_sha": "1" * 40, "run_mode": "PAYLOAD_ONLY",
+        "spec_source": "event_payload", "pr_body_digest": "empty",
+        "attempts": [], "shadow_mode": "detached", "expected_shadows": [],
+        "result": {"verdict": "fail", "summary": "blocking finding", "findings": [
+            {"id": "correctness.bad-state", "severity": "major", "category": "correctness"},
+        ], "finding_dispositions": []},
+        "cost": 0, "tokens": [], "runtime": None,
+        "risk": _primary_risk(),
+    }
+
+
+def _live_record_terminal(*, skip_reason=None, run_attempt=1):
+    agg = _aggregator()
+    identity = agg.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=run_attempt, pr=42)
+    is_draft = skip_reason == "draft"
+    is_fork = skip_reason == "fork"
+    runner = "hosted" if skip_reason == "hosted_runner" else "self"
+    classify_review_expected = "false" if skip_reason == "review_exempt" else ""
+    skipped = skip_reason is not None
+    outcome = agg.evaluate(
+        quality_result="success", primary_result="skipped" if skipped else "failure",
+        runner=runner, is_draft=is_draft, is_fork=is_fork,
+        review_expected=not skipped, classify_review_expected=classify_review_expected,
+        audit=None if skipped else _live_record_audit(), audit_error=None,
+        identity=identity, pr_author="owner",
+    )
+    outcome.convergence = {"fail_count": None, "reconsider": None} if skipped else {"fail_count": 3, "reconsider": True}
+    return agg.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=identity, quality_result="success",
+        primary_result="skipped" if skipped else "failure", review_expected=not skipped,
+        is_draft=is_draft, runner=runner, outcome=outcome,
+    )
+
+
+def _run_live_record_cli(tmp_path, *, audit=None, terminal=None, run_attempt=1, record_output=True):
+    work = tmp_path
+    work.mkdir(parents=True, exist_ok=True)
+    audit_path, preflight_path = work / "audit.json", work / "preflight.json"
+    terminal_path, ledger_path = work / "terminal.json", work / "ledger.jsonl"
+    record_path = work / "review-record.jsonl"
+    if audit is not None:
+        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    preflight_path.write_text(json.dumps(_preflight()), encoding="utf-8")
+    if terminal is not None:
+        terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
+    command = [
+        sys.executable, str(MODULE_PATH), "--audit-path", str(audit_path),
+        "--preflight-path", str(preflight_path), "--install-path", str(work / "missing-install.json"),
+        "--output", str(ledger_path), "--repository", "zlxlabs/gate", "--pr-number", "42",
+        "--run-id", "999", "--run-attempt", str(run_attempt), "--head-sha", "a" * 40,
+        "--expected-repository-id", "123", "--expected-base-sha", "b" * 40,
+        "--expected-caller-sha", "c" * 40, "--expected-reusable-workflow-sha", "w" * 40,
+        "--codex-expected", "true",
+    ]
+    if terminal is not None:
+        command.extend(["--terminal-path", str(terminal_path)])
+    if record_output:
+        command.extend(["--record-output", str(record_path)])
+    env = os.environ.copy()
+    env.pop("GITHUB_STEP_SUMMARY", None)
+    completed = subprocess.run(command, capture_output=True, text=True, env=env)
+    return completed, ledger_path, record_path
+
+
+def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path):
+    audit = _live_record_audit()
+    terminal = _live_record_terminal()
+    completed, ledger_path, record_path = _run_live_record_cli(
+        tmp_path / "with-record", audit=audit, terminal=terminal,
+    )
+    assert completed.returncode == 0, completed.stderr
+    record_bytes = record_path.read_bytes()
+    assert record_bytes.endswith(b"\n") and record_bytes.count(b"\n") == 1
+    record = json.loads(record_bytes)
+    assert set(record) == {
+        "schema_version", "source", "repo", "pr", "base_sha", "merge_base_sha", "head_sha",
+        "run_id", "attempt", "round_index", "gate_hub_commit", "prompt_digest", "model_used",
+        "profile", "reviewer_id", "verdict", "findings", "finding_dispositions", "convergence",
+        "risk", "skip", "recorded_at", "provenance", "legacy_finding_dispositions",
+    }
+    assert record["risk"] == audit["risk"]
+    assert record["convergence"] == terminal["convergence"]
+    assert record["skip"] == {"reason": None}
+    assert record["findings"][0]["introduced"] is None
+    assert "findings[0].introduced" in record["provenance"]["unknown_fields"]
+    assert record["provenance"]["origin"] == "gate-live-review-ledger-v2"
+    assert json.loads(completed.stdout) == json.loads(ledger_path.read_bytes())
+
+    fixture_path = ROOT / "tests" / "fixtures" / "review-record-v1-live.json"
+    fixture = json.loads(fixture_path.read_bytes())
+    assert {key: value for key, value in record.items() if key != "recorded_at"} == {
+        key: value for key, value in fixture.items() if key != "recorded_at"
+    }
+    without_sidecar, old_ledger_path, old_record_path = _run_live_record_cli(
+        tmp_path / "legacy-cli", audit=audit, terminal=terminal, record_output=False,
+    )
+    assert without_sidecar.returncode == 0, without_sidecar.stderr
+    assert not old_record_path.exists()
+    old_row, sidecar_run_row = json.loads(old_ledger_path.read_bytes()), json.loads(ledger_path.read_bytes())
+    assert {key: value for key, value in old_row.items() if key != "recorded_at"} == {
+        key: value for key, value in sidecar_run_row.items() if key != "recorded_at"
+    }
+
+
+@pytest.mark.parametrize("skip_reason", ["draft", "fork", "hosted_runner", "review_exempt"])
+def test_live_record_cli_projects_each_verified_terminal_skip(tmp_path, skip_reason):
+    terminal = _live_record_terminal(skip_reason=skip_reason)
+    completed, _ledger_path, record_path = _run_live_record_cli(tmp_path, terminal=terminal)
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(record_path.read_bytes())
+    assert record["verdict"] is None
+    assert record["skip"] == {"reason": skip_reason}
+
+
+@pytest.mark.parametrize(("field", "value", "run_attempt"), [
+    ("repository_id", 124, 1), ("repository", "zlxlabs/other", 1),
+    ("pr_number", 43, 1), ("run_id", 1000, 1), ("head_sha", "f" * 40, 1),
+    ("run_attempt", 1, 2),
+])
+def test_live_record_cli_does_not_project_terminal_skip_across_identity(
+    tmp_path, field, value, run_attempt,
+):
+    terminal_attempt = value if field == "run_attempt" else run_attempt
+    terminal = _live_record_terminal(skip_reason="draft", run_attempt=terminal_attempt)
+    if field != "run_attempt":
+        terminal[field] = value
+    completed, ledger_path, record_path = _run_live_record_cli(
+        tmp_path, terminal=terminal, run_attempt=run_attempt,
+    )
+    if field not in {"repository_id", "run_attempt"}:
+        assert completed.returncode != 0
+        assert not record_path.exists()
+        return
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(record_path.read_bytes())
+    if field == "run_attempt":
+        assert json.loads(ledger_path.read_bytes())["terminal_source_attempt"] == value
+    assert record["skip"] == {"reason": None}
+    assert record["provenance"]["unknown_fields"]["skip.reason"]
+
+
+def test_live_record_cli_marks_missing_terminal_unknown(tmp_path):
+    missing, _ledger_path, missing_path = _run_live_record_cli(tmp_path / "missing")
+    assert missing.returncode == 0, missing.stderr
+    missing_record = json.loads(missing_path.read_bytes())
+    assert missing_record["skip"] == {"reason": None}
+    assert missing_record["convergence"] == {"fail_count": None, "reconsider": None}
+    assert missing_record["provenance"]["unknown_fields"]["skip.reason"]
+
+
 
 def test_main_no_network_writes_one_v2_row_with_current_fields(tmp_path, monkeypatch):
     module = _module()
