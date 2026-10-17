@@ -9,10 +9,12 @@ inputs and can therefore be replayed in a different process.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
@@ -50,11 +52,17 @@ DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHE
 DEFERRED_RECEIPT_REJECT_REASON = "deferred_not_allowed_for_tier"
 DISPOSITION_REASON_DISPLAY_MAX = 500
 COUNTEREVIDENCE_RERUN_TIMEOUT_S: int = 30
-COUNTEREVIDENCE_ARGV_TEMPLATE = (
-    'expected allowlisted argv is exactly 9 items: '
-    '["git", "grep", "-n", "-F", "-e", <literal>, <head_sha>, "--", <pathspec>] '
-    '(head_sha at index 6)'
+_COUNTEREVIDENCE_ARGV_SPEC = importlib.util.spec_from_file_location(
+    "gate_counterevidence_argv_contract",
+    Path(__file__).with_name("counterevidence_argv.py"),
 )
+if _COUNTEREVIDENCE_ARGV_SPEC is None or _COUNTEREVIDENCE_ARGV_SPEC.loader is None:
+    raise ImportError("counterevidence argv contract is unavailable")
+_COUNTEREVIDENCE_ARGV = importlib.util.module_from_spec(_COUNTEREVIDENCE_ARGV_SPEC)
+_COUNTEREVIDENCE_ARGV_SPEC.loader.exec_module(_COUNTEREVIDENCE_ARGV)
+COUNTEREVIDENCE_ARGV_CONTRACT_VERSION = _COUNTEREVIDENCE_ARGV.COUNTEREVIDENCE_ARGV_CONTRACT_VERSION
+COUNTEREVIDENCE_ARGV_TEMPLATE = _COUNTEREVIDENCE_ARGV.COUNTEREVIDENCE_ARGV_TEMPLATE
+counterevidence_argv_reason = _COUNTEREVIDENCE_ARGV.counterevidence_argv_reason
 
 # This is intentionally local to the public gate repository.  The private
 # policy source is represented only by Scope.policy_version/policy_digest in
@@ -1316,79 +1324,6 @@ def _approved_at_has_time(value: Any) -> bool:
     except (ValueError, TypeError, AttributeError):
         return False
     return True
-
-
-def counterevidence_argv_reason(argv: list[str], head_sha: str) -> str | None:
-    """Return a reject reason unless argv is the allowlisted git-grep form.
-
-    Allowlisted argv is exactly:
-    ["git", "grep", "-n", "-F", "-e", <literal>, <head_sha>, "--", <pathspec>]
-    None means the argv is compliant. Reject text keeps the machine code as a
-    prefix and always includes COUNTEREVIDENCE_ARGV_TEMPLATE.
-    """
-    if not isinstance(head_sha, str) or not head_sha:
-        return (
-            "counterevidence_command_not_allowlisted: head_sha is missing; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if not isinstance(argv, list) or len(argv) != 9:
-        return (
-            "counterevidence_command_not_allowlisted: argv length is not 9; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if any(not isinstance(item, str) for item in argv):
-        return (
-            "counterevidence_command_not_allowlisted: argv items must be strings; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    git, grep, flag_n, flag_f, flag_e, literal, sha, dash, pathspec = argv
-    if git != "git":
-        return (
-            "counterevidence_command_not_allowlisted: argv[0] is not git; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if grep != "grep":
-        return (
-            "counterevidence_command_not_allowlisted: argv[1] is not grep; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if (flag_n, flag_f, flag_e, dash) != ("-n", "-F", "-e", "--"):
-        return (
-            "counterevidence_command_not_allowlisted: "
-            "argv flags must be -n -F -e with -- at index 7; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if not literal or literal.startswith("-"):
-        return (
-            "counterevidence_command_not_allowlisted: "
-            "argv[5] literal is empty or starts with -; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if sha != head_sha:
-        return (
-            "counterevidence_command_not_allowlisted: "
-            "argv[6] is not the current head_sha; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if not pathspec or pathspec.startswith("-") or pathspec.startswith(":"):
-        return (
-            "counterevidence_command_not_allowlisted: "
-            "argv[8] pathspec is empty or starts with - or :; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if pathspec.startswith("/"):
-        return (
-            "counterevidence_command_not_allowlisted: "
-            "argv[8] pathspec must be relative, not absolute; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    if ".." in pathspec.split("/"):
-        return (
-            "counterevidence_command_not_allowlisted: "
-            "argv[8] pathspec must not contain ..; "
-            + COUNTEREVIDENCE_ARGV_TEMPLATE
-        )
-    return None
 
 
 def _counterevidence_reason(receipt: DispositionReceipt) -> str | None:

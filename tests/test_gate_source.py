@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -238,8 +239,9 @@ def source_host(tmp_path):
     (gate_work / "scripts").mkdir()
     shutil.copy(REPO_ROOT / "scripts/gate_source.py", gate_work / "scripts/gate_source.py")
     shutil.copy(REPO_ROOT / "scripts/gate_bounded_retry.py", gate_work / "scripts/gate_bounded_retry.py")
+    shutil.copy(REPO_ROOT / "scripts/scrub_outbound.py", gate_work / "scripts/scrub_outbound.py")
     (gate_work / "scripts/unrelated.py").write_text("# not fetched\n")
-    # The disposition sparse list names four more files; checkout_from_environment
+    # The disposition sparse list names five more files; checkout_from_environment
     # fails the step when a declared sparse path is absent after checkout, so the
     # fixture repo has to carry them for the disposition entry point to run.
     shutil.copy(REPO_ROOT / "scripts/silo_store.py", gate_work / "scripts/silo_store.py")
@@ -250,10 +252,11 @@ def source_host(tmp_path):
         REPO_ROOT / ".github/actions/gate-disposition/issue_receipt.py",
         gate_work / ".github/actions/gate-disposition/issue_receipt.py",
     )
-    shutil.copy(
-        REPO_ROOT / ".github/actions/gate-aggregator/convergence.py",
-        gate_work / ".github/actions/gate-aggregator/convergence.py",
-    )
+    for name in ("aggregate.py", "convergence.py", "neighbor_evidence.py", "counterevidence_argv.py"):
+        shutil.copy(
+            REPO_ROOT / ".github/actions/gate-aggregator" / name,
+            gate_work / ".github/actions/gate-aggregator" / name,
+        )
     _git("add", "-A", cwd=gate_work)
     _git("commit", "-qm", "gate tools", cwd=gate_work)
     gate_sha = _git("rev-parse", "HEAD", cwd=gate_work)
@@ -475,9 +478,46 @@ def test_disposition_checkout_service_materializes_the_declared_subdirectory(sou
     for line in env["GATE_CHECKOUT_SPARSE"].splitlines():
         sparse_path = line.strip()
         assert sparse_path and (dest / sparse_path).is_file(), sparse_path
+    producer_probe = subprocess.run(
+        [sys.executable, str(dest / ".github/actions/gate-disposition/issue_receipt.py"), "--help"],
+        cwd=workspace, capture_output=True, text=True, timeout=30,
+    )
+    assert producer_probe.returncode == 0, producer_probe.stderr
     # The workspace root stays the domain of actions/checkout.
     assert not (workspace / "scripts" / "silo_store.py").exists()
     assert not (workspace / ".github").exists()
+    assert _network_argv(source_host) == []
+
+
+def test_aggregator_loads_argv_contract_from_real_sparse_checkout(source_host):
+    raw = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    step = next(
+        item
+        for item in raw["jobs"]["primary"]["steps"]
+        if item.get("name") == "Inject previous-round findings into primary review context"
+    )
+    workspace = source_host["tmp_path"] / "aggregator-workspace"
+    workspace.mkdir()
+    env = _env(
+        source_host, workspace,
+        GATE_CHECKOUT_REPOSITORY=GATE_REPOSITORY,
+        GATE_CHECKOUT_REF=source_host["gate_sha"],
+        GATE_CHECKOUT_PATH="_gate-silo-src",
+        GATE_CHECKOUT_SPARSE=step["env"]["GATE_CHECKOUT_SPARSE"],
+    )
+    _script_env(env)
+    checkout = _run_bash(
+        'bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"\n'
+        'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout',
+        env,
+    )
+    assert checkout.returncode == 0, f"{checkout.stderr}\n{checkout.stdout}"
+    sparse_root = workspace / "_gate-silo-src"
+    aggregate_probe = subprocess.run(
+        [sys.executable, str(sparse_root / ".github/actions/gate-aggregator/aggregate.py"), "--help"],
+        cwd=workspace, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert aggregate_probe.returncode == 0, aggregate_probe.stderr
     assert _network_argv(source_host) == []
 
 

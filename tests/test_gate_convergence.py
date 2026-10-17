@@ -20,6 +20,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "convergence.py"
+ARGV_MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "counterevidence_argv.py"
+ARGV_VECTORS_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "counterevidence_argv_v1_vectors.json"
 # Must match aggregate.py's spec name. neighbor_evidence.py reuses the first
 # sys.modules entry whose __file__ is convergence.py so Scope dataclass
 # identity matches end to end (gate#297 / gate#321). A second name here
@@ -1421,6 +1423,50 @@ def test_counterevidence_argv_reason_accepts_allowlisted_shape():
 
 def test_counterevidence_argv_template_constant_matches_literal():
     assert CONV.COUNTEREVIDENCE_ARGV_TEMPLATE == _ARGV_TEMPLATE_LITERAL
+
+
+@pytest.mark.parametrize(
+    "case",
+    json.loads(ARGV_VECTORS_PATH.read_text(encoding="utf-8"))["cases"],
+    ids=lambda case: case["id"],
+)
+def test_versioned_argv_vectors_match_public_and_aggregator_validation(case):
+    payload = json.loads(ARGV_VECTORS_PATH.read_text(encoding="utf-8"))
+    assert payload["contract_version"] == CONV.COUNTEREVIDENCE_ARGV_CONTRACT_VERSION
+    spec = importlib.util.spec_from_file_location("gate_public_counterevidence_argv", ARGV_MODULE_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.COUNTEREVIDENCE_ARGV_CONTRACT_VERSION == payload["contract_version"]
+
+    if case["reason_detail"] is None:
+        expected_reason = None
+    else:
+        expected_reason = (
+            f"{payload['reason_code']}: {case['reason_detail']}; "
+            f"{module.COUNTEREVIDENCE_ARGV_TEMPLATE}"
+        )
+    head_sha = case.get("head_sha", payload["head_sha"])
+    public_reason = module.counterevidence_argv_reason(case["argv"], head_sha)
+    assert public_reason == CONV.counterevidence_argv_reason(case["argv"], head_sha) == expected_reason
+
+    if case["id"] in {"allowed_simple_path", "parent_pathspec"}:
+        scope = _scope(head_sha=payload["head_sha"])
+        primary = _primary(scope, run_id=7, run_attempt=2, p1_ids=("p1",))
+        receipt = _disposition(scope, primary=primary)
+        evidence = dict(receipt.counterevidence)
+        evidence["gate_rerun"] = {
+            "argv": case["argv"], "exit_code": 0, "match_count": 1,
+        }
+        status = CONV.validate_disposition_receipt(
+            replace(receipt, counterevidence=evidence),
+            scope=scope, primary=primary, audit_digest="a" * 64,
+        )
+        assert status.active is (expected_reason is None)
+        assert status.reason_code == (
+            "active_false_positive" if expected_reason is None
+            else "counterevidence_command_not_allowlisted"
+        )
 
 
 @pytest.mark.parametrize(
