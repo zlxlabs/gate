@@ -2711,6 +2711,7 @@ jobs:
           install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
           terminal-path: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != '' && format('{0}/gate-terminal/gate-terminal.json', runner.temp) || '' }}
           shadow-path: ${{ runner.temp }}/incremental-shadow/shadow.json
+          record-output: ${{ runner.temp }}/review-ledger/review-record-v1.json
           codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
           codex-waived: false
           expected-repository-id: ${{ github.repository_id }}
@@ -2837,6 +2838,16 @@ jobs:
             echo "::error::Permanent gate terminal archive readback bytes do not match" >&2
             exit 1
           fi
+
+      - name: Upload live review record/v1 to permanent Silo
+        if: always() && steps.build-review-ledger.outcome == 'success'
+        env:
+          REVIEW_RECORD_PATH: ${{ runner.temp }}/review-ledger/review-record-v1.json
+        run: |
+          echo "::notice::step-start: Upload live review record/v1 to permanent Silo"
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          "$SILO_EXEC" put-review-record --file "$REVIEW_RECORD_PATH"
 
       - name: Diagnose silo network after job failure
         if: failure()
