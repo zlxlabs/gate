@@ -5451,18 +5451,32 @@ def test_render_previous_context_preserves_full_findings_and_prior_head(tmp_path
     assert relation["items"][0]["previous_finding_id"] == "prior-major-after-limit"
 
 
-@pytest.mark.parametrize("current_findings", [
-    [{
-        "id": "new-current", "severity": "major", "file": "src/new-check.py", "line": 29,
-        "category": "correctness", "issue": "a distinct current-round finding",
-        "acceptance": "retain this finding with the historical open finding",
-    }],
-    [],
-], ids=["old-plus-new", "old-plus-empty"])
-def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, current_findings):
+@pytest.mark.parametrize(
+    "audit_fixture,withdrawal_case,report_case,expected_ids,expected_gate",
+    [
+        ("primary_review_v2_with_tier.json", "none", "new", ["open-with-evidence", "new-current"], "pass"),
+        ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "actual", "silent", [], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "actual", "same", ["reliability_alternates_survive_hard_kill"], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "actual", "mapped", ["reliability_alternates_survive_hard_kill", "mapped-current"], "fail"),
+        ("primary_review_v2_with_withdrawal.json", "blank", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "unknown", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "missing", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "empty", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
+    ],
+    ids=["old-plus-new", "old-plus-empty", "withdrawal-closes", "same-id-wins", "stable-key-wins",
+         "blank-reason-preserves", "unknown-id-preserves", "missing-withdrawal-preserves", "empty-withdrawals-preserves"],
+)
+def test_silent_round_carries_open_finding_through_ledger_jsonl(
+    tmp_path, audit_fixture, withdrawal_case, report_case, expected_ids, expected_gate,
+):
     ledger_script = ROOT / ".github" / "actions" / "review-ledger" / "build_ledger.py"
+    prior_id = (
+        "reliability_alternates_survive_hard_kill"
+        if audit_fixture.endswith("with_withdrawal.json") else "open-with-evidence"
+    )
     finding = {
-        "id": "open-with-evidence", "severity": "major", "file": "src/check.py", "line": 17,
+        "id": prior_id, "severity": "major", "file": "src/check.py", "line": 17,
         "category": "correctness", "issue": "the quote must remain open",
         "acceptance": "retain the original anchor", "quote": "exact source bytes",
         "anchor": {"path": "src/check.py", "line": 17, "range": [17, 18]},
@@ -5471,11 +5485,52 @@ def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, curren
     audit_dir = round_dir / "audit"
     audit_dir.mkdir(parents=True)
     identity = AGG.Identity(repository_id=123, head_sha="b" * 40, run_id=1000, run_attempt=1, pr=42)
-    audit = json.loads((ROOT / "tests" / "data" / "primary_review_v2_with_tier.json").read_bytes())
+    audit_bytes = (ROOT / "tests" / "data" / audit_fixture).read_bytes()
+    audit = json.loads(audit_bytes)
+    if audit_fixture.endswith("with_withdrawal.json"):
+        # This is the captured producer result; adapter metadata contains local paths.
+        canonical_producer_bytes = json.dumps(audit, ensure_ascii=False, separators=(",", ":")).encode()
+        assert hashlib.sha256(canonical_producer_bytes).hexdigest() == "7a5df2c44f5664436ceb93ada76cc3723ce0b74424b72e56ad842918633913e7"
+        audit = json.loads((ROOT / "tests" / "data" / "primary_review_v2_with_tier.json").read_bytes())
+        audit["result"].update(json.loads(audit_bytes)["result"])
+    if withdrawal_case == "actual":
+        assert audit["result"]["withdrawals"] == [{
+            "finding_id": prior_id,
+            "reason": "The current review confirmed each job uses a disposable container, so this state cannot survive the job.",
+        }]
     audit.update(repository="zlxlabs/gate", repository_id=123, pr=42, run_id=identity.run_id,
                  run_attempt=1, head_sha=identity.head_sha)
     audit["verdict"] = audit["result"]["verdict"] = "pass"
+    if withdrawal_case == "blank":
+        audit["result"]["withdrawals"][0]["reason"] = "  "
+    elif withdrawal_case == "unknown":
+        audit["result"]["withdrawals"][0]["finding_id"] = "unknown-finding"
+    elif withdrawal_case == "missing":
+        audit["result"].pop("withdrawals")
+    elif withdrawal_case == "empty":
+        audit["result"]["withdrawals"] = []
+    elif withdrawal_case == "none":
+        audit["result"].pop("withdrawals", None)
+    if report_case == "new":
+        current_findings = [{
+            "id": "new-current", "severity": "major", "file": "src/new-check.py", "line": 29,
+            "category": "correctness", "issue": "a distinct current-round finding",
+            "acceptance": "retain this finding with the historical open finding",
+        }]
+    elif report_case == "same":
+        current_findings = [{**finding, "quote": "rechecked source bytes"}]
+    elif report_case == "mapped":
+        current_findings = [{
+            **finding, "id": "mapped-current", "issue": "a newly reported claim at the same location",
+            "acceptance": "review the changed claim at the same location",
+        }]
+    else:
+        current_findings = []
     audit["result"]["findings"] = current_findings
+    original_receipt_audit = {
+        field: audit["result"].get(field)
+        for field in ("finding_dispositions", "final_finding_dispositions")
+    }
     audit_path = audit_dir / "primary-review-audit.json"
     audit_path.write_text(json.dumps(audit), encoding="utf-8")
     previous_path = round_dir / "previous-findings.json"
@@ -5491,13 +5546,30 @@ def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, curren
         "--audit-path", str(audit_path), "--previous-findings-path", str(previous_path),
     ], cwd=ROOT, env=clean_env, capture_output=True, text=True, check=False)
     assert annotation.returncode == 0, annotation.stderr
+    if withdrawal_case == "blank":
+        assert "GATE-WITHDRAWAL-IGNORED: invalid explicit withdrawal record" in annotation.stdout
     audit_bytes = audit_path.read_bytes()
     annotated_audit = json.loads(audit_bytes)
     assert annotated_audit["finding_relation"]["history_status"] == "available"
     expected_open_findings = [finding, *current_findings]
-    expected_ids = ["open-with-evidence"] + [item["id"] for item in current_findings]
+    if report_case == "same":
+        expected_open_findings = [{**finding, **current_findings[0]}]
+    if withdrawal_case == "actual" and report_case == "silent":
+        expected_open_findings = []
     assert annotated_audit["finding_relation"]["open_findings"] == expected_open_findings
     assert [item["id"] for item in annotated_audit["finding_relation"]["open_findings"]] == expected_ids
+    assert [item["id"] for item in annotated_audit["result"]["findings"]] == [item["id"] for item in current_findings]
+    expected_counts = {
+        "new": int(report_case == "new"),
+        "repeat": int(report_case == "same"),
+        "conflict": int(report_case == "mapped"),
+    }
+    assert annotated_audit["finding_relation"]["counts"] == expected_counts
+    assert [item["id"] for item in annotated_audit["finding_relation"]["items"]] == [
+        item["id"] for item in current_findings
+    ]
+    assert {field: annotated_audit["result"].get(field) for field in original_receipt_audit} == original_receipt_audit
+    assert annotated_audit["result"].get("withdrawals") == audit["result"].get("withdrawals")
 
     summary = round_dir / "summary.md"
     gate_args = _cli_args(audit_dir, summary, identity=identity)
@@ -5505,13 +5577,15 @@ def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, curren
         [sys.executable, str(MODULE_PATH), *gate_args], cwd=ROOT, env=clean_env,
         capture_output=True, text=True, check=False,
     )
-    assert gate.returncode == 0, gate.stderr
+    assert gate.returncode == (1 if expected_gate == "fail" else 0), gate.stderr
     terminal_path = summary.with_name("gate-terminal.json")
     terminal_bytes = terminal_path.read_bytes()
     terminal = json.loads(terminal_bytes)
-    assert terminal["gate_result"] == "pass"
+    assert terminal["gate_result"] == expected_gate
     assert terminal["finding_relation"]["open_findings"] == expected_open_findings
     assert [item["id"] for item in terminal["finding_relation"]["open_findings"]] == expected_ids
+    assert terminal["finding_relation"]["items"] == annotated_audit["finding_relation"]["items"]
+    assert terminal["finding_relation"]["counts"] == expected_counts
     if current_findings:
         legacy_round = round_dir / "legacy"
         legacy_dir = legacy_round / "audit"
@@ -5552,6 +5626,8 @@ def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, curren
     ledger_entry = json.loads(ledger_bytes.splitlines()[0])
     assert ledger_entry["finding_relation"]["open_findings"] == expected_open_findings
     assert [item["id"] for item in ledger_entry["finding_relation"]["open_findings"]] == expected_ids
+    assert ledger_entry["finding_relation"]["items"] == annotated_audit["finding_relation"]["items"]
+    assert ledger_entry["finding_relation"]["counts"] == expected_counts
 
     silo_store = round_dir / "silo_store.py"
     silo_store.write_text(
@@ -5575,6 +5651,22 @@ def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, curren
     previous_bytes = previous_round_path.read_bytes()
     assert json.loads(previous_bytes)["findings"] == expected_open_findings
     assert [item["id"] for item in json.loads(previous_bytes)["findings"]] == expected_ids
+    if withdrawal_case == "actual" and report_case == "silent":
+        reopened = json.loads(audit_path.read_bytes())
+        reopened.pop("finding_relation")
+        reopened.update(run_id=1001, head_sha="c" * 40)
+        reopened["result"]["findings"] = [finding]
+        reopened["result"]["withdrawals"] = []
+        reopened_path = audit_dir / "reopened-primary-audit.json"
+        reopened_path.write_text(json.dumps(reopened), encoding="utf-8")
+        result = subprocess.run([
+            sys.executable, str(MODULE_PATH), "--annotate-primary-audit",
+            "--audit-path", str(reopened_path), "--previous-findings-path", str(previous_round_path),
+        ], cwd=ROOT, env=clean_env, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        reopened_relation = json.loads(reopened_path.read_bytes())["finding_relation"]
+        assert [item["id"] for item in reopened_relation["open_findings"]] == [prior_id]
+        assert reopened_relation["counts"] == {"new": 1, "repeat": 0, "conflict": 0}
 
 
 def test_render_previous_context_keeps_same_head_older_attempt(tmp_path, monkeypatch):
