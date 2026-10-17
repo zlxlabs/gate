@@ -43,7 +43,7 @@ ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34
 ADVISORY_EVENT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "advisory-shadow-event-v1.json"
 POST_ADVISORY_GH_API_PRODUCER_FIXTURE = """publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
 gh_api() {
-  local remaining_ms request_timeout_ms
+  local remaining_ms request_timeout_ms request_timeout
   remaining_ms=$(( publish_deadline_ms - $(date +%s%3N) ))
   if [ "$remaining_ms" -le 0 ]; then
     return 124

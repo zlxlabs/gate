@@ -1548,7 +1548,7 @@ jobs:
 
           publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
           gh_api() {
-            local remaining_ms request_timeout_ms
+            local remaining_ms request_timeout_ms request_timeout
             remaining_ms=$(( publish_deadline_ms - $(date +%s%3N) ))
             if [ "$remaining_ms" -le 0 ]; then
               return 124
