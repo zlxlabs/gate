@@ -92,6 +92,7 @@ def test_archive_key_allows_only_per_run_review_evidence_pairs():
         (f"primary-audit-v2-{repo_id}-{head_sha}-{run_id}-1", "primary-review-audit.json"),
         (f"gate-terminal-v1-{repo_id}-{head_sha}-{run_id}-1", "gate-terminal.json"),
         (f"primary-review-diagnostics-v2-{repo_id}-{head_sha}-{run_id}-1", "manifest.json"),
+        (f"primary-review-raw-evidence-v1-{repo_id}-{head_sha}-{run_id}-1", "invocation.json"),
         ("advisory-event-claude-glm-5-3-32446501755-1", "nested/advisory-event.json"),
         (f"gate-convergence-receipt-v1-{repo_id}-{head_sha}-{run_id}-1", "convergence-receipt.json"),
         (f"gate-status-panel-delivery-v1-{repo_id}-{head_sha}-{run_id}-1", "gate-status-panel-delivery.json"),
@@ -107,7 +108,7 @@ def test_archive_key_allows_only_per_run_review_evidence_pairs():
         (allowed[2][0], "primary-review-audit.json"),
         (f"primary-audit-v2-999-{head_sha}-{run_id}-1", "primary-review-audit.json"),
         (allowed[0][0], "nested/ledger.jsonl"),
-        (allowed[6][0], "nested/gate-status-panel-delivery.json"),
+        (allowed[7][0], "nested/gate-status-panel-delivery.json"),
         ("advisory-event-__none__-32446501755-1", "advisory/event.json"),
     )
     for artifact_name, relative_path in rejected:
