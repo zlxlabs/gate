@@ -1548,7 +1548,7 @@ jobs:
 
           publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
           gh_api() {
-            local remaining_ms request_timeout_ms
+            local remaining_ms request_timeout_ms request_timeout
             remaining_ms=$(( publish_deadline_ms - $(date +%s%3N) ))
             if [ "$remaining_ms" -le 0 ]; then
               return 124
@@ -1557,7 +1557,9 @@ jobs:
             if [ "$request_timeout_ms" -gt "$remaining_ms" ]; then
               request_timeout_ms="$remaining_ms"
             fi
-            timeout --foreground "${request_timeout_ms}ms" gh api "$@"
+            # GNU timeout accepts fractional seconds, but not an `ms` suffix.
+            printf -v request_timeout '%d.%03ds' "$(( request_timeout_ms / 1000 ))" "$(( request_timeout_ms % 1000 ))"
+            timeout --foreground "$request_timeout" gh api "$@"
             local status=$?
             if [ "$(( publish_deadline_ms - $(date +%s%3N) ))" -le 0 ]; then
               return 124

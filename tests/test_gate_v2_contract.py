@@ -41,6 +41,26 @@ AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "agg
 PREFLIGHT_SCRIPT = REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
 ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
 ADVISORY_EVENT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "advisory-shadow-event-v1.json"
+POST_ADVISORY_GH_API_PRODUCER_FIXTURE = """publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
+gh_api() {
+  local remaining_ms request_timeout_ms request_timeout
+  remaining_ms=$(( publish_deadline_ms - $(date +%s%3N) ))
+  if [ "$remaining_ms" -le 0 ]; then
+    return 124
+  fi
+  request_timeout_ms=$(( OCR_GITHUB_TIMEOUT_SECONDS * 1000 ))
+  if [ "$request_timeout_ms" -gt "$remaining_ms" ]; then
+    request_timeout_ms="$remaining_ms"
+  fi
+  # GNU timeout accepts fractional seconds, but not an `ms` suffix.
+  printf -v request_timeout '%d.%03ds' "$(( request_timeout_ms / 1000 ))" "$(( request_timeout_ms % 1000 ))"
+  timeout --foreground "$request_timeout" gh api "$@"
+  local status=$?
+  if [ "$(( publish_deadline_ms - $(date +%s%3N) ))" -le 0 ]; then
+    return 124
+  fi
+  return "$status"
+}"""
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
@@ -115,6 +135,73 @@ def _load_workflow():
     raw = yaml.safe_load(WORKFLOW.read_text())
     trigger = raw.get("on", raw.get(True))
     return raw, trigger
+
+
+def _post_advisory_gh_api_producer() -> str:
+    raw, _ = _load_workflow()
+    step = next(s for s in raw["jobs"]["ocr"]["steps"] if s.get("name") == "Post advisory PR comment")
+    run = step["run"]
+    start = run.index("publish_deadline_ms=")
+    end = run.index("\n\nset +e", start)
+    producer = run[start:end]
+    assert producer == POST_ADVISORY_GH_API_PRODUCER_FIXTURE
+    return producer
+
+
+def _run_post_advisory_gh_api(tmp_path, *, budget_seconds: int, date_values: list[int]):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    date_values_path = tmp_path / "date-values"
+    date_values_path.write_text("".join(f"{value}\n" for value in date_values), encoding="utf-8")
+    date_index_path = tmp_path / "date-index"
+    date_index_path.write_text("0\n", encoding="utf-8")
+    argv_path = tmp_path / "gh-argv"
+    argv_path.write_bytes(b"")
+    fake_date = fake_bin / "date"
+    fake_date.write_text(
+        "#!/bin/sh\n"
+        'index=$(cat "$GATE_TEST_DATE_INDEX")\n'
+        'line=$((index + 1))\n'
+        'value=$(sed -n "${line}p" "$GATE_TEST_DATE_VALUES")\n'
+        'printf "%s\\n" "$line" > "$GATE_TEST_DATE_INDEX"\n'
+        'printf "%s\\n" "$value"\n',
+        encoding="utf-8",
+    )
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\0" "$@" >> "$GATE_TEST_GH_ARGV"\n'
+        'printf "{\\"ok\\":true}\\n"\n',
+        encoding="utf-8",
+    )
+    fake_date.chmod(0o755)
+    fake_gh.chmod(0o755)
+    timeout_binary = shutil.which("timeout")
+    assert timeout_binary is not None
+    timeout_version = subprocess.run([timeout_binary, "--version"], capture_output=True, text=True, check=True)
+    assert "GNU coreutils" in timeout_version.stdout
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "GATE_TEST_DATE_INDEX": str(date_index_path),
+            "GATE_TEST_DATE_VALUES": str(date_values_path),
+            "GATE_TEST_GH_ARGV": str(argv_path),
+            "OCR_GITHUB_TIMEOUT_SECONDS": "15",
+            "OCR_PUBLISH_BUDGET_SECONDS": str(budget_seconds),
+        }
+    )
+    assert shutil.which("timeout", path=env["PATH"]) == timeout_binary
+    shell = (
+        f"{_post_advisory_gh_api_producer()}\n"
+        "set +e\n"
+        "gh_api user\n"
+        "status=$?\n"
+        "printf 'gh_api_rc=%s\\n' \"$status\"\n"
+    )
+    proc = subprocess.run(["bash", "-x", "-c", shell], env=env, capture_output=True, text=True, timeout=5)
+    argv = argv_path.read_bytes().split(b"\0")
+    return proc, argv[:-1] if argv[-1:] == [b""] else argv
 
 
 def _evaluate_primary_result_expr(expression: str, raw_result: str) -> str:
@@ -1324,6 +1411,41 @@ def test_classify_listing_failure_does_not_output_false(tmp_path):
     assert "review_expected=false" not in text
     assert "review_expected=true" in text
     assert "exit=42" in proc.stdout + proc.stderr + text or "listing PR files failed" in proc.stdout + proc.stderr
+
+
+def test_post_advisory_gh_api_uses_real_gnu_timeout_and_keeps_fifteen_second_cap(tmp_path):
+    proc, argv = _run_post_advisory_gh_api(
+        tmp_path, budget_seconds=120, date_values=[1000, 6000, 6001],
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "gh_api_rc=0" in proc.stdout
+    assert "+ timeout --foreground 15.000s gh api user" in proc.stderr
+    assert argv == [b"api", b"user"]
+
+
+def test_post_advisory_gh_api_keeps_subsecond_deadline_precision(tmp_path):
+    proc, argv = _run_post_advisory_gh_api(
+        tmp_path, budget_seconds=120, date_values=[1000, 120500, 120501],
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "gh_api_rc=0" in proc.stdout
+    assert "+ timeout --foreground 0.500s gh api user" in proc.stderr
+    assert argv == [b"api", b"user"]
+
+
+@pytest.mark.parametrize(
+    ("budget_seconds", "now_ms"),
+    [(0, 1000), (120, 121001)],
+    ids=["zero-budget", "expired-budget"],
+)
+def test_post_advisory_gh_api_skips_gh_for_zero_or_expired_budget(tmp_path, budget_seconds, now_ms):
+    proc, argv = _run_post_advisory_gh_api(
+        tmp_path, budget_seconds=budget_seconds, date_values=[1000, now_ms],
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "gh_api_rc=124" in proc.stdout
+    assert "timeout --foreground" not in proc.stderr
+    assert argv == []
 
 
 def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
