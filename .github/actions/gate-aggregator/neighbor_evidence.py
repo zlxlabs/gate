@@ -135,6 +135,102 @@ def projected_anchor_line(
     return old_line + delta
 
 
+def _finding_anchor_span(finding: Any) -> Optional[tuple[str, int, str]]:
+    """Return a canonical file, line, and exact quote; null lines cannot close findings."""
+    if not isinstance(finding, dict):
+        return None
+    path, line, quote = finding.get("file"), finding.get("line"), finding.get("quote")
+    if (
+        not isinstance(path, str) or not path or Path(path).is_absolute()
+        or ".." in Path(path).parts or "\\" in path or type(line) is not int or line < 1
+        or not isinstance(quote, str) or not quote
+    ):
+        return None
+    return path, line, quote
+
+
+def collect_changed_anchor_ids(
+    *, findings: Sequence[Any], repository: str, previous_head_sha: str,
+    current_head_sha: str, token: str,
+) -> Optional[set[str]]:
+    """Return IDs whose exact old-source anchor was deleted or replaced."""
+    candidates = [
+        (finding["id"], span)
+        for finding in findings if isinstance(finding, dict)
+        if isinstance(finding.get("id"), str) and finding["id"]
+        if (span := _finding_anchor_span(finding)) is not None
+    ]
+    if not candidates:
+        return set()
+    valid_round_heads = (
+        re.fullmatch(r"[0-9a-f]{40}", previous_head_sha)
+        and re.fullmatch(r"[0-9a-f]{40}", current_head_sha)
+        and previous_head_sha != current_head_sha
+    )
+    if not valid_round_heads:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=round_heads_invalid_or_unchanged")
+        return None
+    if not repository or not token:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=repository_or_token_missing")
+        return None
+    collector = _Collector(
+        repository=repository, repository_id=0, pr_number=0,
+        current_head_sha=current_head_sha, terminal_history_rows=(), token=token)
+    try:
+        reason = collector._init_caller_repo()
+        if reason:
+            print(f"GATE-ANCHOR-CLOSURE-UNAVAILABLE reason={reason}")
+            return None
+        caller_dir = collector._caller_dir
+        assert caller_dir is not None
+        for sha in (previous_head_sha, current_head_sha):
+            reason = collector._fetch_commit_into(caller_dir, sha)
+            if reason:
+                print(f"GATE-ANCHOR-CLOSURE-UNAVAILABLE reason={reason}")
+                return None
+        changed: set[str] = set()
+        for path in {anchor[0] for _finding_id, anchor in candidates}:
+            diff = _run_git(
+                ["git", "-C", str(caller_dir), "diff", "--unified=0",
+                 previous_head_sha, current_head_sha, "--", path],
+                timeout_s=_GIT_DIFF_TIMEOUT_S,
+            )
+            if diff.returncode != 0:
+                print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=git_diff_failed")
+                return None
+            hunks = parse_unified_zero_hunks(diff.stdout.decode("utf-8", errors="replace"))
+            path_candidates = [
+                (finding_id, anchor) for finding_id, anchor in candidates if anchor[0] == path
+            ]
+            old_file = _run_git(
+                ["git", "-C", str(caller_dir), "show", f"{previous_head_sha}:{path}"],
+                timeout_s=_GIT_DIFF_TIMEOUT_S)
+            if old_file.returncode != 0:
+                continue
+            try:
+                old_lines = old_file.stdout.decode("utf-8").splitlines()
+            except UnicodeDecodeError:
+                continue
+            for finding_id, (candidate_path, line, quote) in path_candidates:
+                if (candidate_path != path or line > len(old_lines)
+                        or not any(count > 0 and old_start <= line <= old_start + count - 1
+                                   for old_start, count, _new_start, _new_count in hunks)):
+                    continue
+                if old_lines[line - 1] != quote:
+                    continue
+                changed.add(finding_id)
+        return changed
+    except subprocess.TimeoutExpired:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=git_diff_timeout")
+        return None
+    except OSError:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=git_diff_failed")
+        return None
+    finally:
+        if collector._caller_dir is not None:
+            shutil.rmtree(collector._caller_dir, ignore_errors=True)
+
+
 def _finding_key_sha(finding_key: str) -> str:
     return hashlib.sha256(finding_key.encode("utf-8")).hexdigest()[:12]
 

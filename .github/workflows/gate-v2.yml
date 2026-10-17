@@ -1107,6 +1107,13 @@ jobs:
 
       - name: Annotate primary findings with cross-round relation
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           audit="${{ runner.temp }}/primary-review-audit.json"

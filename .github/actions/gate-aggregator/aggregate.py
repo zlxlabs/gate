@@ -980,6 +980,41 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
             relation, previous,
             result.get("withdrawals") if isinstance(result, dict) else None,
         )
+        if (
+            previous.get("available") is True
+            and audit.get("verdict") in {"pass", "fail"}
+            and result.get("verdict") == audit.get("verdict")
+            and all(isinstance(item, dict) for item in findings)
+        ):
+            try:
+                identity = Identity(
+                    repository_id=int(os.environ["REPOSITORY_ID"]), head_sha=os.environ["HEAD_SHA"],
+                    run_id=int(os.environ["RUN_ID"]), run_attempt=int(os.environ["RUN_ATTEMPT"]),
+                    pr=int(os.environ["PR_NUMBER"]),
+                )
+            except (KeyError, ValueError):
+                print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=current_identity_missing")
+            else:
+                if validate_audit_identity(audit, identity):
+                    print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=current_audit_invalid")
+                else:
+                    changed_ids = _NEIGHBOR_EVIDENCE.collect_changed_anchor_ids(
+                        findings=previous["findings"], repository=os.environ.get("GITHUB_REPOSITORY", ""),
+                        previous_head_sha=previous.get("head_sha") or "",
+                        current_head_sha=identity.head_sha,
+                        token=os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", ""),
+                    )
+                    reported = {
+                        pointer for item in relation.get("items", []) if isinstance(item, dict)
+                        for pointer in (item.get("id"), item.get("previous_finding_id"))
+                        if isinstance(pointer, str)
+                    }
+                    closing = (changed_ids or set()) - reported
+                    if closing:
+                        relation["open_findings"] = [
+                            item for item in relation.get("open_findings", [])
+                            if not isinstance(item, dict) or item.get("id") not in closing
+                        ]
         relation["history_status"] = "available" if previous["available"] else "unknown"
         audit["finding_relation"] = relation
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

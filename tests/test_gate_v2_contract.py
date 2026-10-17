@@ -3067,6 +3067,11 @@ def test_finding_relation_history_crosses_jobs_in_the_canonical_audit():
     )
 
     primary_tokens = [token for token in shlex.split(primary["run"]) if token != "\n"]
+    env_keys = ("GH_TOKEN", "HEAD_SHA", "REPOSITORY_ID", "RUN_ID", "RUN_ATTEMPT", "PR_NUMBER")
+    assert tuple(primary["env"].get(key) for key in env_keys) == (
+        "${{ github.token }}", "${{ github.event.pull_request.head.sha }}", "${{ github.repository_id }}",
+        "${{ github.run_id }}", "${{ github.run_attempt }}", "${{ github.event.pull_request.number }}",
+    )
     annotate_index = primary_tokens.index("--annotate-primary-audit")
     assert primary_tokens[annotate_index - 2:annotate_index + 5] == [
         "python3", "$agg", "--annotate-primary-audit", "--audit-path", "$audit",
