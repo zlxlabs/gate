@@ -40,6 +40,8 @@ MISSING_ACCESS_KEY = "SILO_ACCESS_KEY 未传入"
 MISSING_SECRET_KEY = "SILO_SECRET_KEY 未传入"
 ATTEMPT_SUFFIX = re.compile(r"[0-9]+$")
 ARCHIVE_MANIFEST_FILENAME = "archive-manifest-v1.json"
+REVIEW_RECORD_REPO_PART = re.compile(r"^[A-Za-z0-9_.-]+$")
+REVIEW_RECORD_HEAD_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _archive_single_file_name_pattern(repo_id: str) -> tuple[tuple[str, str], ...]:
@@ -578,6 +580,62 @@ def _put_archive_bytes_and_verify(client, bucket: str, key: str, payload: bytes)
     print(key)
 
 
+def review_record_archive_key(record: dict[str, object]) -> str:
+    """Build the review-record/v1 Silo key after validating stable identity fields."""
+    if record.get("schema_version") != "review-record/v1":
+        fail("review-record/v1 file has an unsupported schema_version")
+    repo = record.get("repo")
+    parts = repo.split("/") if isinstance(repo, str) else []
+    if len(parts) != 2 or any(
+        part in {".", ".."} or not REVIEW_RECORD_REPO_PART.fullmatch(part) for part in parts
+    ):
+        fail("review-record/v1 repo must be a safe owner/repo path")
+    pr = record.get("pr")
+    if pr is None:
+        pr_segment = "none"
+    elif type(pr) is int and pr > 0:
+        pr_segment = str(pr)
+    else:
+        fail("review-record/v1 pr must be a positive integer or null")
+    head_sha = record.get("head_sha")
+    if not isinstance(head_sha, str) or not REVIEW_RECORD_HEAD_SHA.fullmatch(head_sha):
+        fail("review-record/v1 head_sha must be 40 lowercase hexadecimal characters")
+    source = record.get("source")
+    if not isinstance(source, str) or source not in {"ci", "pre_seal", "eval"}:
+        fail("review-record/v1 source must be ci, pre_seal, or eval")
+    run_id, attempt = record.get("run_id"), record.get("attempt")
+    if type(run_id) is not int or run_id < 1:
+        fail("review-record/v1 run_id must be a positive integer")
+    if type(attempt) is not int or attempt < 1:
+        fail("review-record/v1 attempt must be a positive integer")
+    owner, repository = parts
+    return (
+        f"archive/review-record/v1/{owner}/{repository}/{pr_segment}/{head_sha}/"
+        f"{source}-{run_id}-{attempt}.json"
+    )
+
+
+def cmd_put_review_record(args: argparse.Namespace) -> int:
+    """Upload original review-record/v1 bytes once and verify the Silo readback."""
+    path = Path(args.file)
+    if not path.is_file():
+        fail(f"put-review-record source is not a file: {path}")
+    try:
+        payload = path.read_bytes()
+        record = json.loads(payload.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        fail(f"review-record/v1 source file is not readable UTF-8 JSON: {type(err).__name__}")
+    if not isinstance(record, dict):
+        fail("review-record/v1 file must contain a JSON object")
+    key = review_record_archive_key(record)
+    client = connect()
+    bucket = bucket_name()
+    if key in list_keys(client, bucket, key):
+        fail(f"Silo review-record/v1 destination already exists; refusing to overwrite: {key}")
+    _put_archive_bytes_and_verify(client, bucket, key, payload)
+    return EXIT_OK
+
+
 def resolve_magicdns(endpoint: str, nameserver: str = "100.100.100.100", timeout: float = 15) -> tuple[str, str]:
     """Query MagicDNS for the A record of SILO_ENDPOINT's hostname.
 
@@ -954,6 +1012,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip: notice and exit 0 when the directory is missing or empty",
     )
     put_dir.set_defaults(func=cmd_put_dir)
+
+    put_record = sub.add_parser("put-review-record", help="append one review-record/v1 to its versioned archive key")
+    put_record.add_argument("--file", required=True, help="source review-record/v1 JSON; original bytes are preserved")
+    put_record.set_defaults(func=cmd_put_review_record)
 
     get = sub.add_parser("get", help="download one key or every object under a prefix")
     get.add_argument("--dest", required=True)
