@@ -4106,14 +4106,16 @@ def _run_pr_convergence_cli(tmp_path, monkeypatch, *, audit_verdict, primary_res
 
 
 @pytest.mark.parametrize(
-    "run_504_head", ("b" * 40, IDENTITY.head_sha),
-    ids=["old-pr-head-failure-counts", "same-pr-head-failure-counts"],
+    "run_501_head,run_504_head",
+    [("c" * 40, "b" * 40), (IDENTITY.head_sha, IDENTITY.head_sha)],
+    ids=["three-distinct-pr-heads", "same-pr-head"],
 )
 def test_cli_convergence_counts_latest_actual_attempt_per_run_and_known_skips(
-    monkeypatch, tmp_path, run_504_head,
+    monkeypatch, tmp_path, run_501_head, run_504_head,
 ):
     history = _primary_convergence_history((501, 502, 503, 504, IDENTITY.run_id), [
-        _primary_convergence_row(501, 1, "fail"), _primary_convergence_row(501, 2, "unavailable"),
+        _primary_convergence_row(501, 1, "fail", head_sha=run_501_head),
+        _primary_convergence_row(501, 2, "unavailable", head_sha=run_501_head),
         _primary_convergence_row(502, 1, "fail"), _primary_convergence_row(502, 2, "pass"),
         _primary_convergence_row(503, 1, None, primary_result="skipped", skip_reason="draft"),
         _primary_convergence_row(504, 1, "fail", head_sha=run_504_head),
