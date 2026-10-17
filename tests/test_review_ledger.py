@@ -1773,8 +1773,12 @@ def test_ledger_copies_finding_relation_counts():
     module = _module()
     _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
     terminal["finding_relation"] = _relation_block("repeat", "f1")
+    terminal["finding_relation"]["open_findings"] = [{
+        "id": "f1", "quote": "raw quote", "anchor": {"path": "a.py", "line": 1},
+    }]
     entry = _build_from_terminal(module, terminal)
     assert entry["finding_relation"]["counts"] == {"new": 0, "repeat": 1, "conflict": 0}
+    assert entry["finding_relation"]["open_findings"] == terminal["finding_relation"]["open_findings"]
 
 
 def test_ledger_rejects_unknown_finding_relation():
@@ -1784,4 +1788,13 @@ def test_ledger_rejects_unknown_finding_relation():
     block["items"][0]["relation_to_previous"] = "maybe"
     terminal["finding_relation"] = block
     with pytest.raises(ValueError, match="GATE-FINDING-RELATION-UNKNOWN"):
+        _build_from_terminal(module, terminal)
+
+
+def test_ledger_rejects_non_object_open_finding():
+    module = _module()
+    _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
+    terminal["finding_relation"] = _relation_block("new")
+    terminal["finding_relation"]["open_findings"] = ["not-a-finding"]
+    with pytest.raises(ValueError, match="open_findings"):
         _build_from_terminal(module, terminal)

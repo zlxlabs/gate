@@ -609,11 +609,37 @@ def relate_findings(current: list[Any], previous: list[Any]) -> list[dict[str, A
 
 def build_finding_relation(findings: list[Any], previous_round: dict[str, Any]) -> dict[str, Any]:
     previous: list[Any] = []
+    open_findings: list[dict[str, Any]] = []
     if previous_round.get("available") is True:
         raw = previous_round.get("findings")
         if not isinstance(raw, list):
             raise FindingRelationError(f"{RELATION_UNKNOWN}: previous findings are not a list")
         previous = raw
+        positions: dict[str, int] = {}
+        for finding in previous:
+            if not isinstance(finding, dict):
+                continue
+            projected = dict(finding)
+            finding_id = projected.get("id")
+            if isinstance(finding_id, str) and finding_id:
+                if finding_id in positions:
+                    open_findings[positions[finding_id]].update(projected)
+                    continue
+                positions[finding_id] = len(open_findings)
+            open_findings.append(projected)
+    else:
+        positions = {}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        projected = dict(finding)
+        finding_id = projected.get("id")
+        if isinstance(finding_id, str) and finding_id in positions:
+            open_findings[positions[finding_id]].update(projected)
+            continue
+        if isinstance(finding_id, str) and finding_id:
+            positions[finding_id] = len(open_findings)
+        open_findings.append(projected)
     items = relate_findings(findings, previous)
     counts = {name: sum(item["relation_to_previous"] == name for item in items) for name in ("new", "repeat", "conflict")}
     return {
@@ -621,6 +647,7 @@ def build_finding_relation(findings: list[Any], previous_round: dict[str, Any]) 
         "counts": counts,
         "review_terminal": "manual_required" if counts["conflict"] else "unchanged",
         "items": items,
+        "open_findings": open_findings,
     }
 
 
@@ -643,6 +670,11 @@ def validate_finding_relation_block(block: Any) -> dict[str, Any]:
         pointer = item.get("previous_finding_id")
         if relation != "new" and (not isinstance(pointer, str) or not pointer):
             raise FindingRelationError(f"{RELATION_UNKNOWN}: {relation} missing previous_finding_id")
+    if "open_findings" in block and (
+        not isinstance(block["open_findings"], list)
+        or any(not isinstance(item, dict) for item in block["open_findings"])
+    ):
+        raise FindingRelationError(f"{RELATION_UNKNOWN}: open_findings")
     terminal = block.get("review_terminal")
     if terminal not in {"unchanged", "manual_required"}:
         raise FindingRelationError(f"{RELATION_UNKNOWN}: review_terminal {terminal!r}")
@@ -681,7 +713,7 @@ def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
 def _previous_findings_from_silo(
     *, repository_id: int, pr_number: int, run_id: int, run_attempt: int,
 ) -> tuple[Optional[str], list[Any]]:
-    """Return the prior head SHA and every finding dictionary; a missing head stays unknown."""
+    """Return carried open facts (legacy latest findings when absent); a missing head stays unknown."""
     import tempfile
 
     key = _ledger_latest_key(repository_id, pr_number)
@@ -708,9 +740,18 @@ def _previous_findings_from_silo(
     review = entry.get("review") if isinstance(entry.get("review"), dict) else {}
     result = review.get("result") if isinstance(review.get("result"), dict) else {}
     findings = result.get("findings") if isinstance(result.get("findings"), list) else []
+    finding_relation = entry.get("finding_relation")
+    if finding_relation is not None and not isinstance(finding_relation, dict):
+        raise RuntimeError("silo-ledger-latest-unreadable")
+    if isinstance(finding_relation, dict) and "open_findings" in finding_relation:
+        carried = finding_relation["open_findings"]
+        if not isinstance(carried, list) or any(not isinstance(item, dict) for item in carried):
+            raise RuntimeError("silo-ledger-latest-unreadable")
+    else:
+        carried = findings
     head_sha = entry.get("head_sha")
-    return (head_sha if isinstance(head_sha, str) and head_sha else None), [
-        item for item in findings if isinstance(item, dict)
+    return head_sha if isinstance(head_sha, str) and head_sha else None, [
+        item for item in carried if isinstance(item, dict)
     ]
 
 
@@ -3899,7 +3940,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         if isinstance(result, dict) and isinstance(result.get("findings"), list):
             findings = result["findings"]
     preset = any(isinstance(item, dict) and "relation_to_previous" in item for item in findings)
-    if preset:
+    # A preset audit keeps the same local input for open carry; absent that path, avoid adding
+    # a Silo read to the annotate flow.
+    if preset and not args.previous_findings_path:
         previous_round = {"available": True, "detail": "audit-preset", "findings": []}
     else:
         previous_round = load_previous_round_findings(
