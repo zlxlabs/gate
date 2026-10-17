@@ -10,6 +10,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -3052,6 +3053,43 @@ def test_gate_job_passes_the_identity_quintuple_to_the_aggregator():
         "--audit-dir", "--summary-path", "--repository", "--terminal-path", "--audit-artifact-name",
     ):
         assert flag in run
+
+
+def test_finding_relation_history_crosses_jobs_in_the_canonical_audit():
+    raw, _ = _load_workflow()
+    primary = next(
+        step for step in raw["jobs"]["primary"]["steps"]
+        if step.get("name") == "Annotate primary findings with cross-round relation"
+    )
+    aggregate = next(
+        step for step in raw["jobs"]["gate"]["steps"]
+        if step.get("name") == "Aggregate required verdict"
+    )
+
+    primary_tokens = [token for token in shlex.split(primary["run"]) if token != "\n"]
+    annotate_index = primary_tokens.index("--annotate-primary-audit")
+    assert primary_tokens[annotate_index - 2:annotate_index + 5] == [
+        "python3", "$agg", "--annotate-primary-audit", "--audit-path", "$audit",
+        "--previous-findings-path", "${RUNNER_TEMP}/previous-findings.json",
+    ]
+    assert 'audit="${{ runner.temp }}/primary-review-audit.json"' in primary["run"]
+
+    previous_tokens = [token for token in shlex.split(next(
+        step["run"] for step in raw["jobs"]["primary"]["steps"]
+        if step.get("name") == "Inject previous-round findings into primary review context"
+    )) if token != "\n"]
+    previous_index = previous_tokens.index("--previous-json")
+    assert previous_tokens[previous_index + 1] == "${RUNNER_TEMP}/previous-findings.json"
+
+    aggregate_tokens = [token for token in shlex.split(aggregate["run"]) if token != "\n"]
+    aggregate_index = aggregate_tokens.index(
+        "_gate-aggregator-src/.github/actions/gate-aggregator/aggregate.py"
+    )
+    aggregate_end = aggregate_tokens.index("rc=$?", aggregate_index)
+    aggregate_args = aggregate_tokens[aggregate_index + 1:aggregate_end]
+    assert "--previous-findings-path" not in aggregate_args
+    audit_dir_index = aggregate_args.index("--audit-dir")
+    assert aggregate_args[audit_dir_index + 1] == "${{ runner.temp }}/primary-audit"
 
 
 def test_gate_job_forwards_the_raw_runner_input_for_strict_validation():

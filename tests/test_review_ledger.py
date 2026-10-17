@@ -183,6 +183,17 @@ def test_review_ledger_consumes_real_primary_v2_tier_artifact_bytes():
         "5f8beb2607fd3cf7a79b0adb539d85a68ee189aed463bd08932835a436f3abb8"
     )
     audit = json.loads(fixture_bytes)
+    findings = audit["result"]["findings"]
+    audit["finding_relation"] = {
+        "schema_version": 1,
+        "counts": {"new": len(findings), "repeat": 0, "conflict": 0},
+        "review_terminal": "unchanged",
+        "items": [
+            {"id": item["id"], "relation_to_previous": "new"} for item in findings
+        ],
+        "open_findings": findings,
+        "history_status": "available",
+    }
 
     entry = module.build_entry(
         repository=audit["repository"], pr_number=audit["pr"], run_id=audit["run_id"],
@@ -1773,11 +1784,13 @@ def test_ledger_copies_finding_relation_counts():
     module = _module()
     _agg, _conv, _identity, _receipts, _outcome, terminal = _producer_terminal()
     terminal["finding_relation"] = _relation_block("repeat", "f1")
+    terminal["finding_relation"]["history_status"] = "available"
     terminal["finding_relation"]["open_findings"] = [{
         "id": "f1", "quote": "raw quote", "anchor": {"path": "a.py", "line": 1},
     }]
     entry = _build_from_terminal(module, terminal)
     assert entry["finding_relation"]["counts"] == {"new": 0, "repeat": 1, "conflict": 0}
+    assert entry["finding_relation"]["history_status"] == "available"
     assert entry["finding_relation"]["open_findings"] == terminal["finding_relation"]["open_findings"]
 
 

@@ -43,6 +43,7 @@ PRIMARY_SPEC_FIELDS = ("spec_source", "pr_body_digest")
 PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
     "kind", "schema_version", "verdict", "attempts", "shadow_mode", "expected_shadows",
     "result", "cost", "tokens", "runtime", "not_expected_reason", "waiver", "risk",
+    "finding_relation",
 }
 PRIMARY_VERDICTS = {"pass", "fail", "unavailable", "not_expected", "waived"}
 PRIMARY_REVIEWER_VERDICTS = {"pass", "fail", "unavailable"}
@@ -558,6 +559,9 @@ def _validate_finding_relation(block: Any) -> dict[str, Any]:
         or any(not isinstance(item, dict) for item in block["open_findings"])
     ):
         raise ValueError("GATE-FINDING-RELATION-UNKNOWN: open_findings")
+    history_status = block.get("history_status")
+    if history_status is not None and history_status not in {"available", "unknown"}:
+        raise ValueError("GATE-FINDING-RELATION-UNKNOWN: history_status")
     terminal = block.get("review_terminal")
     if terminal not in {"unchanged", "manual_required"} or (counts["conflict"] > 0) != (terminal == "manual_required"):
         raise ValueError(f"GATE-FINDING-RELATION-UNKNOWN: review_terminal {terminal!r}")

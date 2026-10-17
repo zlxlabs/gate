@@ -675,6 +675,9 @@ def validate_finding_relation_block(block: Any) -> dict[str, Any]:
         or any(not isinstance(item, dict) for item in block["open_findings"])
     ):
         raise FindingRelationError(f"{RELATION_UNKNOWN}: open_findings")
+    history_status = block.get("history_status")
+    if history_status is not None and history_status not in {"available", "unknown"}:
+        raise FindingRelationError(f"{RELATION_UNKNOWN}: history_status")
     terminal = block.get("review_terminal")
     if terminal not in {"unchanged", "manual_required"}:
         raise FindingRelationError(f"{RELATION_UNKNOWN}: review_terminal {terminal!r}")
@@ -866,9 +869,6 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     audit_path = Path(args.audit_path)
     if not audit_path.is_file():
         return 0
-    if not Path(args.previous_findings_path).is_file():
-        _degrade_previous_round("previous-findings-file-missing")
-        return 0
     previous = load_previous_round_findings(
         path=args.previous_findings_path, repository_id=0, pr_number=0, run_id=0, run_attempt=0,
     )
@@ -876,7 +876,12 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     result = audit.get("result") if isinstance(audit, dict) else None
     findings = result.get("findings") if isinstance(result, dict) else None
     if isinstance(findings, list):
-        apply_finding_relation(Outcome(ok=True), findings, previous)
+        annotation = Outcome(ok=True)
+        apply_finding_relation(annotation, findings, previous)
+        relation = annotation.finding_relation
+        assert relation is not None
+        relation["history_status"] = "available" if previous["available"] else "unknown"
+        audit["finding_relation"] = relation
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
 
@@ -3805,7 +3810,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--panel-delivery-path", default=None, help="durable status-panel delivery diagnostic JSON output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
     parser.add_argument("--publish-only", action="store_true", help="publish the panel after terminal artifact upload")
-    parser.add_argument("--previous-findings-path", default=None)
     args = parser.parse_args(argv_list)
 
     if args.publish_only:
@@ -3939,19 +3943,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         result = audit.get("result")
         if isinstance(result, dict) and isinstance(result.get("findings"), list):
             findings = result["findings"]
-    preset = any(isinstance(item, dict) and "relation_to_previous" in item for item in findings)
-    # A preset audit keeps the same local input for open carry; absent that path, avoid adding
-    # a Silo read to the annotate flow.
-    if preset and not args.previous_findings_path:
-        previous_round = {"available": True, "detail": "audit-preset", "findings": []}
-    else:
-        previous_round = load_previous_round_findings(
-            path=args.previous_findings_path,
-            repository_id=identity.repository_id,
-            pr_number=identity.pr,
-            run_id=identity.run_id,
-            run_attempt=identity.run_attempt,
-        )
     outcome = evaluate(
         quality_result=args.quality_result,
         caller_checks=args.caller_checks,
@@ -3977,7 +3968,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_history_status=convergence_history_status,
         neighbor_evidence=neighbor_evidence,
     )
-    apply_finding_relation(outcome, findings, previous_round)
+    if isinstance(audit, dict):
+        relation = audit.get("finding_relation")
+        try:
+            if relation is None:
+                raise FindingRelationError(f"{RELATION_UNKNOWN}: block missing")
+            outcome.finding_relation = validate_finding_relation_block(relation)
+        except FindingRelationError:
+            print("GATE-FINDING-RELATION-DEGRADED: source=primary-audit detail=unknown")
+            current_findings = [
+                {key: value for key, value in item.items()
+                 if key not in {"relation_to_previous", "previous_finding_id"}}
+                if isinstance(item, dict) else item
+                for item in findings
+            ]
+            relation = build_finding_relation(current_findings, {"available": False})
+            relation["history_status"] = "unknown"
+            outcome.finding_relation = validate_finding_relation_block(relation)
     fail_count, reconsider = _compute_pr_primary_convergence(
         silo_terminal_history if silo_terminal_history is not None else HistoryLoad(),
         identity=identity, primary_result=args.primary_result, outcome=outcome,
