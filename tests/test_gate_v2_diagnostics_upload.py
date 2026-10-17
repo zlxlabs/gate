@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -62,6 +63,177 @@ def _manifest_program():
 def _run_manifest(program, diagnostics_dir, attempt):
     subprocess.run([sys.executable, "-c", program, str(diagnostics_dir), str(attempt)], check=True)
     return json.loads((diagnostics_dir / "manifest.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("mode", ["success", "metadata-only", "token", "put-failure", "occupied", "local-collision"])
+def test_primary_raw_evidence_archive_preserves_one_invocation_and_source(tmp_path, mode):
+    repo_id, head, run_id, attempt = "1326603956", "a" * 40, "32446501755", "1"
+    artifact_name = f"primary-review-raw-evidence-v1-{repo_id}-{head}-{run_id}-{attempt}"
+    substitutions = {
+        "${{ github.repository_id }}": repo_id,
+        "${{ github.event.pull_request.head.sha }}": head,
+        "${{ github.run_id }}": run_id,
+        "${{ github.run_attempt }}": attempt,
+    }
+    steps = _primary_steps()
+    prepare = next(step for step in steps if step.get("name") == "Prepare unique primary raw evidence directory")
+    upload = next(step for step in steps if step.get("name") == "Archive raw primary review evidence permanently")
+    persistent_root = tmp_path / "persistent-evidence"
+    persistent_root.mkdir()
+    neighbor = persistent_root / f"primary-review-raw-evidence-v1-{repo_id}-{head}-{run_id}-2"
+    neighbor.mkdir()
+    (neighbor / "sentinel.bin").write_bytes(b"neighbor invocation")
+    github_env = tmp_path / "github-env"
+    github_env.write_text("", encoding="utf-8")
+    intended_root = persistent_root / artifact_name
+    if mode == "local-collision":
+        intended_root.mkdir()
+        (intended_root / "original.json").write_bytes(b"keep existing invocation")
+
+    prepare_env = {
+        "PATH": os.environ["PATH"],
+        "REVIEW_EVIDENCE_ROOT": str(persistent_root),
+        "GITHUB_ENV": str(github_env),
+    }
+    for key, value in prepare["env"].items():
+        for expression, replacement in substitutions.items():
+            value = value.replace(expression, replacement)
+        prepare_env[key] = value
+    prepare_run = prepare["run"]
+    for expression, replacement in substitutions.items():
+        prepare_run = prepare_run.replace(expression, replacement)
+    prepared = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", prepare_run],
+        cwd=tmp_path,
+        env=prepare_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if mode == "local-collision":
+        assert prepared.returncode != 0
+        assert "refusing to reuse" in prepared.stderr
+        assert (intended_root / "original.json").read_bytes() == b"keep existing invocation"
+        assert github_env.read_text(encoding="utf-8") == ""
+        return
+    assert prepared.returncode == 0, prepared.stderr
+    exported = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
+    evidence_root = Path(exported["REVIEW_EVIDENCE_ROOT"])
+    assert evidence_root == intended_root == Path(exported["PRIMARY_RAW_EVIDENCE_DIR"])
+    metadata = json.loads((evidence_root / "invocation.json").read_bytes())
+    assert metadata == {
+        "schema_version": 1,
+        "repository_id": repo_id,
+        "head_sha": head,
+        "run_id": run_id,
+        "run_attempt": attempt,
+    }
+    output_dir = evidence_root / "review-primary-fixture"
+    if mode != "metadata-only":
+        output_dir.mkdir()
+        raw_payload = b"ghp_1234567890abcdefghijklmnop" if mode == "token" else b"producer bytes\n\xff"
+        (output_dir / "provider-raw.bin").write_bytes(raw_payload)
+    original_files = {
+        path.relative_to(evidence_root).as_posix(): path.read_bytes()
+        for path in evidence_root.rglob("*") if path.is_file()
+    }
+
+    wrapper = tmp_path / "silo_store_fake.py"
+    wrapper.write_text('''import base64, io, json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["REPO_ROOT"])
+from scripts import silo_store as store
+state_path = Path(os.environ["FAKE_SILO_STATE"])
+state = json.loads(state_path.read_text())
+class Client:
+ def list_objects_v2(self, Bucket, Prefix="", **kwargs):
+  state["calls"].append(["LIST", Prefix])
+  return {"Contents": [{"Key": k} for k in state["objects"] if k.startswith(Prefix)], "IsTruncated": False}
+ def put_object(self, Bucket, Key, Body):
+  state["calls"].append(["PUT", Key])
+  if os.environ.get("FAKE_SILO_FAIL_PUT") == "1": raise RuntimeError("injected PUT failure")
+  state["objects"][Key] = base64.b64encode(Body).decode()
+ def get_object(self, Bucket, Key):
+  state["calls"].append(["GET", Key])
+  return {"Body": io.BytesIO(base64.b64decode(state["objects"][Key]))}
+store.connect = Client
+try: rc = store.main()
+except SystemExit as err: rc = int(err.code or 0)
+finally: state_path.write_text(json.dumps(state))
+sys.exit(rc)
+''', encoding="utf-8")
+    source_checkout = tmp_path / "_gate-silo-src" / "scripts"
+    source_checkout.mkdir(parents=True)
+    (source_checkout / "scrub_outbound.py").write_bytes((REPO_ROOT / "scripts/scrub_outbound.py").read_bytes())
+    prefix = f"archive/{repo_id}/{artifact_name}/"
+    initial_objects = {}
+    if mode == "occupied":
+        initial_objects[prefix + "existing.json"] = base64.b64encode(b"keep archived object").decode()
+    state = tmp_path / "silo-state.json"
+    state.write_text(json.dumps({"objects": initial_objects, "calls": []}), encoding="utf-8")
+
+    upload_env = {key: value for key, value in upload.get("env", {}).items()}
+    for key, value in upload_env.items():
+        for expression, replacement in substitutions.items():
+            upload_env[key] = value.replace(expression, replacement)
+            value = upload_env[key]
+    upload_run = upload["run"]
+    for expression, replacement in substitutions.items():
+        upload_run = upload_run.replace(expression, replacement)
+    upload_env.update({
+        "PATH": os.environ["PATH"],
+        "PRIMARY_RAW_EVIDENCE_DIR": str(evidence_root),
+        "RUNNER_TEMP": str(tmp_path),
+        "SILO_EXEC": str(REPO_ROOT / "scripts/silo_exec.sh"),
+        "SILO_STORE": str(wrapper),
+        "REPO_ROOT": str(REPO_ROOT),
+        "FAKE_SILO_STATE": str(state),
+        "FAKE_SILO_FAIL_PUT": "1" if mode == "put-failure" else "0",
+        "AWS_ACCESS_KEY_ID": "test",
+    })
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", upload_run],
+        cwd=tmp_path,
+        env=os.environ | upload_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert (result.returncode == 0) is (mode in {"success", "metadata-only"}), result.stderr + result.stdout
+    assert {path.relative_to(evidence_root).as_posix(): path.read_bytes() for path in evidence_root.rglob("*") if path.is_file()} == original_files
+    puts = {key for method, key in saved["calls"] if method == "PUT"}
+    gets = {key for method, key in saved["calls"] if method == "GET"}
+    objects = {key: base64.b64decode(value) for key, value in saved["objects"].items()}
+    if mode in {"success", "metadata-only"}:
+        expected_paths = set(original_files)
+        expected_keys = {prefix + relative for relative in expected_paths} | {prefix + "archive-manifest-v1.json"}
+        assert set(objects) == expected_keys
+        assert puts == gets == expected_keys
+        assert all(objects[prefix + relative] == payload for relative, payload in original_files.items())
+        manifest = json.loads(objects[prefix + "archive-manifest-v1.json"])
+        assert manifest == {
+            "schema_version": 1,
+            "repository_id": repo_id,
+            "artifact_name": artifact_name,
+            "files": [
+                {"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+                for relative, payload in sorted(original_files.items())
+            ],
+        }
+        assert not any("sentinel.bin" in key for key in objects)
+    else:
+        assert "ghp_1234567890abcdefghijklmnop" not in result.stdout + result.stderr
+        assert not gets
+        if mode in {"token", "occupied"}:
+            assert not puts
+        if mode == "token":
+            assert "known TOKEN category found; Silo upload blocked" in result.stderr
+        elif mode == "put-failure":
+            assert "Silo archive PUT/GET failed" in result.stderr
+        elif mode == "occupied":
+            assert "already exists; refusing to overwrite" in result.stderr
+            assert objects == {prefix + "existing.json": b"keep archived object"}
 
 
 def test_manifest_producer_emits_absent_empty_and_populated_payloads(tmp_path):
