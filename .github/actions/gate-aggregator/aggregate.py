@@ -705,6 +705,49 @@ def apply_finding_relation(outcome: Outcome, findings: list[Any], previous_round
         outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
 
 
+def _close_consumed_false_positive_carry(
+    relation: dict[str, Any], findings: list[Any], disposition_audit: Any,
+) -> dict[str, Any]:
+    """Close only current open carry entries consumed by a valid refuted receipt."""
+    open_findings = relation.get("open_findings")
+    if not isinstance(open_findings, list):
+        return relation
+    if not isinstance(disposition_audit, _CONVERGENCE.DispositionAudit):
+        return relation
+    recorded_receipts = disposition_audit.recorded_receipts
+    recorded_finding_ids = disposition_audit.recorded_finding_ids
+    if len(recorded_receipts) != len(recorded_finding_ids):
+        return relation
+
+    current_keys_by_id: dict[str, list[str]] = {}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        finding_id = finding.get("id")
+        if not isinstance(finding_id, str) or not finding_id:
+            continue
+        if finding.get("severity") not in _CONVERGENCE.P1_SEVERITIES:
+            continue
+        current_keys_by_id.setdefault(finding_id, []).append(_CONVERGENCE.canonical_finding_key(finding))
+
+    closed: set[tuple[str, str]] = set()
+    for receipt, finding_id in zip(recorded_receipts, recorded_finding_ids):
+        if receipt.disposition != "false-positive" or _CONVERGENCE._counterevidence_reason(receipt):
+            continue
+        current_keys = current_keys_by_id.get(finding_id, [])
+        if len(current_keys) == 1:
+            closed.add((finding_id, current_keys[0]))
+    if not closed:
+        return relation
+    return {
+        **relation,
+        "open_findings": [finding for finding in open_findings if (
+            not isinstance(finding, dict)
+            or (finding.get("id"), _CONVERGENCE.canonical_finding_key(finding)) not in closed
+        )],
+    }
+
+
 def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
     return (
         f"{SILO_TERMINAL_TIER}/{repository_id}/"
@@ -795,68 +838,12 @@ def load_previous_round_findings(
     return {"available": True, "detail": "", "head_sha": head_sha, "findings": findings}
 
 
-def _filter_refuted_previous_findings(
-    findings: list[Any], rows: list[dict[str, Any]], receipts: tuple[Any, ...], current: tuple[int, int],
-) -> list[Any]:
-    by_name = {_CONVERGENCE.disposition_receipt_artifact_name(receipt): receipt for receipt in receipts}
-    closed: set[tuple[str, str]] = set()
-    for row in rows:
-        order = (row["run_id"], row["run_attempt"])
-        if order >= current:
-            continue
-        items = row.get("finding_relation", {}).get("items", [])
-        for event in row.get("_disposition_receipt_resolved", []):
-            receipt = by_name.get(event.get("receipt"))
-            key, finding_id = event.get("finding_key"), event.get("finding_id")
-            if not isinstance(receipt, _CONVERGENCE.DispositionReceipt) or receipt.disposition != "false-positive" or not key:
-                continue
-            evidence = receipt.counterevidence or {}
-            expected = {
-                "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
-                "disposition": receipt.disposition, "finding_key": receipt.finding_key,
-                "approver": _CONVERGENCE._bounded_disposition_text(receipt.approver),
-                "approver_id": receipt.approver_id, "approved_at": receipt.approved_at,
-                "reason": _CONVERGENCE._bounded_disposition_text(receipt.reason),
-                "evidence_pointer": _CONVERGENCE._bounded_disposition_text(evidence.get("pointer", "")),
-                "counterevidence_command": _CONVERGENCE._bounded_disposition_text(evidence.get("command", "")),
-                "counterevidence_output": _CONVERGENCE._bounded_disposition_text(evidence.get("output", "")),
-            }
-            if (_CONVERGENCE._counterevidence_reason(receipt)
-                    or not isinstance(finding_id, str) or key != receipt.finding_key
-                    or not all(event.get(k) == v for k, v in expected.items())):
-                continue
-            def same_identity(item: Any) -> bool:
-                return (isinstance(item, dict) and item.get("id") == finding_id
-                        and _CONVERGENCE.canonical_finding_key(item) == key)
-
-            if sum(same_identity(item) for item in items) != 1 or sum(same_identity(item) for item in findings) != 1:
-                continue
-            superseded = False
-            for later in rows:
-                later_order = (later["run_id"], later["run_attempt"])
-                if not order < later_order < current:
-                    continue
-                relation = later.get("finding_relation")
-                if not isinstance(relation, dict) or not isinstance(relation.get("items"), list) or any(
-                    same_identity(item) for item in relation["items"]
-                ):
-                    superseded = True
-                    break
-            if not superseded:
-                closed.add((finding_id, key))
-    return [item for item in findings if not isinstance(item, dict) or (
-        item.get("id"), _CONVERGENCE.canonical_finding_key(item),
-    ) not in closed]
-
-
 def _project_previous_dispositions(
-    *, repository_id: int, pr_number: int, receipts: Optional[tuple[Any, ...]] = None,
+    *, repository_id: int, pr_number: int,
 ) -> list[dict[str, Any]]:
     projected: list[tuple[str, dict[str, Any]]] = []
     dropped = 0
-    for receipt in receipts if receipts is not None else _fetch_silo_disposition_receipts(
-        repository_id=repository_id, pr_number=pr_number,
-    ):
+    for receipt in _fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number):
         counterevidence = None
         tracking_issue = None
         if receipt.disposition == "false-positive":
@@ -911,20 +898,8 @@ def _render_previous_context_cli(argv: list[str]) -> int:
     )
     dispositions = []
     if previous["available"]:
-        receipts = _fetch_silo_disposition_receipts(
-            repository_id=args.repository_id, pr_number=args.pr_number,
-        )
-        repository = os.environ.get("GITHUB_REPOSITORY")
-        if repository:
-            _status, _runs, history = _load_pr_convergence_history(
-                repository=repository, repository_id=args.repository_id, pr_number=args.pr_number,
-            )
-            if _status == "available" and not history.incomplete_reasons:
-                previous["findings"] = _filter_refuted_previous_findings(
-                    previous["findings"], history.rows, receipts, (args.run_id, args.run_attempt),
-                )
         dispositions = _project_previous_dispositions(
-            repository_id=args.repository_id, pr_number=args.pr_number, receipts=receipts,
+            repository_id=args.repository_id, pr_number=args.pr_number,
         )
     previous = {**previous, "dispositions": dispositions}
     Path(args.previous_json).write_text(json.dumps(previous, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -2369,14 +2344,6 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
     resolved = record.get("resolved_findings")
     if isinstance(resolved, list) and all(isinstance(item, str) for item in resolved) and resolved:
         row["resolved_findings"] = [item for item in resolved if "resolved by receipt" not in item]
-    consumption = record.get("disposition_receipt_consumption")
-    events = consumption.get("resolved") if isinstance(consumption, dict) else None
-    if (
-        isinstance(events, list) and _is_strict_int(consumption.get("consumed_count"))
-        and consumption["consumed_count"] == len(events)
-        and all(isinstance(event, dict) for event in events)
-    ):
-        row["_disposition_receipt_resolved"] = events
     if "finding_relation" in record:
         try:
             row["finding_relation"] = validate_finding_relation_block(record.get("finding_relation"))
@@ -2858,7 +2825,7 @@ def _load_pr_convergence_history(
         print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured")
         history.incomplete_reasons.append("Silo terminal history unavailable: not configured")
         return "history_unavailable", (), history
-    token = os.environ.get("GATE_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
     if not token:
         # Without a token the load cannot be PR-targeted; an untargeted read
         # would download every terminal record on the repo (gate#290's revert
@@ -4060,7 +4027,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             relation = build_finding_relation(current_findings, {"available": False})
             relation["history_status"] = "unknown"
             relation = validate_finding_relation_block(relation)
-        outcome.finding_relation = relation
+        outcome.finding_relation = _close_consumed_false_positive_carry(
+            relation, findings, outcome.disposition_audit,
+        )
         if relation["counts"]["conflict"] and outcome.gate_result == "pass":
             (outcome.ok, outcome.gate_result, outcome.classification, outcome.reason_code) = (
                 False, "fail", "code_fail", "primary_findings",
