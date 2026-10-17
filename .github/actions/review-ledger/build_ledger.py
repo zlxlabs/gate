@@ -786,6 +786,8 @@ def build_live_review_record(
     if result is not None and not isinstance(result, dict):
         raise ValueError("live review record result must be an object or null")
     source_findings = [] if result is None else result.get("findings", [])
+    if source_findings is None:
+        source_findings = []
     if not isinstance(source_findings, list) or any(not isinstance(item, dict) for item in source_findings):
         raise ValueError("live review record findings must be an object list")
     if len(source_findings) != review["finding_count"]:

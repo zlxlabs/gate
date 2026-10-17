@@ -495,9 +495,12 @@ def _run_live_record_cli(tmp_path, *, audit=None, terminal=None, run_attempt=1, 
     return completed, ledger_path, record_path
 
 
-def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path):
-    audit = _live_record_audit()
-    terminal = _live_record_terminal()
+@pytest.mark.parametrize("legacy_null_findings", [False, True])
+def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path, legacy_null_findings):
+    audit = _live_record_audit() if not legacy_null_findings else {
+        "status": "fail", "result": {"verdict": "fail", "findings": None},
+    }
+    terminal = _live_record_terminal() if not legacy_null_findings else None
     completed, ledger_path, record_path = _run_live_record_cli(
         tmp_path / "with-record", audit=audit, terminal=terminal,
     )
@@ -511,17 +514,18 @@ def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path):
         "profile", "reviewer_id", "verdict", "findings", "finding_dispositions", "convergence",
         "risk", "skip", "recorded_at", "provenance", "legacy_finding_dispositions",
     }
-    assert record["risk"] == audit["risk"]
-    assert record["convergence"] == terminal["convergence"]
+    assert legacy_null_findings or record["risk"] == audit["risk"]
+    assert legacy_null_findings or record["convergence"] == terminal["convergence"]
     assert record["skip"] == {"reason": None}
-    assert record["findings"][0]["introduced"] is None
-    assert "findings[0].introduced" in record["provenance"]["unknown_fields"]
+    assert (record["findings"] == []) is legacy_null_findings
+    assert legacy_null_findings or record["findings"][0]["introduced"] is None
+    assert legacy_null_findings or "findings[0].introduced" in record["provenance"]["unknown_fields"]
     assert record["provenance"]["origin"] == "gate-live-review-ledger-v2"
     assert json.loads(completed.stdout) == json.loads(ledger_path.read_bytes())
 
     fixture_path = ROOT / "tests" / "fixtures" / "review-record-v1-live.json"
     fixture = json.loads(fixture_path.read_bytes())
-    assert {key: value for key, value in record.items() if key != "recorded_at"} == {
+    assert legacy_null_findings or {key: value for key, value in record.items() if key != "recorded_at"} == {
         key: value for key, value in fixture.items() if key != "recorded_at"
     }
     without_sidecar, old_ledger_path, old_record_path = _run_live_record_cli(
