@@ -2559,7 +2559,7 @@ jobs:
             --file "$INSTALL"
 
       - name: Download canonical primary audit for ledger
-        if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
+        if: ${{ always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
         env:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
           DEST: ${{ runner.temp }}/primary-audit
@@ -2572,7 +2572,7 @@ jobs:
             --dest "$DEST"
 
       - name: Download gate terminal envelope for ledger
-        if: steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''
+        if: always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''
         env:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
           DEST: ${{ runner.temp }}/gate-terminal
@@ -2698,6 +2698,68 @@ jobs:
           fi
           if ! cmp -s "$LEDGER_PATH" "$ARCHIVE_READBACK_PATH"; then
             echo "::error::Permanent review ledger archive readback bytes do not match" >&2
+            exit 1
+          fi
+
+      - name: Archive canonical primary audit permanently
+        if: always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != ''
+        env:
+          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
+          REPO_ID: ${{ github.repository_id }}
+          AUDIT_PATH: ${{ runner.temp }}/primary-audit/primary-review-audit.json
+          ARCHIVE_READBACK_PATH: ${{ runner.temp }}/review-ledger/primary-audit-archive-readback.json
+        run: |
+          echo "::notice::step-start: Archive canonical primary audit permanently"
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          ARTIFACT_NAME="${ARTIFACT_PREFIX##*/}"
+          if ! "$SILO_EXEC" put \
+            --tier archive \
+            --repo-id "$REPO_ID" \
+            --name "$ARTIFACT_NAME" \
+            --file "$AUDIT_PATH"; then
+            echo "::error::Permanent primary audit archive upload failed" >&2
+            exit 1
+          fi
+          if ! "$SILO_EXEC" get --key \
+            "archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json" \
+            --dest "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent primary audit archive readback failed" >&2
+            exit 1
+          fi
+          if ! cmp -s "$AUDIT_PATH" "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent primary audit archive readback bytes do not match" >&2
+            exit 1
+          fi
+
+      - name: Archive gate terminal envelope permanently
+        if: always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''
+        env:
+          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
+          REPO_ID: ${{ github.repository_id }}
+          TERMINAL_PATH: ${{ runner.temp }}/gate-terminal/gate-terminal.json
+          ARCHIVE_READBACK_PATH: ${{ runner.temp }}/review-ledger/gate-terminal-archive-readback.json
+        run: |
+          echo "::notice::step-start: Archive gate terminal envelope permanently"
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          ARTIFACT_NAME="${ARTIFACT_PREFIX##*/}"
+          if ! "$SILO_EXEC" put \
+            --tier archive \
+            --repo-id "$REPO_ID" \
+            --name "$ARTIFACT_NAME" \
+            --file "$TERMINAL_PATH"; then
+            echo "::error::Permanent gate terminal archive upload failed" >&2
+            exit 1
+          fi
+          if ! "$SILO_EXEC" get --key \
+            "archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json" \
+            --dest "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent gate terminal archive readback failed" >&2
+            exit 1
+          fi
+          if ! cmp -s "$TERMINAL_PATH" "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent gate terminal archive readback bytes do not match" >&2
             exit 1
           fi
 

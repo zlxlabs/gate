@@ -77,20 +77,30 @@ def test_build_key_joins_tier_repo_name_and_relative_path():
         store.build_key("d1", "1", "name", "../escape")
 
 
-def test_archive_key_is_limited_to_raw_per_run_review_ledgers():
+def test_archive_key_allows_only_per_run_review_evidence_pairs():
     repo_id = "1326603956"
-    artifact_name = f"codex-review-ledger-v2-{repo_id}-{'a' * 40}-32446501755-1"
-    assert store.build_key("archive", repo_id, artifact_name, "ledger.jsonl") == (
-        f"archive/{repo_id}/{artifact_name}/ledger.jsonl"
+    head_sha = "a" * 40
+    run_id = "32446501755"
+    allowed = (
+        (f"codex-review-ledger-v2-{repo_id}-{head_sha}-{run_id}-1", "ledger.jsonl"),
+        (f"primary-audit-v2-{repo_id}-{head_sha}-{run_id}-1", "primary-review-audit.json"),
+        (f"gate-terminal-v1-{repo_id}-{head_sha}-{run_id}-1", "gate-terminal.json"),
     )
+    for artifact_name, relative_path in allowed:
+        assert store.build_key("archive", repo_id, artifact_name, relative_path) == (
+            f"archive/{repo_id}/{artifact_name}/{relative_path}"
+        )
 
-    for name, relative_path in (
-        (f"primary-audit-v2-{repo_id}-{'a' * 40}-32446501755-1", "ledger.jsonl"),
-        (f"codex-review-ledger-v2-999-{'a' * 40}-32446501755-1", "ledger.jsonl"),
-        (artifact_name, "nested/ledger.jsonl"),
-    ):
+    rejected = (
+        (allowed[0][0], "primary-review-audit.json"),
+        (allowed[1][0], "ledger.jsonl"),
+        (allowed[2][0], "primary-review-audit.json"),
+        (f"primary-audit-v2-999-{head_sha}-{run_id}-1", "primary-review-audit.json"),
+        (allowed[0][0], "nested/ledger.jsonl"),
+    )
+    for artifact_name, relative_path in rejected:
         with pytest.raises(SystemExit) as caught:
-            store.build_key("archive", repo_id, name, relative_path)
+            store.build_key("archive", repo_id, artifact_name, relative_path)
         assert caught.value.code == store.EXIT_ERROR
 
 
@@ -109,7 +119,7 @@ def test_archive_tier_rejects_directory_and_multi_file_writes(tmp_path, monkeypa
             "--file", str(ledger), "--file", str(extra),
         ])
     assert multi_file.value.code == store.EXIT_ERROR
-    assert "archive tier put requires exactly one raw review ledger file" in capsys.readouterr().err
+    assert "archive tier put requires exactly one allowlisted review evidence file" in capsys.readouterr().err
 
     with pytest.raises(SystemExit) as directory:
         store.main([
@@ -743,6 +753,41 @@ def _start_record_server(**attrs):
     return server
 
 
+def _run_gate_silo_step(
+    step: dict,
+    *,
+    tmp_path: Path,
+    server: HTTPServer,
+    artifact_prefix: str,
+    repo_id: str,
+    source_env_name: str,
+    source_path: Path,
+) -> subprocess.CompletedProcess:
+    step_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AWS_ACCESS_KEY_ID": _ACCESS,
+        "AWS_SECRET_ACCESS_KEY": _SECRET,
+        "SILO_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
+        "SILO_BUCKET": "ci-artifacts",
+        "SILO_EXEC": str(_REPO_ROOT / "scripts/silo_exec.sh"),
+        "SILO_STORE": str(_STORE_PY),
+        "RUNNER_TEMP": str(tmp_path),
+        "ARTIFACT_PREFIX": artifact_prefix,
+        "ARTIFACT_NAME": artifact_prefix.rsplit("/", 1)[-1],
+        "REPO_ID": repo_id,
+        "ARCHIVE_READBACK_PATH": str(tmp_path / f"{source_env_name}-archive-readback.json"),
+        source_env_name: str(source_path),
+    }
+    run = step["run"].replace("${{ github.repository_id }}", repo_id)
+    return subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", run],
+        capture_output=True,
+        text=True,
+        env=step_env,
+        check=False,
+    )
+
+
 def test_gate_workflow_dual_writes_the_real_ledger_bytes_to_d30_and_archive(tmp_path):
     workflow = yaml.safe_load((_REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
     steps = workflow["jobs"]["ledger"]["steps"]
@@ -837,6 +882,256 @@ def test_gate_workflow_dual_writes_the_real_ledger_bytes_to_d30_and_archive(tmp_
     expected_get = ("GET", f"/ci-artifacts/archive/{repo_id}/{artifact_name}/ledger.jsonl")
     assert (server.received[2]["method"], server.received[2]["path"]) == expected_get
     assert [record["body"] for record in server.received[:2]] == [ledger_bytes, ledger_bytes]
+
+
+def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
+    workflow = yaml.safe_load((_REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
+    steps = workflow["jobs"]["ledger"]["steps"]
+    download_audit = next(step for step in steps if step.get("name") == "Download canonical primary audit for ledger")
+    archive_audit = next(step for step in steps if step.get("name") == "Archive canonical primary audit permanently")
+    download_terminal = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
+    archive_terminal = next(step for step in steps if step.get("name") == "Archive gate terminal envelope permanently")
+    build_ledger = next(step for step in steps if step.get("name") == "Build v2 review effectiveness ledger")
+    archive_ledger = next(step for step in steps if step.get("name") == "Upload v2 raw review ledger to permanent archive")
+    assert steps.index(download_audit) < steps.index(download_terminal) < steps.index(build_ledger)
+    assert steps.index(build_ledger) < steps.index(archive_ledger) < steps.index(archive_audit) < steps.index(archive_terminal)
+    assert download_terminal["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
+    assert archive_ledger["if"] == "always() && steps.build-review-ledger.outcome == 'success'"
+    assert archive_audit["if"] == "always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != ''"
+    assert archive_terminal["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
+    assert archive_audit["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}"
+    assert archive_terminal["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
+    assert "continue-on-error" not in archive_audit and "continue-on-error" not in archive_terminal
+
+    audit_path = _REPO_ROOT / "tests/data/primary_review_v2_with_tier.json"
+    audit_bytes = audit_path.read_bytes()
+    audit = json.loads(audit_bytes)
+    audit_source_attempt = int(audit["run_attempt"])
+    current_attempt = audit_source_attempt + 1
+    audit_dir = tmp_path / "primary-audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_bytes(audit_bytes)
+    terminal_path = tmp_path / "gate-terminal" / "gate-terminal.json"
+    terminal_path.parent.mkdir()
+    source_audit_name = (
+        f"primary-audit-v2-{audit['repository_id']}-{audit['head_sha']}-{audit['run_id']}-{audit_source_attempt}"
+    )
+    terminal_name = (
+        f"gate-terminal-v1-{audit['repository_id']}-{audit['head_sha']}-{audit['run_id']}-{audit_source_attempt}"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / ".github/actions/gate-aggregator/aggregate.py"),
+            "--quality-result", "success",
+            "--primary-result", "success",
+            "--preflight-result", "success",
+            "--runner", "self",
+            "--is-draft", "false",
+            "--pr-author-json", json.dumps("archive-fixture-author"),
+            "--is-fork", "false",
+            "--classify-review-expected", "true",
+            "--review-expected", "true",
+            "--repository-id", str(audit["repository_id"]),
+            "--repository", audit["repository"],
+            "--head-sha", audit["head_sha"],
+            "--run-id", str(audit["run_id"]),
+            "--run-attempt", str(audit_source_attempt),
+            "--pr-number", str(audit["pr"]),
+            "--audit-source-attempt", str(audit_source_attempt),
+            "--audit-artifact-name", source_audit_name,
+            "--audit-dir", str(audit_dir),
+            "--terminal-path", str(terminal_path),
+            "--summary-path", str(tmp_path / "summary.md"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    terminal_bytes = terminal_path.read_bytes()
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_path.write_bytes(b'{"source":"ledger"}\n')
+    ledger_artifact_name = (f"codex-review-ledger-v2-{audit['repository_id']}-{audit['head_sha']}-"
+                            f"{audit['run_id']}-{current_attempt}")
+
+    server = _start_record_server()
+    archive_cases = (
+        (archive_audit, "AUDIT_PATH", audit_dir / "primary-review-audit.json", source_audit_name, audit_bytes),
+        (archive_terminal, "TERMINAL_PATH", terminal_path, terminal_name, terminal_bytes),
+    )
+    try:
+        ledger_archive = _run_gate_silo_step(
+            archive_ledger, tmp_path=tmp_path, server=server, artifact_prefix=ledger_artifact_name,
+            repo_id=str(audit["repository_id"]), source_env_name="LEDGER_PATH", source_path=ledger_path,
+        )
+        assert ledger_archive.returncode == 0, ledger_archive.stderr + ledger_archive.stdout
+        assert server.objects[
+            f"/ci-artifacts/archive/{audit['repository_id']}/{ledger_artifact_name}/ledger.jsonl"
+        ] == (tmp_path / "LEDGER_PATH-archive-readback.json").read_bytes() == ledger_path.read_bytes()
+
+        for step, source_env_name, source_path, artifact_name, expected_bytes in archive_cases:
+            artifact_tier = "d14" if source_env_name == "AUDIT_PATH" else "d30"
+            artifact_prefix = f"{artifact_tier}/{audit['repository_id']}/{artifact_name}"
+            result = _run_gate_silo_step(
+                step,
+                tmp_path=tmp_path,
+                server=server,
+                artifact_prefix=artifact_prefix,
+                repo_id=str(audit["repository_id"]),
+                source_env_name=source_env_name,
+                source_path=source_path,
+            )
+            expected_key = f"archive/{audit['repository_id']}/{artifact_name}/{source_path.name}"
+            assert result.returncode == 0, result.stderr + result.stdout
+            assert server.objects[f"/ci-artifacts/{expected_key}"] == expected_bytes
+            assert (tmp_path / f"{source_env_name}-archive-readback.json").read_bytes() == expected_bytes
+
+        put_records = [record for record in server.received if record["method"] == "PUT"]
+        assert [record["body"] for record in put_records[:3]] == [
+            ledger_path.read_bytes(), audit_bytes, terminal_bytes,
+        ]
+        assert [record["path"] for record in put_records] == [
+            f"/ci-artifacts/archive/{audit['repository_id']}/{ledger_artifact_name}/ledger.jsonl",
+            f"/ci-artifacts/archive/{audit['repository_id']}/{source_audit_name}/primary-review-audit.json",
+            f"/ci-artifacts/archive/{audit['repository_id']}/{terminal_name}/gate-terminal.json",
+        ]
+
+        for step, source_env_name, source_path, artifact_name, _ in archive_cases:
+            artifact_tier = "d14" if source_env_name == "AUDIT_PATH" else "d30"
+            artifact_prefix = f"{artifact_tier}/{audit['repository_id']}/{artifact_name}"
+            server.get_status = 403
+            failed_get = _run_gate_silo_step(
+                step,
+                tmp_path=tmp_path,
+                server=server,
+                artifact_prefix=artifact_prefix,
+                repo_id=str(audit["repository_id"]),
+                source_env_name=source_env_name,
+                source_path=source_path,
+            )
+            assert failed_get.returncode != 0
+            assert f"Permanent {'primary audit' if source_env_name == 'AUDIT_PATH' else 'gate terminal'} archive readback failed" in failed_get.stderr
+
+            server.get_status = None
+            server.corrupt_get = True
+            mismatched_get = _run_gate_silo_step(
+                step,
+                tmp_path=tmp_path,
+                server=server,
+                artifact_prefix=artifact_prefix,
+                repo_id=str(audit["repository_id"]),
+                source_env_name=source_env_name,
+                source_path=source_path,
+            )
+            assert mismatched_get.returncode != 0
+            assert "archive readback bytes do not match" in mismatched_get.stderr
+
+            server.corrupt_get = False
+            missing_source = _run_gate_silo_step(
+                step,
+                tmp_path=tmp_path,
+                server=server,
+                artifact_prefix=artifact_prefix,
+                repo_id=str(audit["repository_id"]),
+                source_env_name=source_env_name,
+                source_path=tmp_path / f"missing-{source_env_name}.json",
+            )
+            assert missing_source.returncode != 0
+            assert "archive upload failed" in missing_source.stderr
+
+        server.get_status = 403
+        failed_audit_archive = _run_gate_silo_step(
+            archive_audit, tmp_path=tmp_path, server=server,
+            artifact_prefix=f"d14/{audit['repository_id']}/{source_audit_name}",
+            repo_id=str(audit["repository_id"]), source_env_name="AUDIT_PATH",
+            source_path=audit_dir / "primary-review-audit.json",
+        )
+        assert failed_audit_archive.returncode != 0
+        assert "Permanent primary audit archive readback failed" in failed_audit_archive.stderr
+
+        server.get_status = None
+        terminal_after_audit_failure = _run_gate_silo_step(
+            archive_terminal, tmp_path=tmp_path, server=server,
+            artifact_prefix=f"d30/{audit['repository_id']}/{terminal_name}",
+            repo_id=str(audit["repository_id"]), source_env_name="TERMINAL_PATH",
+            source_path=terminal_path,
+        )
+        assert terminal_after_audit_failure.returncode == 0, terminal_after_audit_failure.stderr
+        assert server.objects[f"/ci-artifacts/archive/{audit['repository_id']}/{terminal_name}/gate-terminal.json"] == terminal_bytes
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert all(
+        artifact_name.endswith(f"-{audit_source_attempt}")
+        and not artifact_name.endswith(f"-{current_attempt}")
+        for _, _, _, artifact_name, _ in archive_cases
+    )
+
+
+def test_skipped_gate_archives_terminal_without_fabricating_audit(tmp_path):
+    workflow = yaml.safe_load((_REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
+    steps = workflow["jobs"]["ledger"]["steps"]
+    archive_audit = next(step for step in steps if step.get("name") == "Archive canonical primary audit permanently")
+    archive_terminal = next(step for step in steps if step.get("name") == "Archive gate terminal envelope permanently")
+    audit_output = "steps.resolve-ledger-artifacts.outputs.audit_artifact_id"
+    assert audit_output in archive_audit["if"] and "!= ''" in archive_audit["if"]
+
+    fixture = json.loads((_REPO_ROOT / "tests/data/primary_review_v2_with_tier.json").read_text())
+    repo_id = str(fixture["repository_id"])
+    source_attempt = 1
+    run_id = str(fixture["run_id"])
+    terminal_name = f"gate-terminal-v1-{repo_id}-{fixture['head_sha']}-{run_id}-{source_attempt}"
+    terminal_path = tmp_path / "gate-terminal.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / ".github/actions/gate-aggregator/aggregate.py"),
+            "--quality-result", "success",
+            "--primary-result", "skipped",
+            "--runner", "self",
+            "--is-draft", "false",
+            "--pr-author-json", json.dumps("archive-fixture-author"),
+            "--is-fork", "false",
+            "--classify-review-expected", "false",
+            "--review-expected", "false",
+            "--repository-id", repo_id,
+            "--repository", fixture["repository"],
+            "--head-sha", fixture["head_sha"],
+            "--run-id", run_id,
+            "--run-attempt", str(source_attempt),
+            "--pr-number", str(fixture["pr"]),
+            "--audit-dir", str(tmp_path / "empty-audit"),
+            "--terminal-path", str(terminal_path),
+            "--summary-path", str(tmp_path / "skip-summary.md"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    terminal_bytes = terminal_path.read_bytes()
+    terminal = json.loads(terminal_bytes)
+    assert terminal["gate_result"] == "skipped" and terminal["skip_reason"]
+
+    server = _start_record_server()
+    try:
+        result = _run_gate_silo_step(
+            archive_terminal,
+            tmp_path=tmp_path,
+            server=server,
+            artifact_prefix=f"d30/{repo_id}/{terminal_name}",
+            repo_id=repo_id,
+            source_env_name="TERMINAL_PATH",
+            source_path=terminal_path,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    expected_key = f"/ci-artifacts/archive/{repo_id}/{terminal_name}/gate-terminal.json"
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert server.objects[expected_key] == terminal_bytes
+    assert (tmp_path / "TERMINAL_PATH-archive-readback.json").read_bytes() == terminal_bytes
+    assert not any("/primary-review-audit.json" in record["path"] for record in server.received)
 
 
 def test_cli_put_incomplete_body_emits_one_status_event(tmp_path):

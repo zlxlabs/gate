@@ -2,7 +2,7 @@
 """Put, get, list, and resolve CI artifacts on Silo.
 
 Key layout: d<tier>/<repo_id>/<artifact_name>/<relative path>
-or archive/<repo_id>/<artifact_name>/<relative path> for raw review ledgers.
+or archive/<repo_id>/<artifact_name>/<relative path> for per-run review evidence.
 tier ∈ {d1, d3, d14, d30, archive}. Env: AWS_ACCESS_KEY_ID (SILO_ACCESS_KEY),
 AWS_SECRET_ACCESS_KEY, SILO_ENDPOINT, SILO_BUCKET (default ci-artifacts).
 Exit: 0 ok; 2 miss; 1 any other failure (distinct from miss).
@@ -54,7 +54,7 @@ def bucket_name() -> str:
 
 
 def build_key(tier: str, repo_id: str, artifact_name: str, relative_path: str) -> str:
-    """Return a canonical key; archive accepts only this repo's per-run raw ledger.jsonl."""
+    """Return a canonical key; archive keeps per-run raw review evidence bytes."""
 
     if tier not in TIERS:
         fail(f"tier must be one of {sorted(TIERS)}; got {tier!r}")
@@ -65,14 +65,28 @@ def build_key(tier: str, repo_id: str, artifact_name: str, relative_path: str) -
     rel = relative_path.replace("\\", "/").lstrip("/")
     if not rel or rel.startswith("/") or ".." in Path(rel).parts:
         fail(f"relative path is not a safe object suffix: {relative_path!r}")
-    if tier == ARCHIVE_TIER and (
-        not re.fullmatch(
-            rf"codex-review-ledger-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
-            artifact_name,
+    if tier == ARCHIVE_TIER:
+        allowed_archive_objects = (
+            (
+                rf"codex-review-ledger-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+                "ledger.jsonl",
+            ),
+            (
+                rf"primary-audit-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+                "primary-review-audit.json",
+            ),
+            (
+                rf"gate-terminal-v1-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+                "gate-terminal.json",
+            ),
         )
-        or rel != "ledger.jsonl"
-    ):
-        fail("archive tier only accepts per-run codex-review-ledger-v2 raw ledger.jsonl objects")
+        if not any(
+            relative_path == allowed_suffix and re.fullmatch(name_pattern, artifact_name)
+            for name_pattern, allowed_suffix in allowed_archive_objects
+        ):
+            fail(
+                "archive tier only accepts per-run raw review ledger, primary audit, or gate terminal objects"
+            )
     return f"{tier}/{repo_id}/{artifact_name}/{rel}"
 
 
@@ -537,7 +551,7 @@ def cmd_put(args: argparse.Namespace) -> int:
     if not raw_files:
         fail("put requires at least one --file")
     if args.tier == ARCHIVE_TIER and len(raw_files) != 1:
-        fail("archive tier put requires exactly one raw review ledger file")
+        fail("archive tier put requires exactly one allowlisted review evidence file")
     if len(raw_files) == 1:
         path = Path(raw_files[0])
         if not path.is_file():
@@ -573,7 +587,7 @@ def cmd_put(args: argparse.Namespace) -> int:
 
 def cmd_put_dir(args: argparse.Namespace) -> int:
     if args.tier == ARCHIVE_TIER:
-        fail("archive tier put-dir is unsupported; use put for one raw review ledger.jsonl")
+        fail("archive tier put-dir is unsupported; use put for one allowlisted review evidence file")
     directory = Path(args.dir)
     files = list(iter_dir_files(directory))
     if not files:
