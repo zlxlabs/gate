@@ -906,6 +906,36 @@ def write_ledger(path: Path, entry: dict[str, Any]) -> None:
     path.write_text(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def primary_record_consistency_warning(
+    record_path: Path, *, primary_result: str, run_id: int, attempt: int, head_sha: str,
+) -> str | None:
+    """Read the written compact record bytes and report a same-run primary mismatch."""
+    try:
+        record = json.loads(record_path.read_bytes())
+    except (OSError, ValueError):
+        return "primary review consistency could not read the compact record"
+    if not isinstance(record, dict):
+        return "primary review consistency compact record is not an object"
+    expected = (("run_id", run_id), ("attempt", attempt), ("head_sha", head_sha))
+    if any(type(record.get(key)) is not type(value) or record.get(key) != value for key, value in expected):
+        return "primary review consistency identity does not match the compact record"
+    verdict = record.get("verdict")
+    skip = record.get("skip")
+    if primary_result in {"skipped", "cancelled"} or verdict is None or (
+        isinstance(skip, dict) and skip.get("reason") is not None
+    ):
+        return None
+    mismatches = (primary_result == "success" and verdict in {"fail", "unavailable"}) or (
+        primary_result == "failure" and verdict == "pass"
+    )
+    if mismatches:
+        return (
+            f"primary review consistency mismatch: run_id={run_id} attempt={attempt} "
+            f"head_sha={head_sha} primary={primary_result} record_verdict={verdict}"
+        )
+    return None
+
+
 def _load_json(path: Path) -> dict[str, Any] | None:
     if not path.is_file() or path.stat().st_size == 0:
         return None

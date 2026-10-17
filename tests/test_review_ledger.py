@@ -495,6 +495,49 @@ def _run_live_record_cli(tmp_path, *, audit=None, terminal=None, run_attempt=1, 
     return completed, ledger_path, record_path
 
 
+@pytest.mark.parametrize(("verdict", "primary", "warning"), [
+    ("pass", "success", False), ("fail", "failure", False), ("unavailable", "failure", False),
+    ("fail", "success", True), ("unavailable", "success", True), ("pass", "failure", True),
+])
+def test_primary_consistency_reads_produced_compact_record(tmp_path, verdict, primary, warning):
+    audit = _live_record_audit()
+    audit["verdict"] = verdict
+    audit["result"] = None if verdict == "unavailable" else {
+        "verdict": verdict, "summary": "result", "findings": [] if verdict == "pass" else audit["result"]["findings"],
+    }
+    completed, _ledger, record_path = _run_live_record_cli(tmp_path, audit=audit)
+    assert completed.returncode == 0, completed.stderr
+    message = _module().primary_record_consistency_warning(
+        record_path, primary_result=primary, run_id=999, attempt=1, head_sha="a" * 40,
+    )
+    assert (message is not None) is warning
+    assert message is None or "mismatch" in message
+
+
+@pytest.mark.parametrize(("field", "wrong"), [("run_id", 1000), ("attempt", 2), ("head_sha", "f" * 40)])
+def test_primary_consistency_warns_on_written_identity_mismatch_and_ignores_skip(tmp_path, field, wrong):
+    completed, _ledger, record_path = _run_live_record_cli(
+        tmp_path / "identity", audit=_live_record_audit(),
+    )
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(record_path.read_bytes())
+    record[field] = wrong
+    record_path.write_bytes(json.dumps(record).encode())
+    warning = _module().primary_record_consistency_warning(
+        record_path, primary_result="success", run_id=999, attempt=1, head_sha="a" * 40,
+    )
+    assert warning and "identity" in warning
+    skipped, _ledger, skipped_path = _run_live_record_cli(
+        tmp_path / "skip", terminal=_live_record_terminal(skip_reason="draft"),
+    )
+    assert skipped.returncode == 0, skipped.stderr
+    compact = json.loads(skipped_path.read_bytes())
+    assert compact["verdict"] is None and compact["skip"]["reason"] == "draft"
+    assert _module().primary_record_consistency_warning(
+        skipped_path, primary_result="skipped", run_id=999, attempt=1, head_sha="a" * 40,
+    ) is None
+
+
 @pytest.mark.parametrize("legacy_null_findings", [False, True])
 def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path, legacy_null_findings):
     audit = _live_record_audit() if not legacy_null_findings else {
