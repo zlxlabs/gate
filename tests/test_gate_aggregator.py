@@ -1240,6 +1240,21 @@ def test_primary_verdict_is_transported_from_validated_audit_to_terminal_history
     assert row["primary_verdict"] == verdict
 
 
+def test_main_terminal_omits_primary_verdict_when_findings_are_malformed(tmp_path):
+    audit = _valid_scoped_primary_record()
+    audit["result"]["findings"] = [{"severity": "unknown"}]
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit))
+    summary_path = tmp_path / "summary.md"
+
+    assert AGG.main(_cli_args(audit_dir, summary_path)) == 1
+    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
+
+    assert (terminal["gate_result"], terminal["reason_code"]) == ("unavailable", "audit_invalid")
+    assert "primary_verdict" not in terminal
+
+
 @pytest.mark.parametrize("include_null", [False, True], ids=["legacy-missing", "legacy-null"])
 def test_terminal_history_keeps_missing_or_null_primary_verdict_unknown(include_null):
     record = json.loads(_canary_terminal_bytes())
@@ -1253,9 +1268,10 @@ def test_terminal_history_keeps_missing_or_null_primary_verdict_unknown(include_
     assert row["primary_verdict"] is None
 
 
-def test_invalid_primary_verdict_marks_terminal_history_incomplete(monkeypatch):
+@pytest.mark.parametrize("verdict", ["not-a-primary-verdict", "not_expected", "waived"])
+def test_invalid_primary_verdict_marks_terminal_history_incomplete(monkeypatch, verdict):
     record = json.loads(_canary_terminal_bytes())
-    record["primary_verdict"] = "not-a-primary-verdict"
+    record["primary_verdict"] = verdict
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as bundle:
         bundle.writestr("gate-terminal.json", json.dumps(record))
@@ -1273,6 +1289,16 @@ def test_invalid_primary_verdict_marks_terminal_history_incomplete(monkeypatch):
     assert history.rows == []
     assert len(history.skipped_records) == 1
     assert "primary_verdict" in history.incomplete_reasons[0]
+
+
+@pytest.mark.parametrize("verdict", ["not_expected", "waived"])
+def test_terminal_rejects_nonreview_primary_verdicts(verdict):
+    outcome = AGG.Outcome(
+        ok=False, classification="integration_error", reason_code="audit_invalid",
+        gate_result="unavailable", primary_verdict=verdict,
+    )
+    with pytest.raises(ValueError, match="terminal primary_verdict"):
+        _terminal_for(outcome)
 
 
 def test_terminal_envelope_publishes_shadow_budget_bytes_without_changing_gate_result(tmp_path):

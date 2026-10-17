@@ -145,9 +145,8 @@ sys.modules[_NEIGHBOR_EVIDENCE_SPEC.name] = _NEIGHBOR_EVIDENCE
 _NEIGHBOR_EVIDENCE_SPEC.loader.exec_module(_NEIGHBOR_EVIDENCE)
 
 
-# Mirrors gate-hub's scripts/review/contracts.py PRIMARY_VERDICTS / IDENTITY_FIELDS
-# (see module docstring for why this is a hand-kept mirror, not an import).
-PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable", "not_expected", "waived")
+# Terminal transport includes only primary outcomes the gate may trust.
+PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable")
 IDENTITY_QUINTUPLE = ("repository_id", "head_sha", "run_id", "run_attempt", "pr")
 _IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
 
@@ -1168,8 +1167,8 @@ def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
         errors.append(f"schema_version must be exactly int 1 or 2, got {schema_version!r}")
 
     verdict = record.get("verdict")
-    if verdict not in PRIMARY_VERDICT_DOMAIN:
-        errors.append(f"verdict {verdict!r} is not in the accepted domain {PRIMARY_VERDICT_DOMAIN!r}")
+    if verdict not in PRIMARY_VERDICT_DOMAIN + ("not_expected", "waived"):
+        errors.append(f"verdict {verdict!r} is not in the accepted audit domain")
 
     expected = identity.as_dict()
     for key in IDENTITY_QUINTUPLE:
@@ -1501,6 +1500,7 @@ def evaluate(
     if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
         p1_findings = _canonical_p1_findings(audit)
         if p1_findings is None:
+            outcome.primary_verdict = None
             outcome.ok = False
             outcome.classification = "integration_error"
             outcome.reason_code = "audit_invalid"
