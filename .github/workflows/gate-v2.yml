@@ -1271,6 +1271,25 @@ jobs:
             --dir "$DIAGNOSTICS_DIR" \
             --empty skip
 
+      - name: Archive primary review diagnostics permanently
+        if: always()
+        id: archive-primary-review-diagnostics
+        continue-on-error: true
+        env:
+          ARTIFACT_NAME: primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
+        run: |
+          set -euo pipefail
+          if ! "$SILO_EXEC" put-dir \
+            --tier archive \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$DIAGNOSTICS_DIR" \
+            --empty skip; then
+            echo "::warning::Permanent archive of primary review diagnostics failed"
+            exit 1
+          fi
+
       - name: Diagnose silo network after job failure
         if: failure()
         env:
@@ -1827,6 +1846,24 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --dir "$ADVISORY_DIR"
 
+      - name: Archive advisory review event permanently
+        if: always() && matrix.reviewer != '__none__'
+        id: archive-advisory-review-event
+        continue-on-error: true
+        env:
+          ARTIFACT_NAME: advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
+          ADVISORY_DIR: ${{ runner.temp }}/shadow-events/advisory
+        run: |
+          set -euo pipefail
+          if ! "$SILO_EXEC" put-dir \
+            --tier archive \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$ADVISORY_DIR"; then
+            echo "::warning::Permanent archive of advisory review event failed"
+            exit 1
+          fi
+
       - name: Diagnose silo network after job failure
         if: failure()
         env:
@@ -2056,6 +2093,24 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --dir "$RECEIPT_DIR"
 
+      - name: Archive convergence receipt permanently
+        if: always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'
+        id: archive-convergence-receipt
+        continue-on-error: true
+        env:
+          ARTIFACT_NAME: gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          RECEIPT_DIR: ${{ runner.temp }}/convergence-receipt
+        run: |
+          set -euo pipefail
+          if ! "$SILO_EXEC" put-dir \
+            --tier archive \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$RECEIPT_DIR"; then
+            echo "::warning::Permanent archive of convergence receipt failed"
+            exit 1
+          fi
+
       - name: Upload gate terminal envelope
         if: always()
         id: upload-gate-terminal
@@ -2145,6 +2200,24 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$PANEL_PATH"
+
+      - name: Archive gate status panel delivery diagnostic permanently
+        if: always()
+        id: archive-gate-status-panel-diagnostic
+        continue-on-error: true
+        env:
+          ARTIFACT_NAME: gate-status-panel-delivery-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PANEL_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
+        run: |
+          set -euo pipefail
+          if ! "$SILO_EXEC" put \
+            --tier archive \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --file "$PANEL_PATH"; then
+            echo "::warning::Permanent archive of gate status panel delivery diagnostic failed"
+            exit 1
+          fi
 
       - name: Warn when gate status panel delivery diagnostic is unavailable
         if: always() && (steps.upload-gate-status-panel-diagnostic.outcome == 'failure' || (steps.upload-gate-terminal.outcome == 'failure' && steps.retry-upload-gate-terminal.outcome == 'failure'))
