@@ -2559,7 +2559,7 @@ jobs:
             --file "$INSTALL"
 
       - name: Download canonical primary audit for ledger
-        if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
+        if: ${{ always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
         env:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
           DEST: ${{ runner.temp }}/primary-audit

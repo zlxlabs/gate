@@ -1208,12 +1208,9 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     for copy in copies:
         assert copy == primary_if
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert workflow_text.count(CLASSIFY_GUARD) == 7
+    assert workflow_text.count(CLASSIFY_GUARD) == 6
     assert "outputs.review_expected == 'true'" not in workflow_text
-    assert download_audit["if"] == (
-        REVIEW_EXPECTED_IF[:-3] + " && "
-        "steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}"
-    )
+    assert download_audit["if"] == "${{ always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}"
 
 
 def test_aggregate_passes_skip_reason_facts_from_the_review_expected_atoms():
