@@ -5431,6 +5431,86 @@ def test_render_previous_context_preserves_full_findings_and_prior_head(tmp_path
     assert relation["items"][0]["previous_finding_id"] == "prior-major-after-limit"
 
 
+def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, monkeypatch):
+    ledger_path = ROOT / ".github" / "actions" / "review-ledger" / "build_ledger.py"
+    spec = importlib.util.spec_from_file_location("review_ledger_for_open_findings", ledger_path)
+    ledger = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(ledger)
+    finding = {
+        "id": "open-with-evidence", "severity": "major", "file": "src/check.py", "line": 17,
+        "category": "correctness", "issue": "the quote must remain open",
+        "acceptance": "retain the original anchor", "quote": "exact source bytes",
+        "anchor": {"path": "src/check.py", "line": 17, "range": [17, 18]},
+    }
+
+    def aggregate_round(directory, *, identity, findings, previous_path=None):
+        audit_dir = directory / "audit"
+        audit_dir.mkdir(parents=True)
+        audit = _valid_scoped_primary_record(result={"findings": findings})
+        audit.update(run_id=identity.run_id, run_attempt=identity.run_attempt, head_sha=identity.head_sha)
+        (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit), encoding="utf-8")
+        summary = directory / "summary.md"
+        args = _cli_args(audit_dir, summary, identity=identity)
+        if previous_path:
+            args.extend(["--previous-findings-path", str(previous_path)])
+        assert AGG.main(args) == 0
+        return json.loads(summary.with_name("gate-terminal.json").read_bytes())
+
+    def write_ledger_jsonl(path, terminal):
+        entry = ledger.build_entry(
+            repository="zlxlabs/gate", pr_number=42, run_id=terminal["run_id"],
+            run_attempt=terminal["run_attempt"], head_sha=terminal["head_sha"],
+            preflight={}, audit=None, terminal_envelope=terminal,
+        )
+        ledger.write_ledger(path, entry)
+        raw = path.read_bytes()
+        assert raw.endswith(b"\n")
+        assert json.loads(raw.splitlines()[0])["finding_relation"] == terminal["finding_relation"]
+
+    first_identity = AGG.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=1, pr=42)
+    first_terminal = aggregate_round(tmp_path / "round-1", identity=first_identity, findings=[finding])
+    assert first_terminal["finding_relation"]["open_findings"] == [finding]
+    first_ledger = tmp_path / "round-1.jsonl"
+    write_ledger_jsonl(first_ledger, first_terminal)
+    active_ledger = first_ledger
+
+    def read_latest(argv, _timeout_s):
+        assert argv[0] == "get"
+        Path(argv[argv.index("--dest") + 1]).write_bytes(active_ledger.read_bytes())
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setattr(AGG, "_silo_cli", read_latest)
+    monkeypatch.setattr(AGG, "_project_previous_dispositions", lambda **_kwargs: [])
+
+    for round_number, run_id in ((2, 1000), (3, 1001)):
+        previous_path = tmp_path / f"round-{round_number}-previous.json"
+        assert AGG._render_previous_context_cli([
+            "--repository-id", "123", "--pr-number", "42", "--run-id", str(run_id),
+            "--run-attempt", "1", "--previous-json", str(previous_path),
+        ]) == 0
+        previous = json.loads(previous_path.read_bytes())
+        assert set(previous) == {"available", "detail", "head_sha", "findings", "dispositions"}
+        assert previous["findings"] == [finding]
+        assert previous["findings"][0]["quote"] == finding["quote"]
+        assert previous["findings"][0]["anchor"] == finding["anchor"]
+        identity = AGG.Identity(
+            repository_id=123, head_sha=chr(96 + round_number) * 40,
+            run_id=run_id, run_attempt=1, pr=42,
+        )
+        terminal = aggregate_round(
+            tmp_path / f"round-{round_number}", identity=identity, findings=[], previous_path=previous_path,
+        )
+        relation = terminal["finding_relation"]
+        assert relation["items"] == []
+        assert relation["counts"] == {"new": 0, "repeat": 0, "conflict": 0}
+        assert relation["open_findings"][0]["quote"] == finding["quote"]
+        assert relation["open_findings"][0]["anchor"] == finding["anchor"]
+        active_ledger = tmp_path / f"round-{round_number}.jsonl"
+        write_ledger_jsonl(active_ledger, terminal)
+
+
 def test_render_previous_context_keeps_same_head_older_attempt(tmp_path, monkeypatch):
     ledger, _, objects = _previous_round_fixture_objects()
     rc, payload = _render_previous_round_fixture(
