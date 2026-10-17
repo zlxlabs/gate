@@ -4065,6 +4065,108 @@ def _canary_terminal_zip(gate_result="pass", **kwargs):
     return buf.getvalue()
 
 
+def _primary_convergence_row(
+    run_id, attempt, verdict, *, primary_result=None, skip_reason=None, audit_available=None,
+    head_sha=IDENTITY.head_sha,
+):
+    record = json.loads(_canary_terminal_bytes(
+        "fail" if verdict == "fail" or primary_result == "failure" else "pass",
+        run_id=run_id, run_attempt=attempt, head_sha=head_sha,
+    ))
+    record.update({"primary_result": primary_result or ("failure" if verdict == "fail" else "success"),
+                   "skip_reason": skip_reason, "audit": {"available": verdict is not None if audit_available is None else audit_available}})
+    if verdict is not None:
+        record["primary_verdict"] = verdict
+    return AGG._terminal_row(record, repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42)
+
+
+def _primary_convergence_history(target_run_ids, rows):
+    history = AGG.HistoryLoad(rows=rows)
+    history.target_run_ids = target_run_ids
+    return history
+
+
+def _run_pr_convergence_cli(tmp_path, monkeypatch, *, audit_verdict, primary_result, quality_result="success", caller_checks="", history=None):
+    audit_dir = tmp_path / "audit"
+    if audit_verdict is not None:
+        audit_dir.mkdir()
+        (audit_dir / "primary-review-audit.json").write_text(
+            json.dumps(_valid_scoped_primary_record(verdict=audit_verdict, result={"findings": []})), encoding="utf-8",
+        )
+        if history is not None:
+            monkeypatch.setattr(AGG, "_load_pr_convergence_history", lambda **kwargs: ("available", (), history))
+    monkeypatch.setattr(AGG, "_fetch_disposition_receipts", lambda **kwargs: ())
+    monkeypatch.setattr(AGG, "load_previous_round_findings", lambda **kwargs: {"available": False, "detail": "fixture", "findings": []})
+    summary_path = tmp_path / "summary.md"
+    exit_code = AGG.main(_cli_args(
+        audit_dir, summary_path, quality_result=quality_result, caller_checks=caller_checks,
+        primary_result=primary_result,
+    ))
+    return exit_code, json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
+
+
+def test_cli_convergence_counts_latest_actual_attempt_per_run_and_known_skips(monkeypatch, tmp_path):
+    history = _primary_convergence_history((501, 502, 503, 504, IDENTITY.run_id), [
+        _primary_convergence_row(501, 1, "fail"), _primary_convergence_row(501, 2, "unavailable"),
+        _primary_convergence_row(502, 1, "fail"), _primary_convergence_row(502, 2, "pass"),
+        _primary_convergence_row(503, 1, None, primary_result="skipped", skip_reason="draft"),
+        _primary_convergence_row(504, 1, "fail", head_sha="b" * 40),
+    ])
+    exit_code, terminal = _run_pr_convergence_cli(
+        tmp_path, monkeypatch, history=history, audit_verdict="fail", primary_result="failure",
+    )
+    assert exit_code == 1
+    assert terminal.get("convergence") == {"fail_count": 2, "reconsider": False}
+
+
+@pytest.mark.parametrize(
+    "history,audit_verdict,primary_result,expected",
+    [
+        (_primary_convergence_history((501, IDENTITY.run_id), [
+            _primary_convergence_row(501, 1, None, primary_result="failure", audit_available=True),
+        ]), "fail", "failure", {"fail_count": None, "reconsider": None}),
+        (_primary_convergence_history((501, 502, 503, IDENTITY.run_id), [
+            _primary_convergence_row(501, 1, "fail"), _primary_convergence_row(502, 1, "fail"),
+        ]), "fail", "failure", {"fail_count": None, "reconsider": True}),
+        (None, None, "failure", {"fail_count": None, "reconsider": None}),
+    ],
+    ids=["legacy-reviewed-verdict-missing-never-use-gate-result", "target-gap-three-failure-lower-bound", "current-reviewed-verdict-missing"],
+)
+def test_cli_convergence_keeps_unknown_history_and_verified_lower_bound(
+    history, audit_verdict, primary_result, expected, monkeypatch, tmp_path,
+):
+    exit_code, terminal = _run_pr_convergence_cli(
+        tmp_path, monkeypatch, history=history, audit_verdict=audit_verdict, primary_result=primary_result,
+    )
+    assert exit_code == 1
+    assert terminal.get("convergence") == expected
+
+
+def test_main_terminal_convergence_reads_target_run_gap_and_quality_fail_primary_pass(monkeypatch, tmp_path):
+    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [700, IDENTITY.run_id])
+    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
+    monkeypatch.setattr(AGG, "_fetch_github_terminal_history", lambda **kwargs: AGG.HistoryLoad(
+        incomplete_reasons=[f"no terminal artifact matched run {run_id}" for run_id in (700, IDENTITY.run_id)],
+    ))
+    observed = []
+    load_history = AGG._load_pr_convergence_history
+    def record_loaded_history(**kwargs):
+        result = load_history(**kwargs)
+        observed.append(getattr(result[2], "target_run_ids", None))
+        return result
+    monkeypatch.setattr(AGG, "_load_pr_convergence_history", record_loaded_history)
+
+    exit_code, terminal = _run_pr_convergence_cli(
+        tmp_path, monkeypatch, audit_verdict="pass", primary_result="success",
+        quality_result="failure", caller_checks="failed",
+    )
+    assert (exit_code, terminal["gate_result"], terminal["primary_verdict"]) == (1, "fail", "pass")
+    assert observed == [(700, IDENTITY.run_id)]
+    assert terminal.get("convergence") == {"fail_count": None, "reconsider": False}
+
+
 def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_objects, github_error=None, silo_error=None):
     monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
 
