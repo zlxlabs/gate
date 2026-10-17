@@ -45,6 +45,7 @@ ENTRY_FILES = {
     # previous findings）。本卡主修对象。
     ".github/actions/gate-aggregator/aggregate.py": "gate 槽聚合器",
     ".github/actions/gate-aggregator/convergence.py": "被聚合器载入的同目录模块",
+    ".github/actions/gate-aggregator/counterevidence_argv.py": "被聚合器与回执签发器共享的 argv 契约",
     ".github/actions/gate-aggregator/neighbor_evidence.py": "gate#297 邻域证据采集（subprocess/git/silo I/O 槽）",
     # ledger 槽：增量阻断影子分类（G2 由 ledger job 载入；纯函数，无 I/O）。
     ".github/actions/gate-aggregator/incremental_shadow.py": "ledger 槽增量阻断影子分类（纯函数，无 I/O）",

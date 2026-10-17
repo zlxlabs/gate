@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCER = ROOT / ".github/actions/gate-disposition/issue_receipt.py"
+ARGV_VECTORS = ROOT / ".github/actions/gate-aggregator/counterevidence_argv_v1_vectors.json"
 REPOSITORY = "zlxlabs/gate"
 SCOPE = {
     "repository_id": 123,
@@ -147,6 +149,27 @@ def test_false_positive_producer_writes_v3_counterevidence_payload(tmp_path):
     assert rerun["match_count"] >= 1
     assert rerun["argv"] == ["git", "grep", "-n", "-F", "-e", literal, sha, "--", relpath]
     assert "tracking_issue" not in payload
+
+
+def test_shared_argv_v1_vectors_drive_real_receipt_signer(tmp_path):
+    vectors = json.loads(ARGV_VECTORS.read_text(encoding="utf-8"))
+    convergence = _convergence_module()
+    assert vectors["contract_version"] == convergence.COUNTEREVIDENCE_ARGV_CONTRACT_VERSION
+    allowed = next(case for case in vectors["cases"] if case["id"] == "allowed_simple_path")
+    repo, sha, relpath, literal = _seed_caller_repo(tmp_path / "allowed")
+    argv = list(allowed["argv"])
+    argv[5], argv[6], argv[8] = literal, sha, relpath
+    counterevidence = _allowlisted_ce(sha, relpath=relpath, literal=literal)
+    counterevidence["command"] = shlex.join(argv)
+    result, output_dir = _issue(
+        tmp_path / "signed", disposition="false-positive", counterevidence=counterevidence,
+        head_sha=sha, repo_dir=repo,
+    )
+    assert result.returncode == 0, result.stderr
+    artifact = json.loads(result.stdout)["artifact"]
+    signed = json.loads((output_dir / artifact).read_bytes())
+    assert signed["counterevidence"]["gate_rerun"]["argv"] == argv
+
 
 
 @pytest.mark.parametrize(

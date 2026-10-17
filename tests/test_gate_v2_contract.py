@@ -484,6 +484,7 @@ def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(t
     # only copy in existence has to be the one a sparse checkout leaves there.
     workspace = _checkout_shaped_workspace(tmp_path, DISPOSITION_CHECKOUT_SUBDIR, [
         ".github/actions/gate-aggregator/convergence.py",
+        ".github/actions/gate-aggregator/counterevidence_argv.py",
     ])
     result = subprocess.run(
         [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
@@ -513,6 +514,7 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
     assert listed == {
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
+        ".github/actions/gate-aggregator/counterevidence_argv.py",
         "scripts/silo_store.py",
         "scripts/silo_exec.sh",
     }
@@ -531,6 +533,7 @@ def test_disposition_checkout_uses_reusable_workflow_identity():
     assert_workflow_sha_checkout(checkout, path=DISPOSITION_CHECKOUT_SUBDIR, sparse=[
         ".github/actions/gate-disposition/issue_receipt.py",
         ".github/actions/gate-aggregator/convergence.py",
+        ".github/actions/gate-aggregator/counterevidence_argv.py",
         "scripts/silo_store.py",
         "scripts/silo_exec.sh",
     ])
@@ -3337,6 +3340,7 @@ def test_silo_src_aggregate_sparse_covers_load_time_neighbors():
     # then require every job that runs that script from _gate-silo-src to have
     # checked those files out into that directory before the run.
     deps = re.findall(r'with_name\("([^"]+\.py)"\)', AGGREGATOR_SCRIPT.read_text())
+    deps.append("counterevidence_argv.py")
     assert deps, "aggregate.py has no with_name(\"<file>.py\") load-time neighbors"
     needle = "_gate-silo-src/.github/actions/gate-aggregator/aggregate.py"
     raw, _ = _load_workflow()
