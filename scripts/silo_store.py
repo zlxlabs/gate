@@ -2,7 +2,8 @@
 """Put, get, list, and resolve CI artifacts on Silo.
 
 Key layout: d<tier>/<repo_id>/<artifact_name>/<relative path>
-tier ∈ {d1, d3, d14, d30}. Env: AWS_ACCESS_KEY_ID (SILO_ACCESS_KEY),
+or archive/<repo_id>/<artifact_name>/<relative path> for raw review ledgers.
+tier ∈ {d1, d3, d14, d30, archive}. Env: AWS_ACCESS_KEY_ID (SILO_ACCESS_KEY),
 AWS_SECRET_ACCESS_KEY, SILO_ENDPOINT, SILO_BUCKET (default ci-artifacts).
 Exit: 0 ok; 2 miss; 1 any other failure (distinct from miss).
 """
@@ -26,7 +27,8 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 
-TIERS = frozenset({"d1", "d3", "d14", "d30"})
+ARCHIVE_TIER = "archive"
+TIERS = frozenset({"d1", "d3", "d14", "d30", ARCHIVE_TIER})
 DEFAULT_BUCKET = "ci-artifacts"
 S3_REGION = "us-east-1"
 S3_SERVICE = "s3"
@@ -52,7 +54,7 @@ def bucket_name() -> str:
 
 
 def build_key(tier: str, repo_id: str, artifact_name: str, relative_path: str) -> str:
-    """Return the canonical object key. All four segments are required."""
+    """Return a canonical key; archive accepts only this repo's per-run raw ledger.jsonl."""
 
     if tier not in TIERS:
         fail(f"tier must be one of {sorted(TIERS)}; got {tier!r}")
@@ -63,6 +65,14 @@ def build_key(tier: str, repo_id: str, artifact_name: str, relative_path: str) -
     rel = relative_path.replace("\\", "/").lstrip("/")
     if not rel or rel.startswith("/") or ".." in Path(rel).parts:
         fail(f"relative path is not a safe object suffix: {relative_path!r}")
+    if tier == ARCHIVE_TIER and (
+        not re.fullmatch(
+            rf"codex-review-ledger-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+            artifact_name,
+        )
+        or rel != "ledger.jsonl"
+    ):
+        fail("archive tier only accepts per-run codex-review-ledger-v2 raw ledger.jsonl objects")
     return f"{tier}/{repo_id}/{artifact_name}/{rel}"
 
 
@@ -526,6 +536,8 @@ def cmd_put(args: argparse.Namespace) -> int:
     raw_files = list(args.file or [])
     if not raw_files:
         fail("put requires at least one --file")
+    if args.tier == ARCHIVE_TIER and len(raw_files) != 1:
+        fail("archive tier put requires exactly one raw review ledger file")
     if len(raw_files) == 1:
         path = Path(raw_files[0])
         if not path.is_file():
@@ -542,11 +554,14 @@ def cmd_put(args: argparse.Namespace) -> int:
             files.append((path, path.name))
         if not files:
             fail("put requires at least one existing --file: all sources missing")
+    keyed_files = [
+        (path, build_key(args.tier, args.repo_id, args.name, relative))
+        for path, relative in files
+    ]
     client = connect()
     bucket = bucket_name()
     try:
-        for path, relative in files:
-            key = build_key(args.tier, args.repo_id, args.name, relative)
+        for path, key in keyed_files:
             client.put_object(Bucket=bucket, Key=key, Body=path.read_bytes())
             print(key)
     except SystemExit:
@@ -557,6 +572,8 @@ def cmd_put(args: argparse.Namespace) -> int:
 
 
 def cmd_put_dir(args: argparse.Namespace) -> int:
+    if args.tier == ARCHIVE_TIER:
+        fail("archive tier put-dir is unsupported; use put for one raw review ledger.jsonl")
     directory = Path(args.dir)
     files = list(iter_dir_files(directory))
     if not files:

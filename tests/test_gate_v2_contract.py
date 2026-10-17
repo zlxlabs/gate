@@ -2027,6 +2027,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert terminal_download["if"] == "steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
     assert "continue-on-error" not in terminal_download
     build = steps[build_index]
+    assert build["id"] == "build-review-ledger"
     assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
     assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
     assert build["with"]["codex-expected"] == raw["jobs"]["primary"]["if"]
@@ -2064,6 +2065,22 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "--file \"$LEDGER_PATH\"" in latest["run"]
     assert "$SILO_EXEC" in latest["run"]
     assert "list" not in latest["run"]
+
+    archive_steps = [
+        step for step in steps if step.get("name") == "Upload v2 raw review ledger to permanent archive"
+    ]
+    assert len(archive_steps) == 1
+    archive = archive_steps[0]
+    assert steps.index(archive) == steps.index(latest) + 1
+    assert archive["if"] == "always() && steps.build-review-ledger.outcome == 'success'"
+    assert "continue-on-error" not in archive
+    assert archive["env"]["ARTIFACT_NAME"] == upload["env"]["ARTIFACT_NAME"]
+    assert archive["env"]["LEDGER_PATH"] == upload["env"]["LEDGER_PATH"]
+    assert "--tier archive" in archive["run"]
+    assert "--repo-id \"${{ github.repository_id }}\"" in archive["run"]
+    assert "--name \"$ARTIFACT_NAME\"" in archive["run"]
+    assert "--file \"$LEDGER_PATH\"" in archive["run"]
+    assert "::error::Permanent review ledger archive upload failed" in archive["run"]
 
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:
