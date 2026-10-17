@@ -514,7 +514,7 @@ class FindingRelationError(ValueError):
 
 def _degrade_previous_round(detail: str) -> dict[str, Any]:
     print(f"{RELATION_DEGRADED}: source=previous-ledger detail={detail}")
-    return {"available": False, "detail": detail, "findings": []}
+    return {"available": False, "detail": detail, "head_sha": None, "findings": []}
 
 
 def _norm_text(value: Any) -> str:
@@ -613,7 +613,7 @@ def build_finding_relation(findings: list[Any], previous_round: dict[str, Any]) 
         raw = previous_round.get("findings")
         if not isinstance(raw, list):
             raise FindingRelationError(f"{RELATION_UNKNOWN}: previous findings are not a list")
-        previous = raw[:PREVIOUS_FINDING_LIMIT]
+        previous = raw
     items = relate_findings(findings, previous)
     counts = {name: sum(item["relation_to_previous"] == name for item in items) for name in ("new", "repeat", "conflict")}
     return {
@@ -678,7 +678,10 @@ def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
     )
 
 
-def _previous_findings_from_silo(*, repository_id: int, pr_number: int, run_id: int, run_attempt: int) -> list[Any]:
+def _previous_findings_from_silo(
+    *, repository_id: int, pr_number: int, run_id: int, run_attempt: int,
+) -> tuple[Optional[str], list[Any]]:
+    """Return the prior head SHA and every finding dictionary; a missing head stays unknown."""
     import tempfile
 
     key = _ledger_latest_key(repository_id, pr_number)
@@ -705,7 +708,10 @@ def _previous_findings_from_silo(*, repository_id: int, pr_number: int, run_id: 
     review = entry.get("review") if isinstance(entry.get("review"), dict) else {}
     result = review.get("result") if isinstance(review.get("result"), dict) else {}
     findings = result.get("findings") if isinstance(result.get("findings"), list) else []
-    return [item for item in findings if isinstance(item, dict)][:PREVIOUS_FINDING_LIMIT]
+    head_sha = entry.get("head_sha")
+    return (head_sha if isinstance(head_sha, str) and head_sha else None), [
+        item for item in findings if isinstance(item, dict)
+    ]
 
 
 def load_previous_round_findings(
@@ -723,12 +729,18 @@ def load_previous_round_findings(
             detail = payload.get("detail")
             return _degrade_previous_round(detail if isinstance(detail, str) and detail else "previous-findings-unavailable")
         if isinstance(payload, dict) and payload.get("available") is True and isinstance(payload.get("findings"), list):
-            return {"available": True, "detail": "", "findings": payload["findings"]}
+            head_sha = payload.get("head_sha")
+            return {
+                "available": True,
+                "detail": "",
+                "head_sha": head_sha if isinstance(head_sha, str) and head_sha else None,
+                "findings": payload["findings"],
+            }
         return _degrade_previous_round("previous-findings-file-invalid")
     if not _silo_configured():
         return _degrade_previous_round("silo-not-configured")
     try:
-        findings = _previous_findings_from_silo(
+        head_sha, findings = _previous_findings_from_silo(
             repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt,
         )
     except Exception as exc:
@@ -736,7 +748,7 @@ def load_previous_round_findings(
         if detail in _LATEST_LEDGER_DEGRADE:
             return _degrade_previous_round(detail)
         return _degrade_previous_round(f"silo-ledger-unreadable:{type(exc).__name__}")
-    return {"available": True, "detail": "", "findings": findings}
+    return {"available": True, "detail": "", "head_sha": head_sha, "findings": findings}
 
 
 def _project_previous_dispositions(*, repository_id: int, pr_number: int) -> list[dict[str, Any]]:
