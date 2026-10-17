@@ -74,7 +74,7 @@ def _compact_attempts(audit: dict[str, Any] | None) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        compact.append({
+        compact_attempt = {
             "reviewer": item.get("reviewer"),
             "exit_code": item.get("exit_code"),
             "reason": item.get("reason") or "",
@@ -82,7 +82,10 @@ def _compact_attempts(audit: dict[str, Any] | None) -> list[dict[str, Any]]:
             "cost_usd": item.get("cost_usd"),
             # Optional short redacted adapter diagnostic (e.g. "api_error_status=529 …访问量过大").
             "diag_snippet": item.get("diag_snippet"),
-        })
+        }
+        if "review_stage" in item:
+            compact_attempt["review_stage"] = item["review_stage"]
+        compact.append(compact_attempt)
     return compact
 
 

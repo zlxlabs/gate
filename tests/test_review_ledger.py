@@ -495,6 +495,46 @@ def _run_live_record_cli(tmp_path, *, audit=None, terminal=None, run_attempt=1, 
     return completed, ledger_path, record_path
 
 
+def test_live_record_cli_preserves_primary_and_security_review_stages(tmp_path):
+    fixture_path = ROOT / "tests/data/primary_security_stage_producer_audit.json"
+    audit_bytes = fixture_path.read_bytes()
+    assert hashlib.sha256(audit_bytes).hexdigest() == "9b06d5a3f4abaea77c2fac0bc2708af24c9445b553a857f413b951e6805c1c6e"
+    audit = json.loads(audit_bytes)
+    preflight_path = tmp_path / "preflight.json"
+    preflight_path.write_text(json.dumps(_preflight()), encoding="utf-8")
+    output_path = tmp_path / "ledger.jsonl"
+    cli_args = {
+        "--audit-path": fixture_path, "--preflight-path": preflight_path,
+        "--install-path": tmp_path / "missing-install.json", "--output": output_path,
+        "--repository": audit["repository"], "--pr-number": audit["pr"],
+        "--run-id": audit["run_id"], "--run-attempt": audit["run_attempt"],
+        "--head-sha": audit["head_sha"], "--expected-repository-id": audit["repository_id"],
+        "--expected-base-sha": audit["base_sha"], "--expected-caller-sha": audit["caller_sha"],
+        "--expected-reusable-workflow-sha": audit["reusable_workflow_sha"], "--codex-expected": "true",
+    }
+    command = [sys.executable, str(MODULE_PATH), *[part for key, value in cli_args.items() for part in (key, str(value))]]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    ledger_bytes = output_path.read_bytes()
+    row = json.loads(ledger_bytes)
+    assert [attempt["review_stage"] for attempt in row["review"]["attempts"]] == ["primary", "security"]
+    assert [finding["review_stage"] for finding in row["review"]["result"]["findings"]] == ["security"]
+    assert b'"review_stage": "primary"' in ledger_bytes
+    assert b'"review_stage": "security"' in ledger_bytes
+
+    legacy = _live_record_audit()
+    legacy["attempts"] = [{"reviewer": "codex-sub", "exit_code": 0, "reason": "", "duration_s": 4, "cost_usd": 0}]
+    legacy["runtime"] = {"duration_s": 4}
+    old, old_ledger_path, _ = _run_live_record_cli(
+        tmp_path / "legacy", audit=legacy, terminal=_live_record_terminal(), record_output=False,
+    )
+    assert old.returncode == 0, old.stderr
+    old_bytes = old_ledger_path.read_bytes()
+    old_row = json.loads(old_bytes)
+    assert old_row["review"]["attempts"] == [legacy["attempts"][0] | {"diag_snippet": None}]
+    assert b'"review_stage"' not in old_bytes
+
+
 @pytest.mark.parametrize("legacy_null_findings", [False, True])
 def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path, legacy_null_findings):
     audit = _live_record_audit() if not legacy_null_findings else {
