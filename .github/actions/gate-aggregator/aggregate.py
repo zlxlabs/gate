@@ -3940,7 +3940,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         if isinstance(result, dict) and isinstance(result.get("findings"), list):
             findings = result["findings"]
     preset = any(isinstance(item, dict) and "relation_to_previous" in item for item in findings)
-    if preset:
+    # A preset audit keeps the same local input for open carry; absent that path, avoid adding
+    # a Silo read to the annotate flow.
+    if preset and not args.previous_findings_path:
         previous_round = {"available": True, "detail": "audit-preset", "findings": []}
     else:
         previous_round = load_previous_round_findings(
