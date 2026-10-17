@@ -42,7 +42,7 @@ PRIMARY_SCOPE_FIELDS = ("merge_base_sha", "candidate_commit_sha", "candidate_tre
 PRIMARY_SPEC_FIELDS = ("spec_source", "pr_body_digest")
 PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
     "kind", "schema_version", "verdict", "attempts", "shadow_mode", "expected_shadows",
-    "result", "cost", "tokens", "runtime", "not_expected_reason", "waiver",
+    "result", "cost", "tokens", "runtime", "not_expected_reason", "waiver", "risk",
 }
 PRIMARY_VERDICTS = {"pass", "fail", "unavailable", "not_expected", "waived"}
 PRIMARY_REVIEWER_VERDICTS = {"pass", "fail", "unavailable"}
@@ -55,7 +55,7 @@ LEDGER_ENTRY_REQUIRED_FIELDS = (
 )
 LEDGER_ENTRY_OPTIONAL_FIELDS = (
     "disposition_receipt_consumption", "terminal_source_attempt", "finding_relation",
-    "incremental_blocking_shadow",
+    "risk", "incremental_blocking_shadow",
 )
 _RELATION_VALUES = frozenset({"new", "repeat", "conflict"})
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -220,6 +220,30 @@ def _primary_identity(
         raise ValueError(
             f"invalid canonical primary envelope: extra={sorted(extra)}, missing={sorted(missing)}"
         )
+    if "risk" in audit:
+        risk = audit["risk"]
+        risk_fields = {
+            "declared_tier", "effective_tier", "rule_hits", "rules_version",
+            "human_required", "security_pass",
+        }
+        if not isinstance(risk, dict) or set(risk) != risk_fields:
+            raise ValueError("canonical primary risk must have exactly the six declared fields")
+        for field in ("declared_tier", "effective_tier", "rules_version"):
+            value = risk[field]
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"canonical primary risk.{field} must be non-empty text or null")
+        for field in ("declared_tier", "effective_tier"):
+            if risk[field] is not None and risk[field] not in {"personal", "internal", "saas"}:
+                raise ValueError(f"canonical primary risk.{field} is not a declared risk tier")
+        rule_hits = risk["rule_hits"]
+        if rule_hits is not None and (
+            not isinstance(rule_hits, list)
+            or any(not isinstance(item, str) or not item for item in rule_hits)
+        ):
+            raise ValueError("canonical primary risk.rule_hits must be an array of non-empty strings or null")
+        for field in ("human_required", "security_pass"):
+            if risk[field] is not None and type(risk[field]) is not bool:
+                raise ValueError(f"canonical primary risk.{field} must be boolean or null")
     if "tier" in audit:
         tier = audit["tier"]
         if not (isinstance(tier, str) and tier in {"personal", "internal", "saas"}):
@@ -711,6 +735,8 @@ def build_entry(
         "finding_dispositions": {},
         "false_positive_count": 0,
     }
+    if primary_identity is not None and audit is not None and "risk" in audit:
+        entry["risk"] = audit["risk"]
     if terminal_envelope is not None:
         entry["disposition_receipt_consumption"] = _disposition_receipt_consumption_from_terminal(
             terminal_envelope,
