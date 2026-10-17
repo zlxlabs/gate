@@ -14,10 +14,12 @@ false-positive disposition 仍计入终裁。不另做「不重复计入」：�
 
 ## 处置回执进前轮上下文（gate-hub#1070）
 
-前轮上下文 JSON 在原有 `available`、`detail`、`findings` 之外增加 `dispositions`。处置仅作为 review-primary 的审查上下文，不自动 resolve finding，也不改变 `record_dispositions`、`evaluate_round`、`apply_finding_relation` 或汇总器终态。
+前轮上下文 JSON 在原有 `available`、`detail`、`findings` 之外增加 `dispositions`。处置仅作为 review-primary 的审查上下文；可信 producer 在构造本轮 carry 视图时，才会按下述规则过滤旧 finding，不改变 `record_dispositions`、`evaluate_round`、`apply_finding_relation` 或汇总器终态。
 
 处置只从 Silo `d30/{repository_id}/gate-disposition-receipt-v3-...` 读取，并复用 gate 的 `_fetch_silo_disposition_receipts` 与回执解析。按 `repository_id` 和 `pr_number` 过滤，不按当前 head 或 audit digest 过滤；不读取 GitHub artifact。只保留 `false-positive` 且 `_counterevidence_reason` 通过（command、output、result、pointer 非空且 result 为 `refuted`），或 `deferred` 且 `tracking_issue` 为非空字符串的 v3 回执。旧版、无效反证和未知 disposition 不进入数组；扫描投影输出 `GATE-PREVIOUS-DISPOSITIONS: kept=<n> dropped=<m>`，其中超上限的有效记录也计入 dropped。
 
 每条只输出 `finding_id`、`disposition`、`head_sha`、`approved_at`、`reason`、`counterevidence`、`tracking_issue`。文本使用 `_clip_text` 限制为 240 字符，`head_sha` 保留原值；false-positive 的 `counterevidence` 是 command、output、result、pointer 四字段，`tracking_issue` 为 null；deferred 的 `counterevidence` 为 null，`tracking_issue` 保留其值。按 `approved_at` 倒序，最多 30 条。
 
 Silo 未配置或前轮 ledger 不可用时，JSON 的 `available` 为 false、`findings` 与 `dispositions` 都为空数组，并沿用 `GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=...`。成功注入后，只有 `${RUNNER_TEMP}/previous-findings.json` 非空才经 `$GITHUB_ENV` 导出 `REVIEW_PREVIOUS_ROUND_PATH`；变量值是该文件的绝对路径。消费端只要收到该变量，就必须把文件按上述四键契约严格解析，不接受缺键或非法 JSON。原 `DESIGN_DOC` 拼接通道已随消费端（gate-hub `7b4f322b` 起读 `REVIEW_PREVIOUS_ROUND_PATH`）上线删除；`--annotate-primary-audit` 行为保留。
+
+仅当完整的同 PR 历史 terminal 中存在严格早于本轮的已消费 `false-positive` resolved 事件，且事件与已验证的有效反证 receipt 及当轮 `finding_relation.items` 在 `(finding_id, canonical_finding_key)` 上一致时，才从最新 ledger 的旧 carry 视图中过滤该 finding。若之后的历史轮次再次以同一身份实际报告它，早期 receipt 不再过滤；`deferred`、身份不唯一、`items` 缺失或历史不完整时都保留。此过滤不改写 receipt、terminal 或 ledger，也不改 canonical P1、gate verdict 或 convergence；再次报告的 finding 仍是 open。
