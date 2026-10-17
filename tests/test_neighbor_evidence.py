@@ -21,6 +21,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -197,6 +198,7 @@ class _Spies:
         self.silo_keys: list[str] = []
         self.gh_calls: list[tuple[str, int, str]] = []
         self.git_argvs: list[list[str]] = []
+        self.fetch_timeouts: list[float] = []
         self.silo_mode = "ok"    # ok | absent | wrong | explode
         self.gh_mode = "absent"  # absent | ok
         self.git_fail_mode = None  # None | fetch_timeout | diff_timeout | init_fail
@@ -207,6 +209,8 @@ class _Spies:
 
     def _spy_run_git(self, argv, *, cwd=None, timeout_s):
         self.git_argvs.append(list(argv))
+        if "fetch" in argv:
+            self.fetch_timeouts.append(timeout_s)
         # Timeout/exit-code injection at the _run_git seam: the collector must
         # convert these into fail enums, never let them escape to the caller.
         if self.git_fail_mode == "fetch_timeout" and "fetch" in argv:
@@ -323,6 +327,29 @@ def test_pure_deletion_window_edges_and_accumulated_projection():
     assert NEI.projected_anchor_line([(5, 1, 7, 1)], 187, TOLERANCE) == 187  # net zero
 
 
+def test_anchor_projection_shares_total_git_deadline(caller_repo, monkeypatch):
+    timeouts = []
+    run_git = NEI._run_git
+
+    def record_git_timeout(argv, *, cwd=None, timeout_s):
+        timeouts.append(timeout_s)
+        time.sleep(0.01)
+        return run_git(argv, cwd=cwd, timeout_s=timeout_s)
+
+    monkeypatch.setattr(NEI, "_run_git", record_git_timeout)
+    updates = NEI.collect_anchor_updates(
+        findings=[{"id": "anchor-id", "file": ANCHOR_FILE, "line": 187,
+                   "quote": f"ANCHOR_187 = '{LITERAL}'"}],
+        repository=REPOSITORY, previous_head_sha=caller_repo["sha_a"],
+        current_head_sha=caller_repo["sha_b"], token="fixture-token",
+    )
+
+    assert updates == {"anchor-id": 190}
+    assert len(timeouts) >= 8
+    assert all(0 < timeout_s <= NEI._GIT_SETUP_TIMEOUT_S for timeout_s in timeouts)
+    assert all(later < earlier for earlier, later in zip(timeouts, timeouts[1:]))
+
+
 # ── end-to-end: collector + evaluate (production record_dispositions entry) ──
 
 
@@ -352,6 +379,7 @@ def test_end_to_end_drifted_receipt_is_consumed_as_neighbor(caller_repo, monkeyp
     # Cross-boundary: fetch argv is shallow and never blob-filtered (gate#302).
     fetches = spy.fetch_argvs()
     assert {argv[-1] for argv in fetches} == {sha_a, sha_b}
+    assert spy.fetch_timeouts == [NEI.GIT_FETCH_TIMEOUT_S] * len(fetches)
     for argv in fetches:
         assert "--filter" not in " ".join(argv)
         assert argv[-4:-2] == ["--depth", "1"]
