@@ -850,6 +850,10 @@ def build_live_review_record(
             skip_reason = terminal_envelope["skip_reason"]
             if skip_reason is not None and skip_reason not in ("draft", "fork", "hosted_runner", "review_exempt"):
                 raise ValueError("same-run gate terminal skip_reason is invalid")
+            if terminal_envelope.get("primary_result") == "skipped" and skip_reason is None:
+                unknown["skip.reason"] = (
+                    f"primary_result=skipped with null skip_reason (reason_code={terminal_envelope.get('reason_code')})"
+                )
     else:
         unknown["skip.reason"] = terminal_reason
 

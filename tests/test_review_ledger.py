@@ -442,14 +442,14 @@ def _live_record_audit() -> dict:
     }
 
 
-def _live_record_terminal(*, skip_reason=None, run_attempt=1):
+def _live_record_terminal(*, skip_reason=None, run_attempt=1, unexpected_primary_skip=False):
     agg = _aggregator()
     identity = agg.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_attempt=run_attempt, pr=42)
     is_draft = skip_reason == "draft"
     is_fork = skip_reason == "fork"
     runner = "hosted" if skip_reason == "hosted_runner" else "self"
     classify_review_expected = "false" if skip_reason == "review_exempt" else ""
-    skipped = skip_reason is not None
+    skipped = skip_reason is not None or unexpected_primary_skip
     outcome = agg.evaluate(
         quality_result="success", primary_result="skipped" if skipped else "failure",
         runner=runner, is_draft=is_draft, is_fork=is_fork,
@@ -517,6 +517,7 @@ def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path, 
     assert legacy_null_findings or record["risk"] == audit["risk"]
     assert legacy_null_findings or record["convergence"] == terminal["convergence"]
     assert record["skip"] == {"reason": None}
+    assert legacy_null_findings or "skip.reason" not in record["provenance"]["unknown_fields"]
     assert (record["findings"] == []) is legacy_null_findings
     assert legacy_null_findings or record["findings"][0]["introduced"] is None
     assert legacy_null_findings or "findings[0].introduced" in record["provenance"]["unknown_fields"]
@@ -547,14 +548,28 @@ def test_live_record_cli_projects_each_verified_terminal_skip(tmp_path, skip_rea
     record = json.loads(record_path.read_bytes())
     assert record["verdict"] is None
     assert record["skip"] == {"reason": skip_reason}
+    assert "skip.reason" not in record["provenance"]["unknown_fields"]
+
+
+def test_live_record_cli_preserves_unexpected_primary_skip_as_unknown(tmp_path):
+    terminal = _live_record_terminal(unexpected_primary_skip=True)
+    assert (terminal["primary_result"], terminal["reason_code"], terminal["skip_reason"]) == (
+        "skipped", "unexpected_primary_skip", None,
+    )
+    completed, _ledger_path, record_path = _run_live_record_cli(tmp_path, terminal=terminal)
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(record_path.read_bytes())
+    assert record["skip"] == {"reason": None}
+    assert "unexpected_primary_skip" in record["provenance"]["unknown_fields"]["skip.reason"]
 
 
 @pytest.mark.parametrize(("field", "value", "run_attempt"), [
     ("repository_id", 124, 1), ("repository", "zlxlabs/other", 1),
     ("pr_number", 43, 1), ("run_id", 1000, 1), ("head_sha", "f" * 40, 1),
     ("run_attempt", 1, 2),
+    ("skip_reason", "unexpected_primary_skip", 1),
 ])
-def test_live_record_cli_does_not_project_terminal_skip_across_identity(
+def test_live_record_cli_rejects_invalid_terminal_skip_projection(
     tmp_path, field, value, run_attempt,
 ):
     terminal_attempt = value if field == "run_attempt" else run_attempt
