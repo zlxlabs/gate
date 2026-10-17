@@ -1200,6 +1200,81 @@ def test_terminal_envelope_bytes_unchanged_by_rendering_work():
     assert json.dumps(envelope, ensure_ascii=False, indent=2) + "\n" == _TERMINAL_GOLDEN
 
 
+@pytest.mark.parametrize(
+    "quality_result,primary_result,verdict,is_draft,review_expected,caller_checks,expected_gate,expected_exit",
+    [
+        ("failure", "success", "pass", "false", "true", "failed", "fail", 1),
+        ("skipped", "failure", "fail", "false", "true", None, "fail", 1),
+        ("skipped", "failure", "unavailable", "false", "true", None, "unavailable", 1),
+        ("success", "skipped", None, "true", "false", None, "skipped", 0),
+    ],
+    ids=["quality-failure-with-primary-pass", "primary-fail", "primary-unavailable", "draft-skip"],
+)
+def test_primary_verdict_is_transported_from_validated_audit_to_terminal_history(
+    tmp_path, quality_result, primary_result, verdict, is_draft, review_expected,
+    caller_checks, expected_gate, expected_exit,
+):
+    audit_dir = tmp_path / "audit"
+    if verdict is not None:
+        audit_dir.mkdir()
+        (audit_dir / "primary-review-audit.json").write_text(
+            json.dumps(_valid_primary_record(verdict=verdict)), encoding="utf-8",
+        )
+    summary_path = tmp_path / "summary.md"
+    exit_code = AGG.main(_cli_args(
+        audit_dir, summary_path,
+        quality_result=quality_result, primary_result=primary_result,
+        is_draft=is_draft, review_expected=review_expected, caller_checks=caller_checks,
+    ))
+
+    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
+    row = AGG._terminal_row(
+        terminal, repository="zlxlabs/gate", repository_id=IDENTITY.repository_id,
+        pr_number=IDENTITY.pr,
+    )
+    assert (exit_code, terminal["gate_result"]) == (expected_exit, expected_gate)
+    if verdict is None:
+        assert "primary_verdict" not in terminal
+    else:
+        assert terminal["primary_verdict"] == verdict
+    assert row["primary_verdict"] == verdict
+
+
+@pytest.mark.parametrize("include_null", [False, True], ids=["legacy-missing", "legacy-null"])
+def test_terminal_history_keeps_missing_or_null_primary_verdict_unknown(include_null):
+    record = json.loads(_canary_terminal_bytes())
+    if include_null:
+        record["primary_verdict"] = None
+
+    row = AGG._terminal_row(
+        record, repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+
+    assert row["primary_verdict"] is None
+
+
+def test_invalid_primary_verdict_marks_terminal_history_incomplete(monkeypatch):
+    record = json.loads(_canary_terminal_bytes())
+    record["primary_verdict"] = "not-a-primary-verdict"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("gate-terminal.json", json.dumps(record))
+    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: archive.getvalue())
+    history = AGG.HistoryLoad()
+
+    AGG._consume_terminal_artifact(
+        history,
+        artifact={"name": "gate-terminal-v1-1327629472-test", "expired": False,
+                  "archive_download_url": "https://api.github.com/artifacts/1/zip"},
+        token="test-token", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID,
+        pr_number=42,
+    )
+
+    assert history.rows == []
+    assert len(history.skipped_records) == 1
+    assert "primary_verdict" in history.incomplete_reasons[0]
+
+
 def test_terminal_envelope_publishes_shadow_budget_bytes_without_changing_gate_result(tmp_path):
     audit = _valid_scoped_primary_record()
     terminal_path = tmp_path / "gate-terminal.json"
