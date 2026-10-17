@@ -20,11 +20,13 @@ class FakeClientError(Exception):
 
 
 class FakeS3:
-    def __init__(self, objects=None, *, list_error=None, get_error=None):
+    def __init__(self, objects=None, *, list_error=None, get_error=None, get_transform=None):
         self.objects = dict(objects or {})
         self.list_error = list_error
         self.get_error = get_error
+        self.get_transform = get_transform
         self.puts: list[str] = []
+        self.gets: list[str] = []
 
     def put_object(self, *, Bucket, Key, Body):
         if hasattr(Body, "read"):
@@ -42,7 +44,11 @@ class FakeS3:
             raise self.get_error
         if Key not in self.objects:
             raise FakeClientError("NoSuchKey", f"Key {Key} not found", key=Key)
-        return {"Body": io.BytesIO(self.objects[Key])}
+        self.gets.append(Key)
+        body = self.objects[Key]
+        if self.get_transform is not None:
+            body = self.get_transform(Key, body)
+        return {"Body": io.BytesIO(body)}
 
     def list_objects_v2(self, *, Bucket, Prefix="", ContinuationToken=None):
         if self.list_error is not None:
@@ -85,6 +91,10 @@ def test_archive_key_allows_only_per_run_review_evidence_pairs():
         (f"codex-review-ledger-v2-{repo_id}-{head_sha}-{run_id}-1", "ledger.jsonl"),
         (f"primary-audit-v2-{repo_id}-{head_sha}-{run_id}-1", "primary-review-audit.json"),
         (f"gate-terminal-v1-{repo_id}-{head_sha}-{run_id}-1", "gate-terminal.json"),
+        (f"primary-review-diagnostics-v2-{repo_id}-{head_sha}-{run_id}-1", "manifest.json"),
+        ("advisory-event-claude-glm-5-3-32446501755-1", "nested/advisory-event.json"),
+        (f"gate-convergence-receipt-v1-{repo_id}-{head_sha}-{run_id}-1", "convergence-receipt.json"),
+        (f"gate-status-panel-delivery-v1-{repo_id}-{head_sha}-{run_id}-1", "gate-status-panel-delivery.json"),
     )
     for artifact_name, relative_path in allowed:
         assert store.build_key("archive", repo_id, artifact_name, relative_path) == (
@@ -97,6 +107,8 @@ def test_archive_key_allows_only_per_run_review_evidence_pairs():
         (allowed[2][0], "primary-review-audit.json"),
         (f"primary-audit-v2-999-{head_sha}-{run_id}-1", "primary-review-audit.json"),
         (allowed[0][0], "nested/ledger.jsonl"),
+        (allowed[6][0], "nested/gate-status-panel-delivery.json"),
+        ("advisory-event-__none__-32446501755-1", "advisory/event.json"),
     )
     for artifact_name, relative_path in rejected:
         with pytest.raises(SystemExit) as caught:
@@ -104,7 +116,7 @@ def test_archive_key_allows_only_per_run_review_evidence_pairs():
         assert caught.value.code == store.EXIT_ERROR
 
 
-def test_archive_tier_rejects_directory_and_multi_file_writes(tmp_path, monkeypatch, capsys):
+def test_archive_tier_rejects_unknown_directory_and_multi_file_writes(tmp_path, monkeypatch, capsys):
     fake = FakeS3()
     _use(monkeypatch, fake)
     ledger = tmp_path / "ledger.jsonl"
@@ -123,12 +135,101 @@ def test_archive_tier_rejects_directory_and_multi_file_writes(tmp_path, monkeypa
 
     with pytest.raises(SystemExit) as directory:
         store.main([
-            "put-dir", "--tier", "archive", "--repo-id", "1326603956", "--name", artifact_name,
+            "put-dir", "--tier", "archive", "--repo-id", "1326603956", "--name", "unlisted-artifact",
             "--dir", str(tmp_path),
         ])
     assert directory.value.code == store.EXIT_ERROR
-    assert "archive tier put-dir is unsupported" in capsys.readouterr().err
+    assert "archive tier put-dir only accepts" in capsys.readouterr().err
     assert fake.puts == []
+
+    with pytest.raises(SystemExit) as direct_directory_file:
+        store.main(["put", "--tier", "archive", "--repo-id", "1326603956", "--name", f"primary-review-diagnostics-v2-1326603956-{'a' * 40}-1-1", "--file", str(ledger)])
+    assert direct_directory_file.value.code == store.EXIT_ERROR
+    assert "does not accept files from directory artifacts" in capsys.readouterr().err
+    assert fake.puts == []
+
+
+def test_archive_directory_rejects_manifest_collision_and_existing_destination_before_put(
+    tmp_path, monkeypatch, capsys,
+):
+    repo_id = "1326603956"
+    name = f"gate-convergence-receipt-v1-{repo_id}-{'a' * 40}-32446501755-1"
+    source = tmp_path / "receipt"
+    source.mkdir()
+    (source / "convergence-receipt.json").write_bytes(b"receipt")
+    (source / store.ARCHIVE_MANIFEST_FILENAME).write_bytes(b"collision")
+    fake = FakeS3()
+    _use(monkeypatch, fake)
+    with pytest.raises(SystemExit) as collision:
+        store.main(["put-dir", "--tier", "archive", "--repo-id", repo_id, "--name", name, "--dir", str(source)])
+    assert collision.value.code == store.EXIT_ERROR
+    assert "collides with generated" in capsys.readouterr().err
+    assert fake.puts == []
+
+    (source / store.ARCHIVE_MANIFEST_FILENAME).unlink()
+    occupied_key = f"archive/{repo_id}/{name}/old-object.json"
+    fake.objects[occupied_key] = b"pre-existing"
+    with pytest.raises(SystemExit) as occupied:
+        store.main(["put-dir", "--tier", "archive", "--repo-id", repo_id, "--name", name, "--dir", str(source)])
+    assert occupied.value.code == store.EXIT_ERROR
+    assert "already exists; refusing to overwrite" in capsys.readouterr().err
+    assert fake.puts == []
+    assert fake.objects[occupied_key] == b"pre-existing"
+
+
+def test_archive_primary_diagnostics_requires_complete_original_manifest(tmp_path, monkeypatch, capsys):
+    repo_id = "1326603956"
+    name = f"primary-review-diagnostics-v2-{repo_id}-{'a' * 40}-32446501755-1"
+    source = tmp_path / "diagnostics"
+    source.mkdir()
+    (source / "manifest.json").write_text('{"schema_version":1,"attempt":1,"file_count":0,"files":[]}\n')
+    raw = source / "attempt-1-codex-sub-raw-output.txt"
+    raw.write_bytes(b"raw")
+    fake = FakeS3()
+    _use(monkeypatch, fake)
+    with pytest.raises(SystemExit) as incomplete:
+        store.main(["put-dir", "--tier", "archive", "--repo-id", repo_id, "--name", name, "--dir", str(source)])
+    assert incomplete.value.code == store.EXIT_ERROR
+    assert "raw output inventory differs" in capsys.readouterr().err
+    assert fake.puts == []
+
+
+@pytest.mark.parametrize("artifact_class", ["primary", "advisory", "convergence"])
+def test_archive_empty_directory_semantics_match_each_producer(tmp_path, monkeypatch, capsys, artifact_class):
+    repo_id = "1326603956"
+    if artifact_class == "primary":
+        name = f"primary-review-diagnostics-v2-{repo_id}-{'a' * 40}-32446501755-1"
+        empty = tmp_path / "primary"
+        assert store.main([
+            "put-dir", "--tier", "archive", "--repo-id", repo_id,
+            "--name", name, "--dir", str(empty), "--empty", "skip",
+        ]) == store.EXIT_OK
+        assert "::notice::silo put-dir skipped" in capsys.readouterr().out
+    else:
+        name = (
+            f"advisory-event-claude-32446501755-1" if artifact_class == "advisory"
+            else f"gate-convergence-receipt-v1-{repo_id}-{'a' * 40}-32446501755-1"
+        )
+        empty = tmp_path / artifact_class
+        with pytest.raises(SystemExit) as missing:
+            store.main(["put-dir", "--tier", "archive", "--repo-id", repo_id, "--name", name, "--dir", str(empty)])
+        assert missing.value.code == store.EXIT_ERROR
+        assert "empty or missing" in capsys.readouterr().err
+
+
+def test_archive_readback_mismatch_fails_after_put_and_does_not_retry(tmp_path, monkeypatch, capsys):
+    repo_id = "1326603956"
+    name = f"gate-status-panel-delivery-v1-{repo_id}-{'a' * 40}-32446501755-1"
+    panel = tmp_path / "gate-status-panel-delivery.json"
+    panel.write_bytes(b"original panel")
+    fake = FakeS3(get_transform=lambda _key, _body: b"changed panel")
+    _use(monkeypatch, fake)
+    with pytest.raises(SystemExit) as mismatch:
+        store.main(["put", "--tier", "archive", "--repo-id", repo_id, "--name", name, "--file", str(panel)])
+    assert mismatch.value.code == store.EXIT_ERROR
+    assert "readback hash mismatch" in capsys.readouterr().err
+    key = f"archive/{repo_id}/{name}/gate-status-panel-delivery.json"
+    assert fake.puts == fake.gets == [key]
 
 
 def test_select_attempt_picks_max_at_or_below_current():

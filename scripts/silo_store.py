@@ -39,6 +39,45 @@ EXIT_NOT_FOUND = 2
 MISSING_ACCESS_KEY = "SILO_ACCESS_KEY 未传入"
 MISSING_SECRET_KEY = "SILO_SECRET_KEY 未传入"
 ATTEMPT_SUFFIX = re.compile(r"[0-9]+$")
+ARCHIVE_MANIFEST_FILENAME = "archive-manifest-v1.json"
+
+
+def _archive_single_file_name_pattern(repo_id: str) -> tuple[tuple[str, str], ...]:
+    return (
+        (
+            rf"codex-review-ledger-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+            "ledger.jsonl",
+        ),
+        (
+            rf"primary-audit-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+            "primary-review-audit.json",
+        ),
+        (
+            rf"gate-terminal-v1-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+            "gate-terminal.json",
+        ),
+        (
+            rf"gate-status-panel-delivery-v1-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+            "gate-status-panel-delivery.json",
+        ),
+    )
+
+
+def _archive_directory_name_patterns(repo_id: str) -> tuple[str, ...]:
+    return (
+        rf"primary-review-diagnostics-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+        r"advisory-event-(?!__none__-)[A-Za-z0-9_.-]+-[0-9]+-[0-9]+",
+        rf"gate-convergence-receipt-v1-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
+    )
+
+
+def is_archive_directory_name(repo_id: str, artifact_name: str) -> bool:
+    """Return whether a Silo archive name is one of the three d3 directories."""
+
+    return any(
+        re.fullmatch(pattern, artifact_name)
+        for pattern in _archive_directory_name_patterns(repo_id)
+    )
 
 
 def fail(message: str, code: int = EXIT_ERROR) -> None:
@@ -66,26 +105,14 @@ def build_key(tier: str, repo_id: str, artifact_name: str, relative_path: str) -
     if not rel or rel.startswith("/") or ".." in Path(rel).parts:
         fail(f"relative path is not a safe object suffix: {relative_path!r}")
     if tier == ARCHIVE_TIER:
-        allowed_archive_objects = (
-            (
-                rf"codex-review-ledger-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
-                "ledger.jsonl",
-            ),
-            (
-                rf"primary-audit-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
-                "primary-review-audit.json",
-            ),
-            (
-                rf"gate-terminal-v1-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
-                "gate-terminal.json",
-            ),
-        )
-        if not any(
+        allowed_single = any(
             relative_path == allowed_suffix and re.fullmatch(name_pattern, artifact_name)
-            for name_pattern, allowed_suffix in allowed_archive_objects
-        ):
+            for name_pattern, allowed_suffix in _archive_single_file_name_pattern(repo_id)
+        )
+        allowed_directory = is_archive_directory_name(repo_id, artifact_name)
+        if not (allowed_single or allowed_directory):
             fail(
-                "archive tier only accepts per-run raw review ledger, primary audit, or gate terminal objects"
+                "archive tier only accepts per-run review ledger, audit, terminal, diagnostics, advisory, convergence, or status-panel artifacts"
             )
     return f"{tier}/{repo_id}/{artifact_name}/{rel}"
 
@@ -467,6 +494,90 @@ def iter_dir_files(directory: Path) -> Iterator[tuple[Path, str]]:
         yield path, relative
 
 
+def _validate_archive_directory_files(
+    repo_id: str,
+    artifact_name: str,
+    files: list[tuple[Path, str, bytes]],
+) -> None:
+    """Reject incomplete primary and convergence d3 directory snapshots."""
+
+    by_path = {relative: payload for _, relative, payload in files}
+    if artifact_name.startswith("primary-review-diagnostics-v2-"):
+        manifest_bytes = by_path.get("manifest.json")
+        if manifest_bytes is None:
+            fail("archive primary diagnostics are incomplete: manifest.json is missing")
+        try:
+            manifest = json.loads(manifest_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            fail("archive primary diagnostics are incomplete: manifest.json is invalid")
+        if not isinstance(manifest, dict):
+            fail("archive primary diagnostics are incomplete: manifest.json is invalid")
+        suffix = artifact_name.rsplit("-", 1)[-1]
+        raw_pattern = re.compile(r"^attempt-[0-9]+-[A-Za-z0-9_.-]+-raw-output\.txt$")
+        raw_by_name = {
+            relative: payload
+            for _, relative, payload in files
+            if "/" not in relative and raw_pattern.fullmatch(relative)
+        }
+        manifest_files = manifest.get("files")
+        if (
+            manifest.get("schema_version") != 1
+            or manifest.get("attempt") != int(suffix)
+            or not isinstance(manifest_files, list)
+            or manifest.get("file_count") != len(manifest_files)
+        ):
+            fail("archive primary diagnostics are incomplete: manifest metadata does not match this attempt")
+        expected_raw: dict[str, int] = {}
+        for entry in manifest_files:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("name"), str)
+                or not raw_pattern.fullmatch(entry["name"])
+                or not isinstance(entry.get("bytes"), int)
+                or entry["bytes"] < 0
+                or entry["name"] in expected_raw
+            ):
+                fail("archive primary diagnostics are incomplete: manifest file entry is invalid")
+            expected_raw[entry["name"]] = entry["bytes"]
+        if set(expected_raw) != set(raw_by_name) or any(
+            expected_raw[name] != len(raw_by_name[name]) for name in expected_raw
+        ):
+            fail("archive primary diagnostics are incomplete: raw output inventory differs from manifest.json")
+        top_level_other = sum(
+            1 for _, relative, _ in files
+            if "/" not in relative and relative != "manifest.json" and relative not in raw_by_name
+        )
+        if manifest.get("other_file_count") != top_level_other:
+            fail("archive primary diagnostics are incomplete: other file count differs from manifest.json")
+        return
+
+    if artifact_name.startswith("gate-convergence-receipt-v1-"):
+        if set(by_path) != {"convergence-receipt.json"}:
+            fail("archive convergence directory is incomplete: expected only convergence-receipt.json")
+
+
+def _archive_prefix_is_empty(client, bucket: str, repo_id: str, artifact_name: str) -> None:
+    prefix = artifact_prefix(ARCHIVE_TIER, repo_id, artifact_name) + "/"
+    existing = list_keys(client, bucket, prefix)
+    if existing:
+        fail(f"Silo archive destination already exists; refusing to overwrite: {prefix}")
+
+
+def _put_archive_bytes_and_verify(client, bucket: str, key: str, payload: bytes) -> None:
+    expected_sha = sha256_hex(payload)
+    try:
+        client.put_object(Bucket=bucket, Key=key, Body=payload)
+        response = client.get_object(Bucket=bucket, Key=key)
+        readback = _body_bytes(response["Body"])
+    except SystemExit:
+        raise
+    except Exception as err:  # noqa: BLE001 — preserve the failing Silo boundary
+        fail(f"Silo archive PUT/GET failed for {key}: {type(err).__name__}")
+    if len(readback) != len(payload) or sha256_hex(readback) != expected_sha:
+        fail(f"Silo archive readback hash mismatch for {key}")
+    print(key)
+
+
 def resolve_magicdns(endpoint: str, nameserver: str = "100.100.100.100", timeout: float = 15) -> tuple[str, str]:
     """Query MagicDNS for the A record of SILO_ENDPOINT's hostname.
 
@@ -552,6 +663,8 @@ def cmd_put(args: argparse.Namespace) -> int:
         fail("put requires at least one --file")
     if args.tier == ARCHIVE_TIER and len(raw_files) != 1:
         fail("archive tier put requires exactly one allowlisted review evidence file")
+    if args.tier == ARCHIVE_TIER and is_archive_directory_name(args.repo_id, args.name):
+        fail("archive tier put does not accept files from directory artifacts")
     if len(raw_files) == 1:
         path = Path(raw_files[0])
         if not path.is_file():
@@ -574,10 +687,16 @@ def cmd_put(args: argparse.Namespace) -> int:
     ]
     client = connect()
     bucket = bucket_name()
+    if args.tier == ARCHIVE_TIER and args.name.startswith("gate-status-panel-delivery-v1-"):
+        _archive_prefix_is_empty(client, bucket, args.repo_id, args.name)
     try:
         for path, key in keyed_files:
-            client.put_object(Bucket=bucket, Key=key, Body=path.read_bytes())
-            print(key)
+            payload = path.read_bytes()
+            if args.tier == ARCHIVE_TIER and args.name.startswith("gate-status-panel-delivery-v1-"):
+                _put_archive_bytes_and_verify(client, bucket, key, payload)
+            else:
+                client.put_object(Bucket=bucket, Key=key, Body=payload)
+                print(key)
     except SystemExit:
         raise
     except Exception as err:  # noqa: BLE001
@@ -586,8 +705,8 @@ def cmd_put(args: argparse.Namespace) -> int:
 
 
 def cmd_put_dir(args: argparse.Namespace) -> int:
-    if args.tier == ARCHIVE_TIER:
-        fail("archive tier put-dir is unsupported; use put for one allowlisted review evidence file")
+    if args.tier == ARCHIVE_TIER and not is_archive_directory_name(args.repo_id, args.name):
+        fail("archive tier put-dir only accepts per-run primary diagnostics, advisory, or convergence directories")
     directory = Path(args.dir)
     files = list(iter_dir_files(directory))
     if not files:
@@ -597,6 +716,43 @@ def cmd_put_dir(args: argparse.Namespace) -> int:
             )
             return EXIT_OK
         fail(f"put-dir source is empty or missing: {directory}")
+    if args.tier == ARCHIVE_TIER:
+        if any(path.is_symlink() for path, _ in files):
+            fail("archive put-dir does not accept symlink files")
+        if any(relative == ARCHIVE_MANIFEST_FILENAME for _, relative in files):
+            fail(f"archive put-dir source collides with generated {ARCHIVE_MANIFEST_FILENAME}")
+        archived_files = [(path, relative, path.read_bytes()) for path, relative in files]
+        _validate_archive_directory_files(args.repo_id, args.name, archived_files)
+        manifest = {
+            "schema_version": 1,
+            "repository_id": args.repo_id,
+            "artifact_name": args.name,
+            "files": [
+                {"path": relative, "bytes": len(payload), "sha256": sha256_hex(payload)}
+                for _, relative, payload in archived_files
+            ],
+        }
+        manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        archive_files = [
+            (relative, payload)
+            for _, relative, payload in archived_files
+        ]
+        archive_files.append((ARCHIVE_MANIFEST_FILENAME, manifest_bytes))
+        keyed_files = [
+            (relative, payload, build_key(args.tier, args.repo_id, args.name, relative))
+            for relative, payload in archive_files
+        ]
+        client = connect()
+        bucket = bucket_name()
+        _archive_prefix_is_empty(client, bucket, args.repo_id, args.name)
+        try:
+            for _, payload, key in keyed_files:
+                _put_archive_bytes_and_verify(client, bucket, key, payload)
+        except SystemExit:
+            raise
+        except Exception as err:  # noqa: BLE001 — surface failed Silo archive operations
+            fail(f"Silo archive put-dir failed: {type(err).__name__}")
+        return EXIT_OK
     client = connect()
     bucket = bucket_name()
     try:
