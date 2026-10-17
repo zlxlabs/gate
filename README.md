@@ -163,7 +163,7 @@ fleet 正常拓扑是全 self-hosted；Silo hostname 解析依赖 tailnet DNS。
 和永久前缀 `archive/<repo_id>/<artifact_name>/ledger.jsonl`；`artifact_name` 带仓库 ID、head SHA、run ID
 和 attempt。`archive` tier 仅接受这种单文件 raw ledger，按每轮独立 key 写入，不覆盖其他 run；归档写入失败会在
 ledger job 标成失败步骤并输出 error 注解。过渡期间保留 d30 副本，按 PR 更新的 `codex-review-ledger-latest-v1`
-仍只写 d30，行为不变。永久前缀没有自动到期规则。它与一次性历史副本
+仍只写 d30，行为不变。archive step 会用同一 CI 身份读取刚写入的精确 key 并逐字节比对；读取失败或字节不一致都会显式报错。永久前缀没有自动到期规则。它与一次性历史副本
 `archive/review-ledger/v1/<repo_id>/...` 是两个独立 key 空间；两者都必须永久保留。
 
 Silo 推广已完成，`.github/v2-tag-sync.hold` 熔断文件已移除，`v2` 移动 tag 随主干前移。

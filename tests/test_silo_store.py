@@ -698,6 +698,7 @@ class _RecordHandler(BaseHTTPRequestHandler):
         n = int(raw_cl) if raw_cl else 0
         body = self.rfile.read(n) if n else b""
         self.server.received.append({
+            "method": self.command,
             "path": self.path,
             "content_length_header": raw_cl,
             "body": body,
@@ -708,8 +709,15 @@ class _RecordHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.connection.close()
             return
+        if self.command == "PUT" and self.server.status < 400:
+            self.server.objects[self.path] = body
+        status = self.server.get_status if self.command == "GET" and self.server.get_status else self.server.status
         payload = self.server.body
-        self.send_response_only(self.server.status)
+        if self.command == "GET":
+            payload = self.server.objects.get(self.path, payload)
+        if self.command == "GET" and self.server.corrupt_get and self.path in self.server.objects:
+            payload += b"readback-mismatch"
+        self.send_response_only(status)
         self.send_header("Content-Length", str(len(payload)))
         for name, value in self.server.extra_headers:
             self.send_header(name, value)
@@ -725,6 +733,7 @@ class _RecordHandler(BaseHTTPRequestHandler):
 def _start_record_server(**attrs):
     server = HTTPServer(("127.0.0.1", 0), _RecordHandler)
     server.received, server.status, server.body = [], 200, b""
+    server.objects, server.get_status, server.corrupt_get = {}, None, False
     server.extra_headers, server.close_after_read = (), False
     for key, value in attrs.items():
         setattr(server, key, value)
@@ -787,6 +796,7 @@ def test_gate_workflow_dual_writes_the_real_ledger_bytes_to_d30_and_archive(tmp_
                     .replace("${{ github.run_id }}", str(audit["run_id"]))
                     .replace("${{ github.run_attempt }}", str(audit["run_attempt"])),
                 "LEDGER_PATH": str(ledger_path),
+                "ARCHIVE_READBACK_PATH": str(tmp_path / "review-ledger/archive-readback.jsonl"),
             }
             run = step["run"].replace("${{ github.repository_id }}", repo_id)
             env = {
@@ -809,16 +819,24 @@ def test_gate_workflow_dual_writes_the_real_ledger_bytes_to_d30_and_archive(tmp_
                     check=False,
                 )
             )
+        assert [result.returncode for result in upload_results] == [0, 0]
+        assert (tmp_path / "review-ledger/archive-readback.jsonl").read_bytes() == ledger_bytes
+        archive_run = ["bash", "-euo", "pipefail", "-c", run]
+        for status, corrupt, message in ((403, False, "failed"), (200, True, "bytes do not match")):
+            server.get_status, server.corrupt_get = status, corrupt
+            failed = subprocess.run(archive_run, capture_output=True, text=True, env=env, check=False)
+            assert failed.returncode != 0 and f"Permanent review ledger archive readback {message}" in failed.stderr
     finally:
         server.shutdown()
         server.server_close()
 
-    assert [result.returncode for result in upload_results] == [0, 0]
-    assert [record["path"] for record in server.received] == [
+    assert [record["path"] for record in server.received[:2]] == [
         f"/ci-artifacts/d30/{repo_id}/{artifact_name}/ledger.jsonl",
         f"/ci-artifacts/archive/{repo_id}/{artifact_name}/ledger.jsonl",
     ]
-    assert [record["body"] for record in server.received] == [ledger_bytes, ledger_bytes]
+    expected_get = ("GET", f"/ci-artifacts/archive/{repo_id}/{artifact_name}/ledger.jsonl")
+    assert (server.received[2]["method"], server.received[2]["path"]) == expected_get
+    assert [record["body"] for record in server.received[:2]] == [ledger_bytes, ledger_bytes]
 
 
 def test_cli_put_incomplete_body_emits_one_status_event(tmp_path):

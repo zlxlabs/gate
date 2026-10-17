@@ -2677,6 +2677,7 @@ jobs:
         env:
           ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
+          ARCHIVE_READBACK_PATH: ${{ runner.temp }}/review-ledger/archive-readback.jsonl
         run: |
           echo "::notice::step-start: Upload v2 raw review ledger to permanent archive"
           set -euo pipefail
@@ -2687,6 +2688,16 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --file "$LEDGER_PATH"; then
             echo "::error::Permanent review ledger archive upload failed" >&2
+            exit 1
+          fi
+          if ! "$SILO_EXEC" get --key \
+            "archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl" \
+            --dest "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent review ledger archive readback failed" >&2
+            exit 1
+          fi
+          if ! cmp -s "$LEDGER_PATH" "$ARCHIVE_READBACK_PATH"; then
+            echo "::error::Permanent review ledger archive readback bytes do not match" >&2
             exit 1
           fi
 
