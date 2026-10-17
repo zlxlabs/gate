@@ -331,6 +331,17 @@ def test_validate_audit_identity_directly_on_non_dict_payloads():
         assert errors, f"{bogus!r} should have produced at least one error"
 
 
+@pytest.mark.parametrize(
+    "verdict,reviewer",
+    [("pass", "reviewer"), ("fail", "reviewer"), ("unavailable", "reviewer"),
+     ("not_expected", None), ("waived", None)],
+)
+def test_audit_identity_accepts_every_primary_verdict_domain_value(verdict, reviewer):
+    audit = _valid_primary_record(verdict=verdict, reviewer=reviewer)
+
+    assert not AGG.validate_audit_identity(audit, IDENTITY)
+
+
 @pytest.mark.parametrize("verdict", ["pass", "fail", "unavailable"])
 def test_reviewer_required_non_empty_string_for_verdict_bearing_records(verdict):
     for bogus_reviewer in (None, "", 123, True):
@@ -1200,6 +1211,107 @@ def test_terminal_envelope_bytes_unchanged_by_rendering_work():
     assert json.dumps(envelope, ensure_ascii=False, indent=2) + "\n" == _TERMINAL_GOLDEN
 
 
+@pytest.mark.parametrize(
+    "quality_result,primary_result,verdict,is_draft,review_expected,caller_checks,expected_gate,expected_exit",
+    [
+        ("failure", "success", "pass", "false", "true", "failed", "fail", 1),
+        ("skipped", "failure", "fail", "false", "true", None, "fail", 1),
+        ("skipped", "failure", "unavailable", "false", "true", None, "unavailable", 1),
+        ("success", "skipped", None, "true", "false", None, "skipped", 0),
+    ],
+    ids=["quality-failure-with-primary-pass", "primary-fail", "primary-unavailable", "draft-skip"],
+)
+def test_primary_verdict_is_transported_from_validated_audit_to_terminal_history(
+    tmp_path, quality_result, primary_result, verdict, is_draft, review_expected,
+    caller_checks, expected_gate, expected_exit,
+):
+    audit_dir = tmp_path / "audit"
+    if verdict is not None:
+        audit_dir.mkdir()
+        (audit_dir / "primary-review-audit.json").write_text(
+            json.dumps(_valid_primary_record(verdict=verdict)), encoding="utf-8",
+        )
+    summary_path = tmp_path / "summary.md"
+    exit_code = AGG.main(_cli_args(
+        audit_dir, summary_path,
+        quality_result=quality_result, primary_result=primary_result,
+        is_draft=is_draft, review_expected=review_expected, caller_checks=caller_checks,
+    ))
+
+    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
+    row = AGG._terminal_row(
+        terminal, repository="zlxlabs/gate", repository_id=IDENTITY.repository_id,
+        pr_number=IDENTITY.pr,
+    )
+    assert (exit_code, terminal["gate_result"]) == (expected_exit, expected_gate)
+    if verdict is None:
+        assert "primary_verdict" not in terminal
+    else:
+        assert terminal["primary_verdict"] == verdict
+    assert row["primary_verdict"] == verdict
+
+
+def test_main_terminal_omits_primary_verdict_when_findings_are_malformed(tmp_path):
+    audit = _valid_scoped_primary_record()
+    audit["result"]["findings"] = [{"severity": "unknown"}]
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit))
+    summary_path = tmp_path / "summary.md"
+
+    assert AGG.main(_cli_args(audit_dir, summary_path)) == 1
+    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
+
+    assert (terminal["gate_result"], terminal["reason_code"]) == ("unavailable", "audit_invalid")
+    assert "primary_verdict" not in terminal
+
+
+@pytest.mark.parametrize("include_null", [False, True], ids=["legacy-missing", "legacy-null"])
+def test_terminal_history_keeps_missing_or_null_primary_verdict_unknown(include_null):
+    record = json.loads(_canary_terminal_bytes())
+    if include_null:
+        record["primary_verdict"] = None
+
+    row = AGG._terminal_row(
+        record, repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
+    )
+
+    assert row["primary_verdict"] is None
+
+
+@pytest.mark.parametrize("verdict", ["not-a-primary-verdict", "not_expected", "waived"])
+def test_invalid_primary_verdict_marks_terminal_history_incomplete(monkeypatch, verdict):
+    record = json.loads(_canary_terminal_bytes())
+    record["primary_verdict"] = verdict
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("gate-terminal.json", json.dumps(record))
+    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: archive.getvalue())
+    history = AGG.HistoryLoad()
+
+    AGG._consume_terminal_artifact(
+        history,
+        artifact={"name": "gate-terminal-v1-1327629472-test", "expired": False,
+                  "archive_download_url": "https://api.github.com/artifacts/1/zip"},
+        token="test-token", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID,
+        pr_number=42,
+    )
+
+    assert history.rows == []
+    assert len(history.skipped_records) == 1
+    assert "primary_verdict" in history.incomplete_reasons[0]
+
+
+@pytest.mark.parametrize("verdict", ["not_expected", "waived"])
+def test_terminal_rejects_nonreview_primary_verdicts(verdict):
+    outcome = AGG.Outcome(
+        ok=False, classification="integration_error", reason_code="audit_invalid",
+        gate_result="unavailable", primary_verdict=verdict,
+    )
+    with pytest.raises(ValueError, match="terminal primary_verdict"):
+        _terminal_for(outcome)
+
+
 def test_terminal_envelope_publishes_shadow_budget_bytes_without_changing_gate_result(tmp_path):
     audit = _valid_scoped_primary_record()
     terminal_path = tmp_path / "gate-terminal.json"
@@ -1555,6 +1667,21 @@ def _publish_only_panel_body(
         repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
     )
     return comments[0], row
+
+
+@pytest.mark.parametrize(
+    "verdict,findings",
+    [("pass", None), ("fail", [{"id": "x", "severity": "major", "file": "a.py", "line": 1, "title": "t"}]),
+     ("unavailable", None), ("not_expected", None), ("waived", None)],
+)
+def test_primary_findings_panel_accepts_every_audit_verdict_domain_value(verdict, findings):
+    audit = _valid_primary_record(verdict=verdict)
+    if findings is not None:
+        audit["result"] = {"findings": findings}
+
+    lines = AGG._primary_findings_panel_lines(audit)
+
+    assert bool(lines) is (verdict == "fail")
 
 
 def test_publish_only_status_panel_renders_bounded_scrubbed_primary_findings(monkeypatch, tmp_path):

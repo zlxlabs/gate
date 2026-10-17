@@ -145,9 +145,12 @@ sys.modules[_NEIGHBOR_EVIDENCE_SPEC.name] = _NEIGHBOR_EVIDENCE
 _NEIGHBOR_EVIDENCE_SPEC.loader.exec_module(_NEIGHBOR_EVIDENCE)
 
 
-# Mirrors gate-hub's scripts/review/contracts.py PRIMARY_VERDICTS / IDENTITY_FIELDS
-# (see module docstring for why this is a hand-kept mirror, not an import).
+# The audit schema's complete verdict domain, including states not_expected
+# and waived that this canary evaluator currently rejects at the policy layer.
 PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable", "not_expected", "waived")
+# Terminal history transports only actual review outcomes; skip/policy states
+# remain described by the terminal's existing result and skip_reason fields.
+TERMINAL_PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable")
 IDENTITY_QUINTUPLE = ("repository_id", "head_sha", "run_id", "run_attempt", "pr")
 _IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
 
@@ -316,6 +319,7 @@ class Outcome:
     gate_result: Optional[str] = None
     skip_reason: Optional[str] = None
     audit_available: bool = False
+    primary_verdict: Optional[str] = None
     audit_source_attempt: Optional[int] = None
     audit_artifact_name: Optional[str] = None
     convergence_envelope: Optional[dict[str, Any]] = None
@@ -1022,6 +1026,8 @@ def build_terminal_envelope(
         raise ValueError("terminal field is outside the finite domain")
     if outcome.skip_reason not in (None,) + PRIMARY_SKIP_REASON_DOMAIN:
         raise ValueError("primary skip reason is outside the finite domain")
+    if outcome.primary_verdict is not None and outcome.primary_verdict not in TERMINAL_PRIMARY_VERDICT_DOMAIN:
+        raise ValueError("terminal primary_verdict is outside the finite domain")
     envelope = {
         "schema_version": 1, "kind": "gate_terminal", "repository": repository,
         "repository_id": identity.repository_id, "pr_number": identity.pr, "run_id": identity.run_id,
@@ -1040,6 +1046,8 @@ def build_terminal_envelope(
             outcome.disposition_audit,
         ),
     }
+    if outcome.primary_verdict is not None:
+        envelope["primary_verdict"] = outcome.primary_verdict
     if outcome.recorded_disposition_claims:
         envelope["recorded_disposition_claims"] = list(outcome.recorded_disposition_claims)
     if outcome.convergence_shadow is not None:
@@ -1305,6 +1313,7 @@ def evaluate(
     quality_reason = None if quality_result == "success" or quality_short_circuited else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
     primary_classification = primary_reason = None
     audit_available = False
+    primary_verdict: Optional[str] = None
     convergence_eligible = False
     audit_source = artifact_name = None
     skip_reason = None
@@ -1402,6 +1411,8 @@ def evaluate(
                     convergence_eligible = False
                     audit_source = artifact_name = None
                     primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
+                if audit_available:
+                    primary_verdict = verdict
 
     # gate#199: a primary that was expected but produced no conclusion
     # (cancelled job, missing/invalid audit) means there is no reviewer
@@ -1484,7 +1495,8 @@ def evaluate(
         ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,
         classification=classification, reason_code=reason_code, gate_result=gate_result,
         skip_reason=skip_reason,
-        audit_available=audit_available, audit_source_attempt=audit_source, audit_artifact_name=artifact_name,
+        audit_available=audit_available, primary_verdict=primary_verdict,
+        audit_source_attempt=audit_source, audit_artifact_name=artifact_name,
     )
     # This is deliberately the only convergence hand-off in the single-round
     # evaluator.  It runs only after the existing audit identity/job verdict
@@ -1492,6 +1504,7 @@ def evaluate(
     if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
         p1_findings = _canonical_p1_findings(audit)
         if p1_findings is None:
+            outcome.primary_verdict = None
             outcome.ok = False
             outcome.classification = "integration_error"
             outcome.reason_code = "audit_invalid"
@@ -2158,6 +2171,9 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         raise ValueError("gate terminal head_sha must be a non-empty string")
     if record.get("gate_result") not in GATE_RESULT_DOMAIN:
         raise ValueError("gate terminal gate_result is outside the finite domain")
+    primary_verdict = record.get("primary_verdict")
+    if primary_verdict is not None and primary_verdict not in TERMINAL_PRIMARY_VERDICT_DOMAIN:
+        raise ValueError("gate terminal primary_verdict is outside the finite domain")
     if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
         raise ValueError("gate terminal classification/reason_code is outside the finite domain")
     audit = record.get("audit")
@@ -2181,6 +2197,7 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
         "run_attempt": record["run_attempt"],
         "head_sha": record["head_sha"],
         "gate_result": record["gate_result"],
+        "primary_verdict": primary_verdict,
         "classification": record["classification"],
         "reason_code": record["reason_code"],
         "_eligible_primary_round": eligible_primary_round,
