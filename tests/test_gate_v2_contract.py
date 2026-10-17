@@ -1208,12 +1208,9 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     for copy in copies:
         assert copy == primary_if
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert workflow_text.count(CLASSIFY_GUARD) == 7
+    assert workflow_text.count(CLASSIFY_GUARD) == 6
     assert "outputs.review_expected == 'true'" not in workflow_text
-    assert download_audit["if"] == (
-        REVIEW_EXPECTED_IF[:-3] + " && "
-        "steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}"
-    )
+    assert download_audit["if"] == "${{ always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}"
 
 
 def test_aggregate_passes_skip_reason_facts_from_the_review_expected_atoms():
@@ -2024,7 +2021,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
     assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
     assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
-    assert terminal_download["if"] == "steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
+    assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
     assert "continue-on-error" not in terminal_download
     build = steps[build_index]
     assert build["id"] == "build-review-ledger"
@@ -2728,7 +2725,7 @@ def test_ledger_resolver_step_env_and_download_guard_literals():
     download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
     assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
     terminal_download = next(s for s in ledger_steps if s.get("name") == "Download gate terminal envelope for ledger")
-    assert terminal_download["if"] == "steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
+    assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
 
 
 def test_ledger_build_step_forwards_input_short_circuited():
