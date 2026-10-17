@@ -79,6 +79,24 @@ def _v2_audit(verdict: str, *, cost=None, tokens=None, runtime=None, expected_sh
     return audit
 
 
+def _primary_risk() -> dict:
+    return {
+        "declared_tier": "internal",
+        "effective_tier": "saas",
+        "rule_hits": ["risk-tier", "security"],
+        "rules_version": "risk-rules/v1",
+        "human_required": True,
+        "security_pass": False,
+    }
+
+
+def _build_primary_risk_entry(module, risk: dict) -> dict:
+    return module.build_entry(
+        repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
+        head_sha="head", preflight=_preflight(), audit={**_v2_audit("pass"), "risk": risk},
+    )
+
+
 EXPECTED_IDENTITY = {
     "repository_id": 123,
     "base_sha": "base",
@@ -214,6 +232,79 @@ def test_primary_v2_tier_does_not_allow_other_unknown_fields():
             repository="zlxlabs/app", pr_number=7, run_id=10, run_attempt=1,
             head_sha="head", preflight=_preflight(), audit=audit,
         )
+
+
+def test_main_writes_primary_risk_fields_to_jsonl_without_inference(tmp_path, monkeypatch):
+    module = _module()
+    audit = _v2_audit("fail")
+    risk = _primary_risk()
+    risk.update(rule_hits=[], security_pass=None)
+    audit["risk"] = risk
+
+    rc, output, _audit = _run_ledger_main(
+        module, tmp_path, monkeypatch, preflight=_preflight(), audit=audit,
+    )
+
+    output_bytes = output.read_bytes()
+    assert rc == 0
+    assert output_bytes.endswith(b"\n") and output_bytes.count(b"\n") == 1
+    row = json.loads(output_bytes)
+    assert row["risk"] == risk
+
+
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+def test_primary_risk_accepts_declared_and_effective_tier_values(tier):
+    module = _module()
+    risk = _primary_risk()
+    risk.update(declared_tier=tier, effective_tier=tier)
+    entry = _build_primary_risk_entry(module, risk)
+
+    assert entry["risk"] == risk
+
+
+@pytest.mark.parametrize("field", [
+    "declared_tier", "effective_tier", "rule_hits", "rules_version",
+    "human_required", "security_pass",
+])
+def test_primary_risk_preserves_nullable_schema_fields(field):
+    module = _module()
+    risk = _primary_risk()
+    risk[field] = None
+    entry = _build_primary_risk_entry(module, risk)
+
+    assert entry["risk"] == risk
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("declared_tier", ""), ("declared_tier", 1), ("declared_tier", True),
+    ("declared_tier", "enterprise"), ("effective_tier", []),
+    ("effective_tier", "enterprise"), ("rules_version", ""),
+    ("rules_version", 1), ("rule_hits", [""]), ("rule_hits", [1]),
+    ("rule_hits", {}), ("human_required", 0), ("human_required", "false"),
+    ("security_pass", 1), ("security_pass", "true"),
+])
+def test_primary_risk_rejects_invalid_field_values(field, value):
+    module = _module()
+    risk = _primary_risk()
+    risk[field] = value
+    with pytest.raises(ValueError, match="canonical primary risk"):
+        _build_primary_risk_entry(module, risk)
+
+
+@pytest.mark.parametrize("shape", ["not_object", "missing_field", "unknown_field"])
+def test_primary_risk_rejects_incomplete_or_unknown_shapes(shape):
+    module = _module()
+    risk = _primary_risk()
+    if shape == "not_object":
+        audit_risk = None
+    elif shape == "missing_field":
+        risk.pop("rules_version")
+        audit_risk = risk
+    else:
+        risk["future_policy_signal"] = True
+        audit_risk = risk
+    with pytest.raises(ValueError, match="canonical primary risk"):
+        _build_primary_risk_entry(module, audit_risk)
 
 
 @pytest.mark.parametrize("diff_lines,plan,mode,complete,shards", [(100, "single", "single", True, 1), (5000, "sharded", "sharded+cross-module integration", False, None)])
@@ -365,6 +456,7 @@ def test_main_no_network_writes_one_v2_row_with_current_fields(tmp_path, monkeyp
         "correctness.bad-state", "security.leak",
     ]
     assert row["review"]["result"] == audit["result"]
+    assert "risk" not in row
     assert row["finding_dispositions"] == {}
     assert row["false_positive_count"] == 0
     assert row["disposition_status"] == "success"
