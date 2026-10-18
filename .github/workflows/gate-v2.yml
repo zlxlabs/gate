@@ -887,7 +887,7 @@ jobs:
     needs: [classify_pr_paths]
     if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
     # 防御性路由：仅同仓、合法非空人类作者进入可信评审 runner。
-    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && fromJSON('["self-hosted","linux","codex","gatehub-primary-raw-slot1-20261018"]') || fromJSON('["ubuntu-latest"]') }}
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
     env:
@@ -1142,6 +1142,31 @@ jobs:
         # `git -C GATE_HUB_DIR` artifact disappear on its own, since python3 correctly
         # treats that text as an inert string literal instead of shell source.
         run: python3 "${GATE_HUB_DIR:-/opt/gate-hub}/scripts/review/review-primary" "${{ github.event.pull_request.number }}"
+
+      - name: Diagnose primary raw evidence runtime
+        if: always()
+        run: |
+          set -euo pipefail
+          gate_hub_dir=${GATE_HUB_DIR:-/opt/gate-hub}
+          entrypoint=$(realpath "$gate_hub_dir/scripts/review/review-primary")
+          printf 'PRIMARY-RAW-RUNTIME entrypoint=%s sha256=%s\n' "$entrypoint" "$(sha256sum "$entrypoint" | cut -d' ' -f1)"
+          evidence_root=${REVIEW_EVIDENCE_ROOT:-}
+          if [ -n "$evidence_root" ]; then evidence_root=$(realpath -m -- "$evidence_root"); fi
+          printf 'PRIMARY-RAW-RUNTIME evidence_root=%s\n' "${evidence_root:-unset}"
+          if [ -d "$evidence_root" ]; then
+            printf 'PRIMARY-RAW-DIR exists=1 path=%s\n' "$evidence_root"
+            find "$evidence_root" -type f -printf '%f\t%s\n' | awk -F '\t' '
+              { files++; populated=($2 > 0); if (populated) nonempty++
+                if ($1=="prompt.txt") {p++; if (populated) pn++}
+                if ($1=="events.jsonl") {e++; if (populated) en++}
+                if ($1=="stderr.log") {s++; if (populated) sn++}
+                if ($1=="raw-output.json") {r++; if (populated) rn++}
+                if ($1=="result" || $1 ~ /^result[._-]/) {result++; if (populated) resultn++} }
+              END {printf "PRIMARY-RAW-FILES files=%d nonempty=%d prompt=%d prompt_nonempty=%d events=%d events_nonempty=%d stderr=%d stderr_nonempty=%d raw_output=%d raw_output_nonempty=%d result=%d result_nonempty=%d\n", files,nonempty,p,pn,e,en,s,sn,r,rn,result,resultn}'
+            findmnt -T "$evidence_root" -n -o SOURCE,TARGET,FSTYPE | sed 's/^/PRIMARY-RAW-MOUNT /'
+          else
+            printf 'PRIMARY-RAW-DIR exists=0 path=%s\nPRIMARY-RAW-FILES unavailable=1\nPRIMARY-RAW-MOUNT unavailable=1\n' "${evidence_root:-unset}"
+          fi
 
       - name: Annotate primary findings with cross-round relation
         if: always()
