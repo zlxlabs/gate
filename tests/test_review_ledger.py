@@ -1289,8 +1289,7 @@ def _producer_terminal(*, receipts=(), run_attempt=1):
             }],
         },
     }
-    scope, missing = agg._convergence_scope_from_audit(audit, identity)
-    assert not missing and scope is not None
+    assert (scope := agg._convergence_scope_from_audit(audit, identity)[0]) is not None
     digest = "a" * 64
     typed_receipts = []
     for changes in receipts:
@@ -1447,13 +1446,20 @@ def test_disposition_audit_stays_out_of_review_summary_and_compact_attempts():
 
 
 @pytest.mark.parametrize(
-    ("extra_p1", "expected_gate", "remaining_p1"),
-    [(False, "pass", []), (True, "fail", ["p2"])],
+    ("scenario", "current_id", "current_line", "receipt_kind", "carry_ids"),
+    [
+        ("same-key-distinct-id", "p1", 12, "false-positive", ["p1", "other"]),
+        ("id-drift", "p2", 12, "false-positive", ["p1", "p2"]),
+        ("neighbor-key", "p1", 13, "false-positive", ["old", "p1"]),
+        ("invalid", "p1", 12, "invalid", ["p1"]),
+        ("deferred", "p1", 12, "deferred", ["p1"]),
+    ],
 )
-def test_real_disposition_producer_receipt_flows_through_ledger(
-    tmp_path, extra_p1, expected_gate, remaining_p1,
+def test_real_disposition_producer_closes_only_consumed_current_carry(
+    tmp_path, monkeypatch, scenario, current_id, current_line, receipt_kind, carry_ids,
 ):
     agg = _aggregator()
+    module = _module()
     conv = agg._CONVERGENCE
     repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
     identity = agg.Identity(
@@ -1493,10 +1499,6 @@ def test_real_disposition_producer_receipt_flows_through_ledger(
                     "id": "p1", "severity": "major", "trigger_kind": "inferred",
                     "file": "src/lock.py", "line": 12, "category": "correctness",
                 },
-                *([{
-                    "id": "p2", "severity": "major", "trigger_kind": "inferred",
-                    "file": "src/other.py", "line": 30, "category": "correctness",
-                }] if extra_p1 else []),
             ],
         },
     }
@@ -1532,62 +1534,146 @@ def test_real_disposition_producer_receipt_flows_through_ledger(
     producer_result = json.loads(produced.stdout)
     receipt_bytes = Path(producer_result["path"]).read_bytes()
     receipt_payload = json.loads(receipt_bytes)
-    assert receipt_bytes == json.dumps(
-        receipt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")
-    receipt = conv.parse_disposition_receipt(receipt_payload)
-    audit_digest = conv.canonical_audit_digest(audit)
+    assert receipt_bytes == json.dumps(receipt_payload, sort_keys=True, separators=(",", ":")).encode()
+    receipt = producer_receipt = conv.parse_disposition_receipt(receipt_payload)
+    if receipt_kind == "invalid":
+        receipt = conv.parse_disposition_receipt({
+            **receipt.as_dict(), "counterevidence": {**receipt.counterevidence, "result": "observed"},
+        })
+    elif receipt_kind == "deferred":
+        receipt = conv.parse_disposition_receipt({
+            **receipt.as_dict(), "disposition": "deferred", "counterevidence": None,
+            "tracking_issue": "#123",
+        })
 
-    outcome = agg.evaluate(
-        quality_result="success",
-        primary_result="failure",
-        runner="self",
-        is_draft=False,
-        review_expected=True,
-        audit=audit,
-        audit_error=None,
-        identity=identity,
-        pr_author="zj1123581321",
-        audit_source_attempt=identity.run_attempt,
-        audit_artifact_name="primary-audit-v2-1",
-        scope=scope,
-        audit_digest=audit_digest,
-        waiver_receipts=(receipt,),
-        repository="zlxlabs/gate",
+    current = dict(audit["result"]["findings"][0], id=current_id, line=current_line)
+    carry = [
+        dict(current, id=finding_id, line=(12 if scenario == "neighbor-key" and finding_id == "old" else current_line))
+        for finding_id in carry_ids
+    ]
+    prior_relation = agg.build_finding_relation(carry, {"available": False})
+    prior_audit = json.loads(json.dumps(audit))
+    prior_audit["result"]["findings"] = carry
+    prior_outcome = agg.Outcome(
+        ok=False, classification="code_fail", reason_code="primary_findings", gate_result="fail",
+        finding_relation=prior_relation,
     )
-    assert outcome.gate_result == expected_gate
-    assert outcome.ok is (expected_gate == "pass")
-    assert outcome.convergence_envelope["state"]["clean_streak"] == (1 if expected_gate == "pass" else 0)
-    assert outcome.convergence_envelope["state"]["eligible_rounds"] == 1
+    prior_terminal = agg.build_terminal_envelope(
+        repository="zlxlabs/gate", identity=agg.Identity(123, sha, 999, 1, 42), quality_result="success",
+        primary_result="failure", review_expected=True, is_draft=False, runner="self",
+        outcome=prior_outcome,
+    )
+    prior_entry = module.build_entry(
+        repository="zlxlabs/gate", pr_number=42, run_id=999, run_attempt=1, head_sha=sha,
+        preflight=_preflight(), audit=prior_audit, terminal_envelope=prior_terminal,
+    )
+    ledger_path = tmp_path / "round-1.jsonl"
+    module.write_ledger(ledger_path, prior_entry)
+    latest_body = [ledger_path.read_bytes()]
 
-    terminal = agg.build_terminal_envelope(
-        repository="zlxlabs/gate",
-        identity=identity,
-        quality_result="success",
-        primary_result="failure",
-        review_expected=True,
-        is_draft=False,
-        runner="self",
-        outcome=outcome,
+    def fake_silo_cli(argv, timeout_s):
+        assert argv[0] == "get"
+        Path(argv[argv.index("--dest") + 1]).write_bytes(latest_body[0])
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test")
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "zlxlabs/gate")
+    monkeypatch.setattr(agg, "_silo_configured", lambda: True)
+    monkeypatch.setattr(agg, "_silo_cli", fake_silo_cli)
+    monkeypatch.setattr(agg, "_silo_objects_under", lambda prefix, timeout_s: [])
+    monkeypatch.setattr(agg, "_load_pr_convergence_history", lambda **kwargs: (
+        "history_unavailable", (), agg.HistoryLoad(incomplete_reasons=["missing history"]),
+    ))
+    monkeypatch.setattr(agg, "_fetch_disposition_receipts", lambda **kwargs: (receipt,))
+    rerun_argv = producer_receipt.counterevidence["gate_rerun"]["argv"]
+    monkeypatch.setattr(agg._NEIGHBOR_EVIDENCE, "collect_neighbor_evidence", lambda **kwargs: {
+        receipt.finding_key: conv.NeighborEvidence(
+            current_head_sha=sha, anchor_line_current=current_line, anchor_window_touched=False,
+            rerun_argv=rerun_argv, rerun_exit_code=0, rerun_match_count=1, receipt_scope=scope,
+        ),
+    })
+    previous_path, audit_dir = tmp_path / "previous.json", tmp_path / "current-audit"
+    audit_dir.mkdir()
+    audit_path = audit_dir / "primary-audit.json"
+    audit["result"]["findings"] = [current]
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    render = lambda run_id: agg.main([
+        "--render-previous-context", "--repository-id", "123", "--pr-number", "42",
+        "--run-id", str(run_id), "--run-attempt", "2", "--previous-json", str(previous_path),
+    ])
+    assert render(999) == 0
+    assert [item["id"] for item in json.loads(previous_path.read_bytes())["findings"]] == carry_ids
+    assert agg.main([
+        "--annotate-primary-audit", "--audit-path", str(audit_path),
+        "--previous-findings-path", str(previous_path),
+    ]) == 0
+
+    terminal_path = tmp_path / "gate-terminal.json"
+    def aggregate(run_id, attempt):
+        return agg.main([
+            "--quality-result", "success", "--primary-result", "failure", "--runner", "self",
+            "--is-draft", "false", "--review-expected", "true", "--pr-author-json",
+            json.dumps("zj1123581321"), "--repository-id", "123",
+            "--repository", "zlxlabs/gate", "--head-sha", sha, "--run-id", str(run_id),
+            "--run-attempt", str(attempt), "--pr-number", "42", "--audit-source-attempt", "1",
+            "--audit-artifact-name", "primary-audit-v2-1", "--audit-dir", str(audit_dir),
+            "--terminal-path", str(terminal_path),
+        ])
+    rc = aggregate(999, 2)
+    expected_gate = "pass" if receipt_kind == "false-positive" else "fail"
+    assert rc == (0 if expected_gate == "pass" else 1)
+    terminal = json.loads(terminal_path.read_bytes())
+    assert terminal["gate_result"] == expected_gate and terminal["audit"]["source_attempt"] == 1
+    assert terminal["disposition_receipt_consumption"]["consumed_count"] == int(receipt_kind == "false-positive")
+    assert terminal["disposition_receipt_consumption"]["remaining_p1_ids"] == (
+        [] if receipt_kind == "false-positive" else [current_id]
     )
-    ledger = _module().build_entry(
-        repository="zlxlabs/gate",
-        pr_number=identity.pr,
-        run_id=identity.run_id,
-        run_attempt=identity.run_attempt,
-        head_sha=identity.head_sha,
-        preflight=_preflight(),
-        audit=audit,
-        terminal_envelope=terminal,
+    expected_ids = [finding_id for finding_id in carry_ids if receipt_kind != "false-positive" or finding_id != current_id]
+    assert [item["id"] for item in terminal["finding_relation"]["open_findings"]] == expected_ids
+    resolved = terminal["disposition_receipt_consumption"]["resolved"]
+    if receipt_kind == "false-positive":
+        assert [item["finding_id"] for item in resolved] == [current_id]
+        assert resolved[0]["receipt"] == producer_result["artifact"]
+
+    ledger = module.build_entry(
+        repository="zlxlabs/gate", pr_number=42, run_id=999, run_attempt=2, head_sha=sha,
+        preflight=_preflight(), audit=json.loads(audit_path.read_bytes()), terminal_envelope=terminal,
     )
-    assert terminal["gate_result"] == expected_gate
-    assert terminal["disposition_receipt_consumption"]["remaining_p1_ids"] == remaining_p1
-    resolved = ledger["disposition_receipt_consumption"]["resolved"]
-    assert len(resolved) == 1
-    assert resolved[0]["finding_id"] == "p1"
-    assert resolved[0]["disposition"] == "false-positive"
-    assert resolved[0]["evidence_pointer"] == "tests/test_lock.py::test_lock_regression"
-    assert resolved[0]["receipt"] == producer_result["artifact"]
+    module.write_ledger(ledger_path, ledger)
+    latest_body[0] = ledger_path.read_bytes()
+    recorded = json.loads(latest_body[0])
+    assert latest_body[0] == (json.dumps(recorded, ensure_ascii=False, sort_keys=True) + "\n").encode()
+    assert render(1000) == 0
+    assert [item["id"] for item in json.loads(previous_path.read_bytes())["findings"]] == expected_ids
+
+    if scenario == "same-key-distinct-id":
+        audit3 = json.loads(audit_path.read_bytes())
+        for finding in audit3["result"]["findings"]:
+            finding.pop("relation_to_previous", None)
+            finding.pop("previous_finding_id", None)
+        audit3.update(run_id=1000, run_attempt=1)
+        audit_path.write_text(json.dumps(audit3), encoding="utf-8")
+        assert agg.main([
+            "--annotate-primary-audit", "--audit-path", str(audit_path),
+            "--previous-findings-path", str(previous_path),
+        ]) == 0
+        reopened = json.loads(audit_path.read_bytes())["finding_relation"]
+        assert reopened["items"][0]["relation_to_previous"] == "new"
+        assert current_id in {item["id"] for item in reopened["open_findings"]}
+        monkeypatch.setattr(agg, "_fetch_disposition_receipts", lambda **kwargs: ())
+        assert aggregate(1000, 1) == 1
+        terminal3 = json.loads(terminal_path.read_bytes())
+        assert current_id in {item["id"] for item in terminal3["finding_relation"]["open_findings"]}
+        ledger3 = module.build_entry(
+            repository="zlxlabs/gate", pr_number=42, run_id=1000, run_attempt=1, head_sha=sha,
+            preflight=_preflight(), audit=json.loads(audit_path.read_bytes()), terminal_envelope=terminal3,
+        )
+        module.write_ledger(ledger_path, ledger3)
+        latest_body[0] = ledger_path.read_bytes()
+        assert render(1001) == 0
+        assert current_id in {item["id"] for item in json.loads(previous_path.read_bytes())["findings"]}
+
 
 
 def test_saas_deferred_is_rejected_by_producer_and_aggregator(tmp_path):

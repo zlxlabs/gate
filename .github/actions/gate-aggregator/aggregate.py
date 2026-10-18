@@ -705,6 +705,49 @@ def apply_finding_relation(outcome: Outcome, findings: list[Any], previous_round
         outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
 
 
+def _close_consumed_false_positive_carry(
+    relation: dict[str, Any], findings: list[Any], disposition_audit: Any,
+) -> dict[str, Any]:
+    """Close only current open carry entries consumed by a valid refuted receipt."""
+    open_findings = relation.get("open_findings")
+    if not isinstance(open_findings, list):
+        return relation
+    if not isinstance(disposition_audit, _CONVERGENCE.DispositionAudit):
+        return relation
+    recorded_receipts = disposition_audit.recorded_receipts
+    recorded_finding_ids = disposition_audit.recorded_finding_ids
+    if len(recorded_receipts) != len(recorded_finding_ids):
+        return relation
+
+    current_keys_by_id: dict[str, list[str]] = {}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        finding_id = finding.get("id")
+        if not isinstance(finding_id, str) or not finding_id:
+            continue
+        if finding.get("severity") not in _CONVERGENCE.P1_SEVERITIES:
+            continue
+        current_keys_by_id.setdefault(finding_id, []).append(_CONVERGENCE.canonical_finding_key(finding))
+
+    closed: set[tuple[str, str]] = set()
+    for receipt, finding_id in zip(recorded_receipts, recorded_finding_ids):
+        if receipt.disposition != "false-positive" or _CONVERGENCE._counterevidence_reason(receipt):
+            continue
+        current_keys = current_keys_by_id.get(finding_id, [])
+        if len(current_keys) == 1:
+            closed.add((finding_id, current_keys[0]))
+    if not closed:
+        return relation
+    return {
+        **relation,
+        "open_findings": [finding for finding in open_findings if (
+            not isinstance(finding, dict)
+            or (finding.get("id"), _CONVERGENCE.canonical_finding_key(finding)) not in closed
+        )],
+    }
+
+
 def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
     return (
         f"{SILO_TERMINAL_TIER}/{repository_id}/"
@@ -795,7 +838,9 @@ def load_previous_round_findings(
     return {"available": True, "detail": "", "head_sha": head_sha, "findings": findings}
 
 
-def _project_previous_dispositions(*, repository_id: int, pr_number: int) -> list[dict[str, Any]]:
+def _project_previous_dispositions(
+    *, repository_id: int, pr_number: int,
+) -> list[dict[str, Any]]:
     projected: list[tuple[str, dict[str, Any]]] = []
     dropped = 0
     for receipt in _fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number):
@@ -3982,7 +4027,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             relation = build_finding_relation(current_findings, {"available": False})
             relation["history_status"] = "unknown"
             relation = validate_finding_relation_block(relation)
-        outcome.finding_relation = relation
+        outcome.finding_relation = _close_consumed_false_positive_carry(
+            relation, findings, outcome.disposition_audit,
+        )
         if relation["counts"]["conflict"] and outcome.gate_result == "pass":
             (outcome.ok, outcome.gate_result, outcome.classification, outcome.reason_code) = (
                 False, "fail", "code_fail", "primary_findings",
