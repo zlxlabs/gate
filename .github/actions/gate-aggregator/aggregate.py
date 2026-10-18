@@ -609,11 +609,37 @@ def relate_findings(current: list[Any], previous: list[Any]) -> list[dict[str, A
 
 def build_finding_relation(findings: list[Any], previous_round: dict[str, Any]) -> dict[str, Any]:
     previous: list[Any] = []
+    open_findings: list[dict[str, Any]] = []
     if previous_round.get("available") is True:
         raw = previous_round.get("findings")
         if not isinstance(raw, list):
             raise FindingRelationError(f"{RELATION_UNKNOWN}: previous findings are not a list")
         previous = raw
+        positions: dict[str, int] = {}
+        for finding in previous:
+            if not isinstance(finding, dict):
+                continue
+            projected = dict(finding)
+            finding_id = projected.get("id")
+            if isinstance(finding_id, str) and finding_id:
+                if finding_id in positions:
+                    open_findings[positions[finding_id]].update(projected)
+                    continue
+                positions[finding_id] = len(open_findings)
+            open_findings.append(projected)
+    else:
+        positions = {}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        projected = dict(finding)
+        finding_id = projected.get("id")
+        if isinstance(finding_id, str) and finding_id in positions:
+            open_findings[positions[finding_id]].update(projected)
+            continue
+        if isinstance(finding_id, str) and finding_id:
+            positions[finding_id] = len(open_findings)
+        open_findings.append(projected)
     items = relate_findings(findings, previous)
     counts = {name: sum(item["relation_to_previous"] == name for item in items) for name in ("new", "repeat", "conflict")}
     return {
@@ -621,6 +647,7 @@ def build_finding_relation(findings: list[Any], previous_round: dict[str, Any]) 
         "counts": counts,
         "review_terminal": "manual_required" if counts["conflict"] else "unchanged",
         "items": items,
+        "open_findings": open_findings,
     }
 
 
@@ -643,6 +670,14 @@ def validate_finding_relation_block(block: Any) -> dict[str, Any]:
         pointer = item.get("previous_finding_id")
         if relation != "new" and (not isinstance(pointer, str) or not pointer):
             raise FindingRelationError(f"{RELATION_UNKNOWN}: {relation} missing previous_finding_id")
+    if "open_findings" in block and (
+        not isinstance(block["open_findings"], list)
+        or any(not isinstance(item, dict) for item in block["open_findings"])
+    ):
+        raise FindingRelationError(f"{RELATION_UNKNOWN}: open_findings")
+    history_status = block.get("history_status")
+    if history_status is not None and history_status not in {"available", "unknown"}:
+        raise FindingRelationError(f"{RELATION_UNKNOWN}: history_status")
     terminal = block.get("review_terminal")
     if terminal not in {"unchanged", "manual_required"}:
         raise FindingRelationError(f"{RELATION_UNKNOWN}: review_terminal {terminal!r}")
@@ -681,7 +716,7 @@ def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
 def _previous_findings_from_silo(
     *, repository_id: int, pr_number: int, run_id: int, run_attempt: int,
 ) -> tuple[Optional[str], list[Any]]:
-    """Return the prior head SHA and every finding dictionary; a missing head stays unknown."""
+    """Return carried open facts (legacy latest findings when absent); a missing head stays unknown."""
     import tempfile
 
     key = _ledger_latest_key(repository_id, pr_number)
@@ -708,9 +743,18 @@ def _previous_findings_from_silo(
     review = entry.get("review") if isinstance(entry.get("review"), dict) else {}
     result = review.get("result") if isinstance(review.get("result"), dict) else {}
     findings = result.get("findings") if isinstance(result.get("findings"), list) else []
+    finding_relation = entry.get("finding_relation")
+    if finding_relation is not None and not isinstance(finding_relation, dict):
+        raise RuntimeError("silo-ledger-latest-unreadable")
+    if isinstance(finding_relation, dict) and "open_findings" in finding_relation:
+        carried = finding_relation["open_findings"]
+        if not isinstance(carried, list) or any(not isinstance(item, dict) for item in carried):
+            raise RuntimeError("silo-ledger-latest-unreadable")
+    else:
+        carried = findings
     head_sha = entry.get("head_sha")
-    return (head_sha if isinstance(head_sha, str) and head_sha else None), [
-        item for item in findings if isinstance(item, dict)
+    return head_sha if isinstance(head_sha, str) and head_sha else None, [
+        item for item in carried if isinstance(item, dict)
     ]
 
 
@@ -825,9 +869,6 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     audit_path = Path(args.audit_path)
     if not audit_path.is_file():
         return 0
-    if not Path(args.previous_findings_path).is_file():
-        _degrade_previous_round("previous-findings-file-missing")
-        return 0
     previous = load_previous_round_findings(
         path=args.previous_findings_path, repository_id=0, pr_number=0, run_id=0, run_attempt=0,
     )
@@ -835,7 +876,12 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     result = audit.get("result") if isinstance(audit, dict) else None
     findings = result.get("findings") if isinstance(result, dict) else None
     if isinstance(findings, list):
-        apply_finding_relation(Outcome(ok=True), findings, previous)
+        annotation = Outcome(ok=True)
+        apply_finding_relation(annotation, findings, previous)
+        relation = annotation.finding_relation
+        assert relation is not None
+        relation["history_status"] = "available" if previous["available"] else "unknown"
+        audit["finding_relation"] = relation
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
 
@@ -3764,7 +3810,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--panel-delivery-path", default=None, help="durable status-panel delivery diagnostic JSON output path")
     parser.add_argument("--summary-path", default=None, help="$GITHUB_STEP_SUMMARY")
     parser.add_argument("--publish-only", action="store_true", help="publish the panel after terminal artifact upload")
-    parser.add_argument("--previous-findings-path", default=None)
     args = parser.parse_args(argv_list)
 
     if args.publish_only:
@@ -3898,17 +3943,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         result = audit.get("result")
         if isinstance(result, dict) and isinstance(result.get("findings"), list):
             findings = result["findings"]
-    preset = any(isinstance(item, dict) and "relation_to_previous" in item for item in findings)
-    if preset:
-        previous_round = {"available": True, "detail": "audit-preset", "findings": []}
-    else:
-        previous_round = load_previous_round_findings(
-            path=args.previous_findings_path,
-            repository_id=identity.repository_id,
-            pr_number=identity.pr,
-            run_id=identity.run_id,
-            run_attempt=identity.run_attempt,
-        )
     outcome = evaluate(
         quality_result=args.quality_result,
         caller_checks=args.caller_checks,
@@ -3934,7 +3968,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_history_status=convergence_history_status,
         neighbor_evidence=neighbor_evidence,
     )
-    apply_finding_relation(outcome, findings, previous_round)
+    if isinstance(audit, dict):
+        if "finding_relation" in audit:
+            relation = validate_finding_relation_block(audit["finding_relation"])
+        else:
+            print("GATE-FINDING-RELATION-DEGRADED: source=primary-audit detail=unknown")
+            current_findings = [
+                {key: value for key, value in item.items()
+                 if key not in {"relation_to_previous", "previous_finding_id"}}
+                if isinstance(item, dict) else item
+                for item in findings
+            ]
+            relation = build_finding_relation(current_findings, {"available": False})
+            relation["history_status"] = "unknown"
+            relation = validate_finding_relation_block(relation)
+        outcome.finding_relation = relation
+        if relation["counts"]["conflict"] and outcome.gate_result == "pass":
+            (outcome.ok, outcome.gate_result, outcome.classification, outcome.reason_code) = (
+                False, "fail", "code_fail", "primary_findings",
+            )
+            outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
     fail_count, reconsider = _compute_pr_primary_convergence(
         silo_terminal_history if silo_terminal_history is not None else HistoryLoad(),
         identity=identity, primary_result=args.primary_result, outcome=outcome,

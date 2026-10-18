@@ -5154,8 +5154,12 @@ def test_same_finding_id_is_repeat_with_previous_pointer(tmp_path, capsys):
     audit_dir = _write_relation_audit(tmp_path, finding)
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps({"available": True, "detail": "", "findings": [finding]}))
+    assert AGG.main([
+        "--annotate-primary-audit", "--audit-path",
+        str(audit_dir / "primary-review-audit.json"), "--previous-findings-path", str(previous),
+    ]) == 0
     summary = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(audit_dir, summary) + ["--previous-findings-path", str(previous)])
+    rc = AGG.main(_cli_args(audit_dir, summary))
     assert rc == 0
     terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
     item = terminal["finding_relation"]["items"][0]
@@ -5179,11 +5183,13 @@ def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
     audit_dir = _write_relation_audit(tmp_path, current)
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps({"available": True, "detail": "", "findings": [previous_finding]}))
+    assert AGG.main([
+        "--annotate-primary-audit", "--audit-path",
+        str(audit_dir / "primary-review-audit.json"), "--previous-findings-path", str(previous),
+    ]) == 0
     summary = tmp_path / "summary.md"
     receipt = tmp_path / "convergence-receipt.json"
-    rc = AGG.main(_cli_args(
-        audit_dir, summary, convergence_receipt_path=str(receipt),
-    ) + ["--previous-findings-path", str(previous)])
+    rc = AGG.main(_cli_args(audit_dir, summary, convergence_receipt_path=str(receipt)))
     terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
     relation = terminal["finding_relation"]
     assert rc == 1
@@ -5192,11 +5198,11 @@ def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
     assert relation["counts"]["conflict"] == 1
     assert relation["items"][0]["relation_to_previous"] == "conflict"
     assert relation["items"][0]["previous_finding_id"] == "round-a"
-    assert json.loads(receipt.read_text())["decision"] != "converged"
     body = AGG.render_status_panel([AGG._terminal_row(
         terminal, repository="zlxlabs/gate", repository_id=123, pr_number=42,
     )])
     assert "manual_required" in body and "round-a" in body
+    assert json.loads(receipt.read_text())["decision"] != "converged"
     same = dict(previous_finding, id="other", acceptance=current["acceptance"], issue=current["issue"])
     assert AGG.relate_findings([current], [same])[0]["relation_to_previous"] == "new"
 
@@ -5255,9 +5261,19 @@ def test_shadow_budget_preserves_existing_verdict_contract(case):
         assert shadow.finding_relation["review_terminal"] == "manual_required"
 
 
-def test_unknown_relation_value_is_rejected():
-    with pytest.raises(AGG.FindingRelationError, match="GATE-FINDING-RELATION-UNKNOWN"):
-        AGG.relate_findings([{"id": "a", "relation_to_previous": "maybe"}], [])
+def test_cli_rejects_present_null_finding_relation(tmp_path):
+    audit_dir = _write_relation_audit(tmp_path, {"id": "a"})
+    audit_path = audit_dir / "primary-review-audit.json"
+    audit = json.loads(audit_path.read_text())
+    audit["finding_relation"] = None
+    audit_path.write_text(json.dumps(audit))
+    result = subprocess.run(
+        [sys.executable, str(MODULE_PATH), *_cli_args(audit_dir, tmp_path / "summary.md")],
+        cwd=ROOT, env={**os.environ, "SILO_ENDPOINT": "", "SILO_STORE": "", "GITHUB_TOKEN": "", "GH_TOKEN": ""},
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "GATE-FINDING-RELATION-UNKNOWN: block schema" in result.stderr
 
 
 def test_missing_previous_ledger_marks_new_and_job_succeeds(tmp_path, capsys):
@@ -5267,15 +5283,17 @@ def test_missing_previous_ledger_marks_new_and_job_succeeds(tmp_path, capsys):
     }
     audit_dir = _write_relation_audit(tmp_path, finding)
     summary = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(audit_dir, summary) + ["--previous-findings-path", str(tmp_path / "missing.json")])
+    rc = AGG.main(_cli_args(audit_dir, summary))
     out = capsys.readouterr().out
     terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
     item = terminal["finding_relation"]["items"][0]
     assert rc == 0
     assert terminal["gate_result"] == "pass"
+    assert terminal["finding_relation"]["history_status"] == "unknown"
+    assert terminal["finding_relation"]["open_findings"] == [finding]
     assert item["relation_to_previous"] == "new"
     assert "previous_finding_id" not in item
-    assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=previous-findings-file-missing" in out
+    assert "GATE-FINDING-RELATION-DEGRADED: source=primary-audit detail=unknown" in out
 
 
 def _previous_round_fixture_objects():
@@ -5343,6 +5361,7 @@ def _render_previous_round_fixture(
 
 def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp_path, monkeypatch, capsys):
     ledger, _, objects = _previous_round_fixture_objects()
+    assert "open_findings" not in ledger["finding_relation"]
     rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, objects)
     out = capsys.readouterr().out
 
@@ -5350,6 +5369,7 @@ def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp
     assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions"}
     assert payload["available"] is True
     assert payload["head_sha"] == ledger["head_sha"]
+    assert payload["findings"] == ledger["review"]["result"]["findings"]
     assert payload["findings"] and any(
         finding.get("id") == "reliability_alternates_survive_hard_kill"
         for finding in payload["findings"]
@@ -5429,6 +5449,132 @@ def test_render_previous_context_preserves_full_findings_and_prior_head(tmp_path
     relation = AGG.build_finding_relation([current], loaded)
     assert relation["items"][0]["relation_to_previous"] == "repeat"
     assert relation["items"][0]["previous_finding_id"] == "prior-major-after-limit"
+
+
+@pytest.mark.parametrize("current_findings", [
+    [{
+        "id": "new-current", "severity": "major", "file": "src/new-check.py", "line": 29,
+        "category": "correctness", "issue": "a distinct current-round finding",
+        "acceptance": "retain this finding with the historical open finding",
+    }],
+    [],
+], ids=["old-plus-new", "old-plus-empty"])
+def test_silent_round_carries_open_finding_through_ledger_jsonl(tmp_path, current_findings):
+    ledger_script = ROOT / ".github" / "actions" / "review-ledger" / "build_ledger.py"
+    finding = {
+        "id": "open-with-evidence", "severity": "major", "file": "src/check.py", "line": 17,
+        "category": "correctness", "issue": "the quote must remain open",
+        "acceptance": "retain the original anchor", "quote": "exact source bytes",
+        "anchor": {"path": "src/check.py", "line": 17, "range": [17, 18]},
+    }
+    round_dir = tmp_path / "round-2"
+    audit_dir = round_dir / "audit"
+    audit_dir.mkdir(parents=True)
+    identity = AGG.Identity(repository_id=123, head_sha="b" * 40, run_id=1000, run_attempt=1, pr=42)
+    audit = json.loads((ROOT / "tests" / "data" / "primary_review_v2_with_tier.json").read_bytes())
+    audit.update(repository="zlxlabs/gate", repository_id=123, pr=42, run_id=identity.run_id,
+                 run_attempt=1, head_sha=identity.head_sha)
+    audit["verdict"] = audit["result"]["verdict"] = "pass"
+    audit["result"]["findings"] = current_findings
+    audit_path = audit_dir / "primary-review-audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    previous_path = round_dir / "previous-findings.json"
+    previous_path.write_text(json.dumps({
+        "available": True, "detail": "", "head_sha": "a" * 40, "findings": [finding],
+    }), encoding="utf-8")
+
+    clean_env = os.environ.copy()
+    for key in ("SILO_ENDPOINT", "SILO_STORE", "GITHUB_TOKEN", "GH_TOKEN"):
+        clean_env.pop(key, None)
+    annotation = subprocess.run([
+        sys.executable, str(MODULE_PATH), "--annotate-primary-audit",
+        "--audit-path", str(audit_path), "--previous-findings-path", str(previous_path),
+    ], cwd=ROOT, env=clean_env, capture_output=True, text=True, check=False)
+    assert annotation.returncode == 0, annotation.stderr
+    audit_bytes = audit_path.read_bytes()
+    annotated_audit = json.loads(audit_bytes)
+    assert annotated_audit["finding_relation"]["history_status"] == "available"
+    expected_open_findings = [finding, *current_findings]
+    expected_ids = ["open-with-evidence"] + [item["id"] for item in current_findings]
+    assert annotated_audit["finding_relation"]["open_findings"] == expected_open_findings
+    assert [item["id"] for item in annotated_audit["finding_relation"]["open_findings"]] == expected_ids
+
+    summary = round_dir / "summary.md"
+    gate_args = _cli_args(audit_dir, summary, identity=identity)
+    gate = subprocess.run(
+        [sys.executable, str(MODULE_PATH), *gate_args], cwd=ROOT, env=clean_env,
+        capture_output=True, text=True, check=False,
+    )
+    assert gate.returncode == 0, gate.stderr
+    terminal_path = summary.with_name("gate-terminal.json")
+    terminal_bytes = terminal_path.read_bytes()
+    terminal = json.loads(terminal_bytes)
+    assert terminal["gate_result"] == "pass"
+    assert terminal["finding_relation"]["open_findings"] == expected_open_findings
+    assert [item["id"] for item in terminal["finding_relation"]["open_findings"]] == expected_ids
+    if current_findings:
+        legacy_round = round_dir / "legacy"
+        legacy_dir = legacy_round / "audit"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "primary-review-audit.json").write_text(
+            json.dumps(audit), encoding="utf-8",
+        )
+        legacy_summary = legacy_round / "summary.md"
+        legacy_gate = subprocess.run(
+            [sys.executable, str(MODULE_PATH), *_cli_args(legacy_dir, legacy_summary, identity=identity)],
+            cwd=ROOT, env=clean_env, capture_output=True, text=True, check=False,
+        )
+        assert legacy_gate.returncode == 0, legacy_gate.stderr
+        legacy_terminal = json.loads(legacy_summary.with_name("gate-terminal.json").read_bytes())
+        assert legacy_terminal["finding_relation"]["history_status"] == "unknown"
+        assert [item["id"] for item in legacy_terminal["finding_relation"]["open_findings"]] == [
+            item["id"] for item in current_findings
+        ]
+
+    preflight_path = round_dir / "preflight.json"
+    preflight_path.write_text(json.dumps({
+        "diff_lines": 100, "classification": "single", "review_plan": "single",
+        "thresholds": {"single_turn_lines": 4000},
+    }), encoding="utf-8")
+    output_path = round_dir / "ledger.jsonl"
+    ledger = subprocess.run([
+        sys.executable, str(ledger_script), "--audit-path", str(audit_path),
+        "--preflight-path", str(preflight_path), "--install-path", str(round_dir / "missing-install.json"),
+        "--terminal-path", str(terminal_path), "--output", str(output_path),
+        "--repository", "zlxlabs/gate", "--pr-number", "42", "--run-id", str(identity.run_id),
+        "--run-attempt", "1", "--head-sha", identity.head_sha, "--expected-repository-id", "123",
+        "--expected-base-sha", audit["base_sha"], "--expected-caller-sha", audit["caller_sha"],
+        "--expected-reusable-workflow-sha", audit["reusable_workflow_sha"], "--codex-expected", "true",
+    ], cwd=ROOT, env=clean_env, capture_output=True, text=True, check=False)
+    assert ledger.returncode == 0, ledger.stderr
+    ledger_bytes = output_path.read_bytes()
+    assert ledger_bytes.endswith(b"\n")
+    ledger_entry = json.loads(ledger_bytes.splitlines()[0])
+    assert ledger_entry["finding_relation"]["open_findings"] == expected_open_findings
+    assert [item["id"] for item in ledger_entry["finding_relation"]["open_findings"]] == expected_ids
+
+    silo_store = round_dir / "silo_store.py"
+    silo_store.write_text(
+        "import os, shutil, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[0] == 'get':\n"
+        "    shutil.copyfile(os.environ['C7_LEDGER_PATH'], args[args.index('--dest') + 1])\n"
+        "elif args[0] != 'list':\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    loader_env = {**clean_env, "SILO_ENDPOINT": "local-test", "SILO_STORE": str(silo_store),
+                  "C7_LEDGER_PATH": str(output_path)}
+    previous_round_path = round_dir / "next-round-findings.json"
+    loader = subprocess.run([
+        sys.executable, str(MODULE_PATH), "--render-previous-context", "--repository-id", "123",
+        "--pr-number", "42", "--run-id", "1001", "--run-attempt", "1",
+        "--previous-json", str(previous_round_path),
+    ], cwd=ROOT, env=loader_env, capture_output=True, text=True, check=False)
+    assert loader.returncode == 0, loader.stderr
+    previous_bytes = previous_round_path.read_bytes()
+    assert json.loads(previous_bytes)["findings"] == expected_open_findings
+    assert [item["id"] for item in json.loads(previous_bytes)["findings"]] == expected_ids
 
 
 def test_render_previous_context_keeps_same_head_older_attempt(tmp_path, monkeypatch):
