@@ -2788,6 +2788,7 @@ jobs:
           install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
           terminal-path: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != '' && format('{0}/gate-terminal/gate-terminal.json', runner.temp) || '' }}
           shadow-path: ${{ runner.temp }}/incremental-shadow/shadow.json
+          record-output: ${{ runner.temp }}/review-ledger/review-record-v1.json
           codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
           codex-waived: false
           expected-repository-id: ${{ github.repository_id }}
@@ -2795,6 +2796,30 @@ jobs:
           expected-caller-sha: ${{ github.workflow_sha }}
           expected-reusable-workflow-sha: ${{ job.workflow_sha }}
           input-short-circuited: ${{ steps.resolve-ledger-artifacts.outputs.input_short_circuited }}
+
+      - name: Warn when primary result disagrees with compact review record
+        if: always() && steps.build-review-ledger.outcome == 'success'
+        continue-on-error: true
+        env:
+          RECORD_PATH: ${{ runner.temp }}/review-ledger/review-record-v1.json
+          PRIMARY_RESULT: ${{ needs.primary.result }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PYTHONPATH="$GITHUB_WORKSPACE/_gate-aggregator-src/.github/actions/review-ledger" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from build_ledger import primary_record_consistency_warning
+
+          warning = primary_record_consistency_warning(
+              Path(os.environ["RECORD_PATH"]), primary_result=os.environ["PRIMARY_RESULT"],
+              run_id=int(os.environ["RUN_ID"]), attempt=int(os.environ["RUN_ATTEMPT"]),
+              head_sha=os.environ["HEAD_SHA"],
+          )
+          if warning:
+              print(f"::warning::{warning}")
+          PY
 
       - name: Upload v2 review effectiveness ledger
         env:
@@ -2914,6 +2939,16 @@ jobs:
             echo "::error::Permanent gate terminal archive readback bytes do not match" >&2
             exit 1
           fi
+
+      - name: Upload live review record/v1 to permanent Silo
+        if: always() && steps.build-review-ledger.outcome == 'success'
+        env:
+          REVIEW_RECORD_PATH: ${{ runner.temp }}/review-ledger/review-record-v1.json
+        run: |
+          echo "::notice::step-start: Upload live review record/v1 to permanent Silo"
+          set -euo pipefail
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          "$SILO_EXEC" put-review-record --file "$REVIEW_RECORD_PATH"
 
       - name: Diagnose silo network after job failure
         if: failure()

@@ -823,12 +823,18 @@ class _RecordHandler(BaseHTTPRequestHandler):
             return
         if self.command == "PUT" and self.server.status < 400:
             self.server.objects[self.path] = body
-        status = self.server.get_status if self.command == "GET" and self.server.get_status else self.server.status
+        is_listing = self.command == "GET" and "list-type=2" in self.path
+        status = 200 if is_listing else (
+            self.server.get_status if self.command == "GET" and self.server.get_status else self.server.status
+        )
         payload = self.server.body
         if self.command == "GET":
             payload = self.server.objects.get(self.path, payload)
+        if is_listing:
+            payload = self.server.body
         if self.command == "GET" and self.server.corrupt_get and self.path in self.server.objects:
             payload += b"readback-mismatch"
+        self.server.responded.append({"method": self.command, "path": self.path, "status": status, "body": payload})
         self.send_response_only(status)
         self.send_header("Content-Length", str(len(payload)))
         for name, value in self.server.extra_headers:
@@ -844,7 +850,7 @@ class _RecordHandler(BaseHTTPRequestHandler):
 
 def _start_record_server(**attrs):
     server = HTTPServer(("127.0.0.1", 0), _RecordHandler)
-    server.received, server.status, server.body = [], 200, b""
+    server.received, server.responded, server.status, server.body = [], [], 200, b""
     server.objects, server.get_status, server.corrupt_get = {}, None, False
     server.extra_headers, server.close_after_read = (), False
     for key, value in attrs.items():
@@ -1387,3 +1393,181 @@ def test_request_send_and_recv_body_exceptions(monkeypatch, capsys):
         assert event["declared_content_length"] == event["body_len"] == 2
         assert f"Silo request failed: {type(exc).__name__}" in err
         assert str(exc) not in err
+
+
+def test_gate_workflow_writes_live_review_record_bytes_to_versioned_silo_key(tmp_path):
+    workflow = yaml.safe_load((_REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
+    action = yaml.safe_load((_REPO_ROOT / ".github/actions/review-ledger/action.yml").read_text())
+    steps = workflow["jobs"]["ledger"]["steps"]
+    build = next(step for step in steps if step.get("name") == "Build v2 review effectiveness ledger")
+    upload = next(step for step in steps if step.get("name") == "Upload live review record/v1 to permanent Silo")
+    assert upload["if"] == "always() && steps.build-review-ledger.outcome == 'success'"
+    prior_archives = (
+        "Upload v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger latest pointer",
+        "Upload v2 raw review ledger to permanent archive",
+        "Archive canonical primary audit permanently",
+        "Archive gate terminal envelope permanently",
+    )
+    prior_archive_indices = [
+        steps.index(next(step for step in steps if step.get("name") == name))
+        for name in prior_archives
+    ]
+    assert max(prior_archive_indices) < steps.index(upload)
+    audit_path = _REPO_ROOT / "tests/data/primary_review_v2_with_tier.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    runner_temp = tmp_path / "runner"
+    record_path = Path(build["with"]["record-output"].replace("${{ runner.temp }}", str(runner_temp)))
+    record_input = action["inputs"]["record-output"]
+    assert record_input.get("required") is False and record_input.get("default") == ""
+    input_paths = {
+        "audit-path": str(audit_path),
+        "preflight-path": str(_REPO_ROOT / "tests/fixtures/quality-ledger-input/pr-size-preflight.json"),
+        "install-path": str(_REPO_ROOT / "tests/fixtures/quality-ledger-input/install-result.json"),
+        "terminal-path": "",
+        "shadow-path": str(runner_temp / "incremental-shadow/shadow.json"),
+        "record-output": str(record_path),
+        "codex-expected": "true",
+        "codex-waived": "false",
+        "expected-repository-id": str(audit["repository_id"]),
+        "expected-base-sha": audit["base_sha"],
+        "expected-caller-sha": audit["caller_sha"],
+        "expected-reusable-workflow-sha": audit["reusable_workflow_sha"],
+        "input-short-circuited": "false",
+    }
+    action_run = action["runs"]["steps"][0]["run"]
+    for name, value in input_paths.items():
+        action_run = action_run.replace("${{ inputs." + name + " }}", value)
+    for expression, value in {
+        "${{ github.event.pull_request.number }}": str(audit["pr"]),
+        "${{ github.run_id }}": str(audit["run_id"]),
+        "${{ github.run_attempt }}": str(audit["run_attempt"]),
+        "${{ github.event.pull_request.head.sha }}": audit["head_sha"],
+    }.items():
+        action_run = action_run.replace(expression, value)
+    action_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "GITHUB_ACTION_PATH": str(_REPO_ROOT / ".github/actions/review-ledger"),
+        "GITHUB_REPOSITORY": audit["repository"],
+        "GITHUB_RUN_ID": str(audit["run_id"]),
+        "GITHUB_RUN_ATTEMPT": str(audit["run_attempt"]),
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+        "REVIEW_RECORD_OUTPUT": str(record_path),
+    }
+    build_result = subprocess.run(
+        ["bash", "-x", "-euo", "pipefail", "-c", action_run],
+        capture_output=True, text=True,
+        env=action_env,
+        check=False,
+    )
+    assert build_result.returncode == 0, build_result.stderr + build_result.stdout
+    assert action["runs"]["steps"][0]["env"]["REVIEW_RECORD_OUTPUT"] == "${{ inputs.record-output }}"
+    assert f"--record-output {record_path}" in build_result.stderr
+    ledger_only_temp = tmp_path / "runner-ledger-only"
+    ledger_only_result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", action_run], capture_output=True, text=True,
+        env={**action_env, "RUNNER_TEMP": str(ledger_only_temp), "REVIEW_RECORD_OUTPUT": ""}, check=False,
+    )
+    assert ledger_only_result.returncode == 0, ledger_only_result.stderr + ledger_only_result.stdout
+    assert (ledger_only_temp / "review-ledger/ledger.jsonl").is_file()
+    assert not (ledger_only_temp / "review-ledger/review-record-v1.json").exists()
+    record_bytes = record_path.read_bytes()
+    record = json.loads(record_bytes)
+    assert record["schema_version"] == "review-record/v1"
+    assert record["source"] == "ci" and record["pr"] == audit["pr"]
+    raw_artifact = f"codex-review-ledger-v2-{audit['repository_id']}-{audit['head_sha']}-{audit['run_id']}-{audit['run_attempt']}"
+    assert record["provenance"]["source_key"] == f"silo/ci-artifacts/d30/{audit['repository_id']}/{raw_artifact}/ledger.jsonl"
+
+    server = _start_record_server(body=b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
+    try:
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", upload["run"]],
+            capture_output=True, text=True,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "AWS_ACCESS_KEY_ID": _ACCESS,
+                "AWS_SECRET_ACCESS_KEY": _SECRET,
+                "SILO_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
+                "SILO_BUCKET": "ci-artifacts",
+                "SILO_EXEC": str(_REPO_ROOT / "scripts/silo_exec.sh"),
+                "SILO_STORE": str(_STORE_PY),
+                "RUNNER_TEMP": str(tmp_path),
+                "REVIEW_RECORD_PATH": str(record_path),
+            },
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    owner, repo = audit["repository"].split("/")
+    expected_key = f"archive/review-record/v1/{owner}/{repo}/{audit['pr']}/{audit['head_sha']}/ci-{audit['run_id']}-{audit['run_attempt']}.json"
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert server.objects[f"/ci-artifacts/{expected_key}"] == record_bytes
+    put = next(item for item in server.received if item["method"] == "PUT")
+    assert put["path"] == f"/ci-artifacts/{expected_key}" and put["body"] == record_bytes
+    get = next(item for item in server.responded if item["method"] == "GET" and item["path"] == f"/ci-artifacts/{expected_key}")
+    assert get["body"] == record_bytes
+    assert [item["method"] for item in server.received] == ["GET", "PUT", "GET"]
+    assert not any("latest" in item["path"] or item["method"] == "DELETE" for item in server.received)
+
+
+@pytest.mark.parametrize("payload", [
+    b"not json",
+    json.dumps({"schema_version": "review-record/v1", "source": "unknown", "repo": "example-org/example-repo", "pr": 2, "head_sha": "a" * 40, "run_id": 7, "attempt": 1}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "../gate", "pr": 2, "head_sha": "a" * 40, "run_id": 7, "attempt": 1}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo", "pr": True, "head_sha": "a" * 40, "run_id": 7, "attempt": 1}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo", "pr": 0, "head_sha": "a" * 40, "run_id": 7, "attempt": 1}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo", "pr": 2, "head_sha": "A" * 40, "run_id": 7, "attempt": 1}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo", "pr": 2, "head_sha": "a" * 40, "run_id": True, "attempt": 1}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo", "pr": 2, "head_sha": "a" * 40, "run_id": 0, "attempt": 1}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo", "pr": 2, "head_sha": "a" * 40, "run_id": 7, "attempt": True}).encode(),
+    json.dumps({"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo", "pr": 2, "head_sha": "a" * 40, "run_id": 7, "attempt": 0}).encode(),
+])
+def test_put_review_record_rejects_bad_payload_before_connect(tmp_path, monkeypatch, payload):
+    source = tmp_path / "review-record.json"
+    source.write_bytes(payload)
+    monkeypatch.setattr(store, "connect", lambda: pytest.fail("invalid review record reached Silo"))
+    with pytest.raises(SystemExit) as caught:
+        store.main(["put-review-record", "--file", str(source)])
+    assert caught.value.code == store.EXIT_ERROR
+    assert source.read_bytes() == payload
+
+
+def test_put_review_record_refuses_identical_existing_key(tmp_path, monkeypatch, capsys):
+    record = {"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo",
+              "pr": None, "head_sha": "a" * 40, "run_id": 7, "attempt": 1}
+    payload = (json.dumps(record) + "\n").encode()
+    source = tmp_path / "record.json"
+    source.write_bytes(payload)
+    key = "archive/review-record/v1/example-org/example-repo/none/" + "a" * 40 + "/ci-7-1.json"
+    fake = FakeS3({key: payload})
+    _use(monkeypatch, fake)
+    with pytest.raises(SystemExit) as caught:
+        store.main(["put-review-record", "--file", str(source)])
+    assert caught.value.code == store.EXIT_ERROR
+    assert "refusing to overwrite" in capsys.readouterr().err
+    assert fake.objects[key] == payload and fake.puts == []
+
+
+@pytest.mark.parametrize("failure", ["put", "get", "hash"])
+def test_put_review_record_http_failure_keeps_source_bytes(tmp_path, failure):
+    record = {"schema_version": "review-record/v1", "source": "ci", "repo": "example-org/example-repo",
+              "pr": 2, "head_sha": "b" * 40, "run_id": 8, "attempt": 1}
+    source = tmp_path / "record.json"
+    source.write_bytes((json.dumps(record, separators=(",", ":")) + "\n").encode())
+    source_bytes = source.read_bytes()
+    server = _start_record_server(
+        body=b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+        status=403 if failure == "put" else 200,
+        get_status=403 if failure == "get" else None,
+        corrupt_get=failure == "hash",
+    )
+    try:
+        result = _run_store(["put-review-record", "--file", str(source)], f"http://127.0.0.1:{server.server_port}")
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode == store.EXIT_ERROR
+    assert source.read_bytes() == source_bytes
+    assert not any(item["method"] == "DELETE" for item in server.received)

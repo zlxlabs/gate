@@ -23,6 +23,8 @@ inputs:
   # GATE-INCREMENTAL-SHADOW-UNAVAILABLE line — the field is observational
   # and must never fail the row.
   shadow-path: { required: false, default: "" }
+  # Optional sidecar; omitted callers retain the historical ledger-only output.
+  record-output: { required: false, default: "" }
   codex-expected: { required: true }
   codex-waived: { required: true }
   expected-repository-id: { required: true }
@@ -36,7 +38,13 @@ runs:
   using: composite
   steps:
     - shell: bash
+      env:
+        REVIEW_RECORD_OUTPUT: ${{ inputs.record-output }}
       run: |
+        optional_record_args=()
+        if [[ -n "$REVIEW_RECORD_OUTPUT" ]]; then
+          optional_record_args=(--record-output "$REVIEW_RECORD_OUTPUT")
+        fi
         python3 "$GITHUB_ACTION_PATH/build_ledger.py" \
           --audit-path "${{ inputs.audit-path }}" \
           --preflight-path "${{ inputs.preflight-path }}" \
@@ -55,4 +63,5 @@ runs:
           --expected-reusable-workflow-sha "${{ inputs.expected-reusable-workflow-sha }}" \
           --codex-expected "${{ inputs.codex-expected }}" \
           --codex-waived "${{ inputs.codex-waived }}" \
-          --input-short-circuited "${{ inputs.input-short-circuited }}"
+          --input-short-circuited "${{ inputs.input-short-circuited }}" \
+          "${optional_record_args[@]}"

@@ -74,7 +74,7 @@ def _compact_attempts(audit: dict[str, Any] | None) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        compact.append({
+        compact_attempt = {
             "reviewer": item.get("reviewer"),
             "exit_code": item.get("exit_code"),
             "reason": item.get("reason") or "",
@@ -82,7 +82,10 @@ def _compact_attempts(audit: dict[str, Any] | None) -> list[dict[str, Any]]:
             "cost_usd": item.get("cost_usd"),
             # Optional short redacted adapter diagnostic (e.g. "api_error_status=529 …访问量过大").
             "diag_snippet": item.get("diag_snippet"),
-        })
+        }
+        if "review_stage" in item:
+            compact_attempt["review_stage"] = item["review_stage"]
+        compact.append(compact_attempt)
     return compact
 
 
@@ -904,6 +907,53 @@ def build_live_review_record(
 def write_ledger(path: Path, entry: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def primary_record_consistency_warning(
+    record_path: Path, *, primary_result: str, run_id: int, attempt: int, head_sha: str,
+) -> str | None:
+    """Read the written compact record bytes and report a same-run primary mismatch."""
+    try:
+        record = json.loads(record_path.read_bytes())
+    except (OSError, ValueError):
+        return "primary review consistency could not read the compact record"
+    if not isinstance(record, dict):
+        return "primary review consistency compact record is not an object"
+    expected = (("run_id", run_id), ("attempt", attempt), ("head_sha", head_sha))
+    if any(type(record.get(key)) is not type(value) or record.get(key) != value for key, value in expected):
+        return "primary review consistency identity does not match the compact record"
+    verdict = record.get("verdict")
+    skip = record.get("skip")
+    if primary_result not in {"success", "failure", "skipped", "cancelled"}:
+        return "primary review consistency could not compare: unknown primary result"
+    if verdict is not None and (not isinstance(verdict, str) or verdict not in PRIMARY_VERDICTS):
+        return "primary review consistency could not compare: invalid compact verdict"
+    if not isinstance(skip, dict) or set(skip) != {"reason"}:
+        return "primary review consistency could not compare: invalid compact skip state"
+    skip_reason = skip["reason"]
+    if skip_reason is not None and (
+        not isinstance(skip_reason, str)
+        or skip_reason not in {"draft", "fork", "hosted_runner", "review_exempt"}
+    ):
+        return "primary review consistency could not compare: unknown compact skip reason"
+    explicit_skip = skip_reason is not None
+    if verdict in {"not_expected", "waived"}:
+        return "primary review consistency could not compare: non-review verdict"
+    if verdict is None:
+        if primary_result in {"skipped", "cancelled"} and explicit_skip:
+            return None
+        if not explicit_skip:
+            return "primary review consistency could not compare: null verdict without an explicit skip"
+    mismatches = explicit_skip or primary_result in {"skipped", "cancelled"} or (
+        (primary_result == "success" and verdict in {"fail", "unavailable"})
+        or (primary_result == "failure" and verdict == "pass")
+    )
+    if mismatches:
+        return (
+            f"primary review consistency mismatch: run_id={run_id} attempt={attempt} "
+            f"head_sha={head_sha} primary={primary_result} record_verdict={verdict}"
+        )
+    return None
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
