@@ -1,0 +1,1 @@
+{"result":{"verdict":"pass","summary":"The previous claim was rechecked and refuted.","reviewed_files":["app.py"],"findings":[],"withdrawals":[{"finding_id":"reliability_alternates_survive_hard_kill","reason":"The current review confirmed each job uses a disposable container, so this state cannot survive the job."}],"finding_dispositions":[],"final_finding_dispositions":[]}}

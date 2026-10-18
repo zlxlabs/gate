@@ -705,6 +705,57 @@ def apply_finding_relation(outcome: Outcome, findings: list[Any], previous_round
         outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
 
 
+def _consume_explicit_withdrawals(
+    relation: dict[str, Any], previous_round: dict[str, Any], withdrawals: Any,
+) -> dict[str, Any]:
+    """Close prior open findings only for valid, reasoned audit withdrawals."""
+    if withdrawals is None or withdrawals == []:
+        return relation
+    if not isinstance(withdrawals, list):
+        print("GATE-WITHDRAWAL-IGNORED: invalid explicit withdrawal record")
+        return relation
+    valid_ids: set[str] = set()
+    for item in withdrawals:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"finding_id", "reason"}
+            or not isinstance(item.get("finding_id"), str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", item["finding_id"])
+            or not isinstance(item.get("reason"), str)
+            or not item["reason"].strip()
+        ):
+            print("GATE-WITHDRAWAL-IGNORED: invalid explicit withdrawal record")
+            return relation
+        valid_ids.add(item["finding_id"])
+    if previous_round.get("available") is not True:
+        return relation
+    previous_findings = previous_round.get("findings")
+    if not isinstance(previous_findings, list):
+        return relation
+    prior_ids = {
+        item["id"] for item in previous_findings
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    reported_prior_ids = {
+        pointer
+        for item in relation.get("items", [])
+        if isinstance(item, dict)
+        for pointer in (item.get("id"), item.get("previous_finding_id"))
+        if isinstance(pointer, str)
+    }
+    closable_ids = (valid_ids & prior_ids) - reported_prior_ids
+    open_findings = relation.get("open_findings")
+    if not closable_ids or not isinstance(open_findings, list):
+        return relation
+    return {
+        **relation,
+        "open_findings": [
+            item for item in open_findings
+            if not isinstance(item, dict) or item.get("id") not in closable_ids
+        ],
+    }
+
+
 def _close_consumed_false_positive_carry(
     relation: dict[str, Any], findings: list[Any], disposition_audit: Any,
 ) -> dict[str, Any]:
@@ -925,6 +976,10 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
         apply_finding_relation(annotation, findings, previous)
         relation = annotation.finding_relation
         assert relation is not None
+        relation = _consume_explicit_withdrawals(
+            relation, previous,
+            result.get("withdrawals") if isinstance(result, dict) else None,
+        )
         relation["history_status"] = "available" if previous["available"] else "unknown"
         audit["finding_relation"] = relation
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
