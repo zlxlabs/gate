@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -133,6 +134,117 @@ def projected_anchor_line(
         if last_old < lo:
             delta += new_count - old_count
     return old_line + delta
+
+
+def _finding_anchor_span(finding: Any) -> Optional[tuple[str, int, str]]:
+    """Return a canonical file, line, and exact quote; null lines cannot close findings."""
+    if not isinstance(finding, dict):
+        return None
+    path, line, quote = finding.get("file"), finding.get("line"), finding.get("quote")
+    if (
+        not isinstance(path, str) or not path or Path(path).is_absolute()
+        or ".." in Path(path).parts or "\\" in path or type(line) is not int or line < 1
+        or not isinstance(quote, str) or not quote
+    ):
+        return None
+    return path, line, quote
+
+
+def _bounded_git_timeout_s(maximum_s: float, deadline: Optional[float]) -> float:
+    """Keep anchor-closure Git calls within one wall-clock budget."""
+    if deadline is None:
+        return maximum_s
+    remaining_s = deadline - time.monotonic()
+    if remaining_s <= 0:
+        raise subprocess.TimeoutExpired("GATE-ANCHOR-CLOSURE deadline", maximum_s)
+    return min(maximum_s, remaining_s)
+
+
+def collect_anchor_updates(
+    *, findings: Sequence[Any], repository: str, previous_head_sha: str,
+    current_head_sha: str, token: str,
+) -> Optional[dict[str, Optional[int]]]:
+    """Map exact old-source anchors to current lines; deleted lines map to None.
+
+    Missing or unavailable Git evidence returns no update, so stale coordinates
+    are never represented as verified coordinates for the new head.
+    """
+    candidates = [
+        (finding["id"], span)
+        for finding in findings if isinstance(finding, dict)
+        if isinstance(finding.get("id"), str) and finding["id"]
+        if (span := _finding_anchor_span(finding)) is not None
+    ]
+    if not candidates:
+        return {}
+    valid_round_heads = (
+        re.fullmatch(r"[0-9a-f]{40}", previous_head_sha)
+        and re.fullmatch(r"[0-9a-f]{40}", current_head_sha)
+        and previous_head_sha != current_head_sha
+    )
+    if not valid_round_heads:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=round_heads_invalid_or_unchanged")
+        return None
+    if not repository or not token:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=repository_or_token_missing")
+        return None
+    collector = _Collector(
+        repository=repository, repository_id=0, pr_number=0,
+        current_head_sha=current_head_sha, terminal_history_rows=(), token=token)
+    deadline = time.monotonic() + _GIT_SETUP_TIMEOUT_S
+    try:
+        reason = collector._init_caller_repo(deadline=deadline)
+        if reason:
+            print(f"GATE-ANCHOR-CLOSURE-UNAVAILABLE reason={reason}")
+            return None
+        caller_dir = collector._caller_dir
+        assert caller_dir is not None
+        for sha in (previous_head_sha, current_head_sha):
+            reason = collector._fetch_commit_into(caller_dir, sha, deadline=deadline)
+            if reason:
+                print(f"GATE-ANCHOR-CLOSURE-UNAVAILABLE reason={reason}")
+                return None
+        updates: dict[str, Optional[int]] = {}
+        for path in {anchor[0] for _finding_id, anchor in candidates}:
+            diff = _run_git(
+                ["git", "-C", str(caller_dir), "diff", "--unified=0",
+                 previous_head_sha, current_head_sha, "--", path],
+                timeout_s=_bounded_git_timeout_s(_GIT_DIFF_TIMEOUT_S, deadline),
+            )
+            if diff.returncode != 0:
+                print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=git_diff_failed")
+                return None
+            hunks = parse_unified_zero_hunks(diff.stdout.decode("utf-8", errors="replace"))
+            path_candidates = [
+                (finding_id, anchor) for finding_id, anchor in candidates if anchor[0] == path
+            ]
+            old_file = _run_git(
+                ["git", "-C", str(caller_dir), "show", f"{previous_head_sha}:{path}"],
+                timeout_s=_bounded_git_timeout_s(_GIT_DIFF_TIMEOUT_S, deadline))
+            if old_file.returncode != 0:
+                continue
+            try:
+                old_lines = old_file.stdout.decode("utf-8").splitlines()
+            except UnicodeDecodeError:
+                continue
+            for finding_id, (_candidate_path, line, quote) in path_candidates:
+                if line > len(old_lines) or old_lines[line - 1] != quote:
+                    continue
+                replaced = any(
+                    count > 0 and old_start <= line <= old_start + count - 1
+                    for old_start, count, _new_start, _new_count in hunks
+                )
+                updates[finding_id] = None if replaced else projected_anchor_line(hunks, line, 0)
+        return updates
+    except subprocess.TimeoutExpired:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=git_diff_timeout")
+        return None
+    except OSError:
+        print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=git_diff_failed")
+        return None
+    finally:
+        if collector._caller_dir is not None:
+            shutil.rmtree(collector._caller_dir, ignore_errors=True)
 
 
 def _finding_key_sha(finding_key: str) -> str:
@@ -442,7 +554,7 @@ class _Collector:
             receipt_scope=receipt_scope,
         )
 
-    def _init_caller_repo(self) -> Optional[str]:
+    def _init_caller_repo(self, *, deadline: Optional[float] = None) -> Optional[str]:
         """Set up the throwaway caller repo; ``None`` = ready to fetch, else
         the fail enum for this receipt's UNAVAILABLE line."""
         repo_dir: Optional[Path] = None
@@ -457,24 +569,33 @@ class _Collector:
                  f"AUTHORIZATION: basic {auth}"],
             ]
             for argv in setup:
-                proc = _run_git(argv, cwd=repo_dir, timeout_s=_GIT_SETUP_TIMEOUT_S)
+                proc = _run_git(
+                    argv, cwd=repo_dir,
+                    timeout_s=_bounded_git_timeout_s(_GIT_SETUP_TIMEOUT_S, deadline),
+                )
                 if proc.returncode != 0:
                     shutil.rmtree(repo_dir, ignore_errors=True)
                     return "git_fetch_failed"
             self._caller_dir = repo_dir
             return None
+        except subprocess.TimeoutExpired:
+            if repo_dir is not None:
+                shutil.rmtree(repo_dir, ignore_errors=True)
+            return "git_fetch_timeout" if deadline is not None else "git_fetch_failed"
         except (OSError, subprocess.SubprocessError):
             if repo_dir is not None:
                 shutil.rmtree(repo_dir, ignore_errors=True)
             return "git_fetch_failed"
 
-    def _fetch_commit_into(self, repo_dir: Path, sha: str) -> Optional[str]:
+    def _fetch_commit_into(
+        self, repo_dir: Path, sha: str, *, deadline: Optional[float] = None,
+    ) -> Optional[str]:
         """Shallow-fetch one commit; ``None`` = fetched, else a fail enum
         (timeout → git_fetch_timeout, including this step's cat-file check)."""
         try:
             proc = _run_git(
                 ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", sha],
-                timeout_s=GIT_FETCH_TIMEOUT_S,
+                timeout_s=_bounded_git_timeout_s(GIT_FETCH_TIMEOUT_S, deadline),
             )
         except subprocess.TimeoutExpired:
             return "git_fetch_timeout"
@@ -485,7 +606,7 @@ class _Collector:
         try:
             check = _run_git(
                 ["git", "-C", str(repo_dir), "cat-file", "-e", f"{sha}^{{commit}}"],
-                timeout_s=_GIT_SETUP_TIMEOUT_S,
+                timeout_s=_bounded_git_timeout_s(_GIT_SETUP_TIMEOUT_S, deadline),
             )
         except subprocess.TimeoutExpired:
             return "git_fetch_timeout"
