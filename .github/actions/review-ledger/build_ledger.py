@@ -921,12 +921,29 @@ def primary_record_consistency_warning(
         return "primary review consistency identity does not match the compact record"
     verdict = record.get("verdict")
     skip = record.get("skip")
-    if primary_result in {"skipped", "cancelled"} or verdict is None or (
-        isinstance(skip, dict) and skip.get("reason") is not None
+    if primary_result not in {"success", "failure", "skipped", "cancelled"}:
+        return "primary review consistency could not compare: unknown primary result"
+    if verdict is not None and (not isinstance(verdict, str) or verdict not in PRIMARY_VERDICTS):
+        return "primary review consistency could not compare: invalid compact verdict"
+    if not isinstance(skip, dict) or set(skip) != {"reason"}:
+        return "primary review consistency could not compare: invalid compact skip state"
+    skip_reason = skip["reason"]
+    if skip_reason is not None and (
+        not isinstance(skip_reason, str)
+        or skip_reason not in {"draft", "fork", "hosted_runner", "review_exempt"}
     ):
-        return None
-    mismatches = (primary_result == "success" and verdict in {"fail", "unavailable"}) or (
-        primary_result == "failure" and verdict == "pass"
+        return "primary review consistency could not compare: unknown compact skip reason"
+    explicit_skip = skip_reason is not None
+    if verdict in {"not_expected", "waived"}:
+        return "primary review consistency could not compare: non-review verdict"
+    if verdict is None:
+        if primary_result in {"skipped", "cancelled"} and explicit_skip:
+            return None
+        if not explicit_skip:
+            return "primary review consistency could not compare: null verdict without an explicit skip"
+    mismatches = explicit_skip or primary_result in {"skipped", "cancelled"} or (
+        (primary_result == "success" and verdict in {"fail", "unavailable"})
+        or (primary_result == "failure" and verdict == "pass")
     )
     if mismatches:
         return (

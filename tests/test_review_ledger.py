@@ -538,6 +538,34 @@ def test_primary_consistency_warns_on_written_identity_mismatch_and_ignores_skip
     ) is None
 
 
+@pytest.mark.parametrize(("primary", "skip_reason", "verdict", "corrupt", "warning"), [
+    ("skipped", "draft", None, None, None), ("cancelled", "fork", None, None, None),
+    ("skipped", None, "pass", None, "mismatch"), ("success", "draft", None, None, "mismatch"),
+    ("skipped", None, None, None, "could not compare"), ("unknown", None, "pass", None, "could not compare"),
+    ("success", None, "pass", ["invalid"], "could not compare"),
+])
+def test_primary_consistency_classifies_produced_record_boundaries(
+    tmp_path, primary, skip_reason, verdict, corrupt, warning,
+):
+    audit = None if verdict is None else _live_record_audit()
+    if audit is not None:
+        audit["verdict"] = verdict
+        audit["result"] = None if verdict == "unavailable" else {
+            "verdict": verdict, "summary": "result", "findings": [] if verdict == "pass" else audit["result"]["findings"],
+        }
+    terminal = _live_record_terminal(skip_reason=skip_reason) if skip_reason else None
+    completed, _ledger, record_path = _run_live_record_cli(tmp_path, audit=audit, terminal=terminal)
+    assert completed.returncode == 0, completed.stderr
+    if corrupt:
+        record = json.loads(record_path.read_bytes())
+        record["verdict"] = corrupt
+        record_path.write_bytes(json.dumps(record).encode())
+    message = _module().primary_record_consistency_warning(
+        record_path, primary_result=primary, run_id=999, attempt=1, head_sha="a" * 40,
+    )
+    assert (message is None) if warning is None else (message is not None and warning in message)
+
+
 @pytest.mark.parametrize("legacy_null_findings", [False, True])
 def test_live_record_cli_writes_contract_fixture_and_keeps_legacy_row(tmp_path, legacy_null_findings):
     audit = _live_record_audit() if not legacy_null_findings else {
