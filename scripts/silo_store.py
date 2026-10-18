@@ -67,6 +67,7 @@ def _archive_single_file_name_pattern(repo_id: str) -> tuple[tuple[str, str], ..
 
 def _archive_directory_name_patterns(repo_id: str) -> tuple[str, ...]:
     return (
+        rf"primary-review-raw-evidence-v1-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
         rf"primary-review-diagnostics-v2-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
         r"advisory-event-(?!__none__-)[A-Za-z0-9_.-]+-[0-9]+-[0-9]+",
         rf"gate-convergence-receipt-v1-{re.escape(repo_id)}-[0-9a-f]{{40}}-[0-9]+-[0-9]+",
@@ -74,7 +75,7 @@ def _archive_directory_name_patterns(repo_id: str) -> tuple[str, ...]:
 
 
 def is_archive_directory_name(repo_id: str, artifact_name: str) -> bool:
-    """Return whether a Silo archive name is one of the three d3 directories."""
+    """Return whether a Silo archive name is one of the four per-run directories."""
 
     return any(
         re.fullmatch(pattern, artifact_name)
@@ -114,7 +115,7 @@ def build_key(tier: str, repo_id: str, artifact_name: str, relative_path: str) -
         allowed_directory = is_archive_directory_name(repo_id, artifact_name)
         if not (allowed_single or allowed_directory):
             fail(
-                "archive tier only accepts per-run review ledger, audit, terminal, diagnostics, advisory, convergence, or status-panel artifacts"
+                "archive tier only accepts per-run review ledger, audit, terminal, diagnostics, raw-evidence, advisory, convergence, or status-panel artifacts"
             )
     return f"{tier}/{repo_id}/{artifact_name}/{rel}"
 
@@ -764,7 +765,7 @@ def cmd_put(args: argparse.Namespace) -> int:
 
 def cmd_put_dir(args: argparse.Namespace) -> int:
     if args.tier == ARCHIVE_TIER and not is_archive_directory_name(args.repo_id, args.name):
-        fail("archive tier put-dir only accepts per-run primary diagnostics, advisory, or convergence directories")
+        fail("archive tier put-dir only accepts per-run primary diagnostics, raw evidence, advisory, or convergence directories")
     directory = Path(args.dir)
     files = list(iter_dir_files(directory))
     if not files:

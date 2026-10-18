@@ -1058,6 +1058,44 @@ jobs:
             fi
           fi
 
+      - name: Prepare unique primary raw evidence directory
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          evidence_root=${REVIEW_EVIDENCE_ROOT:-}
+          if [ -z "$evidence_root" ] || [ ! -d "$evidence_root" ] || [ ! -w "$evidence_root" ] || [ ! -x "$evidence_root" ]; then
+            echo "::error::Primary raw evidence root is missing or not writable" >&2
+            exit 1
+          fi
+          artifact_name="primary-review-raw-evidence-v1-${REPOSITORY_ID}-${HEAD_SHA}-${RUN_ID}-${RUN_ATTEMPT}"
+          raw_evidence_dir="$evidence_root/$artifact_name"
+          if ! mkdir -m 700 "$raw_evidence_dir" 2>/dev/null; then
+            echo "::error::Primary raw evidence directory already exists; refusing to reuse: $raw_evidence_dir" >&2
+            exit 1
+          fi
+          python3 - "$raw_evidence_dir" "$REPOSITORY_ID" "$HEAD_SHA" "$RUN_ID" "$RUN_ATTEMPT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          metadata = {
+              "schema_version": 1,
+              "repository_id": sys.argv[2],
+              "head_sha": sys.argv[3],
+              "run_id": sys.argv[4],
+              "run_attempt": sys.argv[5],
+          }
+          with (root / "invocation.json").open("x", encoding="utf-8") as stream:
+              json.dump(metadata, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+          PY
+          printf 'REVIEW_EVIDENCE_ROOT=%s\nPRIMARY_RAW_EVIDENCE_DIR=%s\n' "$raw_evidence_dir" "$raw_evidence_dir" >> "$GITHUB_ENV"
+
       - name: Run review-primary
         env:
           GATE_TIER: ${{ inputs.tier }}
@@ -1210,6 +1248,7 @@ jobs:
           GATE_CHECKOUT_SPARSE: |
             scripts/silo_store.py
             scripts/silo_exec.sh
+            scripts/scrub_outbound.py
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -1289,6 +1328,44 @@ jobs:
             echo "::warning::Permanent archive of primary review diagnostics failed"
             exit 1
           fi
+
+      - name: Archive raw primary review evidence permanently
+        if: always()
+        env:
+          ARTIFACT_NAME: primary-review-raw-evidence-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          evidence_dir=${PRIMARY_RAW_EVIDENCE_DIR:-}
+          if [ -z "$evidence_dir" ] || [ ! -d "$evidence_dir" ]; then
+            echo "::error::Primary raw evidence upload failed: isolated source directory is missing" >&2
+            exit 1
+          fi
+          python3 - "$evidence_dir" <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          evidence_dir = Path(sys.argv[1])
+          evidence_files = [path for path in evidence_dir.rglob("*") if path.is_file()]
+          scrub_path = Path("_gate-silo-src/scripts/scrub_outbound.py")
+          spec = importlib.util.spec_from_file_location("gate_scrub_outbound", scrub_path)
+          if spec is None or spec.loader is None:
+              print("Primary raw evidence upload failed: outbound scrubber is unavailable", file=sys.stderr)
+              raise SystemExit(1)
+          scrubber = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(scrubber)
+          for path in evidence_files:
+              text = path.read_bytes().decode("utf-8", errors="replace")
+              _, categories = scrubber.scrub_outbound_text(text)
+              if "TOKEN" in categories:
+                  print("Primary raw evidence TOKEN scan failed: known TOKEN category found; Silo upload blocked", file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+          "$SILO_EXEC" put-dir \
+            --tier archive \
+            --repo-id "${{ github.repository_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$evidence_dir"
 
       - name: Diagnose silo network after job failure
         if: failure()
