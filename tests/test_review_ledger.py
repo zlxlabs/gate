@@ -495,6 +495,77 @@ def _run_live_record_cli(tmp_path, *, audit=None, terminal=None, run_attempt=1, 
     return completed, ledger_path, record_path
 
 
+@pytest.mark.parametrize(("verdict", "primary", "warning"), [
+    ("pass", "success", False), ("fail", "failure", False), ("unavailable", "failure", False),
+    ("fail", "success", True), ("unavailable", "success", True), ("pass", "failure", True),
+])
+def test_primary_consistency_reads_produced_compact_record(tmp_path, verdict, primary, warning):
+    audit = _live_record_audit()
+    audit["verdict"] = verdict
+    audit["result"] = None if verdict == "unavailable" else {
+        "verdict": verdict, "summary": "result", "findings": [] if verdict == "pass" else audit["result"]["findings"],
+    }
+    completed, _ledger, record_path = _run_live_record_cli(tmp_path, audit=audit)
+    assert completed.returncode == 0, completed.stderr
+    message = _module().primary_record_consistency_warning(
+        record_path, primary_result=primary, run_id=999, attempt=1, head_sha="a" * 40,
+    )
+    assert (message is not None) is warning
+    assert message is None or "mismatch" in message
+
+
+@pytest.mark.parametrize(("field", "wrong"), [("run_id", 1000), ("attempt", 2), ("head_sha", "f" * 40)])
+def test_primary_consistency_warns_on_written_identity_mismatch_and_ignores_skip(tmp_path, field, wrong):
+    completed, _ledger, record_path = _run_live_record_cli(
+        tmp_path / "identity", audit=_live_record_audit(),
+    )
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(record_path.read_bytes())
+    record[field] = wrong
+    record_path.write_bytes(json.dumps(record).encode())
+    warning = _module().primary_record_consistency_warning(
+        record_path, primary_result="success", run_id=999, attempt=1, head_sha="a" * 40,
+    )
+    assert warning and "identity" in warning
+    skipped, _ledger, skipped_path = _run_live_record_cli(
+        tmp_path / "skip", terminal=_live_record_terminal(skip_reason="draft"),
+    )
+    assert skipped.returncode == 0, skipped.stderr
+    compact = json.loads(skipped_path.read_bytes())
+    assert compact["verdict"] is None and compact["skip"]["reason"] == "draft"
+    assert _module().primary_record_consistency_warning(
+        skipped_path, primary_result="skipped", run_id=999, attempt=1, head_sha="a" * 40,
+    ) is None
+
+
+@pytest.mark.parametrize(("primary", "skip_reason", "verdict", "corrupt", "warning"), [
+    ("skipped", "draft", None, None, None), ("cancelled", "fork", None, None, None),
+    ("skipped", None, "pass", None, "mismatch"), ("success", "draft", None, None, "mismatch"),
+    ("skipped", None, None, None, "could not compare"), ("unknown", None, "pass", None, "could not compare"),
+    ("success", None, "pass", ["invalid"], "could not compare"),
+])
+def test_primary_consistency_classifies_produced_record_boundaries(
+    tmp_path, primary, skip_reason, verdict, corrupt, warning,
+):
+    audit = None if verdict is None else _live_record_audit()
+    if audit is not None:
+        audit["verdict"] = verdict
+        audit["result"] = None if verdict == "unavailable" else {
+            "verdict": verdict, "summary": "result", "findings": [] if verdict == "pass" else audit["result"]["findings"],
+        }
+    terminal = _live_record_terminal(skip_reason=skip_reason) if skip_reason else None
+    completed, _ledger, record_path = _run_live_record_cli(tmp_path, audit=audit, terminal=terminal)
+    assert completed.returncode == 0, completed.stderr
+    if corrupt:
+        record = json.loads(record_path.read_bytes())
+        record["verdict"] = corrupt
+        record_path.write_bytes(json.dumps(record).encode())
+    message = _module().primary_record_consistency_warning(
+        record_path, primary_result=primary, run_id=999, attempt=1, head_sha="a" * 40,
+    )
+    assert (message is None) if warning is None else (message is not None and warning in message)
+
+
 def test_live_record_cli_preserves_primary_and_security_review_stages(tmp_path):
     fixture_path = ROOT / "tests/data/primary_security_stage_producer_audit.json"
     audit_bytes = fixture_path.read_bytes()

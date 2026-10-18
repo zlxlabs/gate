@@ -2720,6 +2720,30 @@ jobs:
           expected-reusable-workflow-sha: ${{ job.workflow_sha }}
           input-short-circuited: ${{ steps.resolve-ledger-artifacts.outputs.input_short_circuited }}
 
+      - name: Warn when primary result disagrees with compact review record
+        if: always() && steps.build-review-ledger.outcome == 'success'
+        continue-on-error: true
+        env:
+          RECORD_PATH: ${{ runner.temp }}/review-ledger/review-record-v1.json
+          PRIMARY_RESULT: ${{ needs.primary.result }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PYTHONPATH="$GITHUB_WORKSPACE/_gate-aggregator-src/.github/actions/review-ledger" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from build_ledger import primary_record_consistency_warning
+
+          warning = primary_record_consistency_warning(
+              Path(os.environ["RECORD_PATH"]), primary_result=os.environ["PRIMARY_RESULT"],
+              run_id=int(os.environ["RUN_ID"]), attempt=int(os.environ["RUN_ATTEMPT"]),
+              head_sha=os.environ["HEAD_SHA"],
+          )
+          if warning:
+              print(f"::warning::{warning}")
+          PY
+
       - name: Upload v2 review effectiveness ledger
         env:
           ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
