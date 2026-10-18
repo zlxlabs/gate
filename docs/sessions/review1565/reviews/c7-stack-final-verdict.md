@@ -16,7 +16,7 @@ The range covers the carry/readback step and the three later closure paths. Line
 
 ### #342 — carry open findings
 
-The gate workflow passes previous review context through `gate-v2.yml:1008-1058`; gate-hub's `scripts/review/review-primary:1380-1398` constructs `prior_review_context`. In `aggregate.py:960-1025`, the audit's `open_findings` is written from the relation; `aggregate.py:4111-4127` builds `outcome.finding_relation`, which reaches the terminal at `gate-v2.yml:1257-1258`, then the ledger and next-round loader.
+The gate workflow passes previous review context through `gate-v2.yml:1008-1058`; gate-hub's `scripts/review/review-primary:1380-1398` constructs `prior_review_context`. In `aggregate.py:960-1025`, the audit's `open_findings` is written from the relation; `aggregate.py:4111-4127` builds `outcome.finding_relation`, which reaches the terminal at `aggregate.py:1257-1258`, then the ledger and next-round loader.
 
 Existing regression evidence is `test_silent_round_carries_open_finding_through_ledger_jsonl` (`tests/test_gate_aggregator.py:5522`): audit relation at `5648-5650`, terminal at `5678-5686`, and ledger/loader at `5723-5753`. Its silent-carry case at `5495-5496` expects `pass`. This locks preservation and visibility of carried facts; it does not require every open finding to block the gate. The explicit contract says carry/readback only (`docs/design/cross-round-finding-relation.md:3,9`; PR #342 body). Actual same-location opposing evidence is handled as conflict at `aggregate.py:4128-4132`, covered by `test_opposite_same_location_requirement_is_conflict_and_not_pass` (`tests/test_gate_aggregator.py:5172-5200`).
 
@@ -30,7 +30,7 @@ Existing regression evidence is `test_silent_round_carries_open_finding_through_
 
 ### #346 — removed quoted anchor
 
-A carry closes only when the current primary review provides the exact file, line, and quote matching the old blob, and that old line was deleted or replaced. Unchanged lines are projected to their current line. Missing or unavailable Git evidence preserves carry. Existing coverage includes deleted-anchor, adjacent-insertion, and multi-round projection cases.
+Source-line closure requires the old fact preserved in carry to exactly match file + line + quote on the old blob, and that source line to be deleted or replaced. Unchanged lines are projected to their current line. Missing or unavailable Git evidence preserves carry. Existing coverage includes deleted-anchor, adjacent-insertion, and multi-round projection cases.
 
 ## Considered, not substantiated
 
