@@ -45,8 +45,9 @@ chmod +x scripts/gate-quality
 ```
 
 gate checkout 后从仓库根目录以独立进程执行 `./scripts/gate-quality` 一次，并传入
-临时目录环境变量 `GATE_ARTIFACT_DIR`。入口进程的退出码原样决定 quality 结果：非零
-即失败，gate 不重试、不替换命令，也不接收任意测试命令输入。
+临时目录环境变量 `GATE_ARTIFACT_DIR`。入口把 junit XML 写到
+`$GATE_ARTIFACT_DIR/junit/*.xml` 即被上传保留 90 天。入口进程的退出码原样决定
+quality 结果：非零即失败，gate 不重试、不替换命令，也不接收任意测试命令输入。
 
 迁移期间，入口缺失会输出醒目的弃用告警并继续 legacy 自动探测；入口路径存在但不可
 执行会立即失败且不会回退。入口可执行后，legacy 的 install/lint/duplicate/test 猜测
