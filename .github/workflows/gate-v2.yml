@@ -662,6 +662,27 @@ jobs:
           GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
         run: ./scripts/gate-quality
 
+      # Caller entries write junit XML under $GATE_ARTIFACT_DIR/junit/.
+      # Upload is bookkeeping: missing directory is the unadopted-caller
+      # shape (ignore), and a failed upload must not redden quality.
+      - name: Upload gate-quality junit
+        id: upload-quality-junit
+        if: ${{ always() && steps.quality-entry.outputs.mode == 'entry' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-quality-junit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gate-quality/junit/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Warn on junit upload failure
+        if: ${{ steps.upload-quality-junit.outcome == 'failure' }}
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: echo "::warning::JUNIT-UPLOAD-FAILED run=$RUN_ID attempt=$RUN_ATTEMPT"
+
       - name: Lint / format
         id: lint-format
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}

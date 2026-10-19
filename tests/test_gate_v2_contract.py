@@ -127,6 +127,7 @@ UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886
 EXPECTED_ACTION_REFS = {
     "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
     "actions/cache": "0057852bfaa89a56745cba8c7296529d2fc39830",
+    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
 }
 # fromJSON('["self-hosted","linux","ci"]') — capture each array literal in runs-on.
 _FROMJSON_LABELS_RE = re.compile(r"fromJSON\('(\[[^\]]*\])'\)")
@@ -686,9 +687,25 @@ def test_production_v2_official_actions_are_exactly_sha_pinned():
 
 def test_gate_v2_has_no_github_artifact_actions():
     text = WORKFLOW.read_text(encoding="utf-8")
-    assert "upload-artifact" not in text
     assert "download-artifact" not in text
     raw, _ = _load_workflow()
+    uploads = [
+        (job_name, step)
+        for job_name, job in raw["jobs"].items()
+        for step in job.get("steps", [])
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert uploads == [
+        (
+            "quality",
+            next(
+                step
+                for step in raw["jobs"]["quality"]["steps"]
+                if step.get("id") == "upload-quality-junit"
+            ),
+        )
+    ], "GitHub artifact upload is only the quality-job junit retention path"
+    assert uploads[0][1]["with"]["path"] == "${{ runner.temp }}/gate-quality/junit/"
     assert raw.get("env", {}).get("SILO_ENDPOINT") == "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000"
     assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
     hold = REPO_ROOT / ".github" / "v2-tag-sync.hold"
