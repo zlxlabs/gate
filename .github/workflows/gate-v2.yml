@@ -2576,10 +2576,12 @@ jobs:
       # gate-silo-region: bookkeeping
       - name: Resolve v2 ledger artifacts
         # Terminal/input resolution for the ledger row; audit no longer resolves
-        # here (it arrives via the primary job output). Failures skip the row
-        # build while this job's `continue-on-error: true` keeps the conclusion green.
+        # here (it arrives via the primary job output). A failed step remains
+        # visible in its outcome, while step-level `continue-on-error: true`
+        # keeps this job's check green and existing conditions skip unavailable inputs.
         id: resolve-ledger-artifacts
         if: always()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -2933,11 +2935,12 @@ jobs:
         # missing/corrupt output — same contract the required Silo resolve
         # enforced before the channel split (a reviewed run must leave its
         # audit ledgered); for skipped/cancelled primaries the output is
-        # legitimately absent and the row's audit fields become null. No
-        # step-level continue-on-error: this job's own `continue-on-error:
-        # true` keeps the conclusion green while skipping the row build, exactly
-        # like the pre-split resolver failure path.
+        # legitimately absent and the row's audit fields become null. This is
+        # bookkeeping, not the primary verdict reader: step-level
+        # `continue-on-error: true` preserves the failure outcome without making
+        # the ledger job's check run fail.
         if: always()
+        continue-on-error: true
         env:
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
@@ -2967,10 +2970,11 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Download gate terminal envelope for ledger
-        # Ledger-side input copy of the terminal envelope; this job's own
-        # `continue-on-error: true` keeps its conclusion green on failure (row
-        # build is then skipped, matching the pre-split failure path).
+        # Ledger-side input copy of the terminal envelope; step-level
+        # `continue-on-error: true` keeps this bookkeeping check green on Silo
+        # failure, while the existing input condition controls whether it runs.
         if: always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''
+        continue-on-error: true
         env:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
           DEST: ${{ runner.temp }}/gate-terminal
@@ -3069,9 +3073,10 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Upload v2 review effectiveness ledger
-        # The ledger row itself is bookkeeping (this whole job is); its job-level
-        # `continue-on-error: true` already shields the conclusion. The deferred
-        # line feeds G3's replay queue.
+        # The ledger row itself is bookkeeping; step-level
+        # `continue-on-error: true` keeps this check green while preserving its
+        # failure outcome. The deferred line feeds G3's replay queue.
+        continue-on-error: true
         env:
           ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
@@ -3096,6 +3101,7 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Upload v2 review effectiveness ledger latest pointer
+        continue-on-error: true
         env:
           ARTIFACT_NAME: codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}
           LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl

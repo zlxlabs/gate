@@ -2176,15 +2176,14 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
     assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
     assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
-    assert "continue-on-error" not in terminal_download
+    assert terminal_download["continue-on-error"] is True
     # audit channel (design A.3): the ledger reads needs.primary.outputs instead
     # of resolving/downloading the audit from Silo.
     audit_read = next(step for step in steps if step.get("name") == "Read canonical primary audit from primary job output for ledger")
     assert audit_read["if"] == "always()"
-    # fail-loud for reviewed runs is delegated to the job-level continue-on-error
-    # (conclusion stays green; the row build is skipped), same as the pre-split
-    # required-resolve failure path.
-    assert "continue-on-error" not in audit_read
+    # Ledger-side read remains fail-loud at the step outcome; step-level
+    # continue-on-error keeps this bookkeeping job check green.
+    assert audit_read["continue-on-error"] is True
     assert audit_read["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_b64 }}"
     assert audit_read["env"]["AUDIT_BYTES_DECLARED"] == "${{ needs.primary.outputs.audit_bytes }}"
     assert audit_read["env"]["AUDIT_FILENAME"] == "primary-review-audit.json"
@@ -2224,7 +2223,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     latest = next(step for step in steps if step.get("name") == "Upload v2 review effectiveness ledger latest pointer")
     assert steps.index(latest) == upload_index + 1
     assert "uses" not in latest
-    assert "continue-on-error" not in latest
+    assert latest["continue-on-error"] is True
     assert latest["env"]["ARTIFACT_NAME"] == (
         "codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}"
     )
@@ -2235,9 +2234,8 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "$SILO_EXEC" in latest["run"]
     assert "list" not in latest["run"]
 
-    # the whole ledger job runs under continue-on-error: true — these steps rely
-    # on it instead of a step-level flag
-    assert "continue-on-error" not in upload
+    # Silo uploads keep failures at the step outcome while making the job check green.
+    assert upload["continue-on-error"] is True
     assert "GATE-ARCHIVE-DEFERRED kind=review-ledger " in upload["run"]
     assert "GATE-ARCHIVE-DEFERRED kind=review-ledger-latest " in latest["run"]
 
@@ -3040,8 +3038,8 @@ def test_ledger_resolver_has_no_audit_outputs_after_channel_split(tmp_path):
 def test_ledger_audit_read_still_fail_louds_for_reviewed_success_or_failure(tmp_path, primary_result):
     """Reviewed run + missing audit output must fail the read step (exit 1).
 
-    Same contract the required Silo resolve enforced before the channel split;
-    the job-level continue-on-error keeps the ledger conclusion green.
+    Same input contract the required Silo resolve enforced before the channel
+    split; step-level continue-on-error keeps the ledger job check green.
     """
     raw, _ = _load_workflow()
     step = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Read canonical primary audit from primary job output for ledger")
@@ -3088,21 +3086,24 @@ def test_ledger_resolver_quality_success_still_requires_input_on_cancelled_prima
 def test_ledger_persistence_never_gates_the_conclusion():
     """Inverted contract (design A/E): Silo bookkeeping failures only warn.
 
-    The audit read step stays intentionally unprotected at the step level so a
-    missing reviewed-run audit still skips the row build (job-level
-    continue-on-error keeps the conclusion green), matching the pre-split
-    required-resolve behavior.
+    Every Silo bookkeeping step is protected at the step level; audit read still
+    fails loudly in its step outcome, while the job's check stays green.
     """
     raw, _ = _load_workflow()
     ledger_steps = raw["jobs"]["ledger"]["steps"]
     for name in (
         "Download v2 review ledger inputs",
-        "Read canonical primary audit from primary job output for ledger",
-        "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
     ):
         step = next(s for s in ledger_steps if s.get("name") == name)
         assert "continue-on-error" not in step
+    for name in (
+        "Resolve v2 ledger artifacts",
+        "Read canonical primary audit from primary job output for ledger",
+        "Download gate terminal envelope for ledger",
+    ):
+        step = next(s for s in ledger_steps if s.get("name") == name)
+        assert step["continue-on-error"] is True
     job_level = raw["jobs"]["ledger"].get("continue-on-error") is True
     assert job_level
     for name in (
@@ -3110,7 +3111,7 @@ def test_ledger_persistence_never_gates_the_conclusion():
         "Upload v2 review effectiveness ledger latest pointer",
     ):
         step = next(s for s in ledger_steps if s.get("name") == name)
-        assert "continue-on-error" not in step  # job-level continue-on-error covers it
+        assert step["continue-on-error"] is True
         assert "GATE-ARCHIVE-DEFERRED" in step["run"]
     for name in (
         "Upload v2 raw review ledger to permanent archive",
