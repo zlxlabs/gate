@@ -20,3 +20,10 @@
 - 本段结论：去掉第三支的混合大小写/`+/=` 先行断言后，`# token: acceptance-abandon-failed` 与 `token: acceptance-abandon-failed` 均以 AssertionError 变红（`('# [REDACTED:TOKEN]', ['TOKEN'])` / `('[REDACTED:TOKEN]', ['TOKEN'])`）。已只还原该处 lookaround，生产文件与 HEAD 一致，26 passed。
 - 关键决策与已否决方案：无。仓外红验原文 sha256 `6be2aa771c063b5c9722380f324287e24137d276561a5c1583e5270a688d5c22`（`K16-redtest-kebab.txt`）。
 - 下一步唯一动作：scope 检查、全量测试、push 并开 PR。
+
+## 2026-10-19 · 续修：scope 绿、全量 2 红、已申请扩 scope
+
+- 当前阶段：implementing
+- 本段结论：`card_scope_check.py --range 72c6ec1..HEAD` 3 文件通过；`tests/test_scrub_outbound.py` 26 passed。全量 `2 failed, 1878 passed`：归档路径仍用 `token: synthetic-owner-token-abcdefghijklmnop123456`（全小写 kebab+数字）当 TOKEN 召回。已否决把字母+数字加回第三支。已申请 scope seq=1：`tests/test_gate_v2_raw_evidence_scrub.py`、`tests/test_gate_v2_diagnostics_upload.py`，把 fixture 改成混合大小写凭据形态。
+- 关键决策与已否决方案：合入 origin/main 后 envelope 冻住的 worktree_base 会把主干 6 文件算进越界，已 `reset --hard` 撤掉未推送的 merge（仅现场）。仓外全量原文 sha256 `135b6869cf0ecdaf20e852d2a68d10763ea2d0485667caff1f7396198ad8fbe9`。
+- 下一步唯一动作：`delegate scope-wait` seq=1 通过后改两处 fixture 并重跑失败用例。
