@@ -48,3 +48,10 @@
 - 本段结论：去掉全部 lookaround 后 kebab 两负例以 AssertionError 变红（`# [REDACTED:TOKEN]` / `[REDACTED:TOKEN]`）。只删字母+数字先行断言后，40 位小写 hex 与 synthetic-owner 以 AssertionError 变红，kebab 负例与 `password: Xy7…` 仍绿。已只还原该处，生产文件与 HEAD `72de539` 一致，28 passed。
 - 关键决策与已否决方案：无。仓外 `K16-redtest-kebab-round3.txt` sha256 `1666b7b766774d4b5784f4fd81a7fcb46eeaedb0d031e5c50f2a6f63936c7649`；`K16-redtest-letterdigit-round3.txt` sha256 `0897c5542ac32234c04e47a1fb91729287f17bc8f28dee1762393c7824fc02ed`。
 - 下一步唯一动作：scope 检查、全量测试、push 并开 PR。
+
+## 2026-10-19 · 续修：全量绿，准备开 PR
+
+- 当前阶段：implementing
+- 本段结论：`card_scope_check.py --range 72c6ec1..HEAD` 3 文件通过。全量 `1882 passed in 442.28s (0:07:22)`。两条归档测试未改文件。预算 `72c6ec1..HEAD` 为 80 insertions / 8 deletions，在 target 120 内。
+- 关键决策与已否决方案：无。仓外全量原文 sha256 `68306783d86b518e933a34023079491facba4f939ede7b31b2218194bfd83dde`。
+- 下一步唯一动作：push 分支并开 PR（ready，非 draft），合并方式 merge commit，由主脑合并。
