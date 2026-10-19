@@ -886,8 +886,18 @@ def build_live_review_record(
     reviewer_id = review.get("reviewer")
     if reviewer_id is None:
         unknown["reviewer_id"] = "live ledger has no reviewer identifier"
-    for field in ("round_index", "gate_hub_commit", "prompt_digest", "model_used", "profile"):
+    for field in ("round_index", "prompt_digest", "model_used", "profile"):
         unknown[field] = "live ledger producer has no exact value for this field"
+    registry_commit = primary.get("registry_commit")
+    if registry_commit is None:
+        gate_hub_commit = None
+        unknown["gate_hub_commit"] = "no primary audit for this run so gate_hub_commit is unavailable"
+    else:
+        if not isinstance(registry_commit, str) or not _SHA40_RE.fullmatch(registry_commit):
+            raise ValueError(
+                f"GATE-HUB-COMMIT-INVALID: primary audit registry_commit is not a 40-char lowercase hex commit: {registry_commit!r}"
+            )
+        gate_hub_commit = registry_commit
 
     if type(repository_id) is not int or repository_id <= 0:
         raise ValueError("live review record repository_id must be a positive integer")
@@ -899,7 +909,7 @@ def build_live_review_record(
         "schema_version": "review-record/v1", "source": "ci", "repo": entry["repository"],
         "pr": entry["pr_number"], "base_sha": base_sha, "merge_base_sha": merge_base_sha,
         "head_sha": entry["head_sha"], "run_id": entry["run_id"], "attempt": entry["run_attempt"],
-        "round_index": None, "gate_hub_commit": None, "prompt_digest": None,
+        "round_index": None, "gate_hub_commit": gate_hub_commit, "prompt_digest": None,
         "model_used": None, "profile": None, "reviewer_id": reviewer_id,
         "verdict": review.get("verdict"), "findings": findings,
         "finding_dispositions": finding_dispositions, "convergence": convergence_fields,
