@@ -27,3 +27,10 @@
 - **本段结论**：分支 `card/261019-g1` 推送（commit b4db3fd → b31face → d38700b → progress）。全量 `uv run --python 3.12 --with pytest,PyYAML,diff-cover,coverage python -m pytest -q` = 1865 passed；`python3 scripts/check_pinned_uses.py` 绿；Accept-Check `grep -c GATE-ARCHIVE-DEFERRED … => 1` 通过。**继承红/新红**：主干基线派发时刻不可用（gh api request failed），无法判定继承红；全量当前全绿，无新红。**门禁真实规模验证待主脑执行**（执行器无 fleet 触发权）：在任一真实消费仓（或 canary）以分支 ref 调用跑一次 PR，命令：在目标仓 PR 上以 `uses: zlxlabs/gate/.github/workflows/gate-v2.yml@card/261019-g1` 触发（或临时 workflow_dispatch 包装），验收点：① primary job 的 output 往返（含 findings quote 的真实 audit）在 gate/ledger job 内可解码且 gate 结论与审阅一致；② 用 `iptables -A OUTPUT -d 100.126.6.73 -j REJECT`（或等价方式断 Silo）重跑，gate=pass/正常结论、日志含 `GATE-ARCHIVE-DEFERRED`、ledger job conclusion=success；③ 观察步骤日志无 secret 被 mask 成 `***` 混入 audit 解码结果。
 - **关键决策与已否决方案**：无
 - **下一步唯一动作**：等主脑触发真实规模验证后合入（merge commit 方式，勿 squash——v2 标签依赖 SHA）。
+
+## 里程碑 5：门禁审查 P2 修复（守卫补识别直接调用 silo_store.py）
+
+- **当前阶段**：review-fix-done
+- **本段结论**：codex 审查（branch `card/261019-g1r`，`reviews/G1-verdict.md`）verdict pass、仅一条 P2：守卫 `_silo_touchpoint` 漏扫不经 `$SILO_EXEC` 的直接调用（`python3 "$SILO_STORE" …` / `python3 scripts/silo_store.py …`）。TDD 收口：先加两条变异测试取红（`AssertionError: undeclared direct silo_store.py invocation must turn the guard red … assert []`），再新增 `SILO_STORE_INVOKE_RE`（锚 python 调用位：`python3?\s+"?(?:\$SILO_STORE\b|[^"\s]*silo_store\.py)"?`）转绿；同时加负例测试锁死「env 赋值/sparse-checkout 列表项/注释提及不算触点」防反向过宽。真实 workflow 触点集合不变（30 个）、新规则零命中、零违规，无需补分区声明。全量 1868 passed（原 1865 + 新增 3）、`check_pinned_uses` 绿。commit dc0f846，分支 `card/261019-g1` 已推送。
+- **关键决策与已否决方案**：识别规则选「python 调用位锚定」而非裸匹配 `silo_store.py` 字面量——workflow 里 env 定义（`SILO_STORE: …/silo_store.py`）、sparse-checkout 列表项、注释提及都含该字面量，裸匹配会把 4 个 job 的 job 级 env 误卷进触点（其中 job 级 env 行文本落在前一个 job 末步的切块内，会造成跨 job 误报）。已否决：把 `"$SILO_STORE"` 任意出现都算触点（同上误伤路径，且无增益）。
+- **下一步唯一动作**：无新增待办——门禁真实规模验证仍按里程碑 4 的三点验收等主脑执行，随后 merge commit 合入。
