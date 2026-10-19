@@ -438,7 +438,7 @@ def _live_record_audit() -> dict:
         "repository_id": 123, "repository": "zlxlabs/gate", "pr": 42,
         "base_sha": "b" * 40, "head_sha": "a" * 40, "diff_digest": "d" * 64,
         "policy_version": "policy-v1", "policy_digest": "e" * 64,
-        "registry_commit": "r" * 40, "caller_sha": "c" * 40,
+        "registry_commit": "0123456789abcdef0123456789abcdef01234567", "caller_sha": "c" * 40,
         "reusable_workflow_sha": "w" * 40, "run_id": 999, "run_attempt": 1,
         "job_id": 99, "reviewer": "codex-sub", "verdict": "fail",
         "merge_base_sha": "9" * 40, "candidate_commit_sha": "f" * 40,
@@ -720,6 +720,39 @@ def test_live_record_cli_marks_missing_terminal_unknown(tmp_path):
     assert missing_record["skip"] == {"reason": None}
     assert missing_record["convergence"] == {"fail_count": None, "reconsider": None}
     assert missing_record["provenance"]["unknown_fields"]["skip.reason"]
+
+
+def test_live_record_gate_hub_commit_matches_primary_registry_commit(tmp_path):
+    audit = _live_record_audit()
+    completed, _ledger_path, record_path = _run_live_record_cli(
+        tmp_path, audit=audit, terminal=_live_record_terminal(),
+    )
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(record_path.read_bytes())
+    assert record["gate_hub_commit"] == audit["registry_commit"]
+    assert "gate_hub_commit" not in record["provenance"]["unknown_fields"]
+
+
+def test_live_record_gate_hub_commit_rejects_non_hex_registry_commit():
+    module = _module()
+    audit = _live_record_audit()
+    audit["registry_commit"] = "r" * 40
+    entry = module.build_entry(
+        repository="zlxlabs/gate", pr_number=42, run_id=999, run_attempt=1,
+        head_sha="a" * 40, preflight=_preflight(), audit=audit,
+    )
+    with pytest.raises(ValueError, match="GATE-HUB-COMMIT-INVALID"):
+        module.build_live_review_record(entry, repository_id=123, terminal_envelope=None)
+
+
+def test_live_record_gate_hub_commit_unknown_when_primary_absent(tmp_path):
+    completed, _ledger_path, record_path = _run_live_record_cli(
+        tmp_path, terminal=_live_record_terminal(skip_reason="draft"),
+    )
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(record_path.read_bytes())
+    assert record["gate_hub_commit"] is None
+    assert record["provenance"]["unknown_fields"]["gate_hub_commit"]
 
 
 
