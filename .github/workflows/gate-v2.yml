@@ -2929,6 +2929,7 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Read canonical primary audit from primary job output for ledger
+        id: read-primary-audit-for-ledger
         # Ledger input channel (design A.3): reads the audit from the primary
         # job output instead of resolving/downloading it from Silo. Kept
         # fail-loud for REVIEWED runs (primary success/failure) with a
@@ -2970,6 +2971,7 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Download gate terminal envelope for ledger
+        id: download-gate-terminal-for-ledger
         # Ledger-side input copy of the terminal envelope; step-level
         # `continue-on-error: true` keeps this bookkeeping check green on Silo
         # failure, while the existing input condition controls whether it runs.
@@ -2987,6 +2989,12 @@ jobs:
             --dest "$DEST"
 
       - name: Compute incremental blocking shadow
+        if: >-
+          success() &&
+          steps.resolve-ledger-artifacts.outcome == 'success' &&
+          steps.read-primary-audit-for-ledger.outcome == 'success' &&
+          (steps.download-gate-terminal-for-ledger.outcome == 'skipped' ||
+          steps.download-gate-terminal-for-ledger.outcome == 'success')
         # Card G2 (design: gate-hub
         # docs/designs/convergence-incremental-blocking-shadow.md §2/§5/§8).
         # Observational-only candidate-rule shadow: any failure degrades the
@@ -3026,10 +3034,22 @@ jobs:
             || echo "GATE-INCREMENTAL-SHADOW-UNAVAILABLE: reason=invocation_failed"
 
       - name: Mark Build v2 review effectiveness ledger start
+        if: >-
+          success() &&
+          steps.resolve-ledger-artifacts.outcome == 'success' &&
+          steps.read-primary-audit-for-ledger.outcome == 'success' &&
+          (steps.download-gate-terminal-for-ledger.outcome == 'skipped' ||
+          steps.download-gate-terminal-for-ledger.outcome == 'success')
         run: 'echo "::notice::step-start: Build v2 review effectiveness ledger"'
 
       - name: Build v2 review effectiveness ledger
         id: build-review-ledger
+        if: >-
+          success() &&
+          steps.resolve-ledger-artifacts.outcome == 'success' &&
+          steps.read-primary-audit-for-ledger.outcome == 'success' &&
+          (steps.download-gate-terminal-for-ledger.outcome == 'skipped' ||
+          steps.download-gate-terminal-for-ledger.outcome == 'success')
         timeout-minutes: 1
         uses: ./_gate-aggregator-src/.github/actions/review-ledger
         with:
@@ -3073,6 +3093,7 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Upload v2 review effectiveness ledger
+        if: success() && steps.build-review-ledger.outcome == 'success'
         # The ledger row itself is bookkeeping; step-level
         # `continue-on-error: true` keeps this check green while preserving its
         # failure outcome. The deferred line feeds G3's replay queue.
@@ -3101,6 +3122,7 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Upload v2 review effectiveness ledger latest pointer
+        if: success() && steps.build-review-ledger.outcome == 'success'
         continue-on-error: true
         env:
           ARTIFACT_NAME: codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}

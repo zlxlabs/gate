@@ -2173,6 +2173,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "ARTIFACT_PREFIX" not in input_download.get("env", {})
     assert "$SILO_EXEC" not in input_download["run"]
     terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
+    assert terminal_download["id"] == "download-gate-terminal-for-ledger"
     assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
     assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
     assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
@@ -2180,6 +2181,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     # audit channel (design A.3): the ledger reads needs.primary.outputs instead
     # of resolving/downloading the audit from Silo.
     audit_read = next(step for step in steps if step.get("name") == "Read canonical primary audit from primary job output for ledger")
+    assert audit_read["id"] == "read-primary-audit-for-ledger"
     assert audit_read["if"] == "always()"
     # Ledger-side read remains fail-loud at the step outcome; step-level
     # continue-on-error keeps this bookkeeping job check green.
@@ -2211,6 +2213,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "token" not in build["with"]
 
     upload = steps[upload_index]
+    assert upload["if"] == "success() && steps.build-review-ledger.outcome == 'success'"
     assert "uses" not in upload
     assert upload["env"]["ARTIFACT_NAME"] == (
         "codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
@@ -2223,6 +2226,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     latest = next(step for step in steps if step.get("name") == "Upload v2 review effectiveness ledger latest pointer")
     assert steps.index(latest) == upload_index + 1
     assert "uses" not in latest
+    assert latest["if"] == "success() && steps.build-review-ledger.outcome == 'success'"
     assert latest["continue-on-error"] is True
     assert latest["env"]["ARTIFACT_NAME"] == (
         "codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}"
@@ -2268,6 +2272,70 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     record_upload = next(step for step in steps if step.get("name") == "Upload live review record/v1 to permanent Silo")
     assert record_upload["continue-on-error"] is True
     assert "GATE-ARCHIVE-DEFERRED kind=review-record " in record_upload["run"]
+
+
+def _evaluate_ledger_if(expression: str, outcomes: dict[str, str], *, job_success: bool) -> bool:
+    expression = re.sub(
+        r"steps\.([a-z0-9-]+)\.outcome",
+        lambda match: repr(outcomes[match.group(1)]),
+        expression,
+    )
+    expression = re.sub(r"\bsuccess\(\)", str(job_success), expression)
+    expression = expression.replace("&&", " and ").replace("||", " or ")
+    tree = ast.parse(expression, mode="eval")
+
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BoolOp):
+            values = [evaluate(value) for value in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+        if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+            left, right = evaluate(node.left), evaluate(node.comparators[0])
+            if isinstance(node.ops[0], ast.Eq):
+                return left == right
+        raise AssertionError(f"unsupported ledger if expression node: {ast.dump(node)}")
+
+    return bool(evaluate(tree))
+
+
+def test_ledger_resolve_failure_skips_build_and_both_uploads():
+    steps = _load_workflow()[0]["jobs"]["ledger"]["steps"]
+    named = {step.get("name"): step for step in steps}
+    outcomes = {
+        "resolve-ledger-artifacts": "failure",
+        "read-primary-audit-for-ledger": "success",
+        "download-gate-terminal-for-ledger": "skipped",
+    }
+    build = named["Build v2 review effectiveness ledger"]
+    assert not _evaluate_ledger_if(build["if"], outcomes, job_success=True)
+    outcomes["build-review-ledger"] = "skipped"
+    for name in (
+        "Upload v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger latest pointer",
+    ):
+        assert not _evaluate_ledger_if(named[name]["if"], outcomes, job_success=True)
+
+    # Known-success control: optional terminal download may be skipped, but the
+    # resolved inputs and audit are present, so build and uploads can proceed.
+    outcomes.update(
+        {
+            "resolve-ledger-artifacts": "success",
+            "read-primary-audit-for-ledger": "success",
+            "build-review-ledger": "success",
+        }
+    )
+    assert _evaluate_ledger_if(build["if"], outcomes, job_success=True)
+    for name in (
+        "Upload v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger latest pointer",
+    ):
+        assert _evaluate_ledger_if(named[name]["if"], outcomes, job_success=True)
 
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:

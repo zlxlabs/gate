@@ -202,6 +202,25 @@ def find_silo_region_violations(workflow_text: str) -> list[str]:
                         )
         if region == REGION_BOOKKEEPING and owner_job is None:
             violations.append(f"bookkeeping step {label!r} not found in any job")
+
+    ledger = parsed["jobs"].get("ledger", {})
+    ledger_steps = ledger.get("steps", []) or []
+    bookkeeping_names = set()
+    for block in blocks:
+        header = STEP_HEADER.search(block)
+        if header and _declared_region(block) == REGION_BOOKKEEPING:
+            bookkeeping_names.add((header.group(1) or header.group(2) or "?").strip())
+    bookkeeping_seen = False
+    for step in ledger_steps:
+        name = step.get("name", "<unnamed>")
+        if name in bookkeeping_names:
+            bookkeeping_seen = True
+            continue
+        if bookkeeping_seen and step.get("continue-on-error") is not True and not step.get("if"):
+            violations.append(
+                f"ledger step {name!r} follows a bookkeeping step but has no explicit if "
+                "(implicit success() can run after a continue-on-error bookkeeping failure)"
+            )
     return violations
 
 
@@ -283,6 +302,59 @@ def test_guard_rejects_verdict_step_relabelled_bookkeeping_without_step_coe():
         and "step-level continue-on-error: true" in violation
         for violation in violations
     ), "relabelled verdict step without step-level continue-on-error must turn red"
+
+
+def test_guard_rejects_implicit_success_after_bookkeeping():
+    golden = """jobs:
+  ledger:
+    steps:
+      # gate-silo-region: bookkeeping
+      - name: Persist optional data
+        continue-on-error: true
+        run: '"$SILO_EXEC" get --key x --dest /tmp/x'
+      - name: Next ledger action
+        if: success()
+        run: echo build
+"""
+    assert find_silo_region_violations(golden) == []
+    mutated = golden.replace("        if: success()\n", "", 1)
+    violations = find_silo_region_violations(mutated)
+    assert any(
+        "Next ledger action" in violation and "explicit if" in violation
+        for violation in violations
+    ), "a downstream non-continue-on-error step must not rely on implicit success()"
+
+
+def test_guard_rejects_ledger_build_without_explicit_if():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    block = next(
+        b for b in _split_step_blocks(text)
+        if "- name: Build v2 review effectiveness ledger" in b
+    )
+    condition = re.search(r"(?m)^        if: >-\n(?:          .*\n)+", block)
+    assert condition is not None
+    mutated = text.replace(block, block[:condition.start()] + block[condition.end():], 1)
+    violations = find_silo_region_violations(mutated)
+    assert any(
+        "Build v2 review effectiveness ledger" in violation and "explicit if" in violation
+        for violation in violations
+    ), "Build without an explicit input-success condition must turn the guard red"
+
+
+def test_ledger_build_if_requires_resolve_audit_and_terminal_outcomes():
+    ledger_steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["ledger"]["steps"]
+    build = next(step for step in ledger_steps if step.get("name") == "Build v2 review effectiveness ledger")
+    condition = str(build["if"])
+    assert "steps.resolve-ledger-artifacts.outcome == 'success'" in condition
+    assert "steps.read-primary-audit-for-ledger.outcome == 'success'" in condition
+    assert "steps.download-gate-terminal-for-ledger.outcome == 'success'" in condition
+    assert "steps.download-gate-terminal-for-ledger.outcome == 'skipped'" in condition
+    for name in (
+        "Compute incremental blocking shadow",
+        "Mark Build v2 review effectiveness ledger start",
+    ):
+        step = next(candidate for candidate in ledger_steps if candidate.get("name") == name)
+        assert step["if"] == condition
 
 
 def _minimal_workflow_from_real_text() -> str:
