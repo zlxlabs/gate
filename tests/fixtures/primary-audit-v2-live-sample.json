@@ -1,0 +1,55 @@
+{
+  "kind": "primary_review",
+  "schema_version": 2,
+  "spec_source": "live",
+  "pr_body_digest": "4d1d03caa4a9",
+  "repository_id": 1011924119,
+  "repository": "zlxlabs/WechatChatRoomSummary",
+  "pr": 32,
+  "base_sha": "3abae33a3e8a0e3f2f0ba2bf3e5b7e4a7fd7b234",
+  "head_sha": "cbd85deb8e5d522175c6cc5d9b5e6a6d01ef6c43",
+  "diff_digest": "0a12711a73f75cde679c20839825bc2331d80f81529931ecde6f8d0b7bac0114",
+  "policy_version": "v2",
+  "policy_digest": "5ec99ca9f1a9253f2ea7ae230e9b76b0bff5271dc705b0635c55881fc2981984",
+  "registry_commit": "e8aad7c0bf09a853e639295aa38639be9a748c14",
+  "caller_sha": "03a44764b3b81d410d69ba98270db6aad6846d2f",
+  "reusable_workflow_sha": "a75284af6d212fec0521662dbb73e2001136f185",
+  "run_id": 38216552886,
+  "run_attempt": 1,
+  "job_id": 114703968591,
+  "reviewer": "codex-sub",
+  "merge_base_sha": "3abae33a3e8a0e3f2f0ba2bf3e5b7e4a7fd7b234",
+  "candidate_commit_sha": "03a44764b3b81d410d69ba98270db6aad6846d2f",
+  "candidate_tree_sha": "dfe1e07134a87ec19ccebee2b85ecd695ccd67f0",
+  "run_mode": "PAYLOAD_ONLY",
+  "verdict": "pass",
+  "attempts": [
+    {
+      "reviewer": "codex-sub",
+      "model": "gpt-5.6-luna (effort: high)",
+      "exit_code": 0,
+      "reason": "",
+      "cost_usd": null,
+      "tokens": null,
+      "duration_s": 17.631101914215833,
+      "diag_snippet": null,
+      "effort": "high"
+    }
+  ],
+  "runtime": {
+    "duration_s": 17.631101914215833
+  },
+  "shadow_mode": "detached",
+  "expected_shadows": [],
+  "result": {
+    "verdict": "pass",
+    "summary": "变更与 PR 意图一致：新增并透传 disposition、counterevidence_json 和 tracking_issue 三个可选 workflow_call 输入，未发现会触发本仓 P1 红线的正确性、崩溃或静默出错问题。",
+    "findings": [],
+    "reviewed_files": [
+      ".github/workflows/gate-disposition.yml"
+    ]
+  },
+  "cost": null,
+  "tokens": null,
+  "tier": "personal"
+}

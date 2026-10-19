@@ -975,10 +975,15 @@ def test_gate_workflow_dual_writes_the_real_ledger_bytes_to_d30_and_archive(tmp_
         assert [result.returncode for result in upload_results] == [0, 0]
         assert (tmp_path / "review-ledger/archive-readback.jsonl").read_bytes() == ledger_bytes
         archive_run = ["bash", "-euo", "pipefail", "-c", run]
-        for status, corrupt, message in ((403, False, "failed"), (200, True, "bytes do not match")):
+        for status, corrupt, expected_reason in ((403, False, "readback_failed"), (200, True, "readback_mismatch")):
             server.get_status, server.corrupt_get = status, corrupt
             failed = subprocess.run(archive_run, capture_output=True, text=True, env=env, check=False)
-            assert failed.returncode != 0 and f"Permanent review ledger archive readback {message}" in failed.stderr
+            # bookkeeping (design A.4): failure degrades to the deferred row
+            # instead of a hard ::error; the underlying SILO-REQUEST-FAILED
+            # diagnostics stay on stderr.
+            assert failed.returncode != 0
+            assert "GATE-ARCHIVE-DEFERRED kind=review-ledger-archive " in failed.stdout
+            assert f"reason={expected_reason}" in failed.stdout
     finally:
         server.shutdown()
         server.server_close()
@@ -995,21 +1000,26 @@ def test_gate_workflow_dual_writes_the_real_ledger_bytes_to_d30_and_archive(tmp_
 def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
     workflow = yaml.safe_load((_REPO_ROOT / ".github/workflows/gate-v2.yml").read_text())
     steps = workflow["jobs"]["ledger"]["steps"]
-    download_audit = next(step for step in steps if step.get("name") == "Download canonical primary audit for ledger")
+    # design A.3: the audit now arrives via the primary job output
+    read_audit = next(step for step in steps if step.get("name") == "Read canonical primary audit from primary job output for ledger")
     archive_audit = next(step for step in steps if step.get("name") == "Archive canonical primary audit permanently")
     download_terminal = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
     archive_terminal = next(step for step in steps if step.get("name") == "Archive gate terminal envelope permanently")
     build_ledger = next(step for step in steps if step.get("name") == "Build v2 review effectiveness ledger")
     archive_ledger = next(step for step in steps if step.get("name") == "Upload v2 raw review ledger to permanent archive")
-    assert steps.index(download_audit) < steps.index(download_terminal) < steps.index(build_ledger)
+    assert steps.index(read_audit) < steps.index(download_terminal) < steps.index(build_ledger)
     assert steps.index(build_ledger) < steps.index(archive_ledger) < steps.index(archive_audit) < steps.index(archive_terminal)
     assert download_terminal["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
     assert archive_ledger["if"] == "always() && steps.build-review-ledger.outcome == 'success'"
-    assert archive_audit["if"] == "always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != ''"
+    assert archive_audit["if"] == "always() && needs.primary.outputs.audit_key != ''"
     assert archive_terminal["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
-    assert archive_audit["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}"
+    assert archive_audit["env"]["ARTIFACT_NAME"] == "${{ needs.primary.outputs.audit_key }}"
     assert archive_terminal["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
-    assert "continue-on-error" not in archive_audit and "continue-on-error" not in archive_terminal
+    # bookkeeping (design A.4): failures degrade to deferred rows
+    assert archive_audit["continue-on-error"] is True
+    assert archive_terminal["continue-on-error"] is True
+    assert "GATE-ARCHIVE-DEFERRED kind=primary-audit-archive " in archive_audit["run"]
+    assert "GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive " in archive_terminal["run"]
 
     audit_path = _REPO_ROOT / "tests/data/primary_review_v2_with_tier.json"
     audit_bytes = audit_path.read_bytes()
@@ -1117,8 +1127,10 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
                 source_env_name=source_env_name,
                 source_path=source_path,
             )
+            deferred_kind = "primary-audit-archive" if source_env_name == "AUDIT_PATH" else "gate-terminal-archive"
             assert failed_get.returncode != 0
-            assert f"Permanent {'primary audit' if source_env_name == 'AUDIT_PATH' else 'gate terminal'} archive readback failed" in failed_get.stderr
+            assert f"GATE-ARCHIVE-DEFERRED kind={deferred_kind} " in failed_get.stdout
+            assert "reason=readback_failed" in failed_get.stdout
 
             server.get_status = None
             server.corrupt_get = True
@@ -1132,7 +1144,8 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
                 source_path=source_path,
             )
             assert mismatched_get.returncode != 0
-            assert "archive readback bytes do not match" in mismatched_get.stderr
+            assert f"GATE-ARCHIVE-DEFERRED kind={deferred_kind} " in mismatched_get.stdout
+            assert "reason=readback_mismatch" in mismatched_get.stdout
 
             server.corrupt_get = False
             missing_source = _run_gate_silo_step(
@@ -1145,7 +1158,14 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
                 source_path=tmp_path / f"missing-{source_env_name}.json",
             )
             assert missing_source.returncode != 0
-            assert "archive upload failed" in missing_source.stderr
+            assert f"GATE-ARCHIVE-DEFERRED kind={deferred_kind} " in missing_source.stdout
+            # audit archive checks its own source file; terminal archive relies
+            # on silo_store's fail-loud put
+            if source_env_name == "AUDIT_PATH":
+                assert "reason=source_file_missing" in missing_source.stdout
+            else:
+                assert "reason=put_failed" in missing_source.stdout
+                assert "put source is not a file" in missing_source.stderr
 
         server.get_status = 403
         failed_audit_archive = _run_gate_silo_step(
@@ -1155,7 +1175,8 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
             source_path=audit_dir / "primary-review-audit.json",
         )
         assert failed_audit_archive.returncode != 0
-        assert "Permanent primary audit archive readback failed" in failed_audit_archive.stderr
+        assert "GATE-ARCHIVE-DEFERRED kind=primary-audit-archive " in failed_audit_archive.stdout
+        assert "reason=readback_failed" in failed_audit_archive.stdout
 
         server.get_status = None
         terminal_after_audit_failure = _run_gate_silo_step(
@@ -1182,8 +1203,8 @@ def test_skipped_gate_archives_terminal_without_fabricating_audit(tmp_path):
     steps = workflow["jobs"]["ledger"]["steps"]
     archive_audit = next(step for step in steps if step.get("name") == "Archive canonical primary audit permanently")
     archive_terminal = next(step for step in steps if step.get("name") == "Archive gate terminal envelope permanently")
-    audit_output = "steps.resolve-ledger-artifacts.outputs.audit_artifact_id"
-    assert audit_output in archive_audit["if"] and "!= ''" in archive_audit["if"]
+    # design A.3: archive gating now keys off the primary job output key
+    assert "needs.primary.outputs.audit_key != ''" in archive_audit["if"]
 
     fixture = json.loads((_REPO_ROOT / "tests/data/primary_review_v2_with_tier.json").read_text())
     repo_id = str(fixture["repository_id"])
