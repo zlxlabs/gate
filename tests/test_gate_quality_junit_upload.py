@@ -79,6 +79,27 @@ def test_junit_upload_retains_caller_xml_for_ninety_days_without_failing_absent_
     )
 
 
+def test_junit_upload_warning_still_fires_when_run_quality_already_failed():
+    """GitHub Actions wraps a status-function-free if in implicit success().
+
+    When run-quality is red (tests failed) and the upload also fails, the
+    warning must still fire — otherwise exactly the interesting combination
+    (test red + upload failed) stays silent. The guard must lead with
+    always() && so the implicit success() cannot suppress the step.
+    """
+    upload_index, upload = _junit_upload_step(_quality_steps())
+    upload_id = upload.get("id")
+    warning = _quality_steps()[upload_index + 1]
+    guard = str(warning.get("if", ""))
+    assert guard.startswith("${{ always() && "), (
+        "warning if must lead with always() && so the implicit success() does "
+        f"not skip it when run-quality already failed; got {guard!r}"
+    )
+    assert f"steps.{upload_id}.outcome == 'failure'" in guard, (
+        f"warning if must reference steps.{upload_id}.outcome == 'failure'; got {guard!r}"
+    )
+
+
 def test_junit_upload_failure_emits_warning_without_changing_quality_verdict():
     steps = _quality_steps()
     upload_index, upload = _junit_upload_step(steps)

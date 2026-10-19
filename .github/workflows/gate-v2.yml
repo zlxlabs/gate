@@ -677,7 +677,11 @@ jobs:
           if-no-files-found: ignore
 
       - name: Warn on junit upload failure
-        if: ${{ steps.upload-quality-junit.outcome == 'failure' }}
+        # always() && guards against GitHub's implicit success(): when
+        # run-quality is already red (tests failed) the warning must still
+        # fire, or exactly the interesting combination (test red + upload
+        # failed) stays silent.
+        if: ${{ always() && steps.upload-quality-junit.outcome == 'failure' }}
         env:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
