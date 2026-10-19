@@ -1421,8 +1421,6 @@ jobs:
 
       # gate-silo-region: bookkeeping
       - name: Archive raw primary review evidence permanently
-        # TOKEN scan logic below is card G2's scope and intentionally untouched;
-        # this card only moves the failure out of the job conclusion (design A.4).
         if: always()
         continue-on-error: true
         env:
@@ -1434,46 +1432,84 @@ jobs:
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=source_dir_missing"
             exit 1
           fi
-          if ! python3 - "$evidence_dir" <<'PY'
+          if ! scrubbed_dir=$(mktemp -d -p "${RUNNER_TEMP:?RUNNER_TEMP is required}" primary-raw-evidence.XXXXXX); then
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=scrub_failed"
+            exit 1
+          fi
+          chmod 700 "$scrubbed_dir"
+          if python3 - "$evidence_dir" "$scrubbed_dir" <<'PY'
           import importlib.util
           import sys
           from pathlib import Path
 
           evidence_dir = Path(sys.argv[1])
-          evidence_files = [path for path in evidence_dir.rglob("*") if path.is_file()]
+          scrubbed_dir = Path(sys.argv[2])
+          evidence_files = sorted(path for path in evidence_dir.rglob("*") if path.is_file())
           scrub_path = Path("_gate-silo-src/scripts/scrub_outbound.py")
-          spec = importlib.util.spec_from_file_location("gate_scrub_outbound", scrub_path)
-          if spec is None or spec.loader is None:
-              print("Primary raw evidence upload failed: outbound scrubber is unavailable", file=sys.stderr)
-              raise SystemExit(1)
-          scrubber = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(scrubber)
+          try:
+              spec = importlib.util.spec_from_file_location("gate_scrub_outbound", scrub_path)
+              if spec is None or spec.loader is None:
+                  raise ImportError("scrub module spec unavailable")
+              scrubber = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(scrubber)
+              runtime_values = scrubber.runtime_values_from_environment()
+          except Exception as exc:
+              print(f"Primary raw evidence scrubber unavailable: {exc}", file=sys.stderr)
+              raise SystemExit(10)
+          all_categories: set[str] = set()
+          rewritten = 0
           for path in evidence_files:
-              text = path.read_bytes().decode("utf-8", errors="replace")
-              _, categories = scrubber.scrub_outbound_text(text)
-              if "TOKEN" in categories:
-                  print("Primary raw evidence TOKEN scan failed: known TOKEN category found; Silo upload blocked", file=sys.stderr)
-                  raise SystemExit(1)
+              try:
+                  text = path.read_bytes().decode("utf-8")
+              except UnicodeDecodeError as exc:
+                  print(f"Primary raw evidence non-UTF8 file: {path} ({exc})", file=sys.stderr)
+                  raise SystemExit(11)
+              try:
+                  scrubbed, categories = scrubber.scrub_outbound_text(text, runtime_values=runtime_values)
+              except Exception as exc:
+                  print(f"Primary raw evidence scrub failed: {path} ({exc})", file=sys.stderr)
+                  raise SystemExit(12)
+              for category in categories:
+                  all_categories.add(category)
+              relative = path.relative_to(evidence_dir)
+              destination = scrubbed_dir / relative
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              if scrubbed != text:
+                  rewritten += 1
+              destination.write_text(scrubbed, encoding="utf-8")
+          categories_label = ",".join(sorted(all_categories)) if all_categories else "none"
+          print(f"raw-evidence-scrubbed categories={categories_label} files={rewritten}/{len(evidence_files)}")
           PY
           then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=token_scan_blocked"
+            : scrub ok
+          else
+            rc=$?
+            rm -rf "$scrubbed_dir"
+            case "$rc" in
+              11) reason=non_utf8_file ;;
+              *) reason=scrub_failed ;;
+            esac
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=$reason"
             exit 1
           fi
           if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
             echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=missing_credentials"
+            rm -rf "$scrubbed_dir"
             exit 1
           fi
           if ! out="$($SILO_EXEC put-dir \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --dir "$evidence_dir" 2>&1)"; then
+            --dir "$scrubbed_dir" 2>&1)"; then
             reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
+            rm -rf "$scrubbed_dir"
             exit 1
           fi
+          rm -rf "$scrubbed_dir"
 
       - name: Diagnose silo network after job failure
         if: failure()

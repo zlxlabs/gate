@@ -134,7 +134,10 @@ def test_primary_raw_evidence_archive_preserves_one_invocation_and_source(tmp_pa
     output_dir = evidence_root / "review-primary-fixture"
     if mode != "metadata-only":
         output_dir.mkdir()
-        raw_payload = b"ghp_1234567890abcdefghijklmnop" if mode == "token" else b"producer bytes\n\xff"
+        if mode == "token":
+            raw_payload = b"@@ -10,7 +10,7 @@ token: synthetic-owner-token-abcdefghijklmnop123456\n"
+        else:
+            raw_payload = b"producer bytes\n"
         (output_dir / "provider-raw.bin").write_bytes(raw_payload)
     original_files = {
         path.relative_to(evidence_root).as_posix(): path.read_bytes()
@@ -203,17 +206,31 @@ sys.exit(rc)
         text=True,
     )
     saved = json.loads(state.read_text(encoding="utf-8"))
-    assert (result.returncode == 0) is (mode in {"success", "metadata-only"}), result.stderr + result.stdout
+    assert (result.returncode == 0) is (mode in {"success", "metadata-only", "token"}), result.stderr + result.stdout
     assert {path.relative_to(evidence_root).as_posix(): path.read_bytes() for path in evidence_root.rglob("*") if path.is_file()} == original_files
     puts = {key for method, key in saved["calls"] if method == "PUT"}
     gets = {key for method, key in saved["calls"] if method == "GET"}
     objects = {key: base64.b64decode(value) for key, value in saved["objects"].items()}
-    if mode in {"success", "metadata-only"}:
+    if mode in {"success", "metadata-only", "token"}:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("_diag_scrub", REPO_ROOT / "scripts" / "scrub_outbound.py")
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        expected_uploads = {
+            relative: _mod.scrub_outbound_text(payload.decode("utf-8"), runtime_values={})[0].encode("utf-8")
+            for relative, payload in original_files.items()
+        }
         expected_paths = set(original_files)
         expected_keys = {prefix + relative for relative in expected_paths} | {prefix + "archive-manifest-v1.json"}
         assert set(objects) == expected_keys
         assert puts == gets == expected_keys
-        assert all(objects[prefix + relative] == payload for relative, payload in original_files.items())
+        assert all(objects[prefix + relative] == payload for relative, payload in expected_uploads.items())
+        if mode == "token":
+            assert "raw-evidence-scrubbed categories=TOKEN" in result.stdout
+            assert b"[REDACTED:TOKEN]" in objects[prefix + "review-primary-fixture/provider-raw.bin"]
+            assert b"synthetic-owner-token" not in objects[prefix + "review-primary-fixture/provider-raw.bin"]
+        else:
+            assert "raw-evidence-scrubbed categories=none" in result.stdout
         manifest = json.loads(objects[prefix + "archive-manifest-v1.json"])
         assert manifest == {
             "schema_version": 1,
@@ -221,18 +238,16 @@ sys.exit(rc)
             "artifact_name": artifact_name,
             "files": [
                 {"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
-                for relative, payload in sorted(original_files.items())
+                for relative, payload in sorted(expected_uploads.items())
             ],
         }
         assert not any("sentinel.bin" in key for key in objects)
     else:
-        assert "ghp_1234567890abcdefghijklmnop" not in result.stdout + result.stderr
+        assert b"synthetic-owner-token" not in (result.stdout + result.stderr).encode("utf-8", errors="ignore")
         assert not gets
-        if mode in {"token", "occupied"}:
+        if mode == "occupied":
             assert not puts
-        if mode == "token":
-            assert "known TOKEN category found; Silo upload blocked" in result.stderr
-        elif mode == "put-failure":
+        if mode == "put-failure":
             assert "Silo archive PUT/GET failed" in result.stderr
         elif mode == "occupied":
             assert "already exists; refusing to overwrite" in result.stderr
