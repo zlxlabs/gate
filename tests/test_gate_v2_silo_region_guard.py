@@ -18,8 +18,10 @@
 
 触点判定（invoke 而非 mere mention）：步骤 run 块中出现
 - `"$SILO_EXEC"`（silo_exec.sh 的调用），或
-- `gate_bounded_retry.py" magicdns --silo-store`（Silo DNS 准备，失败即全部记账失败）。
-仅把 `scripts/silo_store.py` 列进 sparse checkout 的步骤不是触点（只取文件，不碰 Silo）。
+- `gate_bounded_retry.py" magicdns --silo-store`（Silo DNS 准备，失败即全部记账失败），或
+- 直接以 python 调 silo_store.py（`python3 "$SILO_STORE" …` / `python3 …/silo_store.py …`；
+  G1-verdict P2 补的洞）。按调用形态匹配：env 赋值（`SILO_STORE: …/silo_store.py`）、
+  sparse-checkout 列表项、注释提及都不是触点（只取文件/转递路径，不碰 Silo）。
 """
 
 from __future__ import annotations
@@ -38,11 +40,20 @@ REGION_BOOKKEEPING = "bookkeeping"
 REGION_COMMENT = re.compile(r"#\s*gate-silo-region:\s*(verdict|bookkeeping)\b")
 STEP_HEADER = re.compile(r"^      - (?:name: (.*)|uses: (.+))$", re.MULTILINE)
 UPLOAD_VERB_RE = re.compile(r'\$SILO_EXEC"?\s+(put|put-dir|put-review-record)\b')
+# python 直调 silo 客户端本体：`python3 "$SILO_STORE" …` / `python3 …/silo_store.py …`。
+# 必须锚在 python 调用位上——裸出现 `silo_store.py` 会误伤 env 赋值与 sparse-checkout 列表项。
+SILO_STORE_INVOKE_RE = re.compile(
+    r'python3?\s+"?(?:\$SILO_STORE\b|[^"\s]*silo_store\.py)"?'
+)
 DEFERRED_LINE = "GATE-ARCHIVE-DEFERRED"
 
 
 def _silo_touchpoint(block: str) -> bool:
     if "$SILO_EXEC" in block or 'gate_bounded_retry.py" magicdns --silo-store' in block:
+        return True
+    # Direct invocation of the Silo client without $SILO_EXEC (G1-verdict P2):
+    # `python3 "$SILO_STORE" put …` / `python3 scripts/silo_store.py put …`.
+    if SILO_STORE_INVOKE_RE.search(block):
         return True
     # The verdict channel itself (design A): the primary-side producer writing
     # the audit output and the gate/ledger-side consumers reading it are part
@@ -282,6 +293,44 @@ def test_guard_rejects_new_undeclared_silo_step_red_proof():
         "          fi\n",
     )
     assert find_silo_region_violations(mutated3) == [], "fully-declared bookkeeping step must pass"
+
+
+@pytest.mark.parametrize(
+    "invoke_line",
+    [
+        'python3 "$SILO_STORE" put --tier archive --repo-id 1 --name x --file /tmp/x\n',
+        "python3 scripts/silo_store.py put --tier archive --repo-id 1 --name x --file /tmp/x\n",
+    ],
+)
+def test_guard_catches_direct_silo_store_invocation(invoke_line):
+    """G1-verdict P2：绕开 $SILO_EXEC 直接调 silo_store.py 的未声明步骤必须让守卫红。"""
+    golden = _minimal_workflow_from_real_text()
+    assert find_silo_region_violations(golden) == [], "golden input must be clean before mutation"
+    mutated = golden + (
+        "      - name: Future direct silo_store.py write\n"
+        "        if: always()\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        f"          {invoke_line}"
+    )
+    violations = find_silo_region_violations(mutated)
+    assert violations, (
+        "undeclared direct silo_store.py invocation must turn the guard red: "
+        f"{invoke_line.strip()!r}"
+    )
+    assert any("Future direct silo_store.py write" in v for v in violations)
+
+
+def test_sparse_checkout_mention_of_silo_store_is_not_a_touchpoint():
+    """新规则不得反向过宽：仅把 silo_store.py 列进 sparse checkout / env 赋值不是触点。"""
+    golden = _minimal_workflow_from_real_text()
+    sparse = golden + (
+        "      - name: Sparse checkout silo client only\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          echo 'scripts/silo_store.py' > .gatesparse\n"
+    )
+    assert find_silo_region_violations(sparse) == []
 
 
 @pytest.mark.parametrize(
