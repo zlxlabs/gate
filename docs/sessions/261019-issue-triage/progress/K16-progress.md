@@ -41,3 +41,10 @@
 - 本段结论：主脑驳回 seq=1。第三支改为「字母且数字 / 大小写混合 / `+/=`」任一即命中。`# token: acceptance-abandon-failed` 仍不命中；`api_key:` 40 位小写十六进制与 `token: synthetic-owner-token-abcdefghijklmnop123456` 命中。两条归档测试未改文件，已绿。agent-config 修前 20 行复扫 TOKEN=1：`fake-token-setenv-181-not-a-real-secret`（字母+数字，按新判据该拦）。
 - 关键决策与已否决方案：不再申请改归档 fixture。`token=ghp_…` 现由第三支整段吞掉（值含字母+数字），`test_scrubs_internal_shapes_and_reports_categories` 期望从 `token=[REDACTED:TOKEN]` 改为 `[REDACTED:TOKEN]`。仓外复扫 sha256 `6d228a1a6b9cec8226cb67d0fb998f97912d1737b55e353e2769c775b12e4bf4`。
 - 下一步唯一动作：反向红验后跑全量、scope 检查、push 并开 PR。
+
+## 2026-10-19 · 续修：反向红验（kebab + 字母数字）
+
+- 当前阶段：implementing
+- 本段结论：去掉全部 lookaround 后 kebab 两负例以 AssertionError 变红（`# [REDACTED:TOKEN]` / `[REDACTED:TOKEN]`）。只删字母+数字先行断言后，40 位小写 hex 与 synthetic-owner 以 AssertionError 变红，kebab 负例与 `password: Xy7…` 仍绿。已只还原该处，生产文件与 HEAD `72de539` 一致，28 passed。
+- 关键决策与已否决方案：无。仓外 `K16-redtest-kebab-round3.txt` sha256 `1666b7b766774d4b5784f4fd81a7fcb46eeaedb0d031e5c50f2a6f63936c7649`；`K16-redtest-letterdigit-round3.txt` sha256 `0897c5542ac32234c04e47a1fb91729287f17bc8f28dee1762393c7824fc02ed`。
+- 下一步唯一动作：scope 检查、全量测试、push 并开 PR。
