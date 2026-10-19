@@ -36,8 +36,8 @@ def test_scrubs_internal_shapes_and_reports_categories():
     assert scrubbed == (
         "runner=[REDACTED:RUNNER_NAME] host=[REDACTED:HOSTNAME] "
         "user=[REDACTED:USERNAME] ip=[REDACTED:PRIVATE_IP] "
-        "auth=[REDACTED:AUTH_PATH] workspace=[REDACTED:ABSOLUTE_PATH] "
-        "token=[REDACTED:TOKEN]"
+            "auth=[REDACTED:AUTH_PATH] workspace=[REDACTED:ABSOLUTE_PATH] "
+            "[REDACTED:TOKEN]"
     )
     assert categories == [
         "PRIVATE_IP", "AUTH_PATH", "ABSOLUTE_PATH", "RUNNER_NAME", "TOKEN",
@@ -76,6 +76,8 @@ def test_negative_samples_are_byte_identical(text: str):
         "password: Xy7abcdefghijklmnopq",
         "secret=SGVsbG9Xb3JsZFRoaXNJc0FLZXlBYmNk",
         "api-key: aaaaaaaa+bbbbbbbbbbbbbbbb==",
+        "api_key: 3f9a8bc0d1e2f3456789abcdef0123456789abcd",
+        "token: synthetic-owner-token-abcdefghijklmnop123456",
     ],
 )
 def test_token_shapes_are_redacted_without_generic_long_token_heuristic(token: str):

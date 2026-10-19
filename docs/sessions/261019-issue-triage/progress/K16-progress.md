@@ -34,3 +34,10 @@
 - 本段结论：`delegate scope-wait` seq=1 1800s 无决策，退出码 4。未改 Scope 外文件，未开 PR。卡分支已提交到 `82bcaac`，待主脑批准 seq=1 后续修两处归档 fixture。
 - 关键决策与已否决方案：无。
 - 下一步唯一动作：主脑 `delegate scope-approve` seq=1 后，把 TOKEN_HUNK / provider-raw.bin 改成混合大小写凭据并重跑那两条测试。
+
+## 2026-10-19 · 续修：第三支补字母+数字，归档两红转绿
+
+- 当前阶段：implementing
+- 本段结论：主脑驳回 seq=1。第三支改为「字母且数字 / 大小写混合 / `+/=`」任一即命中。`# token: acceptance-abandon-failed` 仍不命中；`api_key:` 40 位小写十六进制与 `token: synthetic-owner-token-abcdefghijklmnop123456` 命中。两条归档测试未改文件，已绿。agent-config 修前 20 行复扫 TOKEN=1：`fake-token-setenv-181-not-a-real-secret`（字母+数字，按新判据该拦）。
+- 关键决策与已否决方案：不再申请改归档 fixture。`token=ghp_…` 现由第三支整段吞掉（值含字母+数字），`test_scrubs_internal_shapes_and_reports_categories` 期望从 `token=[REDACTED:TOKEN]` 改为 `[REDACTED:TOKEN]`。仓外复扫 sha256 `6d228a1a6b9cec8226cb67d0fb998f97912d1737b55e353e2769c775b12e4bf4`。
+- 下一步唯一动作：反向红验后跑全量、scope 检查、push 并开 PR。
