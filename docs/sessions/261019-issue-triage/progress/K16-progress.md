@@ -27,3 +27,10 @@
 - 本段结论：`card_scope_check.py --range 72c6ec1..HEAD` 3 文件通过；`tests/test_scrub_outbound.py` 26 passed。全量 `2 failed, 1878 passed`：归档路径仍用 `token: synthetic-owner-token-abcdefghijklmnop123456`（全小写 kebab+数字）当 TOKEN 召回。已否决把字母+数字加回第三支。已申请 scope seq=1：`tests/test_gate_v2_raw_evidence_scrub.py`、`tests/test_gate_v2_diagnostics_upload.py`，把 fixture 改成混合大小写凭据形态。
 - 关键决策与已否决方案：合入 origin/main 后 envelope 冻住的 worktree_base 会把主干 6 文件算进越界，已 `reset --hard` 撤掉未推送的 merge（仅现场）。仓外全量原文 sha256 `135b6869cf0ecdaf20e852d2a68d10763ea2d0485667caff1f7396198ad8fbe9`。
 - 下一步唯一动作：`delegate scope-wait` seq=1 通过后改两处 fixture 并重跑失败用例。
+
+## 2026-10-19 · 续修：scope-wait seq=1 超时停下
+
+- 当前阶段：implementing
+- 本段结论：`delegate scope-wait` seq=1 1800s 无决策，退出码 4。未改 Scope 外文件，未开 PR。卡分支已提交到 `82bcaac`，待主脑批准 seq=1 后续修两处归档 fixture。
+- 关键决策与已否决方案：无。
+- 下一步唯一动作：主脑 `delegate scope-approve` seq=1 后，把 TOKEN_HUNK / provider-raw.bin 改成混合大小写凭据并重跑那两条测试。
