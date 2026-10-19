@@ -43,7 +43,10 @@ def test_primary_writes_restricted_manifest_before_diagnostics_upload():
     assert not any(token in run for token in ("cat ", "read_bytes", "read_text(", "response_body"))
     assert upload["if"] == "always()"
     assert "uses" not in upload
-    assert "continue-on-error" not in upload
+    # 反转（design A/E，gate#339 反例）：诊断上传是记账区——失败只告警 + 补传登记，
+    # 不再改 primary 结论；旧行为（「记账失败必须变红」）由本断言反转锁死。
+    assert upload["continue-on-error"] is True
+    assert "GATE-ARCHIVE-DEFERRED kind=primary-diagnostics" in upload["run"]
     assert upload["env"]["DIAGNOSTICS_DIR"] == DIAGNOSTICS_DIR
     assert "--tier d3" in upload["run"]
     assert "--empty skip" in upload["run"]

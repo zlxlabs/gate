@@ -900,6 +900,21 @@ jobs:
     concurrency:
       group: gate-required-v2-primary-${{ github.workflow }}-${{ github.repository_id }}-${{ github.event.pull_request.number || github.run_id }}
       cancel-in-progress: true
+    # Verdict channel (design 261019-gate-triage A.1/A.2): the canonical audit
+    # travels to gate/ledger through GitHub job outputs (same-run, native), NOT
+    # through Silo — a Silo outage can no longer lose the verdict (audit_missing).
+    # Values are base64 (single line, `base64 -w0`): GitHub officially does not
+    # support secrets in job outputs (actions/runner#1061 — masked values reach
+    # downstream jobs as `***`), and findings quotes may quote PR content; base64
+    # breaks the SecretMasker's literal substring match so the data plane stays
+    # intact while log masking still applies. Size budget: live fleet max is
+    # 26.7 KiB (P99 17.8 KiB); base64 ×4/3 stays far under the 1 MiB expression
+    # evaluation budget — see docs/sessions/261019-gate-triage/evidence/G1-audit-size.md.
+    outputs:
+      audit_json_b64: ${{ steps.publish-audit-output.outputs.audit_json_b64 }}
+      audit_bytes: ${{ steps.publish-audit-output.outputs.audit_bytes }}
+      audit_attempt: ${{ steps.publish-audit-output.outputs.audit_attempt }}
+      audit_key: ${{ steps.publish-audit-output.outputs.audit_key }}
     steps:
       - name: Record network bytes before checkout (primary-1)
         env:
@@ -1005,7 +1020,13 @@ jobs:
           fi
           echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
 
+      # gate-silo-region: bookkeeping
       - name: Inject previous-round findings into primary review context
+        # Silo here only feeds the previous-round context (a ledger-derived
+        # input, not the verdict channel); the inner subshell already degrades
+        # to GATE-FINDING-RELATION-DEGRADED and exits 0. continue-on-error keeps
+        # that guarantee structural, not incidental.
+        continue-on-error: true
         env:
           DESIGN_DOC_INPUT: ${{ inputs.design_doc }}
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
@@ -1262,8 +1283,13 @@ jobs:
           bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
+      # gate-silo-region: bookkeeping
       - name: Resolve Silo hostname via MagicDNS
+        # DNS preparation for the bookkeeping uploads below; the verdict channel
+        # (job outputs) does not depend on Silo reachability, so a failure here
+        # must not fail the primary job — the uploads degrade to deferred rows.
         if: always()
+        continue-on-error: true
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
@@ -1280,43 +1306,100 @@ jobs:
           else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
           fi
 
-      - name: Upload canonical primary audit
-        # Fail-closed by design: if the audit can't be uploaded, the aggregator
-        # must never see a "success" primary job without a matching artifact
-        # to validate — so this step deliberately has NO `continue-on-error`.
-        # Missing source file makes silo_store.py put exit 1 (fail-closed),
-        # matching the previous if-no-files-found: error semantics.
+      # gate-silo-region: verdict
+      - name: Publish canonical primary audit to job output
+        # Verdict channel producer (design A.1). fail-closed: a missing/empty
+        # audit file fails THIS step (and the primary job) rather than letting
+        # gate see a success primary without a readable record — same contract
+        # the Silo upload enforced before the channel split. The over-size check
+        # guards the 1 MiB expression-evaluation budget before GitHub ever sees
+        # the value (live fleet max 26.7 KiB; G1-audit-size.md).
         if: always()
+        id: publish-audit-output
+        env:
+          AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
+          AUDIT_KEY: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          MAX_B64_BYTES: "524288"
+        run: |
+          set -euo pipefail
+          if [ ! -s "$AUDIT_PATH" ]; then
+            echo "::error::canonical primary audit missing or empty at $AUDIT_PATH — refusing to publish a verdict channel without its record" >&2
+            exit 1
+          fi
+          b64=$(base64 -w0 "$AUDIT_PATH")
+          if [ "${#b64}" -gt "$MAX_B64_BYTES" ]; then
+            echo "::error::canonical primary audit base64 length ${#b64} exceeds $MAX_B64_BYTES (GitHub expression-evaluation budget is 1 MiB; see G1-audit-size.md)" >&2
+            exit 1
+          fi
+          {
+            echo "audit_json_b64=$b64"
+            echo "audit_bytes=$(wc -c < "$AUDIT_PATH" | tr -d ' ')"
+            echo "audit_attempt=${{ github.run_attempt }}"
+            echo "audit_key=$AUDIT_KEY"
+          } >> "$GITHUB_OUTPUT"
+
+      # gate-silo-region: bookkeeping
+      - name: Upload canonical primary audit
+        # Retention copy on Silo (design A.3): bookkeeping only — the verdict
+        # now travels via job outputs, so an upload failure must NOT flip the
+        # primary result; it degrades to a deferred row (G3 补传队列的输入契约).
+        if: always()
+        continue-on-error: true
         env:
           ARTIFACT_NAME: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ ! -s "$AUDIT_PATH" ]; then
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit key=d14/${{ github.repository_id }}/$ARTIFACT_NAME reason=source_file_missing"
+            exit 1
+          fi
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit key=d14/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d14 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$AUDIT_PATH"
+            --file "$AUDIT_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit key=d14/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Upload primary review diagnostics
         # The finalizer creates manifest.json for an absent/empty producer
         # directory; --empty skip keeps this best-effort path from changing the
         # primary result if the finalizer itself was killed or failed.
         if: always()
+        continue-on-error: true
         env:
           ARTIFACT_NAME: primary-review-diagnostics-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put-dir \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-diagnostics key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --dir "$DIAGNOSTICS_DIR" \
-            --empty skip
+            --empty skip 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-diagnostics key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Archive primary review diagnostics permanently
         if: always()
         id: archive-primary-review-diagnostics
@@ -1332,22 +1415,26 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --dir "$DIAGNOSTICS_DIR" \
             --empty skip; then
-            echo "::warning::Permanent archive of primary review diagnostics failed"
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-diagnostics-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=put_dir_failed"
             exit 1
           fi
 
+      # gate-silo-region: bookkeeping
       - name: Archive raw primary review evidence permanently
+        # TOKEN scan logic below is card G2's scope and intentionally untouched;
+        # this card only moves the failure out of the job conclusion (design A.4).
         if: always()
+        continue-on-error: true
         env:
           ARTIFACT_NAME: primary-review-raw-evidence-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           evidence_dir=${PRIMARY_RAW_EVIDENCE_DIR:-}
           if [ -z "$evidence_dir" ] || [ ! -d "$evidence_dir" ]; then
-            echo "::error::Primary raw evidence upload failed: isolated source directory is missing" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=source_dir_missing"
             exit 1
           fi
-          python3 - "$evidence_dir" <<'PY'
+          if ! python3 - "$evidence_dir" <<'PY'
           import importlib.util
           import sys
           from pathlib import Path
@@ -1368,11 +1455,25 @@ jobs:
                   print("Primary raw evidence TOKEN scan failed: known TOKEN category found; Silo upload blocked", file=sys.stderr)
                   raise SystemExit(1)
           PY
-          "$SILO_EXEC" put-dir \
+          then
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=token_scan_blocked"
+            exit 1
+          fi
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put-dir \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --dir "$evidence_dir"
+            --dir "$evidence_dir" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
       - name: Diagnose silo network after job failure
         if: failure()
@@ -1898,8 +1999,12 @@ jobs:
           bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
+      # gate-silo-region: bookkeeping
       - name: Resolve Silo hostname via MagicDNS
+        # Advisory events are bookkeeping only; a DNS failure must not fail the
+        # ocr job — the upload below degrades to a deferred row.
         if: always() && matrix.reviewer != '__none__'
+        continue-on-error: true
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
@@ -1916,20 +2021,32 @@ jobs:
           else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
           fi
 
+      # gate-silo-region: bookkeeping
       - name: Upload advisory review event
         if: always() && matrix.reviewer != '__none__'
+        continue-on-error: true
         env:
           ARTIFACT_NAME: advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
           ADVISORY_DIR: ${{ runner.temp }}/shadow-events/advisory
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put-dir \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=advisory-event key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --dir "$ADVISORY_DIR"
+            --dir "$ADVISORY_DIR" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=advisory-event key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Archive advisory review event permanently
         if: always() && matrix.reviewer != '__none__'
         id: archive-advisory-review-event
@@ -1944,7 +2061,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --dir "$ADVISORY_DIR"; then
-            echo "::warning::Permanent archive of advisory review event failed"
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=advisory-event-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=put_dir_failed"
             exit 1
           fi
 
@@ -2023,8 +2140,13 @@ jobs:
       # Primary skipped (exempt / draft / hosted / fork) used to skip MagicDNS,
       # so silo_store.py put failed and ledger saw no terminal (gate#185).
       # Self-hosted same-repo still has tailnet; hosted/fork stay off.
+      # gate-silo-region: bookkeeping
       - name: Resolve Silo hostname via MagicDNS
+        # DNS preparation for the bookkeeping uploads below; the verdict now
+        # arrives via the primary job output, so a Silo DNS failure must not
+        # skip the aggregator — uploads degrade to deferred rows instead.
         if: ${{ always() && inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && github.event.pull_request.head.repo.full_name == github.repository }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           SILO_RESOLUTION="$(python3 "${RUNNER_TEMP}/gate_bounded_retry.py" magicdns --silo-store "$SILO_STORE" --endpoint "$SILO_ENDPOINT" --nameserver 100.100.100.100)" || {
@@ -2041,60 +2163,44 @@ jobs:
           else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
           fi
 
-      - name: Resolve canonical primary audit artifact
-        id: resolve-audit-artifact
+      # gate-silo-region: verdict
+      - name: Read canonical primary audit from primary job output
+        # Verdict channel consumer (design A.2) — replaces the former
+        # "Silo resolve + download" hop (the audit_missing source of gate#312/#348).
+        # Fail-closed contract: every bad shape (missing output / invalid base64 /
+        # length-marker mismatch / broken JSON) collapses into the aggregator's
+        # audit_missing or audit_invalid path, so the gate conclusion becomes
+        # unavailable — never a silent pass. This step exits 0 even on those
+        # paths so the terminal envelope is still generated and records the
+        # reason, matching pre-split behavior; the ::error:: lines carry the
+        # human-readable cause.
         if: ${{ needs.primary.result != 'skipped' }}
-        continue-on-error: true
+        id: read-primary-audit
         env:
-          REPO_ID: ${{ github.repository_id }}
-          CURRENT_ATTEMPT: ${{ github.run_attempt }}
-          AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
+          AUDIT_B64: ${{ needs.primary.outputs.audit_json_b64 }}
+          AUDIT_BYTES_DECLARED: ${{ needs.primary.outputs.audit_bytes }}
+          AUDIT_DIR: ${{ runner.temp }}/primary-audit
+          AUDIT_FILENAME: primary-review-audit.json
         run: |
           set -euo pipefail
-          # Empty outputs keep the best-effort path fail-closed when resolve misses.
-          {
-            echo "artifact_id="
-            echo "source_attempt="
-            echo "artifact_name="
-          } >> "$GITHUB_OUTPUT"
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          set +e
-          selected="$("$SILO_EXEC" resolve \
-            --tier d14 \
-            --repo-id "$REPO_ID" \
-            --name-prefix "$AUDIT_PREFIX" \
-            --attempt "$CURRENT_ATTEMPT")"
-          rc=$?
-          set -e
-          if [ "$rc" -eq 2 ]; then
-            echo "No matching canonical primary audit artifact found" >&2
+          mkdir -p "$AUDIT_DIR"
+          if [ -z "$AUDIT_B64" ]; then
+            echo "::error::primary audit output missing (primary result=${{ needs.primary.result }}) — aggregator will fail closed with audit_missing" >&2
             exit 0
           fi
-          if [ "$rc" -ne 0 ]; then
-            exit "$rc"
-          fi
-          if [ -z "$selected" ]; then
+          tmp="$AUDIT_DIR/.audit.b64.tmp"
+          if ! printf '%s' "$AUDIT_B64" | base64 -d > "$tmp" 2>/dev/null; then
+            echo "::error::primary audit output is not valid base64 — aggregator will fail closed with audit_missing" >&2
+            rm -f "$tmp"
             exit 0
           fi
-          IFS=$'\t' read -r artifact_id source_attempt artifact_name <<< "$selected"
-          {
-            echo "artifact_id=$artifact_id"
-            echo "source_attempt=$source_attempt"
-            echo "artifact_name=$artifact_name"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Download canonical primary audit (best effort — may not exist)
-        if: ${{ needs.primary.result != 'skipped' && steps.resolve-audit-artifact.outputs.artifact_id != '' }}
-        continue-on-error: true
-        env:
-          ARTIFACT_PREFIX: ${{ steps.resolve-audit-artifact.outputs.artifact_id }}
-          DEST: ${{ runner.temp }}/primary-audit
-        run: |
-          set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" get \
-            --prefix "$ARTIFACT_PREFIX" \
-            --dest "$DEST"
+          actual=$(wc -c < "$tmp" | tr -d ' ')
+          if [ "$actual" != "$AUDIT_BYTES_DECLARED" ]; then
+            echo "::error::primary audit output truncated or padded (declared=$AUDIT_BYTES_DECLARED actual=$actual) — aggregator will fail closed with audit_missing" >&2
+            rm -f "$tmp"
+            exit 0
+          fi
+          mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"
 
       - name: Aggregate required verdict
         id: aggregate-required-verdict
@@ -2123,8 +2229,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          AUDIT_SOURCE_ATTEMPT: ${{ steps.resolve-audit-artifact.outputs.source_attempt }}
-          AUDIT_ARTIFACT_NAME: ${{ steps.resolve-audit-artifact.outputs.artifact_name }}
+          AUDIT_SOURCE_ATTEMPT: ${{ needs.primary.outputs.audit_attempt }}
+          AUDIT_ARTIFACT_NAME: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ needs.primary.outputs.audit_attempt }}
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
           CONVERGENCE_RECEIPT_PATH: ${{ runner.temp }}/convergence-receipt/convergence-receipt.json
           GH_TOKEN: ${{ github.token }}
@@ -2163,20 +2269,32 @@ jobs:
           fi
           exit "$rc"
 
+      # gate-silo-region: bookkeeping
       - name: Upload convergence receipt
         if: always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'
+        continue-on-error: true
         env:
           ARTIFACT_NAME: gate-convergence-receipt-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           RECEIPT_DIR: ${{ runner.temp }}/convergence-receipt
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put-dir \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=convergence-receipt key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put-dir \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --dir "$RECEIPT_DIR"
+            --dir "$RECEIPT_DIR" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=convergence-receipt key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Archive convergence receipt permanently
         if: always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'
         id: archive-convergence-receipt
@@ -2191,10 +2309,11 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --dir "$RECEIPT_DIR"; then
-            echo "::warning::Permanent archive of convergence receipt failed"
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=convergence-receipt-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=put_dir_failed"
             exit 1
           fi
 
+      # gate-silo-region: bookkeeping
       - name: Upload gate terminal envelope
         if: always()
         id: upload-gate-terminal
@@ -2204,13 +2323,23 @@ jobs:
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$TERMINAL_PATH"
+            --file "$TERMINAL_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Retry upload gate terminal envelope
         if: always() && steps.upload-gate-terminal.outcome == 'failure'
         id: retry-upload-gate-terminal
@@ -2220,12 +2349,21 @@ jobs:
           TERMINAL_PATH: ${{ runner.temp }}/gate-terminal.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$TERMINAL_PATH"
+            --file "$TERMINAL_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
       - name: Publish gate status panel
         if: always() && (steps.upload-gate-terminal.outcome == 'success' || steps.retry-upload-gate-terminal.outcome == 'success')
@@ -2269,6 +2407,7 @@ jobs:
             --panel-delivery-path "$PANEL_DELIVERY_PATH" \
             --publish-only
 
+      # gate-silo-region: bookkeeping
       - name: Upload gate status panel delivery diagnostic
         if: always()
         id: upload-gate-status-panel-diagnostic
@@ -2278,13 +2417,23 @@ jobs:
           PANEL_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
         run: |
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-status-panel key=d3/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d3 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$PANEL_PATH"
+            --file "$PANEL_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-status-panel key=d3/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Archive gate status panel delivery diagnostic permanently
         if: always()
         id: archive-gate-status-panel-diagnostic
@@ -2299,7 +2448,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$PANEL_PATH"; then
-            echo "::warning::Permanent archive of gate status panel delivery diagnostic failed"
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-status-panel-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME reason=put_failed"
             exit 1
           fi
 
@@ -2364,8 +2513,13 @@ jobs:
           bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
+      # gate-silo-region: bookkeeping
       - name: Resolve Silo hostname via MagicDNS
+        # DNS preparation for the ledger's Silo writes; a failure must not skip
+        # the row build (the audit input now comes from the job output) — the
+        # writes degrade to deferred rows.
         if: always()
+        continue-on-error: true
         run: |
           echo "::notice::step-start: Resolve Silo hostname via MagicDNS"
           set -euo pipefail
@@ -2383,7 +2537,11 @@ jobs:
           else printf '%s %s\n' "$SILO_IP" "$SILO_HOST" | sudo tee -a /etc/hosts >/dev/null
           fi
 
+      # gate-silo-region: bookkeeping
       - name: Resolve v2 ledger artifacts
+        # Terminal/input resolution for the ledger row; audit no longer resolves
+        # here (it arrives via the primary job output). Failures skip the row
+        # build while this job's `continue-on-error: true` keeps the conclusion green.
         id: resolve-ledger-artifacts
         if: always()
         env:
@@ -2392,7 +2550,6 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPO_ID: ${{ github.repository_id }}
           INPUT_PREFIX: review-ledger-input-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
-          AUDIT_PREFIX: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           TERMINAL_PREFIX: gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
@@ -2426,10 +2583,12 @@ jobs:
             fi
             printf '%s' "$out"
           }
+          # canonical audit no longer resolves from Silo (design A.3): the
+          # ledger reads it from the primary job output in the next step; only
+          # the terminal envelope still resolves here.
           INPUT_RESOLVE=""
-          AUDIT_RESOLVE="$(resolve_or_empty d14 "$AUDIT_PREFIX")"
           TERMINAL_RESOLVE="$(resolve_or_empty d30 "$TERMINAL_PREFIX")"
-          export INPUT_RESOLVE AUDIT_RESOLVE TERMINAL_RESOLVE
+          export INPUT_RESOLVE TERMINAL_RESOLVE
           python3 - "$CURRENT_ATTEMPT" "$REVIEW_EXPECTED" "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
@@ -2500,11 +2659,6 @@ jobs:
                   return None
               return attempt, prefix, _name
 
-          audit_artifact = parse_resolve(
-              os.environ.get("AUDIT_RESOLVE"),
-              "No matching canonical primary audit artifact found",
-              expected_text == "true" and primary_result != "cancelled",
-          )
           # Review-not-expected (exempt / classify false / draft / hosted / fork)
           # must still write a ledger row. required stays True when review is
           # expected — missing terminal on that path remains fail-closed.
@@ -2629,8 +2783,6 @@ jobs:
               output.write(f"input_artifact_id={input_artifact[1] if input_artifact else ''}\n")
               output.write(f"input_source_attempt={input_artifact[0] if input_artifact else ''}\n")
               output.write(f"input_short_circuited={'true' if quality_short_circuited and input_artifact is None else 'false'}\n")
-              output.write(f"audit_artifact_id={audit_artifact[1] if audit_artifact else ''}\n")
-              output.write(f"audit_source_attempt={audit_artifact[0] if audit_artifact else ''}\n")
               output.write(f"terminal_artifact_id={terminal_artifact[1] if terminal_artifact else ''}\n")
               output.write(f"terminal_source_attempt={terminal_artifact[0] if terminal_artifact else ''}\n")
               output.write(f"review_expected={expected_text}\n")
@@ -2677,6 +2829,7 @@ jobs:
               raise SystemExit(1)
           PY
 
+      # gate-silo-region: bookkeeping
       - name: Upload v2 review ledger inputs
         id: persist-ledger-input
         if: always() && steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''
@@ -2689,14 +2842,24 @@ jobs:
         run: |
           echo "::notice::step-start: Upload v2 review ledger inputs"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=ledger-input key=d1/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d1 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$PREFLIGHT" \
-            --file "$INSTALL"
+            --file "$INSTALL" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=ledger-input key=d1/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Retry upload v2 review ledger inputs
         id: persist-ledger-input-retry
         if: always() && steps.persist-ledger-input.outcome == 'failure'
@@ -2709,28 +2872,68 @@ jobs:
         run: |
           echo "::notice::step-start: Retry upload v2 review ledger inputs"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=ledger-input key=d1/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d1 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$PREFLIGHT" \
-            --file "$INSTALL"
+            --file "$INSTALL" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=ledger-input key=d1/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
-      - name: Download canonical primary audit for ledger
-        if: ${{ always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}
+      # gate-silo-region: bookkeeping
+      - name: Read canonical primary audit from primary job output for ledger
+        # Ledger input channel (design A.3): reads the audit from the primary
+        # job output instead of resolving/downloading it from Silo. Kept
+        # fail-loud for REVIEWED runs (primary success/failure) with a
+        # missing/corrupt output — same contract the required Silo resolve
+        # enforced before the channel split (a reviewed run must leave its
+        # audit ledgered); for skipped/cancelled primaries the output is
+        # legitimately absent and the row's audit fields become null. No
+        # step-level continue-on-error: this job's own `continue-on-error:
+        # true` keeps the conclusion green while skipping the row build, exactly
+        # like the pre-split resolver failure path.
+        if: always()
         env:
-          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
-          DEST: ${{ runner.temp }}/primary-audit
+          PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
+          PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
+          AUDIT_B64: ${{ needs.primary.outputs.audit_json_b64 }}
+          AUDIT_BYTES_DECLARED: ${{ needs.primary.outputs.audit_bytes }}
+          AUDIT_DIR: ${{ runner.temp }}/primary-audit
+          AUDIT_FILENAME: primary-review-audit.json
         run: |
-          echo "::notice::step-start: Download canonical primary audit for ledger"
+          echo "::notice::step-start: Read canonical primary audit from primary job output for ledger"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" get \
-            --prefix "$ARTIFACT_PREFIX" \
-            --dest "$DEST"
+          fail_loud() { echo "::error::$1" >&2; exit 1; }
+          mkdir -p "$AUDIT_DIR"
+          reviewed=false
+          case "$PRIMARY_RESULT" in success|failure) reviewed=true;; esac
+          if [ -z "$AUDIT_B64" ]; then
+            if [ "$reviewed" = true ]; then
+              fail_loud "primary reviewed ($PRIMARY_RESULT) but audit job output is missing — refusing to ledger a reviewed run without its audit record"
+            fi
+            echo "::notice::primary $PRIMARY_RESULT produced no audit output; ledger row audit fields will be null"
+            exit 0
+          fi
+          tmp="$AUDIT_DIR/.audit.b64.tmp"
+          printf '%s' "$AUDIT_B64" | base64 -d > "$tmp" 2>/dev/null || fail_loud "primary audit output is not valid base64"
+          actual=$(wc -c < "$tmp" | tr -d ' ')
+          [ "$actual" = "$AUDIT_BYTES_DECLARED" ] || fail_loud "primary audit output truncated (declared=$AUDIT_BYTES_DECLARED actual=$actual)"
+          mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"
 
+      # gate-silo-region: bookkeeping
       - name: Download gate terminal envelope for ledger
+        # Ledger-side input copy of the terminal envelope; this job's own
+        # `continue-on-error: true` keeps its conclusion green on failure (row
+        # build is then skipped, matching the pre-split failure path).
         if: always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''
         env:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
@@ -2828,20 +3031,34 @@ jobs:
               print(f"::warning::{warning}")
           PY
 
+      # gate-silo-region: bookkeeping
       - name: Upload v2 review effectiveness ledger
+        # The ledger row itself is bookkeeping (this whole job is); its job-level
+        # `continue-on-error: true` already shields the conclusion. The deferred
+        # line feeds G3's replay queue.
         env:
           ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
         run: |
           echo "::notice::step-start: Upload v2 review effectiveness ledger"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$LEDGER_PATH"
+            --file "$LEDGER_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Upload v2 review effectiveness ledger latest pointer
         env:
           ARTIFACT_NAME: codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}
@@ -2849,15 +3066,26 @@ jobs:
         run: |
           echo "::notice::step-start: Upload v2 review effectiveness ledger latest pointer"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put \
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-latest key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put \
             --tier d30 \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$LEDGER_PATH"
+            --file "$LEDGER_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-latest key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
+      # gate-silo-region: bookkeeping
       - name: Upload v2 raw review ledger to permanent archive
         if: always() && steps.build-review-ledger.outcome == 'success'
+        continue-on-error: true
         env:
           ARTIFACT_NAME: codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           LEDGER_PATH: ${{ runner.temp }}/review-ledger/ledger.jsonl
@@ -2865,59 +3093,79 @@ jobs:
         run: |
           echo "::notice::step-start: Upload v2 raw review ledger to permanent archive"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl reason=missing_credentials"
+            exit 1
+          fi
           if ! "$SILO_EXEC" put \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$LEDGER_PATH"; then
-            echo "::error::Permanent review ledger archive upload failed" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl reason=put_failed"
             exit 1
           fi
           if ! "$SILO_EXEC" get --key \
             "archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl" \
             --dest "$ARCHIVE_READBACK_PATH"; then
-            echo "::error::Permanent review ledger archive readback failed" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl reason=readback_failed"
             exit 1
           fi
           if ! cmp -s "$LEDGER_PATH" "$ARCHIVE_READBACK_PATH"; then
-            echo "::error::Permanent review ledger archive readback bytes do not match" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl reason=readback_mismatch"
             exit 1
           fi
 
+      # gate-silo-region: bookkeeping
       - name: Archive canonical primary audit permanently
-        if: always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != ''
+        # Retention copy (design A.4). The archive key is the same primary-audit
+        # key template as before the channel split; it now comes from the
+        # primary job output instead of a Silo resolve. A Silo failure degrades
+        # to a deferred row — the audit itself already lives in the job output
+        # and the review ledger row.
+        if: always() && needs.primary.outputs.audit_key != ''
+        continue-on-error: true
         env:
-          ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.audit_artifact_id }}
+          ARTIFACT_NAME: ${{ needs.primary.outputs.audit_key }}
           REPO_ID: ${{ github.repository_id }}
           AUDIT_PATH: ${{ runner.temp }}/primary-audit/primary-review-audit.json
           ARCHIVE_READBACK_PATH: ${{ runner.temp }}/review-ledger/primary-audit-archive-readback.json
         run: |
           echo "::notice::step-start: Archive canonical primary audit permanently"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          ARTIFACT_NAME="${ARTIFACT_PREFIX##*/}"
+          if [ ! -s "$AUDIT_PATH" ]; then
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=source_file_missing"
+            exit 1
+          fi
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=missing_credentials"
+            exit 1
+          fi
           if ! "$SILO_EXEC" put \
             --tier archive \
             --repo-id "$REPO_ID" \
             --name "$ARTIFACT_NAME" \
             --file "$AUDIT_PATH"; then
-            echo "::error::Permanent primary audit archive upload failed" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=put_failed"
             exit 1
           fi
           if ! "$SILO_EXEC" get --key \
             "archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json" \
             --dest "$ARCHIVE_READBACK_PATH"; then
-            echo "::error::Permanent primary audit archive readback failed" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=readback_failed"
             exit 1
           fi
           if ! cmp -s "$AUDIT_PATH" "$ARCHIVE_READBACK_PATH"; then
-            echo "::error::Permanent primary audit archive readback bytes do not match" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=readback_mismatch"
             exit 1
           fi
 
+      # gate-silo-region: bookkeeping
       - name: Archive gate terminal envelope permanently
         if: always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''
+        continue-on-error: true
         env:
           ARTIFACT_PREFIX: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}
           REPO_ID: ${{ github.repository_id }}
@@ -2926,36 +3174,51 @@ jobs:
         run: |
           echo "::notice::step-start: Archive gate terminal envelope permanently"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           ARTIFACT_NAME="${ARTIFACT_PREFIX##*/}"
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive key=archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json reason=missing_credentials"
+            exit 1
+          fi
           if ! "$SILO_EXEC" put \
             --tier archive \
             --repo-id "$REPO_ID" \
             --name "$ARTIFACT_NAME" \
             --file "$TERMINAL_PATH"; then
-            echo "::error::Permanent gate terminal archive upload failed" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive key=archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json reason=put_failed"
             exit 1
           fi
           if ! "$SILO_EXEC" get --key \
             "archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json" \
             --dest "$ARCHIVE_READBACK_PATH"; then
-            echo "::error::Permanent gate terminal archive readback failed" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive key=archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json reason=readback_failed"
             exit 1
           fi
           if ! cmp -s "$TERMINAL_PATH" "$ARCHIVE_READBACK_PATH"; then
-            echo "::error::Permanent gate terminal archive readback bytes do not match" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive key=archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json reason=readback_mismatch"
             exit 1
           fi
 
+      # gate-silo-region: bookkeeping
       - name: Upload live review record/v1 to permanent Silo
         if: always() && steps.build-review-ledger.outcome == 'success'
+        continue-on-error: true
         env:
           REVIEW_RECORD_PATH: ${{ runner.temp }}/review-ledger/review-record-v1.json
         run: |
           echo "::notice::step-start: Upload live review record/v1 to permanent Silo"
           set -euo pipefail
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
-          "$SILO_EXEC" put-review-record --file "$REVIEW_RECORD_PATH"
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "SILO_ACCESS_KEY 未传入 — 记账降级为补传登记" >&2
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-record key=review-records/ reason=missing_credentials"
+            exit 1
+          fi
+          if ! out="$($SILO_EXEC put-review-record --file "$REVIEW_RECORD_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-record key=review-records/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
       - name: Diagnose silo network after job failure
         if: failure()

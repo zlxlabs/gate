@@ -1279,10 +1279,6 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     aggregate = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
     publish = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Publish gate status panel")
     resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
-    download_audit = next(
-        s for s in raw["jobs"]["ledger"]["steps"]
-        if s.get("name") == "Download canonical primary audit for ledger"
-    )
     build = next(
         s for s in raw["jobs"]["ledger"]["steps"]
         if s.get("name") == "Build v2 review effectiveness ledger"
@@ -1298,7 +1294,6 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
     assert workflow_text.count(CLASSIFY_GUARD) == 6
     assert "outputs.review_expected == 'true'" not in workflow_text
-    assert download_audit["if"] == "${{ always() && steps.resolve-ledger-artifacts.outputs.audit_artifact_id != '' }}"
 
 
 def test_aggregate_passes_skip_reason_facts_from_the_review_expected_atoms():
@@ -1375,7 +1370,7 @@ def test_ledger_resolver_records_out_of_domain_primary_as_cancelled(tmp_path, ra
     )
     combined = result.stderr + result.stdout
     assert result.returncode == 0, combined
-    assert "audit_artifact_id=\n" in output
+    assert "audit_artifact_id=" not in output  # audit channel moved to job outputs (design A.3)
     assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
     assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
     assert f"::warning::PRIMARY_RESULT normalized from {raw_result!r} to 'cancelled'" in combined
@@ -1905,12 +1900,18 @@ def test_gate_uploads_convergence_receipt_before_terminal_and_panel_publication(
     assert upload["if"] == "always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
     assert "uses" not in upload
     assert "always()" in str(upload["if"])
-    assert "continue-on-error" not in upload
+    # bookkeeping (design A.4): a receipt upload failure must not flip the gate
+    # job; it emits the G3 replay-queue line instead.
+    assert upload["continue-on-error"] is True
     assert upload["env"]["ARTIFACT_NAME"] == CONVERGENCE_RECEIPT_NAME_EXPR
     assert upload["env"]["RECEIPT_DIR"] == CONVERGENCE_RECEIPT_PATH
     assert "--tier d3" in upload["run"]
     assert "$SILO_EXEC" in upload["run"]
-    assert "|| true" not in upload["run"]
+    # the legacy "no swallowed exit codes" guard, refined: the Silo invocation
+    # itself must never carry `|| true` (the `|| true` on the deferred-row
+    # reason extraction only guards grep's no-match exit under pipefail)
+    assert not any("$SILO_EXEC" in line and "|| true" in line for line in upload["run"].splitlines())
+    assert "GATE-ARCHIVE-DEFERRED kind=convergence-receipt " in upload["run"]
 
 
 def test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggregate_rc():
@@ -1941,7 +1942,8 @@ def test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggre
         if step.get("name") == "Upload convergence receipt"
     )
     assert upload["if"] == "always() && steps.aggregate-required-verdict.outputs.convergence-receipt == 'present'"
-    assert "continue-on-error" not in upload
+    assert upload["continue-on-error"] is True
+    assert "GATE-ARCHIVE-DEFERRED" in upload["run"]
 
 
 # ── gate aggregator job: required-check identity + always() ─────────────────
@@ -1994,20 +1996,52 @@ def test_gate_job_never_invokes_aggregator_via_a_moving_uses_ref():
     assert AGGREGATOR_SCRIPT.is_file()
 
 
-def test_gate_job_downloads_the_same_artifact_name_primary_uploads():
+def test_primary_publishes_verdict_output_and_silo_copy_shares_key_template():
+    """Verdict channel producer contract (design A.1) + retention-copy key parity.
+
+    The job output carries the canonical audit to gate/ledger (base64, single
+    line); the Silo d14 upload is bookkeeping only but must keep the same key
+    template so terminal envelopes and archives stay addressable.
+    """
     raw, _ = _load_workflow()
-    primary_steps = raw["jobs"]["primary"]["steps"]
-    upload = next(s for s in primary_steps if s.get("name") == "Upload canonical primary audit")
+    primary = raw["jobs"]["primary"]
+    outputs = primary["outputs"]
+    assert outputs["audit_json_b64"] == "${{ steps.publish-audit-output.outputs.audit_json_b64 }}"
+    assert outputs["audit_bytes"] == "${{ steps.publish-audit-output.outputs.audit_bytes }}"
+    assert outputs["audit_attempt"] == "${{ steps.publish-audit-output.outputs.audit_attempt }}"
+    assert outputs["audit_key"] == "${{ steps.publish-audit-output.outputs.audit_key }}"
+
+    publish = next(s for s in primary["steps"] if s.get("name") == "Publish canonical primary audit to job output")
+    assert publish["if"] == "always()"
+    assert publish["id"] == "publish-audit-output"
+    assert "uses" not in publish
+    # fail-closed verdict channel: missing/empty audit file must fail the step
+    # (and the primary job), never publish an empty record.
+    assert "continue-on-error" not in publish
+    assert "[ ! -s \"$AUDIT_PATH\" ]" in publish["run"]
+    assert "exit 1" in publish["run"]
+    assert 'base64 -w0' in publish["run"]
+    assert "MAX_B64_BYTES" in publish["env"]
+    assert publish["env"]["AUDIT_KEY"] == ARTIFACT_NAME_EXPR
+    assert 'echo "audit_json_b64=$b64"' in publish["run"]
+    assert 'echo "audit_bytes=' in publish["run"]
+    assert 'echo "audit_attempt=${{ github.run_attempt }}"' in publish["run"]
+    assert 'echo "audit_key=$AUDIT_KEY"' in publish["run"]
+
+    upload = next(s for s in primary["steps"] if s.get("name") == "Upload canonical primary audit")
     assert upload["if"] == "always()"
     assert "uses" not in upload
     assert upload["env"]["ARTIFACT_NAME"] == ARTIFACT_NAME_EXPR
-    # fail-closed: unlike legacy's advisory codex-audit upload, this upload has no
-    # continue-on-error. Missing source file makes silo_store put exit 1.
-    assert "continue-on-error" not in upload
+    # bookkeeping (design A.3): the Silo copy must never flip the primary result.
+    assert upload["continue-on-error"] is True
     assert "--tier d14" in upload["run"]
     assert upload["env"]["AUDIT_PATH"] == "${{ runner.temp }}/primary-review-audit.json"
-    assert "|| true" not in upload["run"]
+    # the legacy "no swallowed exit codes" guard, refined: the Silo invocation
+    # itself must never carry `|| true` (the `|| true` on the deferred-row
+    # reason extraction only guards grep's no-match exit under pipefail)
+    assert not any("$SILO_EXEC" in line and "|| true" in line for line in upload["run"].splitlines())
     assert "SILO_ACCESS_KEY 未传入" in upload["run"]
+    assert "GATE-ARCHIVE-DEFERRED kind=primary-audit " in upload["run"]
 
 
 def test_primary_uploads_review_diagnostics_after_canonical_audit():
@@ -2028,32 +2062,28 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     assert "--empty skip" in diagnostics["run"]
 
     gate_steps = raw["jobs"]["gate"]["steps"]
-    resolver = next(s for s in gate_steps if s.get("name") == "Resolve canonical primary audit artifact")
-    assert resolver["id"] == "resolve-audit-artifact"
-    assert resolver["if"] == "${{ needs.primary.result != 'skipped' }}"
-    assert resolver["continue-on-error"] is True
-    assert resolver["env"]["AUDIT_PREFIX"] == ARTIFACT_PREFIX_EXPR
-    resolver_run = resolver["run"]
-    assert "$SILO_EXEC" in resolver_run
-    assert "resolve" in resolver_run
-    assert "--tier d14" in resolver_run
-    assert "--attempt" in resolver_run
-    assert 'artifact_id=' in resolver_run
-    assert 'source_attempt=' in resolver_run
-    assert 'echo "artifact_id="' in resolver_run
-    assert 'echo "artifact_name="' in resolver_run and 'echo "artifact_name=$artifact_name"' in resolver_run
-    assert 'No matching canonical primary audit artifact found' in resolver_run
+    # Verdict channel consumer (design A.2): no Silo resolve/download for the
+    # audit any more — gate reads needs.primary.outputs directly.
+    assert not any("audit" in str(s.get("name", "")).lower() and "$SILO_EXEC" in str(s.get("run", "")) for s in gate_steps)
+    reader = next(s for s in gate_steps if s.get("name") == "Read canonical primary audit from primary job output")
+    assert reader["id"] == "read-primary-audit"
+    assert reader["if"] == "${{ needs.primary.result != 'skipped' }}"
+    assert "continue-on-error" not in reader
+    assert reader["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_b64 }}"
+    assert reader["env"]["AUDIT_BYTES_DECLARED"] == "${{ needs.primary.outputs.audit_bytes }}"
+    assert reader["env"]["AUDIT_DIR"] == "${{ runner.temp }}/primary-audit"
+    assert reader["env"]["AUDIT_FILENAME"] == "primary-review-audit.json"
+    reader_run = reader["run"]
+    # fail-closed collapse paths: every bad shape must leave the audit dir
+    # without a usable file (aggregator audit_missing) and print the reason.
+    assert '[ -z "$AUDIT_B64" ]' in reader_run
+    assert "audit_missing" in reader_run
+    assert "base64 -d" in reader_run
+    assert 'audit_missing" >&2' in reader_run
+    assert 'truncated or padded' in reader_run
+    assert "mkdir -p \"$AUDIT_DIR\"" in reader_run
+    assert 'mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"' in reader_run
 
-    download = next(s for s in gate_steps if s.get("name") == "Download canonical primary audit (best effort — may not exist)")
-    assert download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-audit-artifact.outputs.artifact_id }}"
-    assert download["env"]["DEST"] == "${{ runner.temp }}/primary-audit"
-    assert "$SILO_EXEC" in download["run"]
-    assert " get " in download["run"] or "\n          get " in download["run"] or "silo_store.py\" get" in download["run"]
-    assert download["continue-on-error"] is True
-    assert download["if"] == (
-        "${{ needs.primary.result != 'skipped' && "
-        "steps.resolve-audit-artifact.outputs.artifact_id != '' }}"
-    )
     terminal_upload = next(s for s in gate_steps if s.get("name") == "Upload gate terminal envelope")
     assert terminal_upload["if"] == "always()"
     assert "uses" not in terminal_upload
@@ -2080,7 +2110,6 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
 @pytest.mark.parametrize(
     ("job_name", "step_name"),
     [
-        ("gate", "Resolve canonical primary audit artifact"),
         ("ledger", "Resolve v2 ledger artifacts"),
     ],
 )
@@ -2098,13 +2127,15 @@ def test_artifact_listing_resolvers_retry_with_bounded_timeout(job_name, step_na
 
 
 def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
+    """The attempt/name declared by the primary job output, not a Silo resolve."""
     raw, _ = _load_workflow()
     aggregate_step = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
-    assert aggregate_step["env"]["AUDIT_SOURCE_ATTEMPT"] == (
-        "${{ steps.resolve-audit-artifact.outputs.source_attempt }}"
-    )
+    assert aggregate_step["env"]["AUDIT_SOURCE_ATTEMPT"] == "${{ needs.primary.outputs.audit_attempt }}"
     assert '--audit-source-attempt "$AUDIT_SOURCE_ATTEMPT"' in aggregate_step["run"]
-    assert aggregate_step["env"]["AUDIT_ARTIFACT_NAME"] == "${{ steps.resolve-audit-artifact.outputs.artifact_name }}"
+    assert aggregate_step["env"]["AUDIT_ARTIFACT_NAME"] == (
+        "primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
+        "-${{ github.run_id }}-${{ needs.primary.outputs.audit_attempt }}"
+    )
     assert '--audit-artifact-name "$AUDIT_ARTIFACT_NAME"' in aggregate_step["run"]
 
 
@@ -2146,6 +2177,24 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
     assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
     assert "continue-on-error" not in terminal_download
+    # audit channel (design A.3): the ledger reads needs.primary.outputs instead
+    # of resolving/downloading the audit from Silo.
+    audit_read = next(step for step in steps if step.get("name") == "Read canonical primary audit from primary job output for ledger")
+    assert audit_read["if"] == "always()"
+    # fail-loud for reviewed runs is delegated to the job-level continue-on-error
+    # (conclusion stays green; the row build is skipped), same as the pre-split
+    # required-resolve failure path.
+    assert "continue-on-error" not in audit_read
+    assert audit_read["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_b64 }}"
+    assert audit_read["env"]["AUDIT_BYTES_DECLARED"] == "${{ needs.primary.outputs.audit_bytes }}"
+    assert audit_read["env"]["AUDIT_FILENAME"] == "primary-review-audit.json"
+    audit_read_run = audit_read["run"]
+    assert 'success|failure) reviewed=true' in audit_read_run
+    assert "refusing to ledger a reviewed run without its audit record" in audit_read_run
+    assert "audit fields will be null" in audit_read_run
+    assert "base64 -d" in audit_read_run
+    assert "truncated (declared=" in audit_read_run
+    assert 'mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"' in audit_read_run
     build = steps[build_index]
     assert build["id"] == "build-review-ledger"
     assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
@@ -2186,6 +2235,12 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "$SILO_EXEC" in latest["run"]
     assert "list" not in latest["run"]
 
+    # the whole ledger job runs under continue-on-error: true — these steps rely
+    # on it instead of a step-level flag
+    assert "continue-on-error" not in upload
+    assert "GATE-ARCHIVE-DEFERRED kind=review-ledger " in upload["run"]
+    assert "GATE-ARCHIVE-DEFERRED kind=review-ledger-latest " in latest["run"]
+
     archive_steps = [
         step for step in steps if step.get("name") == "Upload v2 raw review ledger to permanent archive"
     ]
@@ -2193,14 +2248,28 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     archive = archive_steps[0]
     assert steps.index(archive) == steps.index(latest) + 1
     assert archive["if"] == "always() && steps.build-review-ledger.outcome == 'success'"
-    assert "continue-on-error" not in archive
+    assert archive["continue-on-error"] is True
     assert archive["env"]["ARTIFACT_NAME"] == upload["env"]["ARTIFACT_NAME"]
     assert archive["env"]["LEDGER_PATH"] == upload["env"]["LEDGER_PATH"]
     assert "--tier archive" in archive["run"]
     assert "--repo-id \"${{ github.repository_id }}\"" in archive["run"]
     assert "--name \"$ARTIFACT_NAME\"" in archive["run"]
     assert "--file \"$LEDGER_PATH\"" in archive["run"]
-    assert "::error::Permanent review ledger archive upload failed" in archive["run"]
+    assert "GATE-ARCHIVE-DEFERRED kind=review-ledger-archive " in archive["run"]
+
+    audit_archive = next(step for step in steps if step.get("name") == "Archive canonical primary audit permanently")
+    assert audit_archive["if"] == "always() && needs.primary.outputs.audit_key != ''"
+    assert audit_archive["continue-on-error"] is True
+    assert audit_archive["env"]["ARTIFACT_NAME"] == "${{ needs.primary.outputs.audit_key }}"
+    assert "GATE-ARCHIVE-DEFERRED kind=primary-audit-archive " in audit_archive["run"]
+
+    terminal_archive = next(step for step in steps if step.get("name") == "Archive gate terminal envelope permanently")
+    assert terminal_archive["continue-on-error"] is True
+    assert "GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive " in terminal_archive["run"]
+
+    record_upload = next(step for step in steps if step.get("name") == "Upload live review record/v1 to permanent Silo")
+    assert record_upload["continue-on-error"] is True
+    assert "GATE-ARCHIVE-DEFERRED kind=review-record " in record_upload["run"]
 
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:
@@ -2247,7 +2316,7 @@ def test_ledger_steps_emit_start_progress_markers():
         "Resolve Silo hostname via MagicDNS",
         "Resolve v2 ledger artifacts",
         "Download v2 review ledger inputs",
-        "Download canonical primary audit for ledger",
+        "Read canonical primary audit from primary job output for ledger",
         "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger",
@@ -2330,18 +2399,23 @@ def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
     run = resolver["run"]
     for marker in (
         "$SILO_EXEC", "resolve", "--attempt",
-        "input_artifact_id", "audit_artifact_id", "terminal_artifact_id",
+        "input_artifact_id", "terminal_artifact_id",
         "terminal_source_attempt",
     ):
         assert marker in run
+    # audit no longer resolves from Silo (design A.3) — it arrives via the
+    # primary job output in the following step.
+    assert "audit_artifact_id" not in run
+    assert "AUDIT_RESOLVE" not in run
     assert "exact_attempt" not in run
+    assert resolver["env"].get("AUDIT_PREFIX") is None
     assert resolver["env"]["TERMINAL_PREFIX"] == (
         "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
     )
     assert resolver["env"]["REPOSITORY"] == "${{ github.repository }}"
     assert resolver["env"]["RUN_ID"] == "${{ github.run_id }}"
     assert "No matching required ledger input artifact found" in run
-    assert "No matching canonical primary audit artifact found" in run
+    assert "No matching canonical primary audit artifact found" not in run
     assert "No matching required gate terminal artifact found" in run
     assert "Aggregator ran on this attempt but did not produce a terminal artifact" in run
     assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in run
@@ -2932,7 +3006,12 @@ def test_ledger_resolver_result_domain_accepts_legal_values(
     assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
 
 
-def test_ledger_resolver_allows_missing_audit_for_observed_abandoned_primary(tmp_path):
+def test_ledger_resolver_has_no_audit_outputs_after_channel_split(tmp_path):
+    """Audit resolve removed (design A.3): the resolver no longer emits audit_*.
+
+    The audit reaches the ledger through needs.primary.outputs (see
+    test_gate_v2_audit_output_channel.py for the read-step behavior contract).
+    """
     fixture = json.loads(ABANDONED_FIXTURE.read_text(encoding="utf-8"))
     observed = fixture["observed_env"]
     artifacts = [
@@ -2951,26 +3030,33 @@ def test_ledger_resolver_allows_missing_audit_for_observed_abandoned_primary(tmp
         },
     )
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "audit_artifact_id=\n" in output
+    assert "audit_artifact_id=" not in output
+    assert "audit_source_attempt=" not in output
     assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
     assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
 
 
 @pytest.mark.parametrize("primary_result", ["success", "failure"])
-def test_ledger_resolver_still_requires_audit_for_reviewed_success_or_failure(tmp_path, primary_result):
-    result, _output = _run_ledger_resolver(
-        tmp_path,
-        artifacts=[
-            {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
-            {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-        ],
-        current=1,
-        review_expected="true",
-        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": primary_result},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "No matching canonical primary audit artifact found" in combined
+def test_ledger_audit_read_still_fail_louds_for_reviewed_success_or_failure(tmp_path, primary_result):
+    """Reviewed run + missing audit output must fail the read step (exit 1).
+
+    Same contract the required Silo resolve enforced before the channel split;
+    the job-level continue-on-error keeps the ledger conclusion green.
+    """
+    raw, _ = _load_workflow()
+    step = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Read canonical primary audit from primary job output for ledger")
+    env = {
+        "PRIMARY_RESULT_RAW": primary_result,
+        "PRIMARY_RESULT": primary_result,
+        "AUDIT_B64": "",
+        "AUDIT_BYTES_DECLARED": "",
+        "AUDIT_DIR": str(tmp_path / "primary-audit"),
+        "AUDIT_FILENAME": "primary-review-audit.json",
+    }
+    proc = subprocess.run(["bash", "-c", step["run"]], env={**os.environ, **env}, capture_output=True, text=True, timeout=30)
+    combined = proc.stderr + proc.stdout
+    assert proc.returncode != 0
+    assert "refusing to ledger a reviewed run without its audit record" in combined
 
 
 def test_ledger_resolver_cancelled_primary_still_requires_terminal(tmp_path):
@@ -2999,19 +3085,42 @@ def test_ledger_resolver_quality_success_still_requires_input_on_cancelled_prima
     assert "No matching required ledger input artifact found" in combined
 
 
-def test_ledger_persistence_steps_are_fail_closed():
+def test_ledger_persistence_never_gates_the_conclusion():
+    """Inverted contract (design A/E): Silo bookkeeping failures only warn.
+
+    The audit read step stays intentionally unprotected at the step level so a
+    missing reviewed-run audit still skips the row build (job-level
+    continue-on-error keeps the conclusion green), matching the pre-split
+    required-resolve behavior.
+    """
     raw, _ = _load_workflow()
     ledger_steps = raw["jobs"]["ledger"]["steps"]
     for name in (
         "Download v2 review ledger inputs",
-        "Download canonical primary audit for ledger",
+        "Read canonical primary audit from primary job output for ledger",
         "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
+    ):
+        step = next(s for s in ledger_steps if s.get("name") == name)
+        assert "continue-on-error" not in step
+    job_level = raw["jobs"]["ledger"].get("continue-on-error") is True
+    assert job_level
+    for name in (
         "Upload v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger latest pointer",
     ):
         step = next(s for s in ledger_steps if s.get("name") == name)
-        assert "continue-on-error" not in step
+        assert "continue-on-error" not in step  # job-level continue-on-error covers it
+        assert "GATE-ARCHIVE-DEFERRED" in step["run"]
+    for name in (
+        "Upload v2 raw review ledger to permanent archive",
+        "Archive canonical primary audit permanently",
+        "Archive gate terminal envelope permanently",
+        "Upload live review record/v1 to permanent Silo",
+    ):
+        step = next(s for s in ledger_steps if s.get("name") == name)
+        assert step["continue-on-error"] is True
+        assert "GATE-ARCHIVE-DEFERRED" in step["run"]
 
 
 def test_gate_job_review_expected_matches_primary_jobs_own_condition():
