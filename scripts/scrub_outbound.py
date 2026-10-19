@@ -63,12 +63,22 @@ _STATIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "TOKEN",
+        # Third branch (token|api_key|secret|password = value) only matches
+        # credential-shaped values: mixed case, or a base64 extra (+/=).
+        # Single-case identifiers (kebab/snake/attribute chains) are not
+        # credentials. Prefix and Bearer branches are unchanged.
         re.compile(
-            r"(?i)(?:\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|"
-            r"xox[baprs]-[A-Za-z0-9-]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b|"
-            r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}|"
-            r"\b(?:token|api[_-]?key|secret|password)\s*[:=]\s*['\"]?"
-            r"[A-Za-z0-9._~+/=-]{20,})"
+            r"(?:"
+            r"(?i:\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|"
+            r"xox[baprs]-[A-Za-z0-9-]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b)|"
+            r"(?i:\bBearer\s+[A-Za-z0-9._~+/=-]{20,})|"
+            r"(?i:\b(?:token|api[_-]?key|secret|password)\s*[:=]\s*['\"]?)"
+            r"(?:"
+            r"(?=[A-Za-z0-9._~+/=-]*[a-z])(?=[A-Za-z0-9._~+/=-]*[A-Z])|"
+            r"(?=[A-Za-z0-9._~+/=-]*[+/=])"
+            r")"
+            r"[A-Za-z0-9._~+/=-]{20,}"
+            r")"
         ),
     ),
 )
