@@ -1578,7 +1578,7 @@ def evaluate(
                 primary_classification, primary_reason = "integration_error", "audit_source_mismatch"
             else:
                 audit_available = verdict in ("pass", "fail", "unavailable")
-                convergence_eligible = verdict in ("pass", "fail")
+                convergence_eligible = audit_available
                 artifact_name = audit_artifact_name if isinstance(audit_artifact_name, str) and audit_artifact_name else None
                 notes.append(f"primary audit source run_attempt={audit_source} (current run_attempt={identity.run_attempt})")
                 if verdict == "pass":
@@ -1704,7 +1704,7 @@ def evaluate(
     # evaluator.  It runs only after the existing audit identity/job verdict
     # checks have succeeded; the old Outcome fields remain single-round facts.
     if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
-        p1_findings = _canonical_p1_findings(audit)
+        p1_findings = () if audit.get("verdict") == "unavailable" and audit.get("result") is None else _canonical_p1_findings(audit)
         if p1_findings is None:
             outcome.primary_verdict = None
             outcome.ok = False

@@ -852,8 +852,8 @@ def test_cli_non_draft_missing_primary_remains_fail_closed(
     assert terminal["gate_result"] == "unavailable"
 
 
-@pytest.mark.parametrize("verdict", ["fail"])
-def test_cli_exit_nonzero_with_zero_streak_receipt_for_red_round(tmp_path, verdict):
+@pytest.mark.parametrize("verdict", ["fail", "unavailable"])
+def test_cli_exit_nonzero_with_zero_streak_receipt_for_red_or_unavailable_round(tmp_path, verdict):
     audit = _valid_scoped_primary_record(
         verdict=verdict,
         result={"findings": [{
@@ -3520,17 +3520,17 @@ def test_clean_round_at_cross_head_cap_marks_shadow_but_preserves_pass():
 
 
 def test_unavailable_primary_does_not_increment_cross_head_shadow_count():
-    payload = (ROOT / "tests" / "fixtures" / "primary-audit-unavailable-malformed-v2.json").read_bytes()
-    audit_digest = hashlib.sha256(payload).hexdigest()
-    assert audit_digest == "b8b521b776083e374ada7d803516adcfa29472210dba575516a36709956b7cfd"
-    audit = json.loads(payload)
-    scope, missing = AGG._convergence_scope_from_audit(audit, IDENTITY)
-    assert not missing and scope is not None and AGG.validate_audit_identity(audit, IDENTITY) == []
-    assert audit["verdict"] == "unavailable" and audit["result"] is None and audit["attempts"][0]["reason"] == "FINDINGS-MALFORMED-DROPPED stage=single count=1"
+    assert (audit_digest := hashlib.sha256(payload := (ROOT / "tests" / "fixtures" / "primary-audit-unavailable-malformed-v2.json").read_bytes()).hexdigest()) == "b8b521b776083e374ada7d803516adcfa29472210dba575516a36709956b7cfd"
+    scope = AGG._convergence_scope_from_audit(audit := json.loads(payload), IDENTITY)[0]
+    assert scope is not None and AGG.validate_audit_identity(audit, IDENTITY) == [] and audit["verdict"] == "unavailable" and audit["result"] is None
     outcome = AGG.evaluate(**_base_kwargs(primary_result="failure", audit=audit, scope=scope, audit_digest=audit_digest, prior_eligible_run_ids=(101, 102), convergence_history_status="available"))
-    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("review_unavailable", "primary_unavailable", "unavailable")
-    assert outcome.convergence_envelope is None and not any("canonical finding severity" in p for p in outcome.problems)
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("review_unavailable", "primary_unavailable", "unavailable") and outcome.convergence_envelope is not None and outcome.convergence_envelope["state"]["unavailable_streak"] == 1 and not any("canonical finding severity" in p for p in outcome.problems)
     assert outcome.convergence_shadow["eligible_rounds"] == 2 and outcome.convergence_shadow["eligible_this_round"] is False
+    assert AGG.evaluate(**_base_kwargs(primary_result="failure", audit={**audit, "result": {"findings": [{"severity": "unknown"}]}}, scope=scope, audit_digest=audit_digest)).reason_code == "audit_invalid"
+    state = CONV.initial_state(scope)
+    for run_id in range(1000, 1000 + CONV.policy_for(scope).unavailable_budget):
+        state = CONV.evaluate_round(state=state, scope=scope, primary=CONV.CanonicalPrimary(1, IDENTITY.repository_id, IDENTITY.pr, IDENTITY.head_sha, run_id, 1, "unavailable"), audit_digest=audit_digest, processing_key=CONV.ProcessingKey(IDENTITY.repository_id, IDENTITY.pr, run_id, 1)).state
+    assert (state.terminal_decision, state.reason) == ("manual_required", "unavailable budget exhausted")
 
 
 def test_unavailable_cross_head_history_has_no_zero_count():
