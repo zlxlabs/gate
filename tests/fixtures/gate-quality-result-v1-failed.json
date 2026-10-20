@@ -1,0 +1,1 @@
+{"schema":"gate-quality-result/v1","mode":"full","stage":"tests","outcome":"failed","failed_nodeids":["tests/test_git_mirror_fetch.py::test_a_controlled_wait_is_attributed_to_its_lock_in_jsonl[mirror.lock-mirror_lock_ms-consume_lock_ms]"],"evidence":"junit","flake_signal":"undetermined"}

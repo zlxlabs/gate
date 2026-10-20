@@ -662,6 +662,100 @@ jobs:
           GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
         run: ./scripts/gate-quality
 
+      - name: Render gate-quality result
+        id: render-quality-result
+        if: ${{ always() && steps.quality-entry.outputs.mode == 'entry' }}
+        continue-on-error: true
+        env:
+          GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
+        run: |
+          if ! python3 - "$GATE_ARTIFACT_DIR/gate-quality-result.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          result_path = Path(sys.argv[1])
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          def emit(lines):
+              with summary_path.open("a", encoding="utf-8") as summary:
+                  summary.write("### Quality result\n" + "\n".join(lines) + "\n")
+
+          def invalid(reason):
+              emit([f"- Result: invalid ({reason})"])
+              print("::warning::GATE-QUALITY-RESULT-INVALID")
+
+          if not result_path.exists():
+              emit(["- Result: not_produced (caller has not adopted GATE-QUALITY-RESULT-V1)"])
+              raise SystemExit(0)
+
+          try:
+              result = json.loads(result_path.read_text(encoding="utf-8"))
+          except (json.JSONDecodeError, UnicodeDecodeError):
+              invalid("invalid JSON")
+              raise SystemExit(0)
+
+          if not isinstance(result, dict):
+              invalid("root must be an object")
+              raise SystemExit(0)
+          if result.get("schema") != "gate-quality-result/v1":
+              invalid("schema mismatch")
+              raise SystemExit(0)
+
+          mode = result.get("mode")
+          stage = result.get("stage")
+          outcome = result.get("outcome")
+          evidence = result.get("evidence")
+          failed_nodeids = result.get("failed_nodeids")
+          if not isinstance(mode, str):
+              invalid("mode must be a string")
+              raise SystemExit(0)
+          if stage not in ("lint", "tests", "setup"):
+              invalid("stage must be lint, tests, or setup")
+              raise SystemExit(0)
+          if outcome not in ("passed", "failed", "not_started"):
+              invalid("outcome must be passed, failed, or not_started")
+              raise SystemExit(0)
+          if evidence not in ("junit", "junit_missing", "not_applicable"):
+              invalid("evidence must be junit, junit_missing, or not_applicable")
+              raise SystemExit(0)
+          if result.get("flake_signal") != "undetermined":
+              invalid("flake_signal must be undetermined")
+              raise SystemExit(0)
+          if failed_nodeids is not None and (
+              not isinstance(failed_nodeids, list)
+              or not all(isinstance(nodeid, str) for nodeid in failed_nodeids)
+          ):
+              invalid("failed_nodeids must be an array of strings or null")
+              raise SystemExit(0)
+
+          lines = [
+              f"- Stage: {stage}",
+              f"- Outcome: {outcome}",
+              f"- Evidence: {evidence}",
+              f"- Mode: {mode}",
+          ]
+          if failed_nodeids is None:
+              lines.append(f"- Failed tests: unknown (evidence={evidence})")
+          elif not failed_nodeids:
+              lines.append("- Failed tests: none")
+          else:
+              lines.extend([f"- Failed tests ({len(failed_nodeids)}):", "```"])
+              for nodeid in failed_nodeids[:30]:
+                  safe_nodeid = "".join(
+                      char for char in nodeid if char != "`" and not "\x00" <= char <= "\x1f"
+                  )[:300]
+                  lines.append(safe_nodeid)
+              lines.append("```")
+              if len(failed_nodeids) > 30:
+                  lines.append(f"… and {len(failed_nodeids) - 30} more")
+          emit(lines)
+          PY
+          then
+            echo "::warning::GATE-QUALITY-RESULT-RENDER-FAILED"
+          fi
+
       # Caller entries write junit XML under $GATE_ARTIFACT_DIR/junit/.
       # Upload is bookkeeping: missing directory is the unadopted-caller
       # shape (ignore), and a failed upload must not redden quality.
