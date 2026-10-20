@@ -117,6 +117,7 @@ GATE_AGGREGATOR_JOB_NAMES = ("gate", "gate / gate", "gate / gate (draft)")
 GATE_AGGREGATOR_NAME_EXPRESSION = "${{ format('gate{0}', github.event.pull_request.draft && ' (draft)' || '') }}"
 QUALITY_ENTRY_PATH = "scripts/gate-quality"
 QUALITY_ENTRY_MODE = "steps.quality-entry.outputs.mode"
+QUALITY_RESULT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "gate-quality-result-v1-failed.json"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 BOUNDED_RETRY_HELPER = REPO_ROOT / "scripts" / "gate_bounded_retry.py"
 CHECKOUT_HELPER_RUN = 'python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout'
@@ -3749,6 +3750,159 @@ def test_silo_src_aggregate_sparse_covers_load_time_neighbors():
                     f"aggregate.py load-time neighbor {rel}"
                 )
     assert jobs_that_run, f"no job runs {needle}"
+
+
+def _run_quality_result_render(tmp_path, result_bytes=None):
+    raw, _ = _load_workflow()
+    step = next(
+        step for step in _quality_steps(raw)
+        if step.get("id") == "render-quality-result"
+    )
+    artifact_dir = tmp_path / "gate-quality"
+    artifact_dir.mkdir(parents=True)
+    if result_bytes is not None:
+        (artifact_dir / "gate-quality-result.json").write_bytes(result_bytes)
+    summary_path = tmp_path / "summary.md"
+    summary_path.write_bytes(b"")
+    env = os.environ.copy()
+    env.update({
+        "GATE_ARTIFACT_DIR": str(artifact_dir),
+        "GITHUB_STEP_SUMMARY": str(summary_path),
+    })
+    completed = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return step, completed, summary_path.read_bytes()
+
+
+def _quality_result(**overrides):
+    result = {
+        "schema": "gate-quality-result/v1",
+        "mode": "full",
+        "stage": "tests",
+        "outcome": "failed",
+        "failed_nodeids": None,
+        "evidence": "junit_missing",
+        "flake_signal": "undetermined",
+    }
+    result.update(overrides)
+    return (json.dumps(result, separators=(",", ":")) + "\n").encode()
+
+
+def test_quality_result_render_step_uses_real_workflow_script_and_producer_fixture(tmp_path):
+    fixture = QUALITY_RESULT_FIXTURE.read_bytes()
+    assert fixture == (
+        b'{"schema":"gate-quality-result/v1","mode":"full","stage":"tests",'
+        b'"outcome":"failed","failed_nodeids":["tests/test_git_mirror_fetch.py::'
+        b'test_a_controlled_wait_is_attributed_to_its_lock_in_jsonl[mirror.lock-'
+        b'mirror_lock_ms-consume_lock_ms]"],"evidence":"junit","flake_signal":"undetermined"}'
+        b"\n"
+    )
+    _step, completed, summary_bytes = _run_quality_result_render(tmp_path, fixture)
+    summary = summary_bytes.decode()
+    nodeid = (
+        "tests/test_git_mirror_fetch.py::test_a_controlled_wait_is_attributed_to_its_lock_in_jsonl"
+        "[mirror.lock-mirror_lock_ms-consume_lock_ms]"
+    )
+    assert completed.returncode == 0
+    assert "::warning::" not in completed.stdout + completed.stderr
+    assert "### Quality result" in summary
+    assert "- Stage: tests" in summary
+    assert "- Outcome: failed" in summary
+    assert "- Evidence: junit" in summary
+    assert "- Mode: full" in summary
+    assert "- Failed tests (1):" in summary
+    assert f"\n{nodeid}\n" in summary
+
+
+def test_quality_result_render_distinguishes_empty_and_unknown_nodes(tmp_path):
+    _step, empty_run, empty_bytes = _run_quality_result_render(
+        tmp_path / "empty", _quality_result(failed_nodeids=[], evidence="junit")
+    )
+    empty_summary = empty_bytes.decode()
+    assert empty_run.returncode == 0
+    assert "- Failed tests: none" in empty_summary
+
+    _step, unknown_run, unknown_bytes = _run_quality_result_render(tmp_path / "unknown", _quality_result())
+    unknown_summary = unknown_bytes.decode()
+    assert unknown_run.returncode == 0
+    assert "- Failed tests: unknown (evidence=junit_missing)" in unknown_summary
+    assert "none" not in unknown_summary
+
+
+@pytest.mark.parametrize(
+    ("result_bytes", "reason"),
+    [
+        (b"{not-json", "invalid JSON"),
+        (_quality_result(schema="other/v1"), "schema mismatch"),
+        (_quality_result(failed_nodeids=7), "failed_nodeids must be an array of strings or null"),
+        (_quality_result(failed_nodeids=["ok", 7]), "failed_nodeids must be an array of strings or null"),
+    ],
+)
+def test_quality_result_render_invalid_payload_warns_without_failing(tmp_path, result_bytes, reason):
+    _step, completed, summary_bytes = _run_quality_result_render(tmp_path, result_bytes)
+    summary = summary_bytes.decode()
+    assert completed.returncode == 0
+    assert f"- Result: invalid ({reason})" in summary
+    assert "::warning::GATE-QUALITY-RESULT-INVALID" in completed.stdout + completed.stderr
+
+
+def test_quality_result_render_missing_nodeids_field_is_invalid(tmp_path):
+    result = json.loads(_quality_result())
+    del result["failed_nodeids"]
+    result_bytes = (json.dumps(result, separators=(",", ":")) + "\n").encode()
+    _step, completed, summary_bytes = _run_quality_result_render(tmp_path, result_bytes)
+    assert completed.returncode == 0
+    assert "- Result: invalid (failed_nodeids is required)" in summary_bytes.decode()
+    assert "::warning::GATE-QUALITY-RESULT-INVALID" in completed.stdout + completed.stderr
+
+
+def test_quality_result_render_missing_file_is_unadopted_without_warning(tmp_path):
+    _step, completed, summary_bytes = _run_quality_result_render(tmp_path)
+    assert completed.returncode == 0
+    assert summary_bytes == (
+        b"### Quality result\n"
+        b"- Result: not_produced (caller has not adopted GATE-QUALITY-RESULT-V1)\n"
+    )
+    assert "::warning::" not in completed.stdout + completed.stderr
+
+
+def test_quality_result_render_sanitizes_and_caps_failed_nodeids(tmp_path):
+    nodeids = ["bad`" + "x" * 350 + "\x01"] + [f"node-{number}" for number in range(30)]
+    _step, completed, summary_bytes = _run_quality_result_render(
+        tmp_path,
+        _quality_result(failed_nodeids=nodeids, evidence="junit"),
+    )
+    summary = summary_bytes.decode()
+    code_block = summary.split("```\n", 1)[1].split("\n```", 1)[0]
+    node_lines = code_block.splitlines()
+    assert completed.returncode == 0
+    assert "- Failed tests (31):" in summary
+    assert len(node_lines) == 30
+    assert node_lines[0] == "bad" + "x" * 297
+    assert all("`" not in line for line in node_lines)
+    assert "node-29" not in code_block
+    assert "… and 1 more" in summary
+
+
+def test_quality_result_render_step_order_and_fail_open_contract():
+    raw, _ = _load_workflow()
+    steps = _quality_steps(raw)
+    names = [step.get("id") for step in steps]
+    render = next(step for step in steps if step.get("id") == "render-quality-result")
+    assert names.index("run-quality") < names.index("render-quality-result")
+    assert names.index("render-quality-result") < names.index("upload-quality-junit")
+    assert render["name"] == "Render gate-quality result"
+    assert "always()" in render["if"]
+    assert render["continue-on-error"] is True
+    assert render["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
+    assert "_gate-action-src" not in render["run"]
+    assert "_gate-aggregator-src" not in render["run"]
 
 
 def test_quality_entry_contract_covers_missing_non_executable_and_executable_states():
