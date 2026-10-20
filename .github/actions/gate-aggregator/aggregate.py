@@ -1704,7 +1704,7 @@ def evaluate(
     # evaluator.  It runs only after the existing audit identity/job verdict
     # checks have succeeded; the old Outcome fields remain single-round facts.
     if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
-        p1_findings = _canonical_p1_findings(audit)
+        p1_findings = () if audit.get("verdict") == "unavailable" and audit.get("result") is None else _canonical_p1_findings(audit)
         if p1_findings is None:
             outcome.primary_verdict = None
             outcome.ok = False
