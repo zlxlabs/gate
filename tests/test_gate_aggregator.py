@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 ABANDONED_FIXTURE = ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
 CONVERGENCE_HISTORY_FIXTURE = ROOT / "tests" / "fixtures" / "convergence_history" / "gate-hub-pr-928.json"
+UNAVAILABLE_MALFORMED_FIXTURE = ROOT / "tests" / "fixtures" / "primary-audit-unavailable-malformed-v2.json"
 
 
 def _module():
@@ -852,20 +853,21 @@ def test_cli_non_draft_missing_primary_remains_fail_closed(
     assert terminal["gate_result"] == "unavailable"
 
 
-@pytest.mark.parametrize("verdict", ["fail", "unavailable"])
-def test_cli_exit_nonzero_with_zero_streak_receipt_for_red_or_unavailable_round(tmp_path, verdict):
+@pytest.mark.parametrize("verdict,expect_receipt", [("fail", True), ("unavailable", False)])
+def test_cli_convergence_receipt_is_produced_only_for_red_round(tmp_path, verdict, expect_receipt):
     audit = _valid_scoped_primary_record(
         verdict=verdict,
         result={"findings": [{
             "id": "p1", "severity": "major", "file": "src/lock.py", "line": 12,
             "category": "correctness",
-        }]},
+        }]} if verdict == "fail" else None,
     )
     rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="failure")
 
     assert rc != 0
-    assert receipt_path.is_file()
-    assert json.loads(receipt_path.read_text())["clean_streak"] == 0
+    assert receipt_path.is_file() is expect_receipt
+    if expect_receipt:
+        assert json.loads(receipt_path.read_text())["clean_streak"] == 0
 
 
 def test_cli_exit_nonzero_without_receipt_for_fail_closed_audit(tmp_path):
@@ -3531,6 +3533,32 @@ def test_unavailable_primary_does_not_increment_cross_head_shadow_count():
     assert outcome.gate_result == "unavailable"
     assert outcome.convergence_shadow["eligible_rounds"] == 2
     assert outcome.convergence_shadow["eligible_this_round"] is False
+
+
+def test_real_unavailable_malformed_audit_with_scope_stays_primary_unavailable():
+    payload = UNAVAILABLE_MALFORMED_FIXTURE.read_bytes()
+    audit_digest = hashlib.sha256(payload).hexdigest()
+    assert audit_digest == "b8b521b776083e374ada7d803516adcfa29472210dba575516a36709956b7cfd"
+    audit = json.loads(payload)
+    assert audit["verdict"] == "unavailable"
+    assert audit["result"] is None
+    assert audit["attempts"][0]["reason"] == "FINDINGS-MALFORMED-DROPPED stage=single count=1"
+    assert all(field in audit for field in AGG._CONVERGENCE_SCOPE_FIELDS)
+    assert AGG.validate_audit_identity(audit, IDENTITY) == []
+    scope, missing = AGG._convergence_scope_from_audit(audit, IDENTITY)
+    assert scope is not None and not missing
+
+    outcome = AGG.evaluate(**_base_kwargs(
+        primary_result="failure",
+        audit=audit,
+        scope=scope,
+        audit_digest=audit_digest,
+    ))
+
+    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
+        "review_unavailable", "primary_unavailable", "unavailable",
+    )
+    assert not any("canonical finding severity" in problem for problem in outcome.problems)
 
 
 def test_unavailable_cross_head_history_has_no_zero_count():

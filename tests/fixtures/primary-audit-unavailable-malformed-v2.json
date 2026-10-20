@@ -1,0 +1,53 @@
+{
+  "kind": "primary_review",
+  "schema_version": 2,
+  "spec_source": "event_payload",
+  "pr_body_digest": "empty",
+  "repository_id": 123,
+  "repository": "zlxlabs/gate",
+  "pr": 42,
+  "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "diff_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "policy_version": "v2",
+  "policy_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "registry_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "caller_sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "reusable_workflow_sha": "ffffffffffffffffffffffffffffffffffffffff",
+  "run_id": 999,
+  "run_attempt": 1,
+  "job_id": 7001,
+  "reviewer": "claude-deepseek-v4-pro",
+  "verdict": "unavailable",
+  "attempts": [
+    {
+      "reviewer": "codex-sub",
+      "model": "gpt-fixture",
+      "exit_code": 1,
+      "reason": "FINDINGS-MALFORMED-DROPPED stage=single count=1",
+      "cost_usd": null,
+      "tokens": null,
+      "duration_s": 3.0,
+      "diag_snippet": null
+    },
+    {
+      "reviewer": "claude-deepseek-v4-pro",
+      "model": "deepseek-fixture",
+      "exit_code": 21,
+      "reason": "fixture adapter execution failure",
+      "cost_usd": null,
+      "tokens": null,
+      "duration_s": 2.0,
+      "diag_snippet": null
+    }
+  ],
+  "runtime": {
+    "duration_s": 5.0
+  },
+  "shadow_mode": "detached",
+  "expected_shadows": [],
+  "result": null,
+  "cost": null,
+  "tokens": null,
+  "tier": "personal"
+}

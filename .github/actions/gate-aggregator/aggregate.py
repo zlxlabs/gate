@@ -1578,7 +1578,7 @@ def evaluate(
                 primary_classification, primary_reason = "integration_error", "audit_source_mismatch"
             else:
                 audit_available = verdict in ("pass", "fail", "unavailable")
-                convergence_eligible = audit_available
+                convergence_eligible = verdict in ("pass", "fail")
                 artifact_name = audit_artifact_name if isinstance(audit_artifact_name, str) and audit_artifact_name else None
                 notes.append(f"primary audit source run_attempt={audit_source} (current run_attempt={identity.run_attempt})")
                 if verdict == "pass":
