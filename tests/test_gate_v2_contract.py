@@ -2190,18 +2190,19 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "ARTIFACT_PREFIX" not in input_download.get("env", {})
     assert "$SILO_EXEC" not in input_download["run"]
     terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
+    assert terminal_download["id"] == "download-gate-terminal-for-ledger"
     assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
     assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
     assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
-    assert "continue-on-error" not in terminal_download
+    assert terminal_download["continue-on-error"] is True
     # audit channel (design A.3): the ledger reads needs.primary.outputs instead
     # of resolving/downloading the audit from Silo.
     audit_read = next(step for step in steps if step.get("name") == "Read canonical primary audit from primary job output for ledger")
+    assert audit_read["id"] == "read-primary-audit-for-ledger"
     assert audit_read["if"] == "always()"
-    # fail-loud for reviewed runs is delegated to the job-level continue-on-error
-    # (conclusion stays green; the row build is skipped), same as the pre-split
-    # required-resolve failure path.
-    assert "continue-on-error" not in audit_read
+    # Ledger-side read remains fail-loud at the step outcome; step-level
+    # continue-on-error keeps this bookkeeping job check green.
+    assert audit_read["continue-on-error"] is True
     assert audit_read["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_b64 }}"
     assert audit_read["env"]["AUDIT_BYTES_DECLARED"] == "${{ needs.primary.outputs.audit_bytes }}"
     assert audit_read["env"]["AUDIT_FILENAME"] == "primary-review-audit.json"
@@ -2229,6 +2230,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "token" not in build["with"]
 
     upload = steps[upload_index]
+    assert upload["if"] == "success() && steps.build-review-ledger.outcome == 'success'"
     assert "uses" not in upload
     assert upload["env"]["ARTIFACT_NAME"] == (
         "codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
@@ -2241,7 +2243,8 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     latest = next(step for step in steps if step.get("name") == "Upload v2 review effectiveness ledger latest pointer")
     assert steps.index(latest) == upload_index + 1
     assert "uses" not in latest
-    assert "continue-on-error" not in latest
+    assert latest["if"] == "success() && steps.build-review-ledger.outcome == 'success'"
+    assert latest["continue-on-error"] is True
     assert latest["env"]["ARTIFACT_NAME"] == (
         "codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}"
     )
@@ -2252,9 +2255,8 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "$SILO_EXEC" in latest["run"]
     assert "list" not in latest["run"]
 
-    # the whole ledger job runs under continue-on-error: true — these steps rely
-    # on it instead of a step-level flag
-    assert "continue-on-error" not in upload
+    # Silo uploads keep failures at the step outcome while making the job check green.
+    assert upload["continue-on-error"] is True
     assert "GATE-ARCHIVE-DEFERRED kind=review-ledger " in upload["run"]
     assert "GATE-ARCHIVE-DEFERRED kind=review-ledger-latest " in latest["run"]
 
@@ -2287,6 +2289,70 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     record_upload = next(step for step in steps if step.get("name") == "Upload live review record/v1 to permanent Silo")
     assert record_upload["continue-on-error"] is True
     assert "GATE-ARCHIVE-DEFERRED kind=review-record " in record_upload["run"]
+
+
+def _evaluate_ledger_if(expression: str, outcomes: dict[str, str], *, job_success: bool) -> bool:
+    expression = re.sub(
+        r"steps\.([a-z0-9-]+)\.outcome",
+        lambda match: repr(outcomes[match.group(1)]),
+        expression,
+    )
+    expression = re.sub(r"\bsuccess\(\)", str(job_success), expression)
+    expression = expression.replace("&&", " and ").replace("||", " or ")
+    tree = ast.parse(expression, mode="eval")
+
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BoolOp):
+            values = [evaluate(value) for value in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+        if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+            left, right = evaluate(node.left), evaluate(node.comparators[0])
+            if isinstance(node.ops[0], ast.Eq):
+                return left == right
+        raise AssertionError(f"unsupported ledger if expression node: {ast.dump(node)}")
+
+    return bool(evaluate(tree))
+
+
+def test_ledger_resolve_failure_skips_build_and_both_uploads():
+    steps = _load_workflow()[0]["jobs"]["ledger"]["steps"]
+    named = {step.get("name"): step for step in steps}
+    outcomes = {
+        "resolve-ledger-artifacts": "failure",
+        "read-primary-audit-for-ledger": "success",
+        "download-gate-terminal-for-ledger": "skipped",
+    }
+    build = named["Build v2 review effectiveness ledger"]
+    assert not _evaluate_ledger_if(build["if"], outcomes, job_success=True)
+    outcomes["build-review-ledger"] = "skipped"
+    for name in (
+        "Upload v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger latest pointer",
+    ):
+        assert not _evaluate_ledger_if(named[name]["if"], outcomes, job_success=True)
+
+    # Known-success control: optional terminal download may be skipped, but the
+    # resolved inputs and audit are present, so build and uploads can proceed.
+    outcomes.update(
+        {
+            "resolve-ledger-artifacts": "success",
+            "read-primary-audit-for-ledger": "success",
+            "build-review-ledger": "success",
+        }
+    )
+    assert _evaluate_ledger_if(build["if"], outcomes, job_success=True)
+    for name in (
+        "Upload v2 review effectiveness ledger",
+        "Upload v2 review effectiveness ledger latest pointer",
+    ):
+        assert _evaluate_ledger_if(named[name]["if"], outcomes, job_success=True)
 
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:
@@ -3057,8 +3123,8 @@ def test_ledger_resolver_has_no_audit_outputs_after_channel_split(tmp_path):
 def test_ledger_audit_read_still_fail_louds_for_reviewed_success_or_failure(tmp_path, primary_result):
     """Reviewed run + missing audit output must fail the read step (exit 1).
 
-    Same contract the required Silo resolve enforced before the channel split;
-    the job-level continue-on-error keeps the ledger conclusion green.
+    Same input contract the required Silo resolve enforced before the channel
+    split; step-level continue-on-error keeps the ledger job check green.
     """
     raw, _ = _load_workflow()
     step = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Read canonical primary audit from primary job output for ledger")
@@ -3105,21 +3171,24 @@ def test_ledger_resolver_quality_success_still_requires_input_on_cancelled_prima
 def test_ledger_persistence_never_gates_the_conclusion():
     """Inverted contract (design A/E): Silo bookkeeping failures only warn.
 
-    The audit read step stays intentionally unprotected at the step level so a
-    missing reviewed-run audit still skips the row build (job-level
-    continue-on-error keeps the conclusion green), matching the pre-split
-    required-resolve behavior.
+    Every Silo bookkeeping step is protected at the step level; audit read still
+    fails loudly in its step outcome, while the job's check stays green.
     """
     raw, _ = _load_workflow()
     ledger_steps = raw["jobs"]["ledger"]["steps"]
     for name in (
         "Download v2 review ledger inputs",
-        "Read canonical primary audit from primary job output for ledger",
-        "Download gate terminal envelope for ledger",
         "Build v2 review effectiveness ledger",
     ):
         step = next(s for s in ledger_steps if s.get("name") == name)
         assert "continue-on-error" not in step
+    for name in (
+        "Resolve v2 ledger artifacts",
+        "Read canonical primary audit from primary job output for ledger",
+        "Download gate terminal envelope for ledger",
+    ):
+        step = next(s for s in ledger_steps if s.get("name") == name)
+        assert step["continue-on-error"] is True
     job_level = raw["jobs"]["ledger"].get("continue-on-error") is True
     assert job_level
     for name in (
@@ -3127,7 +3196,7 @@ def test_ledger_persistence_never_gates_the_conclusion():
         "Upload v2 review effectiveness ledger latest pointer",
     ):
         step = next(s for s in ledger_steps if s.get("name") == name)
-        assert "continue-on-error" not in step  # job-level continue-on-error covers it
+        assert step["continue-on-error"] is True
         assert "GATE-ARCHIVE-DEFERRED" in step["run"]
     for name in (
         "Upload v2 raw review ledger to permanent archive",

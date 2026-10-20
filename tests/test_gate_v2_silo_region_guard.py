@@ -6,8 +6,9 @@
 
 - 判定区（verdict）：判定必需，fail-closed。禁止 continue-on-error；禁止输出
   GATE-ARCHIVE-DEFERRED（判定失败必须真实变红，不允许降级为告警）。
-- 记账区（bookkeeping）：留存/诊断/归档。必须 continue-on-error: true（GitHub 语义：
-  step outcome=failure 但 job conclusion 不变）；上传/归档类（put/put-dir/put-review-record）
+- 记账区（bookkeeping）：留存/诊断/归档。每一步必须显式设置步骤级
+  continue-on-error: true；job 级 continue-on-error 只改变 workflow run 级结论，job 自己的
+  check run 仍会是 failure，不能避免挡合并。上传/归档类（put/put-dir/put-review-record）
   的 run 块必须在失败路径输出固定格式 `GATE-ARCHIVE-DEFERRED kind=<kind> key=<silo key>
   reason=<错误类别>`（::warning:: 同时输出）——该行是 G3 补传队列的输入契约。
 
@@ -179,15 +180,13 @@ def find_silo_region_violations(workflow_text: str) -> list[str]:
                     "(verdict failures must fail the job, not degrade to a warning)"
                 )
         else:
-            # "Never changes the job conclusion": either a step-level
-            # continue-on-error, or the owning job has a job-level one (the
-            # ledger job does — a failed step there skips the row build but the
-            # conclusion stays green).
-            owner = parsed["jobs"].get(owner_job or "", {})
-            if continue_on_error is not True and owner.get("continue-on-error") is not True:
+            # Job-level continue-on-error only changes the workflow run result;
+            # the job's own check run remains failure and can block PR merging.
+            if continue_on_error is not True:
                 violations.append(
-                    f"step {label!r} is bookkeeping-region but neither it nor its job sets "
-                    "continue-on-error: true (a bookkeeping failure must never change the job conclusion)"
+                    f"step {label!r} is bookkeeping-region but lacks step-level "
+                    "continue-on-error: true (job-level continue-on-error only keeps the run green; "
+                    "the job check remains failure)"
                 )
             is_upload = bool(UPLOAD_VERB_RE.search(run))
             if is_upload:
@@ -203,6 +202,25 @@ def find_silo_region_violations(workflow_text: str) -> list[str]:
                         )
         if region == REGION_BOOKKEEPING and owner_job is None:
             violations.append(f"bookkeeping step {label!r} not found in any job")
+
+    ledger = parsed["jobs"].get("ledger", {})
+    ledger_steps = ledger.get("steps", []) or []
+    bookkeeping_names = set()
+    for block in blocks:
+        header = STEP_HEADER.search(block)
+        if header and _declared_region(block) == REGION_BOOKKEEPING:
+            bookkeeping_names.add((header.group(1) or header.group(2) or "?").strip())
+    bookkeeping_seen = False
+    for step in ledger_steps:
+        name = step.get("name", "<unnamed>")
+        if name in bookkeeping_names:
+            bookkeeping_seen = True
+            continue
+        if bookkeeping_seen and step.get("continue-on-error") is not True and not step.get("if"):
+            violations.append(
+                f"ledger step {name!r} follows a bookkeeping step but has no explicit if "
+                "(implicit success() can run after a continue-on-error bookkeeping failure)"
+            )
     return violations
 
 
@@ -236,6 +254,7 @@ def test_guard_counts_every_expected_touchpoint():
         "Archive gate status panel delivery diagnostic permanently",
         "Resolve v2 ledger artifacts",
         "Read canonical primary audit from primary job output for ledger",
+        "Download gate terminal envelope for ledger",
         "Upload v2 review effectiveness ledger",
         "Upload v2 review effectiveness ledger latest pointer",
         "Upload v2 raw review ledger to permanent archive",
@@ -246,6 +265,96 @@ def test_guard_counts_every_expected_touchpoint():
         assert expected in labels, f"guard no longer sees touchpoint {expected!r}; labels={labels}"
     # 每个 job 的 MagicDNS 准备步骤也在触点集合内
     assert sum(1 for label in labels if label == "Resolve Silo hostname via MagicDNS") == 4
+
+
+def test_guard_rejects_bookkeeping_without_step_coe_even_when_job_coe_is_set():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    parsed = yaml.safe_load(text)
+    assert parsed["jobs"]["ledger"]["continue-on-error"] is True
+    block = next(
+        b for b in _split_step_blocks(text)
+        if "- name: Resolve v2 ledger artifacts" in b
+    )
+    assert "        continue-on-error: true\n" in block
+    mutated = text.replace(block, block.replace("        continue-on-error: true\n", "", 1), 1)
+    violations = find_silo_region_violations(mutated)
+    assert any(
+        "Resolve v2 ledger artifacts" in violation and "step-level continue-on-error: true" in violation
+        for violation in violations
+    ), "job-level continue-on-error must not satisfy the bookkeeping step contract"
+
+
+def test_guard_rejects_verdict_step_relabelled_bookkeeping_without_step_coe():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    block = next(
+        b for b in _split_step_blocks(text)
+        if "- name: Publish canonical primary audit to job output" in b
+    )
+    assert "# gate-silo-region: verdict" in block
+    mutated = text.replace(
+        block,
+        block.replace("# gate-silo-region: verdict", "# gate-silo-region: bookkeeping", 1),
+        1,
+    )
+    violations = find_silo_region_violations(mutated)
+    assert any(
+        "Publish canonical primary audit to job output" in violation
+        and "step-level continue-on-error: true" in violation
+        for violation in violations
+    ), "relabelled verdict step without step-level continue-on-error must turn red"
+
+
+def test_guard_rejects_implicit_success_after_bookkeeping():
+    golden = """jobs:
+  ledger:
+    steps:
+      # gate-silo-region: bookkeeping
+      - name: Persist optional data
+        continue-on-error: true
+        run: '"$SILO_EXEC" get --key x --dest /tmp/x'
+      - name: Next ledger action
+        if: success()
+        run: echo build
+"""
+    assert find_silo_region_violations(golden) == []
+    mutated = golden.replace("        if: success()\n", "", 1)
+    violations = find_silo_region_violations(mutated)
+    assert any(
+        "Next ledger action" in violation and "explicit if" in violation
+        for violation in violations
+    ), "a downstream non-continue-on-error step must not rely on implicit success()"
+
+
+def test_guard_rejects_ledger_build_without_explicit_if():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    block = next(
+        b for b in _split_step_blocks(text)
+        if "- name: Build v2 review effectiveness ledger" in b
+    )
+    condition = re.search(r"(?m)^        if: >-\n(?:          .*\n)+", block)
+    assert condition is not None
+    mutated = text.replace(block, block[:condition.start()] + block[condition.end():], 1)
+    violations = find_silo_region_violations(mutated)
+    assert any(
+        "Build v2 review effectiveness ledger" in violation and "explicit if" in violation
+        for violation in violations
+    ), "Build without an explicit input-success condition must turn the guard red"
+
+
+def test_ledger_build_if_requires_resolve_audit_and_terminal_outcomes():
+    ledger_steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["ledger"]["steps"]
+    build = next(step for step in ledger_steps if step.get("name") == "Build v2 review effectiveness ledger")
+    condition = str(build["if"])
+    assert "steps.resolve-ledger-artifacts.outcome == 'success'" in condition
+    assert "steps.read-primary-audit-for-ledger.outcome == 'success'" in condition
+    assert "steps.download-gate-terminal-for-ledger.outcome == 'success'" in condition
+    assert "steps.download-gate-terminal-for-ledger.outcome == 'skipped'" in condition
+    for name in (
+        "Compute incremental blocking shadow",
+        "Mark Build v2 review effectiveness ledger start",
+    ):
+        step = next(candidate for candidate in ledger_steps if candidate.get("name") == name)
+        assert step["if"] == condition
 
 
 def _minimal_workflow_from_real_text() -> str:
