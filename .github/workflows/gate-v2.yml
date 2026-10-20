@@ -723,6 +723,9 @@ jobs:
           if result.get("flake_signal") != "undetermined":
               invalid("flake_signal must be undetermined")
               raise SystemExit(0)
+          if "failed_nodeids" not in result:
+              invalid("failed_nodeids is required")
+              raise SystemExit(0)
           if failed_nodeids is not None and (
               not isinstance(failed_nodeids, list)
               or not all(isinstance(nodeid, str) for nodeid in failed_nodeids)

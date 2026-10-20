@@ -3852,6 +3852,16 @@ def test_quality_result_render_invalid_payload_warns_without_failing(tmp_path, r
     assert "::warning::GATE-QUALITY-RESULT-INVALID" in completed.stdout + completed.stderr
 
 
+def test_quality_result_render_missing_nodeids_field_is_invalid(tmp_path):
+    result = json.loads(_quality_result())
+    del result["failed_nodeids"]
+    result_bytes = (json.dumps(result, separators=(",", ":")) + "\n").encode()
+    _step, completed, summary_bytes = _run_quality_result_render(tmp_path, result_bytes)
+    assert completed.returncode == 0
+    assert "- Result: invalid (failed_nodeids is required)" in summary_bytes.decode()
+    assert "::warning::GATE-QUALITY-RESULT-INVALID" in completed.stdout + completed.stderr
+
+
 def test_quality_result_render_missing_file_is_unadopted_without_warning(tmp_path):
     _step, completed, summary_bytes = _run_quality_result_render(tmp_path)
     assert completed.returncode == 0
