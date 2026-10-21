@@ -28,6 +28,9 @@ MISE_INPUT = "quality_prepare_mise"
 MISE_STEP_NAME = "Prepare mise tool manager (quality entry opt-in)"
 DETECT_STEP_NAME = "Detect repository quality entry"
 BUSINESS_ENTRY_RUN = "./scripts/gate-quality"
+# gate-hub#1696 redo: the entry is invoked through the termination-recording
+# helper inside the run block, not as the bare run text.
+BUSINESS_ENTRY_CALL = f"gate_run_and_record {BUSINESS_ENTRY_RUN}"
 
 
 def _load_gate_v2():
@@ -154,7 +157,7 @@ def test_quality_mise_bootstrap_sits_between_entry_detection_and_single_business
     mise_index = names.index(MISE_STEP_NAME)
     entry_calls = [
         i for i, s in enumerate(steps)
-        if str(s.get("run", "")).strip() == BUSINESS_ENTRY_RUN
+        if BUSINESS_ENTRY_CALL in str(s.get("run", ""))
     ]
     assert len(entry_calls) == 1, (
         f"business entry ({BUSINESS_ENTRY_RUN}) must still be called exactly once, "
