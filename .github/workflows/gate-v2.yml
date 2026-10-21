@@ -588,6 +588,45 @@ jobs:
             echo "mode=legacy" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install test-termination helper
+        id: install-termination-helper
+        run: |
+          cat > "${RUNNER_TEMP}/gate_record_termination.sh" <<'EOF'
+          # Shared by legacy Tests and entry run-quality (gate-hub#1696).
+          # Phase 2 may emit `CI-SLOT-MEM: ... oom_kill=N`; this card does not parse it.
+          # Nested make: the outer process prints `Error 2`, so tail -n 1 misses an
+          # inner `Error 143` and we fall back to failed (pre-#1696 fail-closed).
+          # Do not scan the whole log for any Error 143 — test output can mention it.
+          gate_run_and_record() {
+            log="${RUNNER_TEMP:-/tmp}/gate-run-tests.$$.log"
+            set +e
+            set -o pipefail
+            "$@" 2>&1 | tee "$log"
+            status=$?
+            set +o pipefail
+            make_err=$(sed -n 's/.*make: \*\*\* \[.*\] Error \([0-9][0-9]*\).*/\1/p' "$log" | tail -n 1)
+            termination=failed
+            signal=0
+            # SIGNAL_PREDICATE: direct 128+N, or make Error 128+N (Error 143/137).
+            if [ "$status" -gt 128 ] || { [ -n "${make_err:-}" ] && [ "$make_err" -gt 128 ]; }; then
+              termination=signal_terminated
+              if [ "$status" -gt 128 ]; then
+                signal=$((status - 128))
+              else
+                signal=$((make_err - 128))
+              fi
+            elif [ "$status" -eq 0 ]; then
+              termination=passed
+            fi
+            {
+              echo "termination=$termination"
+              echo "signal=$signal"
+              echo "exit_code=$status"
+            } >> "$GITHUB_OUTPUT"
+            exit "$status"
+          }
+          EOF
+
       # gate#314: entry-mode callers (e.g. zlxlabs/herdweb) assume the mise
       # tool manager exists.
       # A workflow_call caller cannot inject steps into this job, so the
@@ -661,6 +700,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         env:
           GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
+        shell: "bash --noprofile --norc -c '. \"$RUNNER_TEMP/gate_record_termination.sh\" && gate_run_and_record bash \"$0\"' '{0}'"
         run: ./scripts/gate-quality
 
       - name: Render gate-quality result
@@ -862,13 +902,7 @@ jobs:
         id: run-tests
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
-          # Capture how the test command died. Host earlyoom SIGTERM's pytest
-          # (gate-hub#1696); make then prints `Error 143` and exits 2, so
-          # GitHub only sees a generic step failure. This wrapper survives
-          # (low RSS) and records signal_terminated for the aggregator.
-          # Phase 2 may emit `CI-SLOT-MEM: ... oom_kill=N` from the runner
-          # health-audit (gate-hub#1696). This card does not parse that line.
-          log="${RUNNER_TEMP:-/tmp}/gate-run-tests.$$.log"
+          . "${RUNNER_TEMP}/gate_record_termination.sh"
           run_tests() {
             if   [ -f Makefile ] && grep -qE '^test:' Makefile; then make test
             elif [ -f package.json ]; then npm test --if-present
@@ -879,31 +913,7 @@ jobs:
               else echo "no python test runner on this runner — skipping (runs on self-hosted)"; fi
             else echo "no tests detected"; fi
           }
-          set +e
-          set -o pipefail
-          run_tests 2>&1 | tee "$log"
-          status=$?
-          set +o pipefail
-          make_err=$(sed -n 's/.*make: \*\*\* \[.*\] Error \([0-9][0-9]*\).*/\1/p' "$log" | tail -n 1)
-          termination=failed
-          signal=0
-          # SIGNAL_PREDICATE: direct 128+N, or make Error 128+N (Error 143/137).
-          if [ "$status" -gt 128 ] || { [ -n "${make_err:-}" ] && [ "$make_err" -gt 128 ]; }; then
-            termination=signal_terminated
-            if [ "$status" -gt 128 ]; then
-              signal=$((status - 128))
-            else
-              signal=$((make_err - 128))
-            fi
-          elif [ "$status" -eq 0 ]; then
-            termination=passed
-          fi
-          {
-            echo "termination=$termination"
-            echo "signal=$signal"
-            echo "exit_code=$status"
-          } >> "$GITHUB_OUTPUT"
-          exit "$status"
+          gate_run_and_record run_tests
 
       - name: Checkout gate actions for diff-coverage advisory
         if: always()
@@ -978,9 +988,10 @@ jobs:
           fi
 
       # gate#199 根治：业务检查证据记录步。只读各业务步骤的原生 outcome
-      # 与 Tests 步写出的 termination/signal（不解析日志文本）。PR size
-      # preflight 单算一相（仍走 fail）；Diff coverage advisory 是 advisory
-      # 性质（continue-on-error），不计入业务相。
+      # 与 Tests/run-quality 写出的 termination/signal（不解析日志文本）。
+      # signal_terminated 仅当测试命令是唯一失败的业务步骤；其它步骤
+      # （lint/install 等）只要有 failure，仍记 failed。PR size preflight
+      # 单算一相（仍走 fail）；Diff coverage advisory 不计入业务相。
       - name: Record caller checks outcome
         id: caller-checks-outcome
         if: always()
@@ -988,6 +999,9 @@ jobs:
           PREFLIGHT_OUTCOME: ${{ steps.pr-size-preflight.outcome }}
           PREFLIGHT_STATUS: ${{ steps.pr-size-preflight.outputs.preflight-result }}
           RUN_QUALITY_OUTCOME: ${{ steps.run-quality.outcome }}
+          RUN_QUALITY_TERMINATION: ${{ steps.run-quality.outputs.termination }}
+          RUN_QUALITY_SIGNAL: ${{ steps.run-quality.outputs.signal }}
+          RUN_QUALITY_EXIT_CODE: ${{ steps.run-quality.outputs.exit_code }}
           LINT_FORMAT_OUTCOME: ${{ steps.lint-format.outcome }}
           INSTALL_OUTCOME: ${{ steps.install.outcome }}
           RUN_TESTS_OUTCOME: ${{ steps.run-tests.outcome }}
@@ -1015,10 +1029,35 @@ jobs:
               success) passed=1 ;;
             esac
           done
+          other_failed=0
+          for outcome in "$LINT_FORMAT_OUTCOME" "$INSTALL_OUTCOME"; do
+            case "$outcome" in
+              failure) other_failed=1 ;;
+            esac
+          done
+          if [ "${RUN_QUALITY_OUTCOME:-}" = "failure" ] && [ "${RUN_QUALITY_TERMINATION:-}" != "signal_terminated" ]; then
+            other_failed=1
+          fi
+          if [ "${RUN_TESTS_OUTCOME:-}" = "failure" ] && [ "${RUN_TESTS_TERMINATION:-}" != "signal_terminated" ]; then
+            other_failed=1
+          fi
+          test_signal=0
+          test_signal_n=""
+          test_signal_exit=""
           if [ "${RUN_TESTS_TERMINATION:-}" = "signal_terminated" ]; then
+            test_signal=1
+            test_signal_n="${RUN_TESTS_SIGNAL:-}"
+            test_signal_exit="${RUN_TESTS_EXIT_CODE:-}"
+          fi
+          if [ "${RUN_QUALITY_TERMINATION:-}" = "signal_terminated" ]; then
+            test_signal=1
+            test_signal_n="${RUN_QUALITY_SIGNAL:-}"
+            test_signal_exit="${RUN_QUALITY_EXIT_CODE:-}"
+          fi
+          if [ "$test_signal" -eq 1 ] && [ "$other_failed" -eq 0 ]; then
             echo "caller_checks=signal_terminated" >> "$GITHUB_OUTPUT"
-            echo "caller_signal=${RUN_TESTS_SIGNAL:-}" >> "$GITHUB_OUTPUT"
-            echo "caller_exit_code=${RUN_TESTS_EXIT_CODE:-}" >> "$GITHUB_OUTPUT"
+            echo "caller_signal=$test_signal_n" >> "$GITHUB_OUTPUT"
+            echo "caller_exit_code=$test_signal_exit" >> "$GITHUB_OUTPUT"
           elif [ "$failed" -eq 1 ]; then
             echo "caller_checks=failed" >> "$GITHUB_OUTPUT"
           elif [ "$passed" -eq 1 ]; then
