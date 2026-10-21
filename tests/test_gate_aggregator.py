@@ -561,8 +561,6 @@ def _cli_args(audit_dir, summary_path, **overrides):
         args.extend(["--panel-delivery-path", values["panel_delivery_path"]])
     if values.get("caller_checks") is not None:
         args.extend(["--caller-checks", values["caller_checks"]])
-    if values.get("caller_signal") is not None:
-        args.extend(["--caller-signal", values["caller_signal"]])
     if values.get("preflight_result") is not None:
         args.extend(["--preflight-result", values["preflight_result"]])
     if values.get("convergence_receipt_path") is not None:
@@ -5032,7 +5030,6 @@ def test_issue199_unavailable_panel_renders_infra_action():
 
 @pytest.mark.parametrize("caller_checks,expected", [
     ("failed", ("ci_failure", "quality_failure", "fail")),
-    ("signal_terminated", ("review_unavailable", "quality_infra", "unavailable")),
     ("passed", ("review_unavailable", "quality_infra", "unavailable")),
     ("not_started", ("review_unavailable", "quality_infra", "unavailable")),
     ("", ("review_unavailable", "quality_infra", "unavailable")),  # 证据缺席：旧调用方/记录步前死亡
@@ -5092,20 +5089,6 @@ def test_quality_success_requires_explicit_preflight_success(preflight_result):
         "review_unavailable", "quality_infra", "unavailable"
     )
     assert not any("split the PR" in problem for problem in outcome.problems)
-
-
-def test_signal_terminated_problem_names_the_signal_number():
-    outcome = AGG.evaluate(
-        **_base_kwargs(quality_result="failure", caller_checks="signal_terminated", caller_signal="15")
-    )
-    assert outcome.ok is False
-    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
-        "review_unavailable", "quality_infra", "unavailable",
-    )
-    assert any(
-        "signal 15" in problem and "not a code problem" in problem
-        for problem in outcome.problems
-    )
 
 
 def test_unknown_caller_checks_value_fails_closed():
