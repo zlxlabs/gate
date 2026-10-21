@@ -338,6 +338,7 @@ def test_silo_down_produces_deferred_rows_and_fails_the_step_only(tmp_path, job,
     source.write_text("{}")
     env = {
         "SILO_EXEC": str(fake),
+        "SILO_STORE": str(REPO_ROOT / "scripts" / "silo_store.py"),
         "AWS_ACCESS_KEY_ID": "test",
         "AWS_SECRET_ACCESS_KEY": "test",
         "ARTIFACT_NAME": "fake-artifact",

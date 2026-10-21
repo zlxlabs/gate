@@ -70,6 +70,7 @@ ENTRY_FILES = {
     # 各槽共享：主机取码服务（service/origin）协议的唯一实现，纯标准库。
     "scripts/gate_source.py": "各槽共享取码协议实现（客户端+只读镜像锁+物化）",
     "scripts/silo_store.py": "Silo 标准库客户端（SigV4 自签）",
+    "scripts/archive_failure_reason.py": "Silo 上传失败告警 reason 解析器（标准库）",
     "scripts/silo_exec.sh": "Silo 包装器（exec python3 + 仓内脚本）",
     # 各槽共享：checkout / MagicDNS（仅调 git、curl 固定 SHA 脚本、系统 DNS）。
     "scripts/gate_bounded_retry.py": "各槽 checkout 与 MagicDNS",
