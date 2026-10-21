@@ -1399,6 +1399,7 @@ jobs:
             scripts/silo_store.py
             scripts/silo_exec.sh
             scripts/scrub_outbound.py
+            scripts/archive_failure_reason.py
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -1486,7 +1487,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$AUDIT_PATH" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit key=d14/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -1515,7 +1516,7 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --dir "$DIAGNOSTICS_DIR" \
             --empty skip 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-diagnostics key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -1625,7 +1626,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --dir "$scrubbed_dir" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-raw-evidence key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             rm -rf "$scrubbed_dir"
@@ -2151,6 +2152,7 @@ jobs:
           GATE_CHECKOUT_SPARSE: |
             scripts/silo_store.py
             scripts/silo_exec.sh
+            scripts/archive_failure_reason.py
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -2198,7 +2200,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --dir "$ADVISORY_DIR" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=advisory-event key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -2446,7 +2448,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --dir "$RECEIPT_DIR" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=convergence-receipt key=d3/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -2491,7 +2493,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$TERMINAL_PATH" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -2517,7 +2519,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$TERMINAL_PATH" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -2585,7 +2587,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$PANEL_PATH" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-status-panel key=d3/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -3013,7 +3015,7 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --file "$PREFLIGHT" \
             --file "$INSTALL" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=ledger-input key=d1/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -3043,7 +3045,7 @@ jobs:
             --name "$ARTIFACT_NAME" \
             --file "$PREFLIGHT" \
             --file "$INSTALL" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=ledger-input key=d1/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -3236,7 +3238,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$LEDGER_PATH" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -3262,7 +3264,7 @@ jobs:
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --file "$LEDGER_PATH" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-latest key=d30/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
@@ -3400,7 +3402,7 @@ jobs:
             exit 1
           fi
           if ! out="$($SILO_EXEC put-review-record --file "$REVIEW_RECORD_PATH" 2>&1)"; then
-            reason=$(printf '%s' "$out" | grep -oE 's3_error_code=[A-Za-z_]+' | head -1 | cut -d= -f2 || true)
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-record key=review-records/ reason=${reason:-unclassified}"
             printf '%s\n' "$out" >&2
             exit 1
