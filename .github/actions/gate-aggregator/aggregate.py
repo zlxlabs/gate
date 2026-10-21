@@ -160,12 +160,10 @@ _IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
 # fall through to.
 PRIMARY_RESULT_DOMAIN = ("success", "failure", "cancelled", "skipped")
 QUALITY_RESULT_DOMAIN = PRIMARY_RESULT_DOMAIN
-# gate#199 根治：quality job 末尾记录步上报的业务检查证据值域。空字符串
-# 不是额外的值——它是“证据缺席”（job 在记录步之前死掉、或调用方工作流尚未
+# gate#199 根治：quality job 末尾记录步上报的业务检查证据三值域。空字符串
+# 不是第四个值——它是“证据缺席”（job 在记录步之前死掉、或调用方工作流尚未
 # 升级），与 not_started/passed 同归 unavailable，绝不能默认 fail。
-# signal_terminated：Tests 步被信号打死（make Error 143/137 或 exit 128+N），
-# 仍 fail-closed 为 quality_infra，不放行。gate-hub#1696。
-CALLER_CHECKS_DOMAIN = ("not_started", "passed", "failed", "signal_terminated")
+CALLER_CHECKS_DOMAIN = ("not_started", "passed", "failed")
 # PR size preflight producer's structured result. `blocked` means a measured
 # budget overflow; `unavailable` means measurement failed and must be treated
 # as infrastructure failure. Empty/legacy job states are retained only for
@@ -1461,7 +1459,6 @@ def evaluate(
     convergence_state: Optional[Any] = None,
     waiver_receipts: Sequence[Any] = (),
     caller_checks: str = "",
-    caller_signal: str = "",
     preflight_result: str = "",
     repository: str | None = None,
     prior_eligible_run_ids: Sequence[int] = (),
@@ -1644,13 +1641,6 @@ def evaluate(
                 problems.append(
                     "PR size preflight was unavailable (git measurement failed) — "
                     "treated as an infrastructure problem, not a size decision"
-                )
-                classification, reason_code = "review_unavailable", "quality_infra"
-            elif caller_checks == "signal_terminated":
-                sig = (caller_signal or "").strip() or "unknown"
-                problems.append(
-                    f"quality tests were terminated by signal {sig} — "
-                    "infrastructure (host memory/eviction), not a code problem"
                 )
                 classification, reason_code = "review_unavailable", "quality_infra"
             elif caller_checks == "failed":
@@ -3924,8 +3914,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _render_findings_summary_cli(argv_list[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quality-result", required=True, help="needs.quality.result")
-    parser.add_argument("--caller-checks", default="", help="needs.quality.outputs.caller_checks (not_started|passed|failed|signal_terminated; empty when the evidence step never ran)")
-    parser.add_argument("--caller-signal", default="", help="needs.quality.outputs.caller_signal (signal number when caller_checks=signal_terminated)")
+    parser.add_argument("--caller-checks", default="", help="needs.quality.outputs.caller_checks (not_started|passed|failed; empty when the evidence step never ran)")
     parser.add_argument("--preflight-result", default="", help="structured PR size preflight result (blocked means the measured PR exceeds the single-review budget; unavailable means measurement failed)")
     parser.add_argument("--primary-result", required=True, help="needs.primary.result")
     parser.add_argument("--runner", required=True, help="inputs.runner ('self'/'hosted') — validated strictly")
@@ -4097,7 +4086,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     outcome = evaluate(
         quality_result=args.quality_result,
         caller_checks=args.caller_checks,
-        caller_signal=args.caller_signal,
         preflight_result=args.preflight_result,
         primary_result=args.primary_result,
         runner=args.runner,
