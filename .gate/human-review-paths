@@ -1,0 +1,8 @@
+# 授权链：决定「什么算通过」的文件。改动这些文件需人工确认。
+# 语义：gate-hub scripts/review/risk_classification.py，fnmatchcase，`*` 跨目录；读 base 分支版本。
+# 主审 prompt/rubric 位于 gate-hub scripts/review/prompts/，不在本仓。
+.github/workflows/gate-v2.yml
+.github/workflows/gate-v2-disposition.yml
+.github/workflows/v2-tag-sync.yml
+.github/actions/gate-disposition/*
+.github/actions/gate-aggregator/*
