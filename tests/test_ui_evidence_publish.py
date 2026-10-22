@@ -113,6 +113,9 @@ def test_action_manifest_contract():
         assert "${{" not in spec.get("description", ""), f"input {name} 描述含会被 GitHub 求值的表达式"
     step = manifest["runs"]["steps"][0]
     assert step["if"] == "${{ github.event_name == 'pull_request' }}", "必须 PR 事件 only"
+    assert step["continue-on-error"] == "${{ inputs.e2e-status == 'success' }}", (
+        "仅当 e2e 已成功时，评论 API 故障可见但不应让 job 假红"
+    )
     assert "github.action_path" in step["run"], "脚本须从 github.action_path 解析"
     assert "sticky-comment.sh" in step["run"]
     assert step["env"] == {
