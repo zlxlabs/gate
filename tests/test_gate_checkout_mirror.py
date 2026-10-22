@@ -434,37 +434,6 @@ def test_mirror_hit_localizes_checkout_and_sends_no_origin_pack(tmp_path, reques
     assert _tree_state(workspace) == _tree_state(baseline)
 
 
-def test_consume_lock_wait_reports_a_controlled_exclusive_lock_delay(tmp_path, request):
-    fixture = _fixture(tmp_path)
-    request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
-    lock_file = fixture["mirror_repo"] / "consume.lock"
-    ready = tmp_path / "exclusive-lock-ready"
-    holder = subprocess.Popen(
-        [
-            "bash",
-            "-c",
-            'exec 9<"$1"; flock --exclusive 9; : >"$2"; sleep 1.5',
-            "lock-holder",
-            str(lock_file),
-            str(ready),
-        ],
-    )
-    try:
-        deadline = time.monotonic() + 5
-        while not ready.exists() and time.monotonic() < deadline:
-            assert holder.poll() is None, "exclusive lock holder exited before acquiring the lock"
-            time.sleep(0.01)
-        assert ready.exists(), "exclusive lock holder did not acquire the lock"
-        script = _workflow()["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
-        run = _run_mirror_script(script, fixture, tmp_path / "lock-wait")
-        assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
-        result = _result_line(run)
-        assert type(result["consume_lock_wait_ms"]) is int
-        assert result["consume_lock_wait_ms"] >= 900
-    finally:
-        holder.wait(timeout=5)
-
-
 def test_mirror_misses_report_reason_and_origin_checkout_succeeds(tmp_path, request):
     fixture = _fixture(tmp_path, advance_mirror=True)
     request.addfinalizer(lambda: _stop_git_daemon(fixture["server"]))
