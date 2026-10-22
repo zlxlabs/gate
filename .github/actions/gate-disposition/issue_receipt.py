@@ -74,13 +74,18 @@ def _require_head_objects(head_sha: str, pathspec: str, repo_dir: Path) -> None:
         raise ValueError("counterevidence_head_object_missing")
 
 
-def rerun_counterevidence(command: str, head_sha: str, repo_dir: Path) -> dict:
+def rerun_counterevidence(
+    command: str, head_sha: str, repo_dir: Path, *,
+    match_expectation: str = "present", base_sha: str | None = None,
+) -> dict:
     """Execute the allowlisted git-grep command against repo_dir.
 
     Returns the gate_rerun object. Raises ValueError with a reason literal
-    when the command is not allowlisted, repo_dir lacks the head objects,
+    when the command is not allowlisted, repo_dir lacks base/head objects,
     matches nothing, times out, or fails.
     """
+    if match_expectation not in {"present", "absent"}:
+        raise ValueError("counterevidence_match_expectation_invalid")
     try:
         argv = shlex.split(command)
     except ValueError as exc:
@@ -88,6 +93,14 @@ def rerun_counterevidence(command: str, head_sha: str, repo_dir: Path) -> dict:
     reason = _CONVERGENCE.counterevidence_argv_reason(argv, head_sha)
     if reason is not None:
         raise ValueError(reason)
+    base_rerun = None
+    if match_expectation == "absent":
+        if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+            raise ValueError("counterevidence_base_sha_invalid")
+        base_argv = [*argv[:6], base_sha, *argv[7:]]
+        base_rerun = rerun_counterevidence(
+            shlex.join(base_argv), base_sha, repo_dir,
+        )
     _require_head_objects(head_sha, argv[-1], repo_dir)
     try:
         completed = subprocess.run(
@@ -103,9 +116,25 @@ def rerun_counterevidence(command: str, head_sha: str, repo_dir: Path) -> dict:
         raise ValueError("counterevidence_rerun_failed") from exc
     stdout = completed.stdout or b""
     if completed.returncode == 1:
-        raise ValueError("counterevidence_rerun_no_match")
+        if match_expectation != "absent":
+            raise ValueError("counterevidence_rerun_no_match")
+        if stdout:
+            raise ValueError("counterevidence_rerun_failed")
+        return {
+            "argv": argv,
+            "exit_code": 1,
+            "match_count": 0,
+            "stdout_sha256": _sha256_bytes(stdout),
+            "excerpt": (
+                f"base {base_sha[:12]}: {base_rerun['match_count']} matches; "
+                f"head {head_sha[:12]}: 0 matches"
+            ),
+            "base_rerun": base_rerun,
+        }
     if completed.returncode != 0:
         raise ValueError("counterevidence_rerun_failed")
+    if match_expectation == "absent":
+        raise ValueError("counterevidence_rerun_match_found")
     lines = [line for line in stdout.splitlines() if line]
     if len(lines) < 1:
         raise ValueError("counterevidence_rerun_no_match")
@@ -328,6 +357,7 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
             raise ValueError("counterevidence_required")
         if counterevidence["result"] != "refuted":
             raise ValueError("counterevidence_result_not_refuted")
+        match_expectation = counterevidence.get("match_expectation", "present")
         try:
             argv = shlex.split(counterevidence["command"])
         except ValueError as exc:
@@ -339,6 +369,7 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         counterevidence = dict(counterevidence)
         counterevidence["gate_rerun"] = rerun_counterevidence(
             counterevidence["command"], head_sha, repo_dir,
+            match_expectation=match_expectation, base_sha=scope["base_sha"],
         )
     else:
         if not isinstance(tracking_issue, str):

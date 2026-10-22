@@ -1679,6 +1679,29 @@ def test_neighbor_finding_key_rejects_delta_5_null_line_minor_and_empty_file():
     assert not _neighbor_same(_replay_finding(187), _replay_finding(190, file="other.py"))
 
 
+def test_absent_receipt_expires_when_neighbor_head_matches_again():
+    new_scope, receipt, _current = _replay_pair()
+    new_scope = replace(new_scope, base_sha=_scope(head_sha=receipt.head_sha).base_sha)
+    current = _six_primary(new_scope, _DRIFT_P1)
+    counterevidence = dict(receipt.counterevidence)
+    counterevidence["match_expectation"] = "absent"
+    rerun = dict(counterevidence["gate_rerun"])
+    rerun.update(exit_code=1, match_count=0)
+    base_argv = list(rerun["argv"])
+    base_argv[6] = new_scope.base_sha
+    rerun["base_rerun"] = {
+        "argv": base_argv, "exit_code": 0, "match_count": 1, "excerpt": "src/lock.py:1:locked-behavior",
+    }
+    counterevidence["gate_rerun"] = rerun
+    receipt = replace(receipt, counterevidence=counterevidence)
+    neighbor = _neighbor_evidence(new_scope, receipt)
+    status = CONV.validate_disposition_receipt(
+        receipt, scope=new_scope, primary=current, audit_digest=_NEW_DIGEST,
+        neighbor_evidence={receipt.finding_key: neighbor},
+    )
+    assert status.reason_code == "counterevidence_expired" and status.active is False
+
+
 def test_replay_neighbor_consumes_drifted_head_id_category_and_digest():
     new_scope, receipt, current, mapping, status = _replay_status()
     issued = mapping[receipt.finding_key].receipt_scope
