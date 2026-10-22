@@ -1847,9 +1847,9 @@ def _write_convergence_receipt(path: str, receipt: Any) -> None:
 # Human-readable, per-reason_code explanations rendered into the Step Summary
 # (issues #32/#43): the caller must be able to tell "the primary reviewer
 # rejected the change" apart from "the aggregator could not read the primary
-# reviewer's conclusion" without opening job logs. Phrasing is load-bearing —
-# the "could not be read" entries must never read as a reviewer rejection, and
-# unexpected_primary_skip must never read as the normal draft/fork skip.
+# reviewer's conclusion". Phrasing is load-bearing — the "could not be read"
+# entries must state that the cause is unknown, and unexpected_primary_skip
+# must never read as the normal draft/fork skip.
 REASON_CODE_EXPLANATIONS = {
     "disposition_resolved": (
         "The primary audit reported findings, but every current P1 is covered by an active, "
@@ -1861,15 +1861,16 @@ REASON_CODE_EXPLANATIONS = {
     ),
     "audit_missing": (
         "The primary reviewer's conclusion could NOT be read for this run (no audit artifact was "
-        "produced) — check the primary job logs. This is not a reviewer rejection."
+        "produced); the reason for the primary job result is unknown. This is not a reviewer rejection."
     ),
     "audit_invalid": (
         "The primary reviewer's conclusion could NOT be read for this run (the audit artifact failed "
-        "validation) — check the primary job logs. This is not a reviewer rejection."
+        "validation); the reason for the primary job result is unknown. This is not a reviewer rejection."
     ),
     "audit_source_mismatch": (
         "The primary reviewer's conclusion could NOT be read for this run (the audit's source attempt "
-        "did not match the selected artifact) — check the primary job logs. This is not a reviewer rejection."
+        "did not match the selected artifact); the reason for the primary job result is unknown. "
+        "This is not a reviewer rejection."
     ),
     "job_audit_mismatch": (
         "The primary reviewer's recorded conclusion contradicts the primary job's own status — "
@@ -1984,16 +1985,7 @@ def render_summary(
                 f"`{shadow['eligible_rounds']}/{shadow['limit']}`，"
                 f"decision=`{shadow['terminal_decision']}`；不改变 gate 结论。"
             )
-    if primary_result == "failure" and outcome.reason_code in (
-        "audit_missing", "audit_invalid", "audit_source_mismatch",
-    ):
-        explanation = (
-            "The primary job failed (usually because of a reviewer rejection), but the canonical "
-            "audit artifact could NOT be read, so the result cannot be confirmed programmatically "
-            "— check the primary job logs for the verdict line."
-        )
-    else:
-        explanation = REASON_CODE_EXPLANATIONS.get(outcome.reason_code or "")
+    explanation = REASON_CODE_EXPLANATIONS.get(outcome.reason_code or "")
     if explanation:
         lines.append("")
         lines.append(explanation)
@@ -2023,18 +2015,11 @@ def render_summary(
             "**Synthetic audit generated** (no valid canonical primary audit was available for this run):"
         )
         lines.append("")
-        if primary_result == "failure":
-            lines.append(
-                '`"verdict": null` below means the primary job failed (usually because of a '
-                "reviewer rejection), but the canonical audit artifact could NOT be read, so the "
-                "result cannot be confirmed programmatically. Check the primary job logs for the "
-                "verdict line."
-            )
-        else:
-            lines.append(
-                '`"verdict": null` below means the primary conclusion could not be read — '
-                "it is NOT a reviewer rejection. Check the primary job logs for the real cause."
-            )
+        lines.append(
+            '`"verdict": null` below means no canonical primary review conclusion was available, '
+            "and the cause cannot be determined from the available audit data. "
+            "This is NOT a reviewer rejection."
+        )
         lines.append("")
         lines.append("```json")
         lines.append(json.dumps(outcome.synthetic_audit, ensure_ascii=False, indent=2))
