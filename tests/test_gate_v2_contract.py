@@ -3921,12 +3921,15 @@ def test_quality_entry_contract_covers_missing_non_executable_and_executable_sta
     entry = next(step for step in steps if step.get("name") == "Run scripts/gate-quality")
     assert entry["if"] == "${{ steps.quality-entry.outputs.mode == 'entry' }}"
     assert entry["working-directory"] == "${{ github.workspace }}"
-    assert entry["run"].strip() == "./scripts/gate-quality"
+    # gate-hub#1696 redo: the bare run text became a helper-wrapped call
+    # (no custom shell:) — the entry itself must still be invoked exactly once.
+    assert '. "${RUNNER_TEMP}/gate_record_termination.sh"' in entry["run"]
+    assert "gate_run_and_record ./scripts/gate-quality" in entry["run"]
     assert detect["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
     assert entry["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
     names = [step.get("name") for step in steps]
     assert names.count("Run scripts/gate-quality") == 1
-    assert sum(step.get("run", "").strip() == "./scripts/gate-quality" for step in steps) == 1
+    assert sum("gate_run_and_record ./scripts/gate-quality" in str(step.get("run", "")) for step in steps) == 1
     assert names.index("PR size preflight") < names.index("Run scripts/gate-quality")
 
     legacy_steps = [step for step in steps if step.get("name") in {
