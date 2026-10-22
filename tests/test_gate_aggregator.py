@@ -1438,18 +1438,18 @@ def test_visible_expected_skip_summary_names_draft_as_the_skip_reason(capsys, tm
         ),
         (
             {"audit": None, "audit_error": "missing"},
-            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
-            ["REJECTED"],
+            ["could NOT be read", "reason for the primary job result is unknown", "not a reviewer rejection"],
+            ["REJECTED", "primary job logs"],
         ),
         (
             {"audit": _valid_primary_record(kind="synthetic_primary")},
-            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
-            ["REJECTED"],
+            ["could NOT be read", "reason for the primary job result is unknown", "not a reviewer rejection"],
+            ["REJECTED", "primary job logs"],
         ),
         (
             {"audit_source_attempt": 2},
-            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
-            ["REJECTED"],
+            ["could NOT be read", "reason for the primary job result is unknown", "not a reviewer rejection"],
+            ["REJECTED", "primary job logs"],
         ),
         (
             {"primary_result": "failure", "audit": _valid_primary_record(verdict="pass")},
@@ -1474,53 +1474,39 @@ def test_reason_code_wording_cannot_be_misread(kwargs, must_say, must_not_say):
 
 
 @pytest.mark.parametrize(
-    "primary_result,must_say,must_not_say",
+    "primary_result",
     [
-        (
-            "failure",
-            [
-                "primary job failed",
-                "usually because of a reviewer rejection",
-                "canonical audit artifact could NOT be read",
-                "cannot be confirmed programmatically",
-                "check the primary job logs for the verdict line",
-            ],
-            ["NOT a reviewer rejection", "not a reviewer rejection"],
-        ),
-        (
-            "success",
-            ["could NOT be read", "check the primary job logs", "not a reviewer rejection"],
-            ["primary job failed", "cannot be confirmed programmatically"],
-        ),
+        "failure",
+        "success",
     ],
     ids=["primary_failure", "primary_success"],
 )
-def test_audit_missing_wording_tracks_primary_job_result(
-    tmp_path, primary_result, must_say, must_not_say,
-):
-    # The terminal classification remains fail-closed in both cases; only the
-    # recipient-facing explanation changes with needs.primary.result.
+def test_audit_missing_wording_does_not_infer_from_primary_job_result(tmp_path, primary_result):
+    # The terminal classification and unknown-cause wording hold regardless of
+    # the primary job conclusion; only canonical verdict=fail proves rejection.
     _, summary_path, args = _visible_scenario(
         tmp_path, {"primary_result": primary_result}, None,
     )
     assert AGG.main(args) == 1
     text = summary_path.read_text()
     assert "classification=`integration_error`, reason_code=`audit_missing`, gate_result=`unavailable`" in text
-    for phrase in must_say:
-        assert phrase in text
-    for phrase in must_not_say:
-        assert phrase not in text
+    assert "could NOT be read" in text
+    assert "reason for the primary job result is unknown" in text
+    assert "not a reviewer rejection" in text
+    assert "primary job logs" not in text
+    assert "usually because of a reviewer rejection" not in text
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
         {"audit": None, "audit_error": "missing"},
+        {"primary_result": "failure", "audit": None, "audit_error": "missing"},
         {"audit": _valid_primary_record(kind="synthetic_primary")},
         {"audit_source_attempt": 2},
         {"primary_result": "cancelled", "audit": None},
     ],
-    ids=["audit_missing", "audit_invalid", "audit_source_mismatch", "primary_cancelled"],
+    ids=["audit_missing", "audit_missing_primary_failure", "audit_invalid", "audit_source_mismatch", "primary_cancelled"],
 )
 def test_synthetic_verdict_null_is_explained_before_the_json(kwargs):
     # A human sentence explaining `"verdict": null` must precede the synthetic
@@ -1528,9 +1514,11 @@ def test_synthetic_verdict_null_is_explained_before_the_json(kwargs):
     outcome = AGG.evaluate(**_base_kwargs(**kwargs))
     assert outcome.synthetic_audit is not None
     text = AGG.render_summary(outcome)
-    explanation = '"verdict": null` below means the primary conclusion could not be read'
+    explanation = '"verdict": null` below means no canonical primary review conclusion was available'
     assert explanation in text
     assert "NOT a reviewer rejection" in text
+    assert "cause cannot be determined from the available audit data" in text
+    assert "primary job logs" not in text
     assert text.index(explanation) < text.index('  "verdict": null')
 
 
