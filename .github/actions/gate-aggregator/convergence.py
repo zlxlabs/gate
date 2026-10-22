@@ -841,6 +841,9 @@ def _consume_neighbor_disposition(
     audit_digest: str,
     digest_ok: bool,
 ) -> DispositionStatus:
+    if isinstance(receipt.counterevidence, dict):
+        if receipt.counterevidence.get("match_expectation", "present") != "present":
+            return _counterevidence_expired(receipt)
     if evidence.current_head_sha != scope.head_sha:
         return _counterevidence_expired(receipt)
     if evidence.anchor_window_touched:
@@ -1342,10 +1345,40 @@ def _counterevidence_reason(receipt: DispositionReceipt) -> str | None:
     argv_reason = counterevidence_argv_reason(argv if isinstance(argv, list) else [], receipt.head_sha)
     if argv_reason is not None:
         return "counterevidence_command_not_allowlisted"
-    if type(rerun.get("exit_code")) is not int or rerun.get("exit_code") != 0:
-        return "counterevidence_not_rerun"
+    expectation = evidence.get("match_expectation", "present")
     match_count = rerun.get("match_count")
-    if type(match_count) is not int or match_count < 1:
+    if expectation == "present":
+        if type(rerun.get("exit_code")) is not int or rerun.get("exit_code") != 0:
+            return "counterevidence_not_rerun"
+        if type(match_count) is not int or match_count < 1:
+            return "counterevidence_not_rerun"
+        return None
+    if expectation != "absent":
+        return "counterevidence_not_rerun"
+    base = rerun.get("base_rerun")
+    base_argv = base.get("argv") if isinstance(base, dict) else None
+    if (
+        not isinstance(base, dict)
+        or not isinstance(base_argv, list) or len(base_argv) != len(argv)
+        or base_argv[:6] != argv[:6] or base_argv[7:] != argv[7:]
+        or not isinstance(base_argv[6], str)
+        or re.fullmatch(r"[0-9a-f]{40}", base_argv[6]) is None
+    ):
+        return "counterevidence_not_rerun"
+    base_sha = base_argv[6]
+    if counterevidence_argv_reason(base_argv, base_sha) is not None:
+        return "counterevidence_command_not_allowlisted"
+    if (
+        type(base.get("exit_code")) is not int or base.get("exit_code") != 0
+        or type(base.get("match_count")) is not int or base["match_count"] < 1
+        or not _nonempty_text(base.get("excerpt"))
+    ):
+        return "counterevidence_not_rerun"
+    if (
+        type(rerun.get("exit_code")) is not int or rerun.get("exit_code") != 1
+        or type(match_count) is not int or match_count != 0
+        or not _nonempty_text(rerun.get("excerpt"))
+    ):
         return "counterevidence_not_rerun"
     return None
 

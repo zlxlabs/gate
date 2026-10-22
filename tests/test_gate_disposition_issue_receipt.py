@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,10 +47,10 @@ def _git_env():
     return env
 
 
-def _seed_caller_repo(root, *, relpath="src/lock.py", literal="locked-behavior"):
+def _seed_caller_repo(root, *, relpath="src/lock.py", literal="locked-behavior", source_text=None):
     repo = Path(root) / "caller"
     (repo / relpath).parent.mkdir(parents=True, exist_ok=True)
-    (repo / relpath).write_text(f"{literal}\n", encoding="utf-8")
+    (repo / relpath).write_text(source_text or f"{literal}\n", encoding="utf-8")
     env = _git_env()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, env=env)
     subprocess.run(["git", "config", "user.email", "gate-test@example.com"], cwd=repo, check=True, capture_output=True, env=env)
@@ -69,7 +70,7 @@ def _allowlisted_ce(sha, *, relpath="src/lock.py", literal="locked-behavior", ou
     }
 
 
-def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None):
+def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=None):
     audit = {
         **SCOPE,
         "repository": REPOSITORY,
@@ -93,17 +94,23 @@ def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None):
     }
     if head_sha is not None:
         audit["head_sha"] = head_sha
+    if base_sha is not None:
+        audit["base_sha"] = base_sha
     return audit
 
 
 def _issue(tmp_path, *, disposition=None, counterevidence=None, tracking_issue=None,
-           tier="personal", trigger_kind="inferred", head_sha=None, repo_dir=None):
+           tier="personal", trigger_kind="inferred", head_sha=None, base_sha=None, repo_dir=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     head_sha = head_sha or SCOPE["head_sha"]
     audit_path = tmp_path / "audit.json"
-    audit_path.write_text(json.dumps(_audit(tier, trigger_kind=trigger_kind, head_sha=head_sha)))
+    audit_path.write_text(json.dumps(_audit(
+        tier, trigger_kind=trigger_kind, head_sha=head_sha, base_sha=base_sha,
+    )))
     output_dir = tmp_path / "output"
     scope = {**SCOPE, "tier": tier, "head_sha": head_sha}
+    if base_sha is not None:
+        scope["base_sha"] = base_sha
     command = [
         sys.executable, str(PRODUCER), "issue",
         "--output-dir", str(output_dir), "--audit-path", str(audit_path),
@@ -471,15 +478,26 @@ def test_false_positive_producer_rejects_command_not_allowlisted(tmp_path, comma
     assert not output_dir.exists()
 
 
-def test_false_positive_producer_rejects_rerun_no_match(tmp_path):
+@pytest.mark.parametrize(
+    ("expectation", "literal", "reason"),
+    [
+        ("present", "absent-literal", "counterevidence_rerun_no_match"),
+        ("absent", "absent-literal", "counterevidence_rerun_no_match"),
+        ("absent", "present-text", "counterevidence_rerun_match_found"),
+    ],
+)
+def test_false_positive_producer_rejects_unproven_match_expectations(tmp_path, expectation, literal, reason):
     repo, sha, relpath, _literal = _seed_caller_repo(tmp_path, literal="present-text")
-    counterevidence = _allowlisted_ce(sha, relpath=relpath, literal="absent-literal")
+    counterevidence = _allowlisted_ce(sha, relpath=relpath, literal=literal)
+    if expectation == "absent":
+        counterevidence["match_expectation"] = expectation
     result, output_dir = _issue(
         tmp_path / "issue", disposition="false-positive",
-        counterevidence=counterevidence, head_sha=sha, repo_dir=repo,
+        counterevidence=counterevidence, head_sha=sha,
+        base_sha=sha if expectation == "absent" else None, repo_dir=repo,
     )
     assert result.returncode != 0
-    assert "counterevidence_rerun_no_match" in result.stderr
+    assert reason in result.stderr
     assert not output_dir.exists()
 
 
@@ -498,14 +516,30 @@ def test_false_positive_producer_rejects_forged_output_when_rerun_no_match(tmp_p
     assert not output_dir.exists()
 
 
-def test_false_positive_producer_rejects_head_object_missing(tmp_path):
-    empty = tmp_path / "not-a-repo"
-    empty.mkdir()
-    sha = "a" * 40
-    counterevidence = _allowlisted_ce(sha)
+@pytest.mark.parametrize("missing_side", ["head", "base"])
+def test_false_positive_producer_rejects_object_missing(tmp_path, missing_side):
+    if missing_side == "head":
+        repo = tmp_path / "not-a-repo"
+        repo.mkdir()
+        sha = "a" * 40
+        base_sha = None
+        counterevidence = _allowlisted_ce(sha)
+    else:
+        literal = "media.capswriter"
+        origin, base_sha, relpath, _ = _seed_caller_repo(
+            tmp_path, relpath="src/lock.py", literal=literal,
+        )
+        (origin / relpath).write_text("no legacy reference\n", encoding="utf-8")
+        subprocess.run(["git", "add", relpath], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "remove legacy import"], cwd=origin, check=True,
+                       capture_output=True, env=_git_env())
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=origin, text=True).strip()
+        repo = _prepare_caller_head(origin, tmp_path / "shallow", sha, blob_filter=False)
+        counterevidence = _allowlisted_ce(sha, relpath="*.py", literal=literal)
+        counterevidence["match_expectation"] = "absent"
     result, output_dir = _issue(
         tmp_path / "issue", disposition="false-positive",
-        counterevidence=counterevidence, head_sha=sha, repo_dir=empty,
+        counterevidence=counterevidence, head_sha=sha, base_sha=base_sha, repo_dir=repo,
     )
     assert result.returncode != 0
     assert "counterevidence_head_object_missing" in result.stderr
@@ -529,14 +563,20 @@ def test_rerun_timeout_is_counterevidence_rerun_timeout(tmp_path, monkeypatch):
         )
 
 
-def test_rerun_spawn_failure_is_counterevidence_rerun_failed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", ["spawn", "exit"])
+def test_rerun_failure_is_counterevidence_rerun_failed(tmp_path, monkeypatch, failure):
     repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
     module = _producer_module()
+    real_run = module.subprocess.run
 
-    def boom(*_args, **_kwargs):
-        raise OSError("git is not executable")
+    def fail(argv, *_args, **_kwargs):
+        if argv[1] != "grep":
+            return real_run(argv, *_args, **_kwargs)
+        if failure == "spawn":
+            raise OSError("git is not executable")
+        return subprocess.CompletedProcess(argv, 2, stdout=b"", stderr=b"grep failed")
 
-    monkeypatch.setattr(module.subprocess, "run", boom)
+    monkeypatch.setattr(module.subprocess, "run", fail)
     with pytest.raises(ValueError, match="counterevidence_rerun_failed"):
         module.rerun_counterevidence(
             f"git grep -n -F -e {literal} {sha} -- {relpath}", sha, repo,
@@ -635,22 +675,92 @@ def test_blob_filtered_caller_head_reports_missing_head_object_not_timeout(tmp_p
     assert time.monotonic() - started < 30
 
 
-def test_depth_one_caller_head_issues_receipt_from_real_git_grep(tmp_path):
-    repo, sha, relpath, literal = _seed_caller_repo(tmp_path)
-    prepared = _prepare_caller_head(repo, tmp_path / "full", sha, blob_filter=False)
-    assert subprocess.run(
-        ["git", "-C", str(prepared), "rev-list", "--objects", "--missing=print", sha, "--", relpath],
-        check=True, capture_output=True,
-    ).stdout.count(b"?") == 0
-    counterevidence = _allowlisted_ce(sha, relpath=relpath, literal=literal, output="stale")
+@pytest.mark.parametrize("expectation", ["present", "absent"])
+def test_disposition_workflow_fetches_only_required_commits(tmp_path, expectation):
+    absent = expectation == "absent"
+    if absent:
+        literal = "media.capswriter"
+        repo, base_sha, relpath, _ = _seed_caller_repo(
+            tmp_path, relpath="src/lock.py", literal=literal,
+            source_text=(literal + "\n") * 6,
+        )
+        (repo / relpath).write_text("from official_sdk import Client\n", encoding="utf-8")
+        subprocess.run(["git", "add", relpath], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "remove legacy import"], cwd=repo, check=True,
+                       capture_output=True, env=_git_env())
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    else:
+        repo, sha, _relpath, _literal = _seed_caller_repo(tmp_path)
+        base_sha = None
+    for capability in ("uploadpack.allowAnySHA1InWant", "uploadpack.allowFilter"):
+        subprocess.run(["git", "config", capability, "true"], cwd=repo, check=True, capture_output=True)
+    workflow = yaml.safe_load((ROOT / ".github/workflows/gate-v2-disposition.yml").read_text())
+    fetch_step = next(
+        step for step in workflow["jobs"]["control"]["steps"]
+        if step.get("name") == "Fetch caller head for counterevidence rerun"
+    )
+    trace = tmp_path / "git-trace.jsonl"
+    workspace = tmp_path / "workflow"
+    workspace.mkdir()
+    env = {
+        **os.environ, "GITHUB_WORKSPACE": str(workspace), "GITHUB_REPOSITORY": "owner/repo",
+        "GITHUB_ENV": str(tmp_path / "github-env"), "GH_TOKEN": "test-token",
+        "CURRENT_HEAD_SHA": sha,
+        "CURRENT_SCOPE_JSON": json.dumps({"base_sha": base_sha or SCOPE["base_sha"]}),
+        "DISPOSITION_COUNTEREVIDENCE_JSON": json.dumps({"match_expectation": expectation}),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.file://{repo}.insteadOf",
+        "GIT_CONFIG_VALUE_0": "https://github.com/owner/repo.git",
+        "GIT_TRACE2_EVENT": str(trace),
+    }
+    fetch_result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", fetch_step["run"]],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+    )
+    assert fetch_result.returncode == 0, fetch_result.stderr
+    caller_dir = Path((tmp_path / "github-env").read_text().split("CALLER_HEAD_DIR=", 1)[1].strip())
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    fetch_argv = next(event["argv"] for event in events
+                      if event.get("event") == "start" and "fetch" in event.get("argv", []))
+    expected_shas = [sha, base_sha] if absent else [sha]
+    assert fetch_argv[-(len(expected_shas) + 1):] == ["origin", *expected_shas]
+    if not absent:
+        return
+    prepared = caller_dir
+    evidence = _allowlisted_ce(
+        sha, relpath="*.py", literal=literal,
+        output="legacy reference absent after SDK migration",
+    )
+    evidence["match_expectation"] = expectation
     result, output_dir = _issue(
-        tmp_path / "issue", disposition="false-positive",
-        counterevidence=counterevidence, head_sha=sha, repo_dir=prepared,
+        tmp_path / "issue", disposition="false-positive", counterevidence=evidence,
+        head_sha=sha, base_sha=base_sha, repo_dir=prepared,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads((output_dir / json.loads(result.stdout)["artifact"]).read_bytes())
-    rerun = payload["counterevidence"]["gate_rerun"]
-    actual = subprocess.run(rerun["argv"], cwd=prepared, capture_output=True, check=True)
-    assert rerun["exit_code"] == 0
-    assert rerun["match_count"] >= 1
-    assert actual.stdout.decode("utf-8") == rerun["excerpt"]
+    receipt_evidence = payload["counterevidence"]
+    rerun = receipt_evidence["gate_rerun"]
+    assert receipt_evidence["result"] == "refuted" and rerun["excerpt"]
+    base_rerun = rerun["base_rerun"]
+    assert base_rerun["match_count"] == 6
+    assert base_rerun["argv"][5:7] == [literal, base_sha]
+    assert (rerun["argv"][6], rerun["exit_code"], rerun["match_count"]) == (sha, 1, 0)
+    convergence = _convergence_module()
+    receipt = convergence.parse_disposition_receipt(payload)
+    scope = convergence.Scope(**{**SCOPE, "base_sha": base_sha or SCOPE["base_sha"], "head_sha": sha})
+    primary = convergence.CanonicalPrimary(
+        schema_version=1, repository_id=SCOPE["repository_id"], pr_number=SCOPE["pr_number"],
+        head_sha=sha, run_id=7, run_attempt=1, verdict="fail", p1_ids=("finding-one",),
+        p1_findings=(("finding-one", "major", "inferred", "src/guard.py", 12, "correctness"),),
+    )
+    status = convergence.validate_disposition_receipt(
+        receipt, scope=scope, primary=primary,
+        audit_digest=convergence.canonical_audit_digest(_audit(head_sha=sha, base_sha=base_sha)),
+    )
+    assert (status.valid, status.active, status.reason) == (True, True, "active_false_positive")
+    wrong_scope = convergence.Scope(**{**scope.as_dict(), "base_sha": "f" * 40, "tier": scope.tier})
+    rejected = convergence.validate_disposition_receipt(
+        receipt, scope=wrong_scope, primary=primary,
+        audit_digest=convergence.canonical_audit_digest(_audit(head_sha=sha, base_sha=base_sha)),
+    )
+    assert rejected.reason_code == "epoch_mismatch_stale"

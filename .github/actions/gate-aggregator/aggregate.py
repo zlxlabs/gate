@@ -908,6 +908,8 @@ def _project_previous_dispositions(
                 field: _clip_text(evidence[field])
                 for field in ("command", "output", "result", "pointer")
             }
+            if evidence.get("match_expectation") == "absent":
+                counterevidence["match_expectation"] = "absent"
         elif receipt.disposition == "deferred":
             if not isinstance(receipt.tracking_issue, str) or not receipt.tracking_issue.strip():
                 dropped += 1

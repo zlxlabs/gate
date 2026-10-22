@@ -451,7 +451,7 @@ def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
     # gate#302: the caller head must arrive complete. A blob-filtered clone
     # defers the pathspec blobs to per-object promisor fetches and the grep
     # times out without saying why.
-    assert "timeout 300 git -C \"$repo_dir\" fetch --depth 1 origin \"$CURRENT_HEAD_SHA\"" in run
+    assert 'timeout 300 git -C "$repo_dir" fetch --depth 1 origin "${fetch_shas[@]}"' in run
     assert not [line for line in run.splitlines() if "fetch" in line and "--filter" in line]
     assert "--missing=print" in run
     assert "_gate-caller-head" in run
