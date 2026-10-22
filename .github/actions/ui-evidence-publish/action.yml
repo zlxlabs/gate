@@ -31,6 +31,7 @@ runs:
   steps:
     - name: PR 粘性评论(e2e 状态 + 证据深链)
       if: ${{ github.event_name == 'pull_request' }}
+      continue-on-error: ${{ inputs.e2e-status == 'success' }}
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
