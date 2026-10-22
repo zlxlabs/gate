@@ -4,7 +4,7 @@
 - 工单：`zlxlabs/gate-hub#1751`
 - 冻结代码审查范围：`7b547448bd83150f1a767573d7ab81b5f55de452..71ac0c29e3e7c0bdb8546993eb674f0b85e85b6f`
 - 审查结论：可合并；冻结代码 diff 无阻断 finding，正常 PR 检查仍须通过。
-- failure-visibility: clean
+failure-visibility: clean
 
 本文件记录的代码审查对象固定为上述 SHA 范围。写入本 verdict 和更新 PR 描述不改变该范围。
 
