@@ -59,7 +59,7 @@ def _silo_touchpoint(block: str) -> bool:
     # The verdict channel itself (design A): the primary-side producer writing
     # the audit output and the gate/ledger-side consumers reading it are part
     # of the verdict/bookkeeping partition even though they never touch Silo.
-    if 'audit_json_b64=' in block or 'needs.primary.outputs.audit_json_b64' in block:
+    if 'audit_json_gz_b64=' in block or 'needs.primary.outputs.audit_json_gz_b64' in block:
         return True
     return False
 

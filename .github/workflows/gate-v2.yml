@@ -1114,15 +1114,18 @@ jobs:
     # Verdict channel (design 261019-gate-triage A.1/A.2): the canonical audit
     # travels to gate/ledger through GitHub job outputs (same-run, native), NOT
     # through Silo — a Silo outage can no longer lose the verdict (audit_missing).
-    # Values are base64 (single line, `base64 -w0`): GitHub officially does not
-    # support secrets in job outputs (actions/runner#1061 — masked values reach
-    # downstream jobs as `***`), and findings quotes may quote PR content; base64
-    # breaks the SecretMasker's literal substring match so the data plane stays
-    # intact while log masking still applies. Size budget: live fleet max is
-    # 26.7 KiB (P99 17.8 KiB); base64 ×4/3 stays far under the 1 MiB expression
-    # evaluation budget — see docs/sessions/261019-gate-triage/evidence/G1-audit-size.md.
+    # Values are `gzip -n -9 | base64 -w0` (single line): base64 breaks the
+    # SecretMasker's literal substring match so the data plane stays intact while
+    # log masking still applies (GitHub does not support secrets in job outputs,
+    # actions/runner#1061 — masked values reach downstream jobs as `***`; audit
+    # findings quotes may quote PR content). Size budget: the binding constraint
+    # is the consumer's single environment string (Linux MAX_ARG_STRLEN=131072
+    # bytes per argv/env entry, gate#377), NOT the 1 MiB expression budget —
+    # gzip keeps live-fleet-max payloads (26.7 KiB raw) ~5-10x smaller; the
+    # producer fail-louds at MAX_PAYLOAD_CHARS below — see
+    # docs/sessions/261019-gate-triage/evidence/G1-audit-size.md.
     outputs:
-      audit_json_b64: ${{ steps.publish-audit-output.outputs.audit_json_b64 }}
+      audit_json_gz_b64: ${{ steps.publish-audit-output.outputs.audit_json_gz_b64 }}
       audit_bytes: ${{ steps.publish-audit-output.outputs.audit_bytes }}
       audit_attempt: ${{ steps.publish-audit-output.outputs.audit_attempt }}
       audit_key: ${{ steps.publish-audit-output.outputs.audit_key }}
@@ -1523,28 +1526,39 @@ jobs:
         # Verdict channel producer (design A.1). fail-closed: a missing/empty
         # audit file fails THIS step (and the primary job) rather than letting
         # gate see a success primary without a readable record — same contract
-        # the Silo upload enforced before the channel split. The over-size check
-        # guards the 1 MiB expression-evaluation budget before GitHub ever sees
-        # the value (live fleet max 26.7 KiB; G1-audit-size.md).
+        # the Silo upload enforced before the channel split. Payload is
+        # `gzip -n -9 -c | base64 -w0` (single line, -n for byte-reproducible
+        # output): JSON audits compress ~5-10x, and the binding size constraint
+        # is the consumer's single environment string — Linux MAX_ARG_STRLEN
+        # 131072 bytes per argv/env entry (execve(2), include/linux limits.h) —
+        # not the 1 MiB expression budget. An over-limit value would kill the
+        # consumer's bash with E2BIG ("Argument list too long", gate#377) at a
+        # step where the error names the wrong cause, so the producer checks the
+        # real bound and fail-louds here. MAX_PAYLOAD_CHARS=120000 leaves ~8%
+        # headroom under MAX_ARG_STRLEN for the `AUDIT_B64=` name prefix and
+        # sibling env vars of the consumer step. No fallback channel on purpose:
+        # an audit that cannot travel the verdict channel must fail the primary
+        # job, not silently degrade to bookkeeping-only. G1-audit-size.md §5.
         if: always()
         id: publish-audit-output
         env:
           AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
           AUDIT_KEY: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          MAX_B64_BYTES: "524288"
+          MAX_PAYLOAD_CHARS: "120000"
         run: |
           set -euo pipefail
           if [ ! -s "$AUDIT_PATH" ]; then
             echo "::error::canonical primary audit missing or empty at $AUDIT_PATH — refusing to publish a verdict channel without its record" >&2
             exit 1
           fi
-          b64=$(base64 -w0 "$AUDIT_PATH")
-          if [ "${#b64}" -gt "$MAX_B64_BYTES" ]; then
-            echo "::error::canonical primary audit base64 length ${#b64} exceeds $MAX_B64_BYTES (GitHub expression-evaluation budget is 1 MiB; see G1-audit-size.md)" >&2
+          payload=$(gzip -n -9 -c "$AUDIT_PATH" | base64 -w0)
+          if [ "${#payload}" -gt "$MAX_PAYLOAD_CHARS" ]; then
+            echo "AUDIT-PAYLOAD-OVER-ENV-LIMIT b64_chars=${#payload} limit=${MAX_PAYLOAD_CHARS} raw_bytes=$(wc -c < "$AUDIT_PATH" | tr -d ' ') max_arg_strlen=131072" >&2
+            echo "::error::canonical primary audit payload (${#payload} chars after gzip+base64) exceeds single-env-string limit ${MAX_PAYLOAD_CHARS} (MAX_ARG_STRLEN=131072 with headroom) — refusing to publish a verdict channel the consumer cannot exec; trim findings quotes or the audit (gate#377; G1-audit-size.md)" >&2
             exit 1
           fi
           {
-            echo "audit_json_b64=$b64"
+            echo "audit_json_gz_b64=$payload"
             echo "audit_bytes=$(wc -c < "$AUDIT_PATH" | tr -d ' ')"
             echo "audit_attempt=${{ github.run_attempt }}"
             echo "audit_key=$AUDIT_KEY"
@@ -2417,7 +2431,7 @@ jobs:
         # Verdict channel consumer (design A.2) — replaces the former
         # "Silo resolve + download" hop (the audit_missing source of gate#312/#348).
         # Fail-closed contract: every bad shape (missing output / invalid base64 /
-        # length-marker mismatch / broken JSON) collapses into the aggregator's
+        # corrupt gzip / length-marker mismatch / broken JSON) collapses into the aggregator's
         # audit_missing or audit_invalid path, so the gate conclusion becomes
         # unavailable — never a silent pass. This step exits 0 even on those
         # paths so the terminal envelope is still generated and records the
@@ -2426,7 +2440,7 @@ jobs:
         if: ${{ needs.primary.result != 'skipped' }}
         id: read-primary-audit
         env:
-          AUDIT_B64: ${{ needs.primary.outputs.audit_json_b64 }}
+          AUDIT_B64: ${{ needs.primary.outputs.audit_json_gz_b64 }}
           AUDIT_BYTES_DECLARED: ${{ needs.primary.outputs.audit_bytes }}
           AUDIT_DIR: ${{ runner.temp }}/primary-audit
           AUDIT_FILENAME: primary-review-audit.json
@@ -2437,12 +2451,19 @@ jobs:
             echo "::error::primary audit output missing (primary result=${{ needs.primary.result }}) — aggregator will fail closed with audit_missing" >&2
             exit 0
           fi
-          tmp="$AUDIT_DIR/.audit.b64.tmp"
-          if ! printf '%s' "$AUDIT_B64" | base64 -d > "$tmp" 2>/dev/null; then
+          tmp_in="$AUDIT_DIR/.audit.b64.tmp"
+          tmp="$AUDIT_DIR/.audit.gz.tmp"
+          if ! printf '%s' "$AUDIT_B64" | base64 -d > "$tmp_in" 2>/dev/null; then
             echo "::error::primary audit output is not valid base64 — aggregator will fail closed with audit_missing" >&2
-            rm -f "$tmp"
+            rm -f "$tmp_in" "$tmp"
             exit 0
           fi
+          if ! gunzip -c "$tmp_in" > "$tmp" 2>/dev/null; then
+            echo "::error::primary audit output does not gunzip (truncated or corrupt gzip payload) — aggregator will fail closed with audit_missing" >&2
+            rm -f "$tmp_in" "$tmp"
+            exit 0
+          fi
+          rm -f "$tmp_in"
           actual=$(wc -c < "$tmp" | tr -d ' ')
           if [ "$actual" != "$AUDIT_BYTES_DECLARED" ]; then
             echo "::error::primary audit output truncated or padded (declared=$AUDIT_BYTES_DECLARED actual=$actual) — aggregator will fail closed with audit_missing" >&2
@@ -3162,7 +3183,7 @@ jobs:
         env:
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
-          AUDIT_B64: ${{ needs.primary.outputs.audit_json_b64 }}
+          AUDIT_B64: ${{ needs.primary.outputs.audit_json_gz_b64 }}
           AUDIT_BYTES_DECLARED: ${{ needs.primary.outputs.audit_bytes }}
           AUDIT_DIR: ${{ runner.temp }}/primary-audit
           AUDIT_FILENAME: primary-review-audit.json
@@ -3180,8 +3201,11 @@ jobs:
             echo "::notice::primary $PRIMARY_RESULT produced no audit output; ledger row audit fields will be null"
             exit 0
           fi
-          tmp="$AUDIT_DIR/.audit.b64.tmp"
-          printf '%s' "$AUDIT_B64" | base64 -d > "$tmp" 2>/dev/null || fail_loud "primary audit output is not valid base64"
+          tmp_in="$AUDIT_DIR/.audit.b64.tmp"
+          tmp="$AUDIT_DIR/.audit.gz.tmp"
+          printf '%s' "$AUDIT_B64" | base64 -d > "$tmp_in" 2>/dev/null || fail_loud "primary audit output is not valid base64"
+          gunzip -c "$tmp_in" > "$tmp" 2>/dev/null || fail_loud "primary audit output does not gunzip (truncated or corrupt gzip payload)"
+          rm -f "$tmp_in"
           actual=$(wc -c < "$tmp" | tr -d ' ')
           [ "$actual" = "$AUDIT_BYTES_DECLARED" ] || fail_loud "primary audit output truncated (declared=$AUDIT_BYTES_DECLARED actual=$actual)"
           mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"

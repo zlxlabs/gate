@@ -2039,14 +2039,16 @@ def test_gate_job_never_invokes_aggregator_via_a_moving_uses_ref():
 def test_primary_publishes_verdict_output_and_silo_copy_shares_key_template():
     """Verdict channel producer contract (design A.1) + retention-copy key parity.
 
-    The job output carries the canonical audit to gate/ledger (base64, single
-    line); the Silo d14 upload is bookkeeping only but must keep the same key
+    The job output carries the canonical audit to gate/ledger (gzip+base64,
+    single line — gate#377: bounded by the consumer's single env string
+    MAX_ARG_STRLEN=131072, not the 1 MiB expression budget); the Silo d14
+    upload is bookkeeping only but must keep the same key
     template so terminal envelopes and archives stay addressable.
     """
     raw, _ = _load_workflow()
     primary = raw["jobs"]["primary"]
     outputs = primary["outputs"]
-    assert outputs["audit_json_b64"] == "${{ steps.publish-audit-output.outputs.audit_json_b64 }}"
+    assert outputs["audit_json_gz_b64"] == "${{ steps.publish-audit-output.outputs.audit_json_gz_b64 }}"
     assert outputs["audit_bytes"] == "${{ steps.publish-audit-output.outputs.audit_bytes }}"
     assert outputs["audit_attempt"] == "${{ steps.publish-audit-output.outputs.audit_attempt }}"
     assert outputs["audit_key"] == "${{ steps.publish-audit-output.outputs.audit_key }}"
@@ -2060,10 +2062,12 @@ def test_primary_publishes_verdict_output_and_silo_copy_shares_key_template():
     assert "continue-on-error" not in publish
     assert "[ ! -s \"$AUDIT_PATH\" ]" in publish["run"]
     assert "exit 1" in publish["run"]
-    assert 'base64 -w0' in publish["run"]
-    assert "MAX_B64_BYTES" in publish["env"]
+    # gate#377: gzip 载荷 + 单环境串上限 + fail-loud 锚行
+    assert "gzip -n -9 -c \"$AUDIT_PATH\" | base64 -w0" in publish["run"]
+    assert publish["env"]["MAX_PAYLOAD_CHARS"] == "120000"
+    assert "AUDIT-PAYLOAD-OVER-ENV-LIMIT" in publish["run"]
     assert publish["env"]["AUDIT_KEY"] == ARTIFACT_NAME_EXPR
-    assert 'echo "audit_json_b64=$b64"' in publish["run"]
+    assert 'echo "audit_json_gz_b64=$payload"' in publish["run"]
     assert 'echo "audit_bytes=' in publish["run"]
     assert 'echo "audit_attempt=${{ github.run_attempt }}"' in publish["run"]
     assert 'echo "audit_key=$AUDIT_KEY"' in publish["run"]
@@ -2109,7 +2113,7 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     assert reader["id"] == "read-primary-audit"
     assert reader["if"] == "${{ needs.primary.result != 'skipped' }}"
     assert "continue-on-error" not in reader
-    assert reader["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_b64 }}"
+    assert reader["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_gz_b64 }}"
     assert reader["env"]["AUDIT_BYTES_DECLARED"] == "${{ needs.primary.outputs.audit_bytes }}"
     assert reader["env"]["AUDIT_DIR"] == "${{ runner.temp }}/primary-audit"
     assert reader["env"]["AUDIT_FILENAME"] == "primary-review-audit.json"
@@ -2119,6 +2123,7 @@ def test_primary_uploads_review_diagnostics_after_canonical_audit():
     assert '[ -z "$AUDIT_B64" ]' in reader_run
     assert "audit_missing" in reader_run
     assert "base64 -d" in reader_run
+    assert "gunzip -c" in reader_run
     assert 'audit_missing" >&2' in reader_run
     assert 'truncated or padded' in reader_run
     assert "mkdir -p \"$AUDIT_DIR\"" in reader_run
@@ -2226,7 +2231,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     # Ledger-side read remains fail-loud at the step outcome; step-level
     # continue-on-error keeps this bookkeeping job check green.
     assert audit_read["continue-on-error"] is True
-    assert audit_read["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_b64 }}"
+    assert audit_read["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_gz_b64 }}"
     assert audit_read["env"]["AUDIT_BYTES_DECLARED"] == "${{ needs.primary.outputs.audit_bytes }}"
     assert audit_read["env"]["AUDIT_FILENAME"] == "primary-review-audit.json"
     audit_read_run = audit_read["run"]
@@ -2234,6 +2239,7 @@ def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
     assert "refusing to ledger a reviewed run without its audit record" in audit_read_run
     assert "audit fields will be null" in audit_read_run
     assert "base64 -d" in audit_read_run
+    assert "gunzip -c" in audit_read_run
     assert "truncated (declared=" in audit_read_run
     assert 'mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"' in audit_read_run
     build = steps[build_index]
