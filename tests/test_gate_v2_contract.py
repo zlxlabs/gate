@@ -493,7 +493,7 @@ def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_arti
     assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
     control = raw["jobs"]["control"]
     assert control["env"]["SILO_STORE"].endswith("scripts/silo_store.py")
-    assert control["runs-on"] == ["self-hosted", "linux", "ci"]
+    assert control["runs-on"] == ["self-hosted", "linux", "ci", "git-source-service"]
     names = [step.get("name") for step in control["steps"]]
     dns_index = names.index("Resolve Silo hostname via MagicDNS")
     first_s3 = next(
