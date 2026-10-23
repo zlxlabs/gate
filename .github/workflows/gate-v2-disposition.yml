@@ -351,8 +351,53 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${CURRENT_HEAD_SHA:-}"
-          test -n "${GH_TOKEN:-}"
           test -n "${GITHUB_REPOSITORY:-}"
+          eval "$GATE_SOURCE_DECIDE_SCRIPT"
+          mode=$(cat "$RUNNER_TEMP/gate-source-mode")
+          if [ "$mode" = service ]; then
+            source_root=$(realpath -e "$source_root") || { echo "::error::COUNTEREVIDENCE-SOURCE-MIRROR-UNREADABLE: $source_root" >&2; exit 1; }
+            repository=${GITHUB_REPOSITORY:?}
+            case "$repository" in zlxlabs/*) ;; *) echo "::error::COUNTEREVIDENCE-SOURCE-REPOSITORY-REJECTED: $repository" >&2; exit 1 ;; esac
+            budget=${GATE_SOURCE_BUDGET_SECS:-180}
+            deadline=$(( $(date +%s) + budget ))
+            client="$source_root/git-source-prepare"
+            [ -x "$client" ] || { echo "::error::COUNTEREVIDENCE-SOURCE-CLIENT-MISSING: $client" >&2; exit 1; }
+            prepare_shas=("$CURRENT_HEAD_SHA")
+            if [ "$(jq -r '.match_expectation // "present"' <<< "$DISPOSITION_COUNTEREVIDENCE_JSON")" = absent ]; then
+              base_sha="$(jq -er '.base_sha | select(test("^[0-9a-f]{40}$"))' <<< "$CURRENT_SCOPE_JSON")"
+              prepare_shas+=("$base_sha")
+            fi
+            for commit in "${prepare_shas[@]}"; do
+              if [ "${#commit}" -ne 40 ] || [[ "$commit" == *[!0-9a-f]* ]]; then
+                echo "::error::COUNTEREVIDENCE-SOURCE-COMMIT-INVALID: $commit" >&2
+                exit 1
+              fi
+              client_raw=$("$client" --repository "$repository" --commit "$commit" --deadline-epoch "$deadline" 2>&1 >/dev/null) && client_status=0 || client_status=$?
+              client_line=$(printf '%s\n' "$client_raw" | grep -m1 '^GIT-SOURCE-PREPARE-V1 ' || true)
+              if [ "$client_status" -ne 0 ]; then
+                case "$client_status" in
+                  2) mapped=SOURCE-REQUEST-INVALID ;;
+                  3) mapped=SOURCE-SERVICE-UNAVAILABLE ;;
+                  4) mapped=SOURCE-PREPARE-FAILED ;;
+                  5) mapped=SOURCE-COMMIT-MISMATCH ;;
+                  6) mapped=SOURCE-OBJECTS-INCOMPLETE ;;
+                  7) mapped=SOURCE-LOCK-TIMEOUT ;;
+                  8) mapped=SOURCE-DEADLINE-EXCEEDED ;;
+                  9) mapped=SOURCE-PROTOCOL-ERROR ;;
+                  *) mapped=SOURCE-CLIENT-FAILED ;;
+                esac
+                if [ -n "$client_line" ]; then
+                  echo "::error::COUNTEREVIDENCE-${mapped}: exit=$client_status line=${client_line:0:512}" >&2
+                else
+                  echo "::error::COUNTEREVIDENCE-${mapped}: exit=$client_status no GIT-SOURCE-PREPARE-V1 line" >&2
+                fi
+                exit 1
+              fi
+            done
+            echo "CALLER_HEAD_DIR=$source_root/${repository}.git" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          test -n "${GH_TOKEN:-}"
           repo_dir="${GITHUB_WORKSPACE}/_gate-caller-head"
           rm -rf "$repo_dir"
           mkdir -p "$repo_dir"
@@ -368,15 +413,21 @@ jobs:
           # gate#302: no blob filter. git grep has to read every blob under the
           # counterevidence pathspec, and a --filter=blob:none clone serves them
           # one promisor round trip at a time, which burned the 30s rerun budget.
-          if ! timeout 300 git -C "$repo_dir" fetch --depth 1 origin "${fetch_shas[@]}"; then
-            echo "::error::caller head/base not fetchable for the counterevidence rerun" >&2
+          fetch_rc=0
+          timeout 300 git -C "$repo_dir" fetch --depth 1 origin "${fetch_shas[@]}" && fetch_rc=0 || fetch_rc=$?
+          if [ "$fetch_rc" -ne 0 ]; then
+            if [ "$fetch_rc" -eq 124 ]; then
+              echo "::error::COUNTEREVIDENCE-SOURCE-TIMEOUT: git fetch --depth 1 exceeded 300s" >&2
+            else
+              echo "::error::COUNTEREVIDENCE-SOURCE-FETCH-FAILED: git fetch exit=$fetch_rc" >&2
+            fi
             exit 1
           fi
           git -C "$repo_dir" cat-file -e "$CURRENT_HEAD_SHA^{commit}"
           missing="$(git -C "$repo_dir" rev-list --objects --missing=print "${fetch_shas[@]}" \
             | grep -c '^?' || true)"
           if [ "$missing" -ne 0 ]; then
-            echo "::error::caller head/base is missing $missing objects; the rerun would fetch them one by one" >&2
+            echo "::error::COUNTEREVIDENCE-SOURCE-OBJECTS-INCOMPLETE: caller head/base is missing $missing objects; the rerun would fetch them one by one" >&2
             exit 1
           fi
           echo "CALLER_HEAD_DIR=$repo_dir" >> "$GITHUB_ENV"
@@ -405,6 +456,43 @@ jobs:
           test -n "$DISPOSITION_APPROVER"
           test -n "$DISPOSITION_APPROVER_ID"
           test -n "$CALLER_HEAD_DIR"
+          eval "$GATE_SOURCE_DECIDE_SCRIPT"
+          mode=$(cat "$RUNNER_TEMP/gate-source-mode")
+          export GIT_NO_REPLACE_OBJECTS=1
+          if [ "$mode" = service ]; then
+            lock_file="$CALLER_HEAD_DIR/consume.lock"
+            [ -f "$lock_file" ] || { echo "::error::COUNTEREVIDENCE-SOURCE-LOCK-UNREADABLE: $lock_file" >&2; exit 1; }
+            budget=${GATE_SOURCE_BUDGET_SECS:-180}
+            deadline=$(( $(date +%s) + budget ))
+            remaining=$(( deadline - $(date +%s) ))
+            [ "$remaining" -ge 1 ] || { echo "::error::COUNTEREVIDENCE-SOURCE-DEADLINE-EXCEEDED: budget $budget exhausted before the lock" >&2; exit 1; }
+            exec {source_lock_fd}<"$lock_file"
+            flock --shared -w "$remaining" "$source_lock_fd" || { echo "::error::COUNTEREVIDENCE-SOURCE-LOCK-TIMEOUT: $lock_file after ${remaining}s of a ${budget}s budget" >&2; exit 1; }
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0=safe.directory
+            export GIT_CONFIG_VALUE_0="$CALLER_HEAD_DIR"
+            demand_ref="refs/demand/$CURRENT_HEAD_SHA"
+            demand_commit=$(git --git-dir="$CALLER_HEAD_DIR" rev-parse --verify --quiet "$demand_ref^{commit}") || {
+              echo "::error::COUNTEREVIDENCE-SOURCE-DEMAND-REF-MISSING: $demand_ref" >&2
+              exit 1
+            }
+            if [ "$demand_commit" != "$CURRENT_HEAD_SHA" ]; then
+              echo "::error::COUNTEREVIDENCE-SOURCE-PIN-MISMATCH: $demand_ref resolves to $demand_commit, expected $CURRENT_HEAD_SHA" >&2
+              exit 1
+            fi
+            if [ "$(jq -r '.match_expectation // "present"' <<< "$DISPOSITION_COUNTEREVIDENCE_JSON")" = absent ]; then
+              base_sha="$(jq -er '.base_sha | select(test("^[0-9a-f]{40}$"))' <<< "$CURRENT_SCOPE_JSON")"
+              base_ref="refs/demand/$base_sha"
+              base_commit=$(git --git-dir="$CALLER_HEAD_DIR" rev-parse --verify --quiet "$base_ref^{commit}") || {
+                echo "::error::COUNTEREVIDENCE-SOURCE-DEMAND-REF-MISSING: $base_ref" >&2
+                exit 1
+              }
+              if [ "$base_commit" != "$base_sha" ]; then
+                echo "::error::COUNTEREVIDENCE-SOURCE-PIN-MISMATCH: $base_ref resolves to $base_commit, expected $base_sha" >&2
+                exit 1
+              fi
+            fi
+          fi
           approved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           output="$(python3 _gate-disposition-src/.github/actions/gate-disposition/issue_receipt.py issue \
             --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
@@ -420,6 +508,9 @@ jobs:
             --repo-dir "$CALLER_HEAD_DIR")"
           artifact_name="$(printf '%s' "$output" | jq -r '.artifact')"
           test -n "$artifact_name" && echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = service ]; then
+            flock --unlock "$source_lock_fd"
+          fi
 
       - name: Upload immutable disposition artifact
         if: always() && steps.disposition.outcome == 'success'

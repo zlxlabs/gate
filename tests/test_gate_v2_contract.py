@@ -447,6 +447,14 @@ def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
     assert "uses" not in fetch
     assert fetch["env"]["GH_TOKEN"] == "${{ github.token }}"
     run = fetch["run"]
+    assert "eval \"$GATE_SOURCE_DECIDE_SCRIPT\"" in run
+    assert 'if [ "$mode" = service ]' in run
+    assert run.index('if [ "$mode" = service ]') < run.index("git-source-prepare")
+    assert "flock" not in run
+    assert "COUNTEREVIDENCE-${mapped}" in run
+    assert "SOURCE-SERVICE-UNAVAILABLE" in run
+    assert "COUNTEREVIDENCE-SOURCE-TIMEOUT" in run
+    assert "COUNTEREVIDENCE-SOURCE-FETCH-FAILED" in run
     assert "git -C \"$repo_dir\" init --quiet" in run
     # gate#302: the caller head must arrive complete. A blob-filtered clone
     # defers the pathspec blobs to per-object promisor fetches and the grep
@@ -456,6 +464,18 @@ def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
     assert "--missing=print" in run
     assert "_gate-caller-head" in run
     assert raw["permissions"]["contents"] == "read"
+    issue = next(
+        step for step in control["steps"]
+        if step.get("name") == "Issue immutable disposition artifact"
+    )
+    issue_run = issue["run"]
+    assert "GIT_NO_REPLACE_OBJECTS=1" in issue_run
+    assert "consume.lock" in issue_run
+    assert "flock --shared" in issue_run
+    assert issue_run.index("flock --shared") < issue_run.index("issue_receipt.py issue")
+    assert issue_run.index("issue_receipt.py issue") < issue_run.index("flock --unlock")
+    assert "GIT_CONFIG_KEY_0=safe.directory" in issue_run
+    assert "COUNTEREVIDENCE-SOURCE-PIN-MISMATCH" in issue_run
     assert names.index("Resolve current PR head and canonical primary audit") < names.index(
         "Fetch caller head for counterevidence rerun"
     )
@@ -1062,6 +1082,7 @@ def test_disposition_receipt_step_runs_the_producer_from_the_checkout_subdirecto
         "GITHUB_TRIGGERING_ACTOR": "owner",
         "GITHUB_ENV": str(github_env),
         "GITHUB_OUTPUT": str(github_output),
+        "GATE_SOURCE_DECIDE_SCRIPT": raw["env"]["GATE_SOURCE_DECIDE_SCRIPT"],
     }
     result = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
@@ -1176,6 +1197,7 @@ def _run_receipt_step(tmp_path, values: dict[str, str]) -> subprocess.CompletedP
         "GITHUB_ENV": str(github_env),
         "GITHUB_OUTPUT": str(github_output),
         "CALLER_HEAD_DIR": str(caller_head),
+        "GATE_SOURCE_DECIDE_SCRIPT": _load_disposition_workflow()[0]["env"]["GATE_SOURCE_DECIDE_SCRIPT"],
     }
     result = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],

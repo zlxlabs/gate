@@ -708,6 +708,7 @@ def test_disposition_workflow_fetches_only_required_commits(tmp_path, expectatio
         "CURRENT_HEAD_SHA": sha,
         "CURRENT_SCOPE_JSON": json.dumps({"base_sha": base_sha or SCOPE["base_sha"]}),
         "DISPOSITION_COUNTEREVIDENCE_JSON": json.dumps({"match_expectation": expectation}),
+        "GATE_SOURCE_DECIDE_SCRIPT": workflow["env"]["GATE_SOURCE_DECIDE_SCRIPT"],
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": f"url.file://{repo}.insteadOf",
         "GIT_CONFIG_VALUE_0": "https://github.com/owner/repo.git",
