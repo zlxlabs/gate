@@ -106,6 +106,12 @@ on:
       # project dependency; legacy auto-detection never touches mise. Callers
       # that omit this input keep today's behavior exactly.
       quality_prepare_mise: { type: boolean, default: false }
+      # gate-hub#1724 (canary receipt targeting): optional extra runner label
+      # appended to the END of the SELF-HOSTED branch of quality / primary /
+      # ledger, so a canary caller can pin those three jobs onto one runner
+      # slot. Empty keeps every runs-on identical to its pre-#1724 form; the
+      # value is checked by classify_pr_paths' first step ([a-z0-9-]{1,64}).
+      extra_runner_label: { type: string, default: "" }
     secrets:
       FEISHU_CI_WEBHOOK:
         # Optional: public repos MUST pass this as a repo SECRET (fork PR runs
@@ -433,6 +439,18 @@ jobs:
     outputs:
       review_expected: ${{ steps.classify.outputs.review_expected }}
     steps:
+      # gate-hub#1724: validate the caller's optional `extra_runner_label`
+      # BEFORE anything else runs — this job is the earliest that always runs.
+      - name: Validate extra_runner_label
+        env:
+          EXTRA_RUNNER_LABEL: ${{ inputs.extra_runner_label }}
+        run: |
+          set -euo pipefail
+          label="${EXTRA_RUNNER_LABEL:-}"
+          if [ -n "$label" ] && ! [[ "$label" =~ ^[a-z0-9-]{1,64}$ ]]; then
+            echo "EXTRA-RUNNER-LABEL-INVALID: extra_runner_label must match ^[a-z0-9-]{1,64}$"
+            exit 1
+          fi
       - name: Checkout classify script at this workflow's own commit
         env:
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
@@ -506,7 +524,8 @@ jobs:
     # results and aggregates them fail-closed.
     # 仅同仓合法人类 PR 可选 ci 标签；Bot、fork、非法作者走 hosted。
     # 标签不证明镜像隔离或应用依赖，部署状态须由平台实测确认。
-    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724: `extra_runner_label` (default "") appends ONE label to the self-hosted branch only.
+    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && (inputs.extra_runner_label != '' && fromJSON(format('["self-hosted","linux","ci",{0}]', toJSON(inputs.extra_runner_label))) || fromJSON('["self-hosted","linux","ci"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     outputs:
       ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
@@ -1098,7 +1117,8 @@ jobs:
     needs: [classify_pr_paths]
     if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
     # 防御性路由：仅同仓、合法非空人类作者进入可信评审 runner。
-    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724: `extra_runner_label` (default "") appends ONE label to the self-hosted branch only.
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label != '' && fromJSON(format('["self-hosted","linux","codex",{0}]', toJSON(inputs.extra_runner_label))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
     env:
@@ -2746,7 +2766,8 @@ jobs:
     needs: [quality, primary, gate, classify_pr_paths]
     if: always()
     continue-on-error: true
-    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724: `extra_runner_label` (default "") appends ONE label to the self-hosted branch only.
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && (inputs.extra_runner_label != '' && fromJSON(format('["self-hosted","linux","codex",{0}]', toJSON(inputs.extra_runner_label))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 10
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
