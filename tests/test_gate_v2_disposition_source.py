@@ -372,8 +372,7 @@ def test_service_prepare_unavailable_does_not_touch_origin(tmp_path):
     assert fetch.returncode != 0
     assert issue is None
     combined = fetch.stderr + fetch.stdout
-    assert "COUNTEREVIDENCE-SOURCE-" in combined
-    assert "SOURCE-SERVICE-UNAVAILABLE" in combined
+    assert "COUNTEREVIDENCE-SOURCE-SERVICE-UNAVAILABLE" in combined
     assert not list(host["output_dir"].iterdir())
     joined = _joined_argv(_argv_events(host["argv_log"]))
     assert "fetch" not in joined and "github.com" not in joined
