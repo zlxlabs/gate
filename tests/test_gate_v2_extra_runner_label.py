@@ -1,16 +1,11 @@
-"""gate-hub#1724: caller-supplied `extra_runner_label` on gate-v2's runs-on.
+"""gate-hub#1724: caller-supplied extra runner labels on gate-v2's runs-on.
 
-The input appends ONE extra runner label to the SELF-HOSTED branch of the
-quality / primary / ledger jobs. Locked here, on the workflow's own `runs-on`
-text: an empty input (the default) leaves every branch byte-equivalent to the
-pre-#1724 expression; a legal input appends the label at the END of the
-self-hosted array only; an illegal input fails loudly with an
-EXTRA-RUNNER-LABEL-INVALID anchor line. A `runs-on` expression is
-`${{ <guard> && <slot> || <hosted> }}`; splitting it into those three parts
-makes the branch coverage complete (an IDENTICAL guard selects the same branch
-in every context, so an identical slot + hosted fallback => identical
-rendering). Slots are rendered by translating the small GitHub Actions
-expression subset gate-v2 uses into Python and evaluating it.
+Two inputs split BY RUNNER CLASS: `extra_runner_label_ci` appends ONE label to
+quality's SELF-HOSTED branch (ci-class slots) only; `extra_runner_label_review`
+appends ONE label to primary / ledger's (codex-class slots) only. Empty inputs
+leave every branch byte-equivalent to the pre-#1724 form; a legal input appends
+at the END of its own class's array only; an illegal one fails loudly with an
+EXTRA-RUNNER-LABEL-INVALID anchor naming the offending input.
 """
 from __future__ import annotations
 
@@ -25,7 +20,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # GATE_V2_WORKFLOW_PATH is a mutation hook for the red-verification run.
 WORKFLOW = Path(os.environ.get("GATE_V2_WORKFLOW_PATH") or REPO_ROOT / ".github/workflows/gate-v2.yml")
-TARGET_JOBS = ("quality", "primary", "ledger")
+CI_JOBS = ("quality",)
+REVIEW_JOBS = ("primary", "ledger")
+TARGET_JOBS = CI_JOBS + REVIEW_JOBS
 
 # The pre-#1724 runs-on parts, verbatim (base commit ea62830).
 _GUARD_CONTROL = """(inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))"""
@@ -69,24 +66,26 @@ def _gha_python(src):
     return "".join(chunk(p) if index % 2 == 0 else p for index, p in enumerate(parts))
 
 
-def _render_slot(slot, label):
-    """Render the label array of a slot for the given input label."""
+def _render_slot(slot, ci="", review=""):
+    """Render the label array of a slot for the given input labels."""
     return eval(_gha_python(slot), {"__builtins__": {}},
-                {**_GHA_NS, "inputs": {"extra_runner_label": label}})
+                {**_GHA_NS, "inputs": {"extra_runner_label_ci": ci, "extra_runner_label_review": review}})
 
 
 def _workflow():
     raw = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     return raw, raw.get("on", raw.get(True))
 
-def test_extra_runner_label_input_is_declared_with_an_empty_default():
+def test_the_two_inputs_are_declared_with_empty_defaults_and_the_old_name_is_gone():
     _, trigger = _workflow()
-    assert trigger["workflow_call"]["inputs"]["extra_runner_label"] == {"type": "string", "default": ""}
+    inputs = trigger["workflow_call"]["inputs"]
+    assert inputs["extra_runner_label_ci"] == inputs["extra_runner_label_review"] == {"type": "string", "default": ""}
+    assert "extra_runner_label" not in inputs and not re.search(r"extra_runner_label(?![_A-Za-z0-9])", WORKFLOW.read_text(encoding="utf-8"))
 
 
-def test_only_the_three_target_jobs_reference_the_new_input():
+def test_only_the_three_target_jobs_reference_the_label_inputs():
     raw, _ = _workflow()
-    referencing = [job for job in raw["jobs"] if "extra_runner_label" in str(raw["jobs"][job]["runs-on"])]
+    referencing = [job for job in raw["jobs"] if "extra_runner_label_" in str(raw["jobs"][job]["runs-on"])]
     assert sorted(referencing) == sorted(TARGET_JOBS)
 
 
@@ -100,20 +99,29 @@ def test_runs_on_parts_match_the_pre_change_baseline():
         assert _render_slot(slot, "") == old_labels, job
 
 
-def test_valid_label_appends_to_the_end_of_the_self_hosted_array():
+def test_a_label_appends_only_to_jobs_of_its_own_runner_class():
     raw, _ = _workflow()
-    label = "canary-abc123-ci-i5"
+    for label_kwargs, own_jobs in ((dict(ci="canary-abc123-ci-03"), CI_JOBS), (dict(review="canary-abc123-review-01"), REVIEW_JOBS)):
+        for job in TARGET_JOBS:
+            slot, hosted = _split(str(raw["jobs"][job]["runs-on"]))[1:]
+            expected = PRE_CHANGE[job][1] + ([next(iter(label_kwargs.values()))] if job in own_jobs else [])
+            assert _render_slot(slot, **label_kwargs) == expected and "extra_runner_label_" not in hosted, (label_kwargs, job)
+
+
+def test_both_labels_each_target_their_own_jobs():
+    raw, _ = _workflow()
+    ci_label, review_label = "canary-ci-01", "canary-review-02"
     for job in TARGET_JOBS:
-        _, slot, hosted = _split(str(raw["jobs"][job]["runs-on"]))
-        assert _render_slot(slot, label) == PRE_CHANGE[job][1] + [label], job
-        assert "extra_runner_label" not in hosted, job
+        slot = _split(str(raw["jobs"][job]["runs-on"]))[1]
+        extra = [ci_label] if job in CI_JOBS else [review_label]
+        assert _render_slot(slot, ci=ci_label, review=review_label) == PRE_CHANGE[job][1] + extra, job
 
 
 def test_slot_renderer_semantics_selfcheck():
-    slot = """(inputs.extra_runner_label != '' && fromJSON(format('["a",{0}]', toJSON(inputs.extra_runner_label))) || fromJSON('["b"]'))"""
-    assert _render_slot(slot, "x") == ["a", "x"]
-    assert _render_slot(slot, "") == ["b"]
-    assert _render_slot("""fromJSON('["c"]')""", "x") == ["c"]
+    slot = """(inputs.extra_runner_label_review != '' && fromJSON(format('["a",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["b"]'))"""
+    assert _render_slot(slot, review="x") == ["a", "x"]
+    assert _render_slot(slot) == ["b"]
+    assert _render_slot("""fromJSON('["c"]')""", ci="x") == ["c"]
 
 
 def _validation_step():
@@ -121,27 +129,29 @@ def _validation_step():
     job = raw["jobs"]["classify_pr_paths"]
     assert str(job.get("if")) == "always()"
     step = job["steps"][0]
-    assert step["name"] == "Validate extra_runner_label"
-    assert step["env"]["EXTRA_RUNNER_LABEL"] == "${{ inputs.extra_runner_label }}"
+    assert step["name"] == "Validate extra runner label inputs"
+    assert step["env"]["EXTRA_RUNNER_LABEL_CI"] == "${{ inputs.extra_runner_label_ci }}"
+    assert step["env"]["EXTRA_RUNNER_LABEL_REVIEW"] == "${{ inputs.extra_runner_label_review }}"
     return step
 
 
-def _run_validation(script, label):
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=dict(os.environ, EXTRA_RUNNER_LABEL=label))
+def _run_validation(script, ci_label="", review_label=""):
+    env = dict(os.environ, EXTRA_RUNNER_LABEL_CI=ci_label, EXTRA_RUNNER_LABEL_REVIEW=review_label)
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
 
 def test_validation_step_rejects_an_illegal_label_loudly():
     script = _validation_step()["run"]
-    for bad in ("Uppercase", "has space", "x" * 65, "label!", "标签", 'a"b', "a\nb"):
-        result = _run_validation(script, bad)
-        assert result.returncode != 0, bad
-        anchors = [ln for ln in result.stdout.splitlines() if ln.startswith("EXTRA-RUNNER-LABEL-INVALID")]
-        assert anchors, (bad, result.stdout, result.stderr)
+    for bad in ("Uppercase", "has space", "x" * 65, "label!", "标签", 'a"b', "a\nb", "ci=x"):
+        for name, kwargs in (("extra_runner_label_ci", dict(ci_label=bad)), ("extra_runner_label_review", dict(review_label=bad))):
+            result = _run_validation(script, **kwargs)
+            anchors = [ln for ln in result.stdout.splitlines() if ln.startswith("EXTRA-RUNNER-LABEL-INVALID")]
+            assert result.returncode != 0 and len(anchors) == 1 and name in anchors[0], (name, bad, anchors)
 
 
 def test_validation_step_accepts_an_empty_or_legal_label():
     script = _validation_step()["run"]
     for good in ("", "canary-abc123-ci-i5", "a", "x" * 64):
-        result = _run_validation(script, good)
+        result = _run_validation(script, ci_label=good, review_label=good)
         assert result.returncode == 0, (good, result.stdout, result.stderr)
         assert "EXTRA-RUNNER-LABEL-INVALID" not in result.stdout

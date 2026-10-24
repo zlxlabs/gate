@@ -55,11 +55,12 @@ CLASSIFY_GUARD = "needs.classify_pr_paths.outputs.review_expected != 'false'"
 PR_AUTHOR_GUARD = "toJSON(github.event.pull_request.user.login)"
 CLASSIFY_JOB_ID = "classify_pr_paths"
 # gate-hub#1724: gate-v2.yml's `primary` job may carry the OPTIONAL extra-label
-# extension (a canary-only runner label). The Shadow workflow deliberately does
-# NOT carry it (its jobs are outside the gate-v2 receipt set), so the locks
-# below compare the ROUTING, extension removed — the routing guard stays
-# byte-identical, so the fork/draft defense-in-depth is unchanged.
-_EXTRA_LABEL_RE = re.compile(r"\(inputs\.extra_runner_label != ''.*?fromJSON\('(\[[^\]]*\])'\)\)")
+# extension (a canary-only runner label — `extra_runner_label_review` after the
+# split by runner class). The Shadow workflow deliberately does NOT carry it
+# (its jobs are outside the gate-v2 receipt set), so the locks below compare
+# the ROUTING, extension removed — the routing guard stays byte-identical, so
+# the fork/draft defense-in-depth is unchanged.
+_EXTRA_LABEL_RE = re.compile(r"\(inputs\.extra_runner_label_(?:ci|review) != ''.*?fromJSON\('(\[[^\]]*\])'\)\)")
 
 
 def _routing_only(runs_on):
