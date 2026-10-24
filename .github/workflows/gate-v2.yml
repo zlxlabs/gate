@@ -113,6 +113,12 @@ on:
       # ledger's SELF-HOSTED branch (codex-class slots). One shared input can't
       # work: a ci-class slot never satisfies a runs-on asking for "codex", so
       # the wrong class would queue forever (ci-infra-canary run 40068806052).
+      # gate-hub#1724 retirement: the pre-#1724 single-label input stays
+      # DECLARED with an empty default (the moving-v2 caller contract forbids
+      # removing inputs), but nothing consumes it except the classify_pr_paths
+      # retirement check — no runs-on reads it, so a caller still passing it
+      # gets a loud failure instead of a silently dropped label.
+      extra_runner_label: { type: string, default: "" }
       # Empty keeps every runs-on identical to its pre-#1724 form.
       extra_runner_label_ci: { type: string, default: "" }
       extra_runner_label_review: { type: string, default: "" }
@@ -447,10 +453,13 @@ jobs:
       # BEFORE anything else runs — this job is the earliest that always runs.
       - name: Validate extra runner label inputs
         env:
+          EXTRA_RUNNER_LABEL_RETIRED: ${{ inputs.extra_runner_label }}
           EXTRA_RUNNER_LABEL_CI: ${{ inputs.extra_runner_label_ci }}
           EXTRA_RUNNER_LABEL_REVIEW: ${{ inputs.extra_runner_label_review }}
         run: |
           set -euo pipefail
+          # Retired input (gate-hub#1724): refuse loudly, never silently ignore.
+          [ -z "${EXTRA_RUNNER_LABEL_RETIRED:-}" ] || { echo "EXTRA-RUNNER-LABEL-INVALID: extra_runner_label is retired; use extra_runner_label_ci / extra_runner_label_review"; exit 1; }
           for pair in "extra_runner_label_ci=${EXTRA_RUNNER_LABEL_CI:-}" "extra_runner_label_review=${EXTRA_RUNNER_LABEL_REVIEW:-}"; do
             label="${pair#*=}"
             [ -z "$label" ] || [[ "$label" =~ ^[a-z0-9-]{1,64}$ ]] || { echo "EXTRA-RUNNER-LABEL-INVALID: ${pair%%=*} must match ^[a-z0-9-]{1,64}$"; exit 1; }
