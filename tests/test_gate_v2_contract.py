@@ -876,6 +876,7 @@ def test_workflow_call_inputs_include_review_exempt_paths():
         "control_runner",
         "review_exempt_paths",
         "quality_prepare_mise",
+        "extra_runner_label",
     }
     declared = trigger["workflow_call"]["inputs"]["review_exempt_paths"]
     assert declared["type"] == "string"

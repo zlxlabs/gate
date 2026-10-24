@@ -54,6 +54,17 @@ RUNNER_GUARD = "inputs.runner == 'self'"
 CLASSIFY_GUARD = "needs.classify_pr_paths.outputs.review_expected != 'false'"
 PR_AUTHOR_GUARD = "toJSON(github.event.pull_request.user.login)"
 CLASSIFY_JOB_ID = "classify_pr_paths"
+# gate-hub#1724: gate-v2.yml's `primary` job may carry the OPTIONAL extra-label
+# extension (a canary-only runner label). The Shadow workflow deliberately does
+# NOT carry it (its jobs are outside the gate-v2 receipt set), so the locks
+# below compare the ROUTING, extension removed — the routing guard stays
+# byte-identical, so the fork/draft defense-in-depth is unchanged.
+_EXTRA_LABEL_RE = re.compile(r"\(inputs\.extra_runner_label != ''.*?fromJSON\('(\[[^\]]*\])'\)\)")
+
+
+def _routing_only(runs_on):
+    """A runs-on ternary with gate-hub#1724's optional extra-label extension removed."""
+    return _EXTRA_LABEL_RE.sub(r"fromJSON('\1')", runs_on)
 CLASSIFY_SCRIPT = "_gate-classify-src/scripts/classify_pr_reviewable_paths.py"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
@@ -332,12 +343,11 @@ def test_resolve_runs_on_is_byte_identical_to_gate_v2_primary_runs_on():
     required_raw = _load_required_workflow()
     resolve_runs_on = str(raw["jobs"]["resolve"]["runs-on"])
     primary_runs_on = str(required_raw["jobs"]["primary"]["runs-on"])
-    assert resolve_runs_on == primary_runs_on, (
+    assert _routing_only(resolve_runs_on) == _routing_only(primary_runs_on), (
         "gate-shadow-v2.yml's `resolve` job runs-on: must be byte-for-byte identical to "
-        "gate-v2.yml's `primary` job runs-on:\n"
-        f"resolve runs-on:  {resolve_runs_on!r}\n"
-        f"primary runs-on:  {primary_runs_on!r}"
-    )
+        "gate-v2.yml's `primary` job runs-on (modulo the optional #1724 extra-label "
+        f"extension):\nresolve: {resolve_runs_on!r}\nprimary: {primary_runs_on!r}")
+    assert "extra_runner_label" not in resolve_runs_on
 
 
 def test_shadow_runs_on_matches_the_same_fork_guard_ternary():
@@ -345,7 +355,8 @@ def test_shadow_runs_on_matches_the_same_fork_guard_ternary():
     required_raw = _load_required_workflow()
     shadow_runs_on = str(raw["jobs"]["shadow"]["runs-on"])
     primary_runs_on = str(required_raw["jobs"]["primary"]["runs-on"])
-    assert shadow_runs_on == primary_runs_on
+    assert _routing_only(shadow_runs_on) == _routing_only(primary_runs_on)
+    assert "extra_runner_label" not in shadow_runs_on
 
 
 def test_resolve_has_no_checkout_step():
