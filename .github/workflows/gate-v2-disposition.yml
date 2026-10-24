@@ -167,8 +167,9 @@ jobs:
     environment:
       name: gate-disposition
     # Silo is on tailnet; GitHub-hosted cannot reach 100.x. Use the ci pool
-    # (same labels as quality), not ubuntu-latest.
-    runs-on: [self-hosted, linux, ci]
+    # (same labels as quality), not ubuntu-latest. git-source-service limits it
+    # to hosts whose SOURCE-MODE is service, where the host mirror exists (#373).
+    runs-on: [self-hosted, linux, ci, git-source-service]
     timeout-minutes: 10
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
