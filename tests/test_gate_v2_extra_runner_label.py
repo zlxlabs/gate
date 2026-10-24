@@ -76,11 +76,27 @@ def _workflow():
     raw = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     return raw, raw.get("on", raw.get(True))
 
-def test_the_two_inputs_are_declared_with_empty_defaults_and_the_old_name_is_gone():
-    _, trigger = _workflow()
+_RETIRED_BARE = re.compile(r"extra_runner_label(?![_A-Za-z0-9])")
+
+
+def test_label_inputs_are_declared_and_the_retired_input_is_unused():
+    raw, trigger = _workflow()
     inputs = trigger["workflow_call"]["inputs"]
     assert inputs["extra_runner_label_ci"] == inputs["extra_runner_label_review"] == {"type": "string", "default": ""}
-    assert "extra_runner_label" not in inputs and not re.search(r"extra_runner_label(?![_A-Za-z0-9])", WORKFLOW.read_text(encoding="utf-8"))
+    # gate-hub#1724 retirement: the pre-#1724 single input stays DECLARED
+    # (the moving-v2 contract at 8c475d11 forbids removing inputs) but is
+    # only referenced by its declaration and the classify_pr_paths retirement
+    # check — never by any runs-on.
+    assert inputs["extra_runner_label"] == {"type": "string", "default": ""}
+    assert not any(_RETIRED_BARE.search(str(job.get("runs-on"))) for job in raw["jobs"].values())
+    for line in WORKFLOW.read_text(encoding="utf-8").splitlines():
+        if not _RETIRED_BARE.search(line):
+            continue
+        assert (
+            re.match(r'\s*extra_runner_label:\s*\{ type: string, default: "" \}\s*(#.*)?$', line)
+            or "inputs.extra_runner_label" in line
+            or "is retired" in line
+        ), line
 
 
 def test_only_the_three_target_jobs_reference_the_label_inputs():
@@ -135,8 +151,13 @@ def _validation_step():
     return step
 
 
-def _run_validation(script, ci_label="", review_label=""):
-    env = dict(os.environ, EXTRA_RUNNER_LABEL_CI=ci_label, EXTRA_RUNNER_LABEL_REVIEW=review_label)
+def _run_validation(script, ci_label="", review_label="", retired_label=""):
+    env = dict(
+        os.environ,
+        EXTRA_RUNNER_LABEL_RETIRED=retired_label,
+        EXTRA_RUNNER_LABEL_CI=ci_label,
+        EXTRA_RUNNER_LABEL_REVIEW=review_label,
+    )
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
 
@@ -155,3 +176,14 @@ def test_validation_step_accepts_an_empty_or_legal_label():
         result = _run_validation(script, ci_label=good, review_label=good)
         assert result.returncode == 0, (good, result.stdout, result.stderr)
         assert "EXTRA-RUNNER-LABEL-INVALID" not in result.stdout
+
+
+def test_retired_input_fails_loudly_when_non_empty_and_passes_when_empty():
+    script = _validation_step()["run"]
+    result = _run_validation(script, retired_label="canary-legacy-slot")
+    anchors = [ln for ln in result.stdout.splitlines() if ln.startswith("EXTRA-RUNNER-LABEL-INVALID")]
+    assert result.returncode != 0, result.stdout
+    assert anchors == [
+        "EXTRA-RUNNER-LABEL-INVALID: extra_runner_label is retired; use extra_runner_label_ci / extra_runner_label_review"
+    ]
+    assert _run_validation(script).returncode == 0
