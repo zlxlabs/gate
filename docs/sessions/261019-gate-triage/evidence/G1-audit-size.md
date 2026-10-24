@@ -105,3 +105,31 @@ output 值中），数据面保真；日志面 masking 仍然生效（解码后�
 | 5 | `actions/runner` `FileCommandManager.cs`（GITHUB_OUTPUT vs STEP_SUMMARY 对比） | §2.2 |
 | 6 | `actions/runner#1061`（维护者答复）、#1498、#2316 | §2.2 |
 | 7 | 真实样本 fixture：`tests/fixtures/primary-audit-v2-live-sample.json`（pass、findings 空、扫描干净） | 跨边界测试输入 |
+
+## 5. 增补（gate#377，2026-10-24）：真实上限是单环境串，不是 1 MiB 表达式预算
+
+§2.1 的 1 MiB 表达式求值预算只是 GitHub 端的上限；**真正先到的是 consumer 侧单条
+argv/env 串上限** `MAX_ARG_STRLEN = 131072` 字节（Linux `include/linux limits.h`，
+32 页；见 execve(2) 对 E2BIG 的说明）。gate/ledger 的 read 步骤把
+`needs.primary.outputs.audit_json_gz_b64` 放进单个 env `AUDIT_B64`，值长超过该限
+时 bash 进程根本起不来：`Argument list too long`（gate-hub run 40019381441 实测
+`AUDIT_B64` 136170 字节，三次 attempt 同样失败，与 runner 无关）。
+
+结论修正：
+
+- 传输上限由 **producer 按真实约束检查**：`MAX_PAYLOAD_CHARS=120000`，即
+  MAX_ARG_STRLEN 131072 减去约 8% 余量（`AUDIT_B64=` 名前缀、同步骤其余 env、
+  bash 内部用量）。超限 fail-loud（锚行 `AUDIT-PAYLOAD-OVER-ENV-LIMIT`，含实际
+  长度、上限、原始字节数），不再让失败落在 consumer 侧报 E2BIG。
+- 载荷改为 `gzip -n -9 | base64 -w0`（单行不变，仍满足 §2.3 的反屏蔽约束——
+  base64 字节层依旧打断 SecretMasker 子串匹配；gzip 不改变这一点）。JSON audit
+  实测压缩约 5–10 倍，live fleet max 26.7 KiB → gzip 后个位数 KiB，120000 字符
+  上限对 fleet 现状余量 ≥ 10 倍；对 §1 最坏外推（findings 数百条）同样充足。
+- §2.1 的 1 MiB 表达式预算仍在链路上，但 gzip 后不再是先到的约束；保留作第二道
+  上限，无需单独检查。
+- 无回退通道（不「超限改走 Silo」）：判定通道装不下的 audit 属于 primary 产出
+  缺陷，必须在 producer 端红出来，而不是静默降级成 bookkeeping。
+
+锁定：producer/consumer 行为由 `tests/test_gate_v2_audit_output_channel.py`
+（含 ≥136KB fixture 跨边界往返与超限 fail-loud 红验）与
+`tests/test_gate_v2_contract.py`（结构与锚行锁）共同锁死。
