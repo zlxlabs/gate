@@ -1,17 +1,21 @@
-"""A 段行为契约：判定记录走 primary job outputs（gate / gate#348、#312）。
+"""A 段行为契约：判定记录走 primary job outputs（gate / gate#348、#312、#377）。
 
-跨边界测试纪律：primary 的 `audit_json_b64` output 与 gate/ledger 的读取步骤之间是
-跨 job 序列化边界——这里的测试用**真实的 canonical audit 样本**
-（tests/fixtures/primary-audit-v2-live-sample.json，取自 Silo d14 的 fleet 实际产物）
-真实执行 publish / read 两个 run 块，并驱动 aggregate.py 完整判定路径，断言字段逐一可用；
+跨边界测试纪律：primary 的 `audit_json_gz_b64` output（`gzip -n -9 | base64 -w0`，
+gate#377：约束上限是 consumer 侧单个环境串 MAX_ARG_STRLEN=131072 字节，不是 1 MiB
+表达式预算）与 gate/ledger 的读取步骤之间是跨 job 序列化边界——这里的测试用
+**真实的 canonical audit 样本**（tests/fixtures/primary-audit-v2-live-sample.json，
+取自 Silo d14 的 fleet 实际产物）与仿真实结构的 ≥136KB 大 audit，真实执行
+publish / read 两个 run 块，并驱动 aggregate.py 完整判定路径，断言字段逐一可用；
 Silo 调用一律打桩（fake silo_exec 注入失败），证明记账失败不改变判定结论。
 """
 
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -71,14 +75,15 @@ def test_publish_run_block_encodes_live_sample_byte_exact(tmp_path):
     env = {
         "AUDIT_PATH": str(audit_path),
         "AUDIT_KEY": "primary-audit-v2-1011924119-" + "c" * 40 + "-38216552886-1",
-        "MAX_B64_BYTES": "524288",
+        "MAX_PAYLOAD_CHARS": "120000",
         "GITHUB_OUTPUT": str(github_output),
     }
     result = _bash_run(_substitute(publish["run"]), env, tmp_path)
     assert result.returncode == 0, result.stderr
     outputs = dict(line.split("=", 1) for line in github_output.read_text().splitlines())
-    assert base64.b64decode(outputs["audit_json_b64"]) == LIVE_SAMPLE.read_bytes()
-    assert "\n" not in outputs["audit_json_b64"]
+    assert gzip.decompress(base64.b64decode(outputs["audit_json_gz_b64"])) == LIVE_SAMPLE.read_bytes()
+    assert "\n" not in outputs["audit_json_gz_b64"]
+    assert len(outputs["audit_json_gz_b64"]) < 120000  # 远低于单环境串上限
     assert outputs["audit_bytes"] == str(LIVE_SAMPLE.stat().st_size)
     assert outputs["audit_attempt"] == "1"
     assert outputs["audit_key"].endswith("-38216552886-1")
@@ -100,25 +105,97 @@ def test_publish_run_block_fails_closed_on_missing_and_oversize(tmp_path):
         env = {
             "AUDIT_PATH": str(audit_path),
             "AUDIT_KEY": "k",
-            "MAX_B64_BYTES": "524288",
+            "MAX_PAYLOAD_CHARS": "120000",
             "GITHUB_OUTPUT": str(github_output),
         }
         result = _bash_run(_substitute(publish["run"]), env, tmp_path)
         assert result.returncode != 0, name
         assert "missing or empty" in result.stderr
         assert github_output.read_text() == "", name
-    # oversize guard: the 1 MiB expression budget is protected before publish
+    # oversize guard (gate#377)：约束是 consumer 侧单环境串
+    # （MAX_ARG_STRLEN=131072），不可压缩的随机数据 gzip 后仍超限 → fail-loud
     audit_path = tmp_path / "audit-big.json"
-    audit_path.write_bytes(b'{"pad":"<' + b"x" * 700_000 + b'"}')
+    original = b'{"pad":"' + os.urandom(100_000) + b'"}'
+    audit_path.write_bytes(original)
     env = {
         "AUDIT_PATH": str(audit_path),
         "AUDIT_KEY": "k",
-        "MAX_B64_BYTES": "524288",
+        "MAX_PAYLOAD_CHARS": "120000",
         "GITHUB_OUTPUT": str(github_output),
     }
     result = _bash_run(_substitute(publish["run"]), env, tmp_path)
     assert result.returncode != 0
+    anchor = next(line for line in result.stderr.splitlines() if line.startswith("AUDIT-PAYLOAD-OVER-ENV-LIMIT"))
+    m = re.search(r"b64_chars=(\d+) limit=(\d+)", anchor)
+    assert m, anchor
+    assert int(m.group(2)) == 120000
+    assert int(m.group(1)) > int(m.group(2))
     assert "exceeds" in result.stderr
+    assert github_output.read_text() == ""
+    assert audit_path.read_bytes() == original  # gzip -c 不动源文件（后续 Silo 上传还要读）
+
+    # 对照组：同量级但可压缩的载荷（旧 1 MiB 预算检查下的超标样本）如今正常发布
+    audit_path = tmp_path / "audit-compressible.json"
+    audit_path.write_bytes(b'{"pad":"<' + b"x" * 700_000 + b'"}')
+    env["AUDIT_PATH"] = str(audit_path)
+    result = _bash_run(_substitute(publish["run"]), env, tmp_path)
+    assert result.returncode == 0, result.stderr
+    outputs = dict(line.split("=", 1) for line in github_output.read_text().splitlines())
+    assert len(outputs["audit_json_gz_b64"]) < 120000
+
+
+def test_big_audit_round_trips_producer_to_consumer_within_env_limit(tmp_path):
+    """跨边界（gate#377）：≥136KB audit → producer gzip 载荷 < 上限 → 真实 bash
+    consumer 经 env 解出 → 与原字节一致。红验性质：producer 撤掉 gzip（载荷按
+    base64 直解约 4/3 放大后超限）→ 步骤红；consumer 撤掉 gunzip（写出的不是
+    原字节，长度标记也不符）→ 不产出文件。"""
+    audit = json.loads(LIVE_SAMPLE.read_text(encoding="utf-8"))
+    audit["result"]["summary"] = "large-PR review with many quoted findings (synthetic, primary_review schema)"
+    audit["result"]["findings"] = [
+        {
+            "file": ".github/workflows/gate-v2.yml",
+            "line": 1500 + i,
+            "severity": ["major", "minor", "info"][i % 3],
+            "title": f"finding-{i}: quoted source line may quote PR content",
+            "quote": "line of PR diff " + json.dumps({"idx": i, "pad": "0123456789abcdef" * 16}),
+        }
+        for i in range(500)
+    ]
+    raw = json.dumps(audit, ensure_ascii=False, indent=2).encode("utf-8")
+    assert len(raw) >= 136_000, f"fixture 须仿真实 E2BIG 现场体积，实际 {len(raw)}"
+
+    # producer：真实执行 publish run 块
+    github_output = tmp_path / "github_output"
+    github_output.write_text("", encoding="utf-8")
+    publish = _step("primary", "Publish canonical primary audit to job output")
+    env = {
+        "AUDIT_PATH": str(tmp_path / "in.json"),
+        "AUDIT_KEY": f"primary-audit-v2-{audit['repository_id']}-{audit['head_sha']}-{audit['run_id']}-{audit['run_attempt']}",
+        "MAX_PAYLOAD_CHARS": "120000",
+        "GITHUB_OUTPUT": str(github_output),
+    }
+    (tmp_path / "in.json").write_bytes(raw)
+    result = _bash_run(_substitute(publish["run"]), env, tmp_path)
+    assert result.returncode == 0, result.stderr
+    outputs = dict(line.split("=", 1) for line in github_output.read_text().splitlines())
+    payload = outputs["audit_json_gz_b64"]
+    assert len(payload) < 120000, f"gzip 后载荷 {len(payload)} 字符必须塞进单环境串上限"
+
+    # consumer：真实 bash 子进程，载荷像 Actions 一样经 env 传入
+    audit_dir = tmp_path / "primary-audit"
+    reader = _step("gate", "Read canonical primary audit from primary job output")
+    result = _bash_run(
+        _substitute(reader["run"], **{"${{ needs.primary.result }}": "success"}),
+        {
+            "AUDIT_B64": payload,
+            "AUDIT_BYTES_DECLARED": outputs["audit_bytes"],
+            "AUDIT_DIR": str(audit_dir),
+            "AUDIT_FILENAME": "primary-review-audit.json",
+        },
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (audit_dir / "primary-review-audit.json").read_bytes() == raw
 
 
 # ── read step (consumer side) × three injected corruptions ──────────────────
@@ -137,7 +214,8 @@ def _read_gate_audit(tmp_path: Path, *, b64: str, declared: str) -> subprocess.C
 
 def test_read_gate_audit_round_trips_live_sample(tmp_path):
     sample = LIVE_SAMPLE.read_bytes()
-    result = _read_gate_audit(tmp_path, b64=base64.b64encode(sample).decode(), declared=str(len(sample)))
+    payload = base64.b64encode(gzip.compress(sample, 9, mtime=0)).decode()
+    result = _read_gate_audit(tmp_path, b64=payload, declared=str(len(sample)))
     assert result.returncode == 0, result.stderr
     written = tmp_path / "primary-audit" / "primary-review-audit.json"
     assert written.read_bytes() == sample
@@ -148,18 +226,20 @@ def test_read_gate_audit_round_trips_live_sample(tmp_path):
     [
         ("missing", "audit output missing"),
         ("bad_base64", "not valid base64"),
-        ("truncated", "truncated or padded"),
+        ("truncated", "does not gunzip"),
     ],
 )
 def test_read_gate_audit_fail_closed_paths(tmp_path, corruption, expect_in_stderr):
     sample = LIVE_SAMPLE.read_bytes()
-    b64_full = base64.b64encode(sample).decode()
+    b64_full = base64.b64encode(gzip.compress(sample, 9, mtime=0)).decode()
     if corruption == "missing":
         b64, declared = "", str(len(sample))
     elif corruption == "bad_base64":
         b64, declared = "!!!not-base64!!!", "123"
     else:
-        b64, declared = b64_full[: len(b64_full) // 2], str(len(sample))
+        # 去掉末尾 4 个 base64 字符：长度仍为 4 的倍数 → base64 解码必成功，
+        # 但产物缺 gzip 尾部（CRC+ISIZE）→ gunzip 确定性失败、fail-closed
+        b64, declared = b64_full[:-4], str(len(sample))
     result = _read_gate_audit(tmp_path, b64=b64, declared=declared)
     # exit 0 on purpose: the terminal envelope must still be produced; the
     # fail-closed decision belongs to the aggregator (audit_missing below).
@@ -200,7 +280,6 @@ def test_live_sample_travels_publish_read_aggregate_and_passes(tmp_path):
     """E2E：真实样本经 publish→read→aggregate，verdict pass 且字段逐一可用。"""
     audit = json.loads(LIVE_SAMPLE.read_text(encoding="utf-8"))
     sample = LIVE_SAMPLE.read_bytes()
-    b64 = base64.b64encode(sample).decode()
 
     # producer: publish step writes the job output
     github_output = tmp_path / "github_output"
@@ -209,7 +288,7 @@ def test_live_sample_travels_publish_read_aggregate_and_passes(tmp_path):
     env = {
         "AUDIT_PATH": str(tmp_path / "in.json"),
         "AUDIT_KEY": f"primary-audit-v2-{audit['repository_id']}-{audit['head_sha']}-{audit['run_id']}-{audit['run_attempt']}",
-        "MAX_B64_BYTES": "524288",
+        "MAX_PAYLOAD_CHARS": "120000",
         "GITHUB_OUTPUT": str(github_output),
     }
     (tmp_path / "in.json").write_bytes(sample)
@@ -223,7 +302,7 @@ def test_live_sample_travels_publish_read_aggregate_and_passes(tmp_path):
     result = _bash_run(
         _substitute(reader["run"], **{"${{ needs.primary.result }}": "success"}),
         {
-            "AUDIT_B64": outputs["audit_json_b64"],
+            "AUDIT_B64": outputs["audit_json_gz_b64"],
             "AUDIT_BYTES_DECLARED": outputs["audit_bytes"],
             "AUDIT_DIR": str(audit_dir),
             "AUDIT_FILENAME": "primary-review-audit.json",
@@ -253,7 +332,7 @@ def test_live_sample_with_broken_channel_fails_closed(tmp_path):
     """故障注入：output 截断 → aggregate 走 audit_missing → gate unavailable。"""
     audit = json.loads(LIVE_SAMPLE.read_text(encoding="utf-8"))
     sample = LIVE_SAMPLE.read_bytes()
-    b64 = base64.b64encode(sample).decode()
+    b64 = base64.b64encode(gzip.compress(sample, 9, mtime=0)).decode()
     audit_dir = tmp_path / "primary-audit"
     audit_dir.mkdir()
     reader = _step("gate", "Read canonical primary audit from primary job output")
@@ -382,7 +461,8 @@ def test_ledger_audit_read_rejects_corrupt_payload_for_reviewed_run(tmp_path):
     env = {
         "PRIMARY_RESULT_RAW": "success",
         "PRIMARY_RESULT": "success",
-        "AUDIT_B64": base64.b64encode(sample).decode()[:20],  # 截断
+        # 20 是 4 的倍数：base64 解码成功、gunzip 必败 → fail-loud
+        "AUDIT_B64": base64.b64encode(gzip.compress(sample, 9, mtime=0)).decode()[:20],
         "AUDIT_BYTES_DECLARED": str(len(sample)),
         "AUDIT_DIR": str(tmp_path / "primary-audit"),
         "AUDIT_FILENAME": "primary-review-audit.json",

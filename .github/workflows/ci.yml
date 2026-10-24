@@ -11,12 +11,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The caller-contract guard diffs refs/tags/v2 against the working tree;
+      # a default checkout fetches no tags, which made the guard silently SKIP
+      # and PR CI go false-green (gate-hub#1724). Fetch it, and run the guard
+      # fail-loud via GATE_CONTRACT_GUARD_REQUIRED below.
+      - name: Fetch the moving v2 tag for the caller-contract guard
+        run: git fetch origin refs/tags/v2:refs/tags/v2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install deps
         run: pip install pytest pyyaml diff-cover coverage
       - name: Run tests
+        env:
+          GATE_CONTRACT_GUARD_REQUIRED: "1"
         run: python -m pytest -q
 
       - name: Check internal uses pins

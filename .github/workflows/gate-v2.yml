@@ -106,6 +106,22 @@ on:
       # project dependency; legacy auto-detection never touches mise. Callers
       # that omit this input keep today's behavior exactly.
       quality_prepare_mise: { type: boolean, default: false }
+      # gate-hub#1724 (canary receipt targeting): optional extra runner labels
+      # split BY RUNNER CLASS. `extra_runner_label_ci` appends ONE label to the
+      # END of quality's SELF-HOSTED branch (ci-class slots);
+      # `extra_runner_label_review` appends ONE label to the END of primary /
+      # ledger's SELF-HOSTED branch (codex-class slots). One shared input can't
+      # work: a ci-class slot never satisfies a runs-on asking for "codex", so
+      # the wrong class would queue forever (ci-infra-canary run 40068806052).
+      # gate-hub#1724 retirement: the pre-#1724 single-label input stays
+      # DECLARED with an empty default (the moving-v2 caller contract forbids
+      # removing inputs), but nothing consumes it except the classify_pr_paths
+      # retirement check — no runs-on reads it, so a caller still passing it
+      # gets a loud failure instead of a silently dropped label.
+      extra_runner_label: { type: string, default: "" }
+      # Empty keeps every runs-on identical to its pre-#1724 form.
+      extra_runner_label_ci: { type: string, default: "" }
+      extra_runner_label_review: { type: string, default: "" }
     secrets:
       FEISHU_CI_WEBHOOK:
         # Optional: public repos MUST pass this as a repo SECRET (fork PR runs
@@ -433,6 +449,21 @@ jobs:
     outputs:
       review_expected: ${{ steps.classify.outputs.review_expected }}
     steps:
+      # gate-hub#1724: validate the caller's optional extra runner labels
+      # BEFORE anything else runs — this job is the earliest that always runs.
+      - name: Validate extra runner label inputs
+        env:
+          EXTRA_RUNNER_LABEL_RETIRED: ${{ inputs.extra_runner_label }}
+          EXTRA_RUNNER_LABEL_CI: ${{ inputs.extra_runner_label_ci }}
+          EXTRA_RUNNER_LABEL_REVIEW: ${{ inputs.extra_runner_label_review }}
+        run: |
+          set -euo pipefail
+          # Retired input (gate-hub#1724): refuse loudly, never silently ignore.
+          [ -z "${EXTRA_RUNNER_LABEL_RETIRED:-}" ] || { echo "EXTRA-RUNNER-LABEL-INVALID: extra_runner_label is retired; use extra_runner_label_ci / extra_runner_label_review"; exit 1; }
+          for pair in "extra_runner_label_ci=${EXTRA_RUNNER_LABEL_CI:-}" "extra_runner_label_review=${EXTRA_RUNNER_LABEL_REVIEW:-}"; do
+            label="${pair#*=}"
+            [ -z "$label" ] || [[ "$label" =~ ^[a-z0-9-]{1,64}$ ]] || { echo "EXTRA-RUNNER-LABEL-INVALID: ${pair%%=*} must match ^[a-z0-9-]{1,64}$"; exit 1; }
+          done
       - name: Checkout classify script at this workflow's own commit
         env:
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
@@ -506,7 +537,8 @@ jobs:
     # results and aggregates them fail-closed.
     # 仅同仓合法人类 PR 可选 ci 标签；Bot、fork、非法作者走 hosted。
     # 标签不证明镜像隔离或应用依赖，部署状态须由平台实测确认。
-    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && fromJSON('["self-hosted","linux","ci"]') || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724: `extra_runner_label_ci` (default "") appends ONE label to quality's self-hosted branch only.
+    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && (inputs.extra_runner_label_ci != '' && fromJSON(format('["self-hosted","linux","ci",{0}]', toJSON(inputs.extra_runner_label_ci))) || fromJSON('["self-hosted","linux","ci"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     outputs:
       ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
@@ -1098,7 +1130,8 @@ jobs:
     needs: [classify_pr_paths]
     if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
     # 防御性路由：仅同仓、合法非空人类作者进入可信评审 runner。
-    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724: `extra_runner_label_review` (default "") appends ONE label to primary's self-hosted branch only.
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux","codex",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
     env:
@@ -1114,15 +1147,18 @@ jobs:
     # Verdict channel (design 261019-gate-triage A.1/A.2): the canonical audit
     # travels to gate/ledger through GitHub job outputs (same-run, native), NOT
     # through Silo — a Silo outage can no longer lose the verdict (audit_missing).
-    # Values are base64 (single line, `base64 -w0`): GitHub officially does not
-    # support secrets in job outputs (actions/runner#1061 — masked values reach
-    # downstream jobs as `***`), and findings quotes may quote PR content; base64
-    # breaks the SecretMasker's literal substring match so the data plane stays
-    # intact while log masking still applies. Size budget: live fleet max is
-    # 26.7 KiB (P99 17.8 KiB); base64 ×4/3 stays far under the 1 MiB expression
-    # evaluation budget — see docs/sessions/261019-gate-triage/evidence/G1-audit-size.md.
+    # Values are `gzip -n -9 | base64 -w0` (single line): base64 breaks the
+    # SecretMasker's literal substring match so the data plane stays intact while
+    # log masking still applies (GitHub does not support secrets in job outputs,
+    # actions/runner#1061 — masked values reach downstream jobs as `***`; audit
+    # findings quotes may quote PR content). Size budget: the binding constraint
+    # is the consumer's single environment string (Linux MAX_ARG_STRLEN=131072
+    # bytes per argv/env entry, gate#377), NOT the 1 MiB expression budget —
+    # gzip keeps live-fleet-max payloads (26.7 KiB raw) ~5-10x smaller; the
+    # producer fail-louds at MAX_PAYLOAD_CHARS below — see
+    # docs/sessions/261019-gate-triage/evidence/G1-audit-size.md.
     outputs:
-      audit_json_b64: ${{ steps.publish-audit-output.outputs.audit_json_b64 }}
+      audit_json_gz_b64: ${{ steps.publish-audit-output.outputs.audit_json_gz_b64 }}
       audit_bytes: ${{ steps.publish-audit-output.outputs.audit_bytes }}
       audit_attempt: ${{ steps.publish-audit-output.outputs.audit_attempt }}
       audit_key: ${{ steps.publish-audit-output.outputs.audit_key }}
@@ -1523,28 +1559,39 @@ jobs:
         # Verdict channel producer (design A.1). fail-closed: a missing/empty
         # audit file fails THIS step (and the primary job) rather than letting
         # gate see a success primary without a readable record — same contract
-        # the Silo upload enforced before the channel split. The over-size check
-        # guards the 1 MiB expression-evaluation budget before GitHub ever sees
-        # the value (live fleet max 26.7 KiB; G1-audit-size.md).
+        # the Silo upload enforced before the channel split. Payload is
+        # `gzip -n -9 -c | base64 -w0` (single line, -n for byte-reproducible
+        # output): JSON audits compress ~5-10x, and the binding size constraint
+        # is the consumer's single environment string — Linux MAX_ARG_STRLEN
+        # 131072 bytes per argv/env entry (execve(2), include/linux limits.h) —
+        # not the 1 MiB expression budget. An over-limit value would kill the
+        # consumer's bash with E2BIG ("Argument list too long", gate#377) at a
+        # step where the error names the wrong cause, so the producer checks the
+        # real bound and fail-louds here. MAX_PAYLOAD_CHARS=120000 leaves ~8%
+        # headroom under MAX_ARG_STRLEN for the `AUDIT_B64=` name prefix and
+        # sibling env vars of the consumer step. No fallback channel on purpose:
+        # an audit that cannot travel the verdict channel must fail the primary
+        # job, not silently degrade to bookkeeping-only. G1-audit-size.md §5.
         if: always()
         id: publish-audit-output
         env:
           AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
           AUDIT_KEY: primary-audit-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          MAX_B64_BYTES: "524288"
+          MAX_PAYLOAD_CHARS: "120000"
         run: |
           set -euo pipefail
           if [ ! -s "$AUDIT_PATH" ]; then
             echo "::error::canonical primary audit missing or empty at $AUDIT_PATH — refusing to publish a verdict channel without its record" >&2
             exit 1
           fi
-          b64=$(base64 -w0 "$AUDIT_PATH")
-          if [ "${#b64}" -gt "$MAX_B64_BYTES" ]; then
-            echo "::error::canonical primary audit base64 length ${#b64} exceeds $MAX_B64_BYTES (GitHub expression-evaluation budget is 1 MiB; see G1-audit-size.md)" >&2
+          payload=$(gzip -n -9 -c "$AUDIT_PATH" | base64 -w0)
+          if [ "${#payload}" -gt "$MAX_PAYLOAD_CHARS" ]; then
+            echo "AUDIT-PAYLOAD-OVER-ENV-LIMIT b64_chars=${#payload} limit=${MAX_PAYLOAD_CHARS} raw_bytes=$(wc -c < "$AUDIT_PATH" | tr -d ' ') max_arg_strlen=131072" >&2
+            echo "::error::canonical primary audit payload (${#payload} chars after gzip+base64) exceeds single-env-string limit ${MAX_PAYLOAD_CHARS} (MAX_ARG_STRLEN=131072 with headroom) — refusing to publish a verdict channel the consumer cannot exec; trim findings quotes or the audit (gate#377; G1-audit-size.md)" >&2
             exit 1
           fi
           {
-            echo "audit_json_b64=$b64"
+            echo "audit_json_gz_b64=$payload"
             echo "audit_bytes=$(wc -c < "$AUDIT_PATH" | tr -d ' ')"
             echo "audit_attempt=${{ github.run_attempt }}"
             echo "audit_key=$AUDIT_KEY"
@@ -2417,7 +2464,7 @@ jobs:
         # Verdict channel consumer (design A.2) — replaces the former
         # "Silo resolve + download" hop (the audit_missing source of gate#312/#348).
         # Fail-closed contract: every bad shape (missing output / invalid base64 /
-        # length-marker mismatch / broken JSON) collapses into the aggregator's
+        # corrupt gzip / length-marker mismatch / broken JSON) collapses into the aggregator's
         # audit_missing or audit_invalid path, so the gate conclusion becomes
         # unavailable — never a silent pass. This step exits 0 even on those
         # paths so the terminal envelope is still generated and records the
@@ -2426,7 +2473,7 @@ jobs:
         if: ${{ needs.primary.result != 'skipped' }}
         id: read-primary-audit
         env:
-          AUDIT_B64: ${{ needs.primary.outputs.audit_json_b64 }}
+          AUDIT_B64: ${{ needs.primary.outputs.audit_json_gz_b64 }}
           AUDIT_BYTES_DECLARED: ${{ needs.primary.outputs.audit_bytes }}
           AUDIT_DIR: ${{ runner.temp }}/primary-audit
           AUDIT_FILENAME: primary-review-audit.json
@@ -2437,12 +2484,19 @@ jobs:
             echo "::error::primary audit output missing (primary result=${{ needs.primary.result }}) — aggregator will fail closed with audit_missing" >&2
             exit 0
           fi
-          tmp="$AUDIT_DIR/.audit.b64.tmp"
-          if ! printf '%s' "$AUDIT_B64" | base64 -d > "$tmp" 2>/dev/null; then
+          tmp_in="$AUDIT_DIR/.audit.b64.tmp"
+          tmp="$AUDIT_DIR/.audit.gz.tmp"
+          if ! printf '%s' "$AUDIT_B64" | base64 -d > "$tmp_in" 2>/dev/null; then
             echo "::error::primary audit output is not valid base64 — aggregator will fail closed with audit_missing" >&2
-            rm -f "$tmp"
+            rm -f "$tmp_in" "$tmp"
             exit 0
           fi
+          if ! gunzip -c "$tmp_in" > "$tmp" 2>/dev/null; then
+            echo "::error::primary audit output does not gunzip (truncated or corrupt gzip payload) — aggregator will fail closed with audit_missing" >&2
+            rm -f "$tmp_in" "$tmp"
+            exit 0
+          fi
+          rm -f "$tmp_in"
           actual=$(wc -c < "$tmp" | tr -d ' ')
           if [ "$actual" != "$AUDIT_BYTES_DECLARED" ]; then
             echo "::error::primary audit output truncated or padded (declared=$AUDIT_BYTES_DECLARED actual=$actual) — aggregator will fail closed with audit_missing" >&2
@@ -2746,7 +2800,8 @@ jobs:
     needs: [quality, primary, gate, classify_pr_paths]
     if: always()
     continue-on-error: true
-    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724: `extra_runner_label_review` (default "") appends ONE label to ledger's self-hosted branch only.
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux","codex",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 10
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
@@ -3162,7 +3217,7 @@ jobs:
         env:
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
-          AUDIT_B64: ${{ needs.primary.outputs.audit_json_b64 }}
+          AUDIT_B64: ${{ needs.primary.outputs.audit_json_gz_b64 }}
           AUDIT_BYTES_DECLARED: ${{ needs.primary.outputs.audit_bytes }}
           AUDIT_DIR: ${{ runner.temp }}/primary-audit
           AUDIT_FILENAME: primary-review-audit.json
@@ -3180,8 +3235,11 @@ jobs:
             echo "::notice::primary $PRIMARY_RESULT produced no audit output; ledger row audit fields will be null"
             exit 0
           fi
-          tmp="$AUDIT_DIR/.audit.b64.tmp"
-          printf '%s' "$AUDIT_B64" | base64 -d > "$tmp" 2>/dev/null || fail_loud "primary audit output is not valid base64"
+          tmp_in="$AUDIT_DIR/.audit.b64.tmp"
+          tmp="$AUDIT_DIR/.audit.gz.tmp"
+          printf '%s' "$AUDIT_B64" | base64 -d > "$tmp_in" 2>/dev/null || fail_loud "primary audit output is not valid base64"
+          gunzip -c "$tmp_in" > "$tmp" 2>/dev/null || fail_loud "primary audit output does not gunzip (truncated or corrupt gzip payload)"
+          rm -f "$tmp_in"
           actual=$(wc -c < "$tmp" | tr -d ' ')
           [ "$actual" = "$AUDIT_BYTES_DECLARED" ] || fail_loud "primary audit output truncated (declared=$AUDIT_BYTES_DECLARED actual=$actual)"
           mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"

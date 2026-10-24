@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -206,8 +208,43 @@ def _tag_commit() -> str:
         check=False,
     )
     if result.returncode != 0:
+        # PR CI must not let this guard silently skip (the false-green behind
+        # gate-hub#1724): ci.yml sets GATE_CONTRACT_GUARD_REQUIRED=1 after
+        # fetching refs/tags/v2, so a missing tag there is a hard failure.
+        if os.environ.get("GATE_CONTRACT_GUARD_REQUIRED") == "1":
+            pytest.fail(
+                "GATE_CONTRACT_GUARD_REQUIRED=1 but refs/tags/v2 is unavailable; "
+                "the caller-contract guard must not silently skip in CI"
+            )
         pytest.skip("refs/tags/v2 is unavailable; CI must fetch tags for this guard")
     return result.stdout.strip()
+
+
+def _repo_without_the_tag(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+
+def test_tag_commit_fails_when_guard_required_and_tag_missing(tmp_path, monkeypatch):
+    _repo_without_the_tag(tmp_path, monkeypatch)
+    monkeypatch.setenv("GATE_CONTRACT_GUARD_REQUIRED", "1")
+    # A skip here is exactly the #1724 false-green shape, so it must read RED,
+    # not as a skipped (green) test.
+    try:
+        _tag_commit()
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"guard skipped instead of failing: {exc}")
+    except pytest.fail.Exception as exc:
+        assert "GATE_CONTRACT_GUARD_REQUIRED" in str(exc)
+    else:
+        pytest.fail("_tag_commit() neither failed nor errored on a missing tag")
+
+
+def test_tag_commit_skips_when_guard_not_required_and_tag_missing(tmp_path, monkeypatch):
+    _repo_without_the_tag(tmp_path, monkeypatch)
+    monkeypatch.delenv("GATE_CONTRACT_GUARD_REQUIRED", raising=False)
+    with pytest.raises(pytest.skip.Exception):
+        _tag_commit()
 
 
 def _load_at_ref(ref: str, path: str):
