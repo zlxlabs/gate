@@ -27,6 +27,9 @@ self-hosted-runner:
                     # group id=4). No /opt/review-auth, /opt/codex-state, or
                     # /opt/review-circuit mounts — see gate-hub
                     # docs/designs/runner-ci-pool-split.md.
+    - git-source-service  # carried by runners on hosts whose SOURCE-MODE is service
+                    # (host git mirror present); gate-v2-disposition.yml requires it
+                    # (#373). Added by gate-hub runner/run-ephemeral-runner.sh.
 
 # null (not an empty array) leaves configuration-variable ("vars.*") checking
 # disabled — this repo does not maintain an explicit `vars.*` allowlist anywhere, and an
