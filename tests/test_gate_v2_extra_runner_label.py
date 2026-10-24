@@ -1,10 +1,12 @@
-"""gate-hub#1724: caller-supplied extra runner labels on gate-v2's runs-on.
+"""gate-hub#1724/#1819: caller-supplied extra runner labels on gate-v2's runs-on.
 
-Two inputs split BY RUNNER CLASS: `extra_runner_label_ci` appends ONE label to
-quality's SELF-HOSTED branch (ci-class slots) only; `extra_runner_label_review`
-appends ONE label to primary / ledger's (codex-class slots) only. Empty inputs
-leave every branch byte-equivalent to the pre-#1724 form; a legal input appends
-at the END of its own class's array only; an illegal one fails loudly with an
+Two inputs split BY RUNNER CLASS: when non-empty, `extra_runner_label_ci`
+REPLACES quality's lane label "ci" on the SELF-HOSTED branch (ci-class slots)
+only; `extra_runner_label_review` likewise REPLACES "codex" on primary /
+ledger's (codex-class slots). gate-hub#1819: during the canary window the
+canary slot registers ONLY its canary label, so a runs-on that still requires
+the lane label would never match. Empty inputs leave every branch
+byte-equivalent to the pre-#1724 form; an illegal one fails loudly with an
 EXTRA-RUNNER-LABEL-INVALID anchor naming the offending input.
 """
 from __future__ import annotations
@@ -115,22 +117,35 @@ def test_runs_on_parts_match_the_pre_change_baseline():
         assert _render_slot(slot, "") == old_labels, job
 
 
-def test_a_label_appends_only_to_jobs_of_its_own_runner_class():
+def test_a_label_replaces_the_lane_label_only_on_jobs_of_its_own_runner_class():
+    # gate-hub#1819: the canary slot registers only the canary label during the
+    # window, so a non-empty label REPLACES the lane label instead of joining
+    # it; jobs of the other class keep their full pre-change label array.
     raw, _ = _workflow()
-    for label_kwargs, own_jobs in ((dict(ci="canary-abc123-ci-03"), CI_JOBS), (dict(review="canary-abc123-review-01"), REVIEW_JOBS)):
+    for label_kwargs, own_jobs, lane_label in ((dict(ci="canary-abc123-ci-03"), CI_JOBS, "ci"), (dict(review="canary-abc123-review-01"), REVIEW_JOBS, "codex")):
         for job in TARGET_JOBS:
             slot, hosted = _split(str(raw["jobs"][job]["runs-on"]))[1:]
-            expected = PRE_CHANGE[job][1] + ([next(iter(label_kwargs.values()))] if job in own_jobs else [])
-            assert _render_slot(slot, **label_kwargs) == expected and "extra_runner_label_" not in hosted, (label_kwargs, job)
+            label = next(iter(label_kwargs.values()))
+            if job in own_jobs:
+                rendered = _render_slot(slot, **label_kwargs)
+                assert rendered == ["self-hosted", "linux", label], (label_kwargs, job, rendered)
+                assert lane_label not in rendered, (label_kwargs, job, rendered)
+            else:
+                assert _render_slot(slot, **label_kwargs) == PRE_CHANGE[job][1], (label_kwargs, job)
+            assert "extra_runner_label_" not in hosted, (label_kwargs, job)
 
 
 def test_both_labels_each_target_their_own_jobs():
+    # gate-hub#1819: each label replaces its own class's lane label; with both
+    # inputs set the array is exactly ["self-hosted","linux",<own label>].
     raw, _ = _workflow()
     ci_label, review_label = "canary-ci-01", "canary-review-02"
     for job in TARGET_JOBS:
         slot = _split(str(raw["jobs"][job]["runs-on"]))[1]
-        extra = [ci_label] if job in CI_JOBS else [review_label]
-        assert _render_slot(slot, ci=ci_label, review=review_label) == PRE_CHANGE[job][1] + extra, job
+        extra = ci_label if job in CI_JOBS else review_label
+        lane_label = "ci" if job in CI_JOBS else "codex"
+        rendered = _render_slot(slot, ci=ci_label, review=review_label)
+        assert rendered == ["self-hosted", "linux", extra] and lane_label not in rendered, (job, rendered)
 
 
 def test_slot_renderer_semantics_selfcheck():
