@@ -107,10 +107,14 @@ on:
       # that omit this input keep today's behavior exactly.
       quality_prepare_mise: { type: boolean, default: false }
       # gate-hub#1724 (canary receipt targeting): optional extra runner labels
-      # split BY RUNNER CLASS. `extra_runner_label_ci` appends ONE label to the
-      # END of quality's SELF-HOSTED branch (ci-class slots);
-      # `extra_runner_label_review` appends ONE label to the END of primary /
-      # ledger's SELF-HOSTED branch (codex-class slots). One shared input can't
+      # split BY RUNNER CLASS. When non-empty, `extra_runner_label_ci`
+      # REPLACES quality's lane label "ci" on the SELF-HOSTED branch
+      # (ci-class slots); `extra_runner_label_review` likewise REPLACES
+      # "codex" on primary / ledger's SELF-HOSTED branch (codex-class slots).
+      # gate-hub#1819: during the canary window the canary slot registers ONLY
+      # its canary label (not lane+canary), so a runs-on still requiring the
+      # lane label would never match that slot; empty keeps every runs-on
+      # byte-identical to its pre-#1724 form. One shared input can't
       # work: a ci-class slot never satisfies a runs-on asking for "codex", so
       # the wrong class would queue forever (ci-infra-canary run 40068806052).
       # gate-hub#1724 retirement: the pre-#1724 single-label input stays
@@ -537,8 +541,8 @@ jobs:
     # results and aggregates them fail-closed.
     # 仅同仓合法人类 PR 可选 ci 标签；Bot、fork、非法作者走 hosted。
     # 标签不证明镜像隔离或应用依赖，部署状态须由平台实测确认。
-    # gate-hub#1724: `extra_runner_label_ci` (default "") appends ONE label to quality's self-hosted branch only.
-    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && (inputs.extra_runner_label_ci != '' && fromJSON(format('["self-hosted","linux","ci",{0}]', toJSON(inputs.extra_runner_label_ci))) || fromJSON('["self-hosted","linux","ci"]')) || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724/#1819: `extra_runner_label_ci` (default "") REPLACES the lane label "ci" on quality's self-hosted branch only (empty keeps ["self-hosted","linux","ci"]).
+    runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && (inputs.extra_runner_label_ci != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_ci))) || fromJSON('["self-hosted","linux","ci"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     outputs:
       ledger_input_upload: ${{ steps.ledger-input-upload-outcome.outputs.ledger_input_upload }}
@@ -1130,8 +1134,8 @@ jobs:
     needs: [classify_pr_paths]
     if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
     # 防御性路由：仅同仓、合法非空人类作者进入可信评审 runner。
-    # gate-hub#1724: `extra_runner_label_review` (default "") appends ONE label to primary's self-hosted branch only.
-    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux","codex",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724/#1819: `extra_runner_label_review` (default "") REPLACES the lane label "codex" on primary's self-hosted branch only (empty keeps ["self-hosted","linux","codex"]).
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     # Decoupled from quality's `timeout_minutes` — see that input's comment.
     timeout-minutes: ${{ inputs.primary_timeout_minutes }}
     env:
@@ -2800,8 +2804,8 @@ jobs:
     needs: [quality, primary, gate, classify_pr_paths]
     if: always()
     continue-on-error: true
-    # gate-hub#1724: `extra_runner_label_review` (default "") appends ONE label to ledger's self-hosted branch only.
-    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux","codex",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
+    # gate-hub#1724/#1819: `extra_runner_label_review` (default "") REPLACES the lane label "codex" on ledger's self-hosted branch only (empty keeps ["self-hosted","linux","codex"]).
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 10
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.SILO_ACCESS_KEY }}
