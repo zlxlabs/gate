@@ -1,0 +1,198 @@
+# Independent reusable workflow for remote red_on_base dual-tree contrast.
+# Does not alter gate-v2.yml. Consumers read the artifact JSON, never job conclusion.
+name: red-on-base
+
+on:
+  workflow_call:
+    inputs:
+      dispatch_id:   { type: string, required: true }
+      contrast_sha:  { type: string, required: true }
+      tip_sha:       { type: string, required: true }
+      contrast_tree: { type: string, required: true }
+      tip_tree:      { type: string, required: true }
+      pytest_files:  { type: string, required: true, description: "JSON array of repo-relative pytest paths" }
+      shell_files:   { type: string, required: true, description: "JSON array of repo-relative test*.sh paths; empty skips shell" }
+      timeout_minutes:
+        type: number
+        default: 15
+        # Default 15: changed-test subset only (not full quality). Quality
+        # median ~688s / job budget 45; 15 covers checkout + subset without
+        # occupying a ci slot for a full quality run.
+        description: "Per-tree wall clock. Default 15 because only the changed-test subset runs, not full quality (median ~688s, budget 45)."
+
+permissions:
+  contents: read
+
+jobs:
+  tree:
+    name: ${{ matrix.role }}
+    runs-on: [self-hosted, linux, ci]
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: contrast
+            sha: ${{ inputs.contrast_sha }}
+            tree: ${{ inputs.contrast_tree }}
+          - role: tip
+            sha: ${{ inputs.tip_sha }}
+            tree: ${{ inputs.tip_tree }}
+    steps:
+      - name: Checkout caller at SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 1
+
+      - name: Run subset and write tree files
+        if: always()
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+          ROLE: ${{ matrix.role }}
+          PYTEST_FILES_JSON: ${{ inputs.pytest_files }}
+          SHELL_FILES_JSON: ${{ inputs.shell_files }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          TREE_OUT: ${{ runner.temp }}/red-on-base-tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$TREE_OUT"
+          step_insufficient=""; entry_present=false; pytest_requested=false; pytest_exit=""; actual_sha=""; actual_tree=""
+          finish() {
+            printf '%s' "$step_insufficient" >"$TREE_OUT/step_insufficient"
+            printf '%s' "$entry_present" >"$TREE_OUT/entry_present"
+            printf '%s' "$pytest_requested" >"$TREE_OUT/pytest_requested"
+            printf '%s' "$pytest_exit" >"$TREE_OUT/pytest_exit"
+          }
+          trap finish EXIT
+          printf '%s' "$ROLE" >"$TREE_OUT/role"
+          printf '%s' "$EXPECTED_SHA" >"$TREE_OUT/expected_sha"
+          printf '%s' "$EXPECTED_TREE" >"$TREE_OUT/expected_tree"
+          if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            actual_sha=$(git rev-parse HEAD)
+            actual_tree=$(git rev-parse 'HEAD^{tree}')
+          fi
+          printf '%s' "$actual_sha" >"$TREE_OUT/actual_sha"
+          printf '%s' "$actual_tree" >"$TREE_OUT/actual_tree"
+          if [ "$actual_sha" != "$EXPECTED_SHA" ]; then step_insufficient=sha_mismatch
+          elif [ "$actual_tree" != "$EXPECTED_TREE" ]; then step_insufficient=tree_mismatch
+          fi
+          : >"$TREE_OUT/shell.jsonl"
+          if [ -z "$step_insufficient" ]; then
+            python3 -c 'import json,os,sys; sys.stdout.write("\n".join(json.loads(os.environ["PYTEST_FILES_JSON"])))' >"$TREE_OUT/pytest_files.txt"
+            python3 -c 'import json,os,sys; sys.stdout.write("\n".join(json.loads(os.environ["SHELL_FILES_JSON"])))' >"$TREE_OUT/shell_files.txt"
+            if [ -s "$TREE_OUT/pytest_files.txt" ]; then
+              pytest_requested=true
+              if [ -x scripts/gate-quality ]; then
+                entry_present=true
+                GATE_RED_ON_BASE_PYTEST_FILES=$(cat "$TREE_OUT/pytest_files.txt")
+                export GATE_RED_ON_BASE_PYTEST_FILES
+                export GATE_RED_ON_BASE_JUNIT="$TREE_OUT/junit.xml"
+                budget=$((TIMEOUT_MINUTES * 60 - 60))
+                [ "$budget" -ge 60 ] || budget=60
+                set +e
+                timeout -s TERM "$budget" ./scripts/gate-quality
+                pytest_exit=$?
+                set -e
+                if [ "$pytest_exit" -eq 124 ] || [ "$pytest_exit" -eq 137 ]; then step_insufficient=timeout
+                elif [ "$pytest_exit" -ne 0 ] && [ ! -f "$TREE_OUT/junit.xml" ]; then step_insufficient=install_failed
+                fi
+              else
+                step_insufficient=entry_missing
+              fi
+            elif [ -x scripts/gate-quality ]; then entry_present=true
+            fi
+            if [ -z "$step_insufficient" ] && [ -s "$TREE_OUT/shell_files.txt" ]; then
+              while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                set +e
+                timeout -s TERM 300 bash "$f"
+                rc=$?
+                set -e
+                if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then step_insufficient=timeout; break; fi
+                if [ "$rc" -eq 0 ]; then
+                  python3 -c 'import json,sys; json.dump({"id":sys.argv[1],"status":"pass","fail_kind":None,"channel":"shell"},sys.stdout); print()' "$f" >>"$TREE_OUT/shell.jsonl"
+                else
+                  python3 -c 'import json,sys; json.dump({"id":sys.argv[1],"status":"fail","fail_kind":"assertion","channel":"shell"},sys.stdout); print()' "$f" >>"$TREE_OUT/shell.jsonl"
+                fi
+              done <"$TREE_OUT/shell_files.txt"
+            fi
+          fi
+          if [ -n "$pytest_exit" ] && [ "$pytest_exit" -ne 0 ]; then exit "$pytest_exit"; fi
+          if [ "$step_insufficient" = timeout ]; then exit 124; fi
+
+      - name: Mark cancelled
+        if: cancelled()
+        env:
+          TREE_OUT: ${{ runner.temp }}/red-on-base-tree
+        run: |
+          mkdir -p "$TREE_OUT"
+          touch "$TREE_OUT/cancelled"
+
+      - name: Upload tree artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: red-on-base-tree-${{ matrix.role }}-${{ inputs.dispatch_id }}
+          path: ${{ runner.temp }}/red-on-base-tree/
+          if-no-files-found: error
+          retention-days: 14
+
+  result:
+    needs: tree
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gate scripts at this workflow pin
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          sparse-checkout: scripts
+      - name: Download contrast tree
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: red-on-base-tree-contrast-${{ inputs.dispatch_id }}
+          path: ${{ runner.temp }}/trees/contrast
+      - name: Download tip tree
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: red-on-base-tree-tip-${{ inputs.dispatch_id }}
+          path: ${{ runner.temp }}/trees/tip
+      - name: Synthesize red-on-base-result/v1
+        if: always()
+        env:
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONTRAST_SHA: ${{ inputs.contrast_sha }}
+          TIP_SHA: ${{ inputs.tip_sha }}
+          CONTRAST_TREE: ${{ inputs.contrast_tree }}
+          TIP_TREE: ${{ inputs.tip_tree }}
+          PYTEST_FILES_JSON: ${{ inputs.pytest_files }}
+          SHELL_FILES_JSON: ${{ inputs.shell_files }}
+          CONTRAST_DIR: ${{ runner.temp }}/trees/contrast
+          TIP_DIR: ${{ runner.temp }}/trees/tip
+          OUT_DIR: ${{ runner.temp }}/red-on-base-result
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          python3 scripts/red_on_base_result.py \
+            --dispatch-id "$DISPATCH_ID" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+            --contrast-sha "$CONTRAST_SHA" --tip-sha "$TIP_SHA" \
+            --contrast-tree "$CONTRAST_TREE" --tip-tree "$TIP_TREE" \
+            --pytest-files "$PYTEST_FILES_JSON" --shell-files "$SHELL_FILES_JSON" \
+            --contrast-dir "$CONTRAST_DIR" --tip-dir "$TIP_DIR" --out "$OUT_DIR/result.json"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: red-on-base-${{ inputs.dispatch_id }}
+          path: ${{ runner.temp }}/red-on-base-result/result.json
+          if-no-files-found: error
+          retention-days: 14

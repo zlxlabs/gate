@@ -80,6 +80,7 @@ ENTRY_FILES = {
     "scripts/classify_pr_reviewable_paths.py": "quality/primary 入口分类",
     # 本仓 CI 入口：同属“运行期装包计费”相邻面，纳入防漂移。
     "scripts/check_pinned_uses.py": "本仓 CI pin 检查",
+    "scripts/red_on_base_result.py": "red-on-base result 槽：合成 artifact JSON，纯标准库",
     # tag 同步/发布入口（hosted 槽），纳入闭集防漂移。
     "scripts/v2_release_state.py": "发布状态入口",
     "scripts/v2_tag_guard.py": "tag 门禁入口",

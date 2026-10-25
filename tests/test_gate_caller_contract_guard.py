@@ -266,8 +266,23 @@ def _workflow_path(filename: str) -> str:
 
 def test_v2_contract_does_not_break_existing_callers():
     tag_commit = _tag_commit()
+    added_since_tag = subprocess.check_output(
+        ["git", "diff", "--name-status", tag_commit], cwd=REPO_ROOT, text=True,
+    ).splitlines()
     failures = []
     for path in WORKFLOW_PATHS:
+        listed = subprocess.run(
+            ["git", "cat-file", "-e", f"{tag_commit}:{path}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+        if listed.returncode != 0:
+            # Skip only PR-added files (status A). Rename/delete must not skip.
+            assert f"A\t{path}" in added_since_tag, (
+                f"{path} missing on v2 is not added since {tag_commit}"
+            )
+            continue
         baseline = _load_at_ref(tag_commit, path)
         current = yaml.safe_load((REPO_ROOT / path).read_text())
         failures.extend(f"{path}: {item}" for item in contract_violations(baseline, current))

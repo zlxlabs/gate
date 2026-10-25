@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install deps
-        run: pip install pytest pyyaml diff-cover coverage
+        run: pip install pytest pyyaml diff-cover coverage jsonschema==4.10.3
       - name: Run tests
         env:
           GATE_CONTRACT_GUARD_REQUIRED: "1"
