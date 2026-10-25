@@ -75,8 +75,13 @@ def load_tree_dir(path: Path | None) -> TreeSnapshot:
         actual_tree=_read(path / "actual_tree"),
         step_insufficient=_read(path / "step_insufficient") or None,
     )
-    if (path / "cancelled").is_file() and snap.step_insufficient is None:
-        snap.step_insufficient = "cancelled"
+    if snap.step_insufficient is None:
+        if (path / "cancelled").is_file():
+            snap.step_insufficient = "cancelled"
+        elif _read(path / "pytest_requested") == "true" and _read(path / "entry_present") != "true":
+            snap.step_insufficient = "entry_missing"
+        elif _read(path / "pytest_exit") not in ("", "0") and not (path / "junit.xml").is_file():
+            snap.step_insufficient = "install_failed"
     if (path / "junit.xml").is_file():
         try:
             snap.cases.extend(parse_junit(path / "junit.xml"))

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "red-on-base-result/v1",
+  "$id": "https://github.com/zlxlabs/gate/blob/main/docs/red-on-base-result-v1.schema.json",
   "type": "object",
   "required": ["schema", "dispatch_id", "run_id", "run_attempt", "contrast_sha", "tip_sha", "contrast_tree", "tip_tree", "evidence_status", "trees"],
   "properties": {

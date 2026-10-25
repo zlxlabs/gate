@@ -69,6 +69,12 @@ def test_gate_v2_yml_untouched():
     assert diff == b""
 
 
+def test_schema_id_is_absolute_https_uri():
+    schema = json.loads((REPO / "docs/red-on-base-result-v1.schema.json").read_text())
+    assert schema["$id"].startswith("https://")
+    assert schema["properties"]["schema"]["const"] == "red-on-base-result/v1"
+
+
 def test_caller_template_dispatches_v2():
     doc = _doc(CALLER)
     assert "workflow_dispatch" in _trigger(doc)

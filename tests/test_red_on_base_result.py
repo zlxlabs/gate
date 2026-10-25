@@ -8,8 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import jsonschema
 import pytest
+jsonschema = pytest.importorskip("jsonschema")
 
 from scripts.red_on_base_result import load_tree_dir, parse_junit, synthesize
 
@@ -122,3 +122,19 @@ def test_insufficient_without_code_fails_schema(tmp_path):
     doc.pop("insufficient_code", None)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(doc, SCHEMA)
+
+
+@pytest.mark.parametrize("code", ["artifact_missing", "cancelled", "install_failed", "entry_missing"])
+def test_insufficient_input_codes(tmp_path, code):
+    _tree(tmp_path / "t", role="tip", sha=T_SHA, tree=T_TREE, junit=_junit("pass_mod", tmp_path / "p"))
+    c = tmp_path / "c"
+    if code != "artifact_missing":
+        _tree(c, role="contrast", sha=C_SHA, tree=C_TREE, pytest_exit="1" if code == "install_failed" else "0")
+        if code == "cancelled":
+            (c / "cancelled").write_text("", encoding="utf-8")
+        elif code == "entry_missing":
+            (c / "pytest_requested").write_text("true", encoding="utf-8")
+            (c / "entry_present").write_text("false", encoding="utf-8")
+    doc = _synth(tmp_path / "x" if code == "artifact_missing" else c, tmp_path / "t")
+    jsonschema.validate(doc, SCHEMA)
+    assert doc["insufficient_code"] == code
