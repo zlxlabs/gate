@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "red-on-base-result/v1",
+  "type": "object",
+  "required": ["schema", "dispatch_id", "run_id", "run_attempt", "contrast_sha", "tip_sha", "contrast_tree", "tip_tree", "evidence_status", "trees"],
+  "properties": {
+    "schema": {"const": "red-on-base-result/v1"},
+    "dispatch_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "integer"},
+    "run_attempt": {"type": "integer"},
+    "contrast_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "tip_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "contrast_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "tip_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "test_files": {"type": "object", "properties": {
+      "pytest": {"type": "array", "items": {"type": "string"}},
+      "shell": {"type": "array", "items": {"type": "string"}}
+    }},
+    "evidence_status": {"enum": ["complete", "insufficient"]},
+    "insufficient_code": {"enum": ["zero_cases", "all_skipped", "install_failed", "cancelled", "timeout", "sha_mismatch", "tree_mismatch", "artifact_missing", "junit_unreadable", "entry_missing", "run_not_found", "not_completed"]},
+    "trees": {"type": "object", "required": ["contrast", "tip"], "properties": {
+      "contrast": {"$ref": "#/$defs/tree"},
+      "tip": {"$ref": "#/$defs/tree"}
+    }}
+  },
+  "allOf": [{"if": {"properties": {"evidence_status": {"const": "insufficient"}}, "required": ["evidence_status"]}, "then": {"required": ["insufficient_code"]}}],
+  "$defs": {
+    "tree": {"type": "object", "required": ["sha", "tree", "cases"], "properties": {
+      "sha": {"type": "string"}, "tree": {"type": "string"},
+      "cases": {"type": "array", "items": {"$ref": "#/$defs/case"}}
+    }},
+    "case": {"type": "object", "required": ["id", "status", "fail_kind", "channel"], "properties": {
+      "id": {"type": "string"},
+      "status": {"enum": ["pass", "fail", "error", "skip"]},
+      "fail_kind": {"anyOf": [{"type": "null"}, {"enum": ["assertion", "collection", "import", "environment", "timeout"]}]},
+      "channel": {"enum": ["pytest", "shell"]}
+    }}
+  }
+}

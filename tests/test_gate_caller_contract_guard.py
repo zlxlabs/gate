@@ -268,6 +268,15 @@ def test_v2_contract_does_not_break_existing_callers():
     tag_commit = _tag_commit()
     failures = []
     for path in WORKFLOW_PATHS:
+        listed = subprocess.run(
+            ["git", "cat-file", "-e", f"{tag_commit}:{path}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+        if listed.returncode != 0:
+            # New reusable workflow with no v2 callers yet (e.g. red-on-base).
+            continue
         baseline = _load_at_ref(tag_commit, path)
         current = yaml.safe_load((REPO_ROOT / path).read_text())
         failures.extend(f"{path}: {item}" for item in contract_violations(baseline, current))
