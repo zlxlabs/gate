@@ -43,8 +43,15 @@ PRIMARY_SPEC_FIELDS = ("spec_source", "pr_body_digest")
 PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
     "kind", "schema_version", "verdict", "attempts", "shadow_mode", "expected_shadows",
     "result", "cost", "tokens", "runtime", "not_expected_reason", "waiver", "risk",
-    "finding_relation",
+    "finding_relation", "intent_provenance",
 }
+# Mirrors gate-hub scripts/review/contracts.py INTENT_PROVENANCE_FIELDS /
+# INTENT_SOURCE_VALUES / intent_provenance_error: the optional composite the
+# producer writes since gate-hub #1900.
+INTENT_PROVENANCE_FIELDS = (
+    "intent_source", "task_id", "issue_numbers", "intent_chars", "skipped_sources",
+)
+INTENT_SOURCE_VALUES = frozenset({"task_card_branch", "task_card_pr_body", "issue_body", "missing"})
 PRIMARY_VERDICTS = {"pass", "fail", "unavailable", "not_expected", "waived"}
 PRIMARY_REVIEWER_VERDICTS = {"pass", "fail", "unavailable"}
 PRIMARY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -252,6 +259,37 @@ def _primary_identity(
         tier = audit["tier"]
         if not (isinstance(tier, str) and tier in {"personal", "internal", "saas"}):
             raise ValueError("canonical primary tier must be personal, internal, or saas")
+    if "intent_provenance" in audit:
+        provenance = audit["intent_provenance"]
+        if not isinstance(provenance, dict):
+            raise ValueError("canonical primary intent_provenance must be an object")
+        if set(provenance) != set(INTENT_PROVENANCE_FIELDS):
+            raise ValueError(
+                "canonical primary intent_provenance must hold exactly "
+                f"{sorted(INTENT_PROVENANCE_FIELDS)}"
+            )
+        source = provenance["intent_source"]
+        if not isinstance(source, str) or source not in INTENT_SOURCE_VALUES:
+            raise ValueError(
+                f"canonical primary intent_provenance intent_source must be one of {sorted(INTENT_SOURCE_VALUES)}"
+            )
+        task_id = provenance["task_id"]
+        if task_id is not None and (not isinstance(task_id, str) or not task_id):
+            raise ValueError("canonical primary intent_provenance task_id must be non-empty text or null")
+        issue_numbers = provenance["issue_numbers"]
+        if not isinstance(issue_numbers, list) or any(
+            type(number) is not int or number <= 0 for number in issue_numbers
+        ):
+            raise ValueError("canonical primary intent_provenance issue_numbers must be an array of positive integers")
+        if type(provenance["intent_chars"]) is not int or provenance["intent_chars"] < 0:
+            raise ValueError("canonical primary intent_provenance intent_chars must be a non-negative integer")
+        skipped = provenance["skipped_sources"]
+        if not isinstance(skipped, list) or any(
+            not isinstance(item, str) or not item for item in skipped
+        ):
+            raise ValueError(
+                "canonical primary intent_provenance skipped_sources must be an array of non-empty strings"
+            )
     if (
         isinstance(audit["repository_id"], bool) or not isinstance(audit["repository_id"], int)
         or audit["repository_id"] <= 0
