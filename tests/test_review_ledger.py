@@ -247,22 +247,17 @@ def test_primary_v2_tier_does_not_allow_other_unknown_fields():
 
 # gate-hub PR #1900 (42535dae38) made canonical primary audits carry this optional
 # composite. Cross-repo publish boundary (gate-hub issue #1879): the fixture is the
-# recorded producer primary envelope (tests/data/primary_review_v2_with_tier.json)
-# plus the ``intent_provenance`` value copied verbatim from
-# ``gh api repos/zlxlabs/gate-hub/contents/tests/fixtures/primary-audit-redline-golden.json``.
+# recorded producer envelope (tests/data/primary_review_v2_with_tier.json) plus the
+# ``intent_provenance`` value copied verbatim from gate-hub's real producer artifact
+# ``tests/fixtures/primary-audit-redline-golden.json``. Both the fixture bytes and the
+# transcribed value are pinned below, so drift on either side turns this test red.
 INTENT_PROVENANCE_FIXTURE = ROOT / "tests" / "fixtures" / "primary-intent-provenance-envelope.json"
-# sha256 of the fixture bytes; drift here means the recorded envelope or the producer
-# value changed and the red-on-drift contract must be re-established deliberately.
 INTENT_PROVENANCE_FIXTURE_SHA256 = (
     "580efc6d580ef47c5840889649dbe9c8427d33869361b805be01095b437538a0"
 )
-# The producer's value, transcribed from the gate-hub artifact named above.
 RECORDED_INTENT_PROVENANCE = {
-    "intent_source": "missing",
-    "task_id": None,
-    "issue_numbers": [],
-    "intent_chars": 0,
-    "skipped_sources": [],
+    "intent_source": "missing", "task_id": None, "issue_numbers": [],
+    "intent_chars": 0, "skipped_sources": [],
 }
 
 
@@ -287,9 +282,11 @@ def test_recorded_primary_intent_provenance_envelope_is_accepted():
     assert audit["intent_provenance"] == RECORDED_INTENT_PROVENANCE
 
     entry = _build_intent_entry(module, audit)
-
     assert entry["primary_identity"]["head_sha"] == audit["head_sha"]
     assert "intent_provenance" not in entry["primary_identity"]
+    # Optional: without the field the entry is byte-identical to the recorded envelope.
+    without = {key: value for key, value in audit.items() if key != "intent_provenance"}
+    assert _build_intent_entry(module, without)["primary_identity"] == entry["primary_identity"]
 
 
 def test_primary_intent_provenance_does_not_open_the_envelope_to_other_fields():
@@ -338,16 +335,6 @@ def test_primary_intent_provenance_rejects_incomplete_or_unknown_shapes(shape):
 
     with pytest.raises(ValueError, match="intent_provenance"):
         _build_intent_entry(module, audit)
-
-
-def test_primary_intent_provenance_stays_optional():
-    module = _module()
-    audit = _intent_envelope()
-    audit.pop("intent_provenance")
-
-    entry = _build_intent_entry(module, audit)
-
-    assert "intent_provenance" not in entry["primary_identity"]
 
 
 def test_main_writes_primary_risk_fields_to_jsonl_without_inference(tmp_path, monkeypatch):
