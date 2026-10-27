@@ -245,6 +245,111 @@ def test_primary_v2_tier_does_not_allow_other_unknown_fields():
         )
 
 
+# gate-hub PR #1900 (42535dae38) made canonical primary audits carry this optional
+# composite. Cross-repo publish boundary (gate-hub issue #1879): the fixture is the
+# recorded producer primary envelope (tests/data/primary_review_v2_with_tier.json)
+# plus the ``intent_provenance`` value copied verbatim from
+# ``gh api repos/zlxlabs/gate-hub/contents/tests/fixtures/primary-audit-redline-golden.json``.
+INTENT_PROVENANCE_FIXTURE = ROOT / "tests" / "fixtures" / "primary-intent-provenance-envelope.json"
+# sha256 of the fixture bytes; drift here means the recorded envelope or the producer
+# value changed and the red-on-drift contract must be re-established deliberately.
+INTENT_PROVENANCE_FIXTURE_SHA256 = (
+    "580efc6d580ef47c5840889649dbe9c8427d33869361b805be01095b437538a0"
+)
+# The producer's value, transcribed from the gate-hub artifact named above.
+RECORDED_INTENT_PROVENANCE = {
+    "intent_source": "missing",
+    "task_id": None,
+    "issue_numbers": [],
+    "intent_chars": 0,
+    "skipped_sources": [],
+}
+
+
+def _intent_envelope() -> dict:
+    return json.loads(INTENT_PROVENANCE_FIXTURE.read_bytes().decode("utf-8"))
+
+
+def _build_intent_entry(module, audit: dict) -> dict:
+    return module.build_entry(
+        repository=audit["repository"], pr_number=audit["pr"], run_id=audit["run_id"],
+        run_attempt=audit["run_attempt"], head_sha=audit["head_sha"],
+        preflight=_preflight(), audit=audit,
+    )
+
+
+def test_recorded_primary_intent_provenance_envelope_is_accepted():
+    module = _module()
+    fixture_bytes = INTENT_PROVENANCE_FIXTURE.read_bytes()
+    assert hashlib.sha256(fixture_bytes).hexdigest() == INTENT_PROVENANCE_FIXTURE_SHA256
+    audit = _intent_envelope()
+    assert audit["kind"] == "primary_review"
+    assert audit["intent_provenance"] == RECORDED_INTENT_PROVENANCE
+
+    entry = _build_intent_entry(module, audit)
+
+    assert entry["primary_identity"]["head_sha"] == audit["head_sha"]
+    assert "intent_provenance" not in entry["primary_identity"]
+
+
+def test_primary_intent_provenance_does_not_open_the_envelope_to_other_fields():
+    module = _module()
+    audit = {**_intent_envelope(), "bogus_field": 1}
+
+    with pytest.raises(ValueError, match=r"invalid canonical primary envelope: extra=\['bogus_field'\]"):
+        _build_intent_entry(module, audit)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("intent_source", "task_card"),
+    ("intent_source", None),
+    ("task_id", ""),
+    ("task_id", 7),
+    ("issue_numbers", ["385"]),
+    ("issue_numbers", [0]),
+    ("issue_numbers", True),
+    ("intent_chars", -1),
+    ("intent_chars", True),
+    ("skipped_sources", [""]),
+    ("skipped_sources", "none"),
+])
+def test_primary_intent_provenance_rejects_illegal_values(field, value):
+    module = _module()
+    audit = _intent_envelope()
+    audit["intent_provenance"] = {**audit["intent_provenance"], field: value}
+
+    with pytest.raises(ValueError, match="intent_provenance"):
+        _build_intent_entry(module, audit)
+
+
+@pytest.mark.parametrize("shape", ["not_object", "missing_field", "unknown_field"])
+def test_primary_intent_provenance_rejects_incomplete_or_unknown_shapes(shape):
+    module = _module()
+    audit = _intent_envelope()
+    provenance = dict(audit["intent_provenance"])
+    if shape == "not_object":
+        audit["intent_provenance"] = ["missing"]
+    elif shape == "missing_field":
+        provenance.pop("skipped_sources")
+        audit["intent_provenance"] = provenance
+    else:
+        provenance["future_intent_signal"] = True
+        audit["intent_provenance"] = provenance
+
+    with pytest.raises(ValueError, match="intent_provenance"):
+        _build_intent_entry(module, audit)
+
+
+def test_primary_intent_provenance_stays_optional():
+    module = _module()
+    audit = _intent_envelope()
+    audit.pop("intent_provenance")
+
+    entry = _build_intent_entry(module, audit)
+
+    assert "intent_provenance" not in entry["primary_identity"]
+
+
 def test_main_writes_primary_risk_fields_to_jsonl_without_inference(tmp_path, monkeypatch):
     module = _module()
     audit = _v2_audit("fail")
