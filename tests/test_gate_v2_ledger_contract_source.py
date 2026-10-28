@@ -162,11 +162,37 @@ def _git_blob(*args: str) -> bytes:
 
 
 def _service_host(tmp_path: Path, head: str) -> dict:
-    """Service-mode host whose upstream carries this repo's real HEAD commit."""
+    """Service-mode host carrying the published consumer snapshot.
+
+    CI checkouts are shallow (actions/checkout fetch-depth 1), and git refuses
+    to push/fetch a shallow closure into a full repository, so the fixture
+    builds a parentless snapshot commit from the bytes of `git show HEAD:<file>`
+    for exactly the files this chain consumes (the four consumer files plus the
+    two bootstrap tools). Every snapshot file is byte-checked against the
+    published HEAD blob, so the payload IS the released consumer; the snapshot
+    SHA differs from `head` only by lineage, which the consumer chain never
+    reads.
+    """
+    snapshot_files = sorted(set(CONSUMER_FILES) | {
+        "scripts/gate_source.py", "scripts/gate_bounded_retry.py",
+    })
+    work = tmp_path / "consumer-snapshot"
+    work.mkdir()
+    _git("init", "--quiet", cwd=work)
+    for relative in snapshot_files:
+        target = work / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(_git_blob("show", f"{head}:{relative}"))
+    _git("add", "-A", cwd=work)
+    _git("commit", "--quiet", "-m", "published consumer snapshot", cwd=work)
+    snapshot_sha = _git("rev-parse", "HEAD", cwd=work)
+    for relative in snapshot_files:
+        assert (work / relative).read_bytes() == _git_blob("show", f"{head}:{relative}"), relative
+
     upstream = tmp_path / "upstream" / "zlxlabs" / "gate.git"
     upstream.parent.mkdir(parents=True)
     _git("init", "--bare", "--quiet", str(upstream))
-    _git("-C", str(REPO_ROOT), "push", "--quiet", str(upstream), f"{head}:refs/heads/main")
+    _git("-C", str(work), "push", "--quiet", str(upstream), f"{snapshot_sha}:refs/heads/main")
     mirror_root = tmp_path / "cache/git"
     mirror_root.mkdir(parents=True)
     (mirror_root / "SOURCE-MODE").write_text("service\n")
@@ -184,6 +210,7 @@ def _service_host(tmp_path: Path, head: str) -> dict:
     return {
         "upstream": upstream, "mirror_root": mirror_root, "bin": bin_dir,
         "argv_log": argv_log, "runner_temp": tmp_path / "runner-temp",
+        "snapshot_sha": snapshot_sha,
     }
 
 
@@ -196,6 +223,7 @@ def test_consumer_step_materializes_the_published_files_at_workflow_sha(tmp_path
     """
     head = _git("-C", str(REPO_ROOT), "rev-parse", "HEAD")
     host = _service_host(tmp_path, head)
+    snapshot_sha = host["snapshot_sha"]
     workspace = tmp_path / "workspace"
     planted = workspace / CONSUMER_SUBDIR
     planted.mkdir(parents=True)
@@ -214,8 +242,11 @@ def test_consumer_step_materializes_the_published_files_at_workflow_sha(tmp_path
         "GITHUB_WORKSPACE": str(workspace),
         # Resolved the way the runner resolves them: the two job-context
         # expressions to fixture values, everything else from the step itself.
+        # The ref is the snapshot commit's real 40-hex SHA (byte-equal to the
+        # published HEAD tree), so the step's pin and PIN-mismatch machinery
+        # run against a true SHA exactly as in production.
         "GATE_CHECKOUT_REPOSITORY": "zlxlabs/gate",
-        "GATE_CHECKOUT_REF": head,
+        "GATE_CHECKOUT_REF": snapshot_sha,
         "GATE_CHECKOUT_PATH": step["env"]["GATE_CHECKOUT_PATH"],
         "GATE_CHECKOUT_SPARSE": step["env"]["GATE_CHECKOUT_SPARSE"],
         "GATE_GITHUB_TOKEN": "fixture-token",
@@ -234,7 +265,9 @@ def test_consumer_step_materializes_the_published_files_at_workflow_sha(tmp_path
 
     dest = workspace / CONSUMER_SUBDIR
     assert not (dest / "caller-planted.txt").exists()
-    assert _git("rev-parse", "HEAD", cwd=dest) == head
+    # The checkout pins the ref it was handed (PIN-mismatch guard ran) and the
+    # materialized bytes are the PUBLISHED consumer, not the fixture's lineage.
+    assert _git("rev-parse", "HEAD", cwd=dest) == snapshot_sha
     # Sparse checkout keeps the full index (`ls-files` over-reports); the DISK
     # is what the consumer reads, so the materialized set must be exactly the
     # four published files.
