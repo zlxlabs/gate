@@ -5,8 +5,10 @@ The consumer (gate-v2 workflow + review-ledger composite action + builder +
 scrub) is published with the reusable workflow itself. The quality job must
 materialize exactly those files from `job.workflow_sha` — never the caller
 tree, never a moving ref — before `scripts/gate-quality` runs, and hand the
-absolute path over via GATE_LEDGER_CONSUMER_DIR. gate-hub does not consume the
-variable yet; until it does, quality behavior stays byte-identical.
+absolute runner.temp path over via GATE_LEDGER_CONSUMER_DIR without adding a
+nested checkout to the caller workspace.
+
+Failure marker: LEDGER-CONSUMER-WORKSPACE-CONTAMINATION
 """
 
 from __future__ import annotations
@@ -68,9 +70,14 @@ def _assert_contract(steps: list[dict]) -> None:
     assert env["GATE_GITHUB_TOKEN"] == "${{ github.token }}"
     assert BOOTSTRAP_CALL in checkout["run"]
     assert CHECKOUT_HELPER_RUN in checkout["run"]
+    root_export = 'export GITHUB_WORKSPACE="$RUNNER_TEMP"'
+    assert root_export in checkout["run"]
+    assert checkout["run"].index(root_export) < checkout["run"].index(BOOTSTRAP_CALL)
+    assert "GITHUB_ENV" not in checkout["run"]
+    assert "GITHUB_WORKSPACE" not in checkout["env"]
     assert "${{" not in checkout["run"]
     assert (entry.get("env") or {}).get("GATE_LEDGER_CONSUMER_DIR") == (
-        f"${{{{ github.workspace }}}}/{CONSUMER_SUBDIR}"
+        f"${{{{ runner.temp }}}}/{CONSUMER_SUBDIR}"
     )
     assert "gate_run_and_record ./scripts/gate-quality" in entry["run"]
     assert entry["env"]["GATE_ARTIFACT_DIR"] == "${{ runner.temp }}/gate-quality"
@@ -87,11 +94,11 @@ def test_consumer_files_are_published_in_this_repo():
 
 
 def test_pre_caller_cleanup_never_removes_the_consumer_dir():
-    """The consumer dir must survive until the quality entry that reads it."""
+    """The caller's same-named ordinary directory is not ours to remove."""
     steps = _quality_steps()
     stale = _named(steps, "Remove stale gate source directories")
     pre = _named(steps, "Remove gate action source before caller checks")
-    assert CONSUMER_SUBDIR in stale["run"]
+    assert CONSUMER_SUBDIR not in stale["run"]
     assert CONSUMER_SUBDIR not in pre["run"]
 
 
@@ -127,6 +134,14 @@ MUTATIONS = {
     ),
     "path-caller-tree": lambda steps: _named(steps, CHECKOUT_STEP_NAME)["env"].__setitem__(
         "GATE_CHECKOUT_PATH", "."
+    ),
+    "workspace-export-dropped": lambda steps: _named(steps, CHECKOUT_STEP_NAME).__setitem__(
+        "run", _named(steps, CHECKOUT_STEP_NAME)["run"].replace(
+            'export GITHUB_WORKSPACE="$RUNNER_TEMP"', ""
+        )
+    ),
+    "env-caller-workspace": lambda steps: _named(steps, QUALITY_STEP_NAME)["env"].__setitem__(
+        "GATE_LEDGER_CONSUMER_DIR", f"${{{{ github.workspace }}}}/{CONSUMER_SUBDIR}"
     ),
     "sparse-missing-file": _drop_builder_from_sparse,
     "env-dropped": lambda steps: _named(steps, QUALITY_STEP_NAME)["env"].pop("GATE_LEDGER_CONSUMER_DIR"),
@@ -218,8 +233,9 @@ def test_consumer_step_materializes_the_published_files_at_workflow_sha(tmp_path
     """E2E: the workflow's REAL step body (its own env and run are the producer)
     materializes the four consumer files from this repo's actual HEAD through
     the service mirror. The payload is the released consumer — bytes equal
-    `git show HEAD:<file>`, nothing else is tracked, caller-planted content at
-    the destination is cleared, no credential is persisted, no network is used.
+    `git show HEAD:<file>`, nothing else is tracked, runner.temp residue is
+    cleared, the caller tree is untouched, no credential is persisted, and no
+    network is used.
     """
     head = _git("-C", str(REPO_ROOT), "rev-parse", "HEAD")
     host = _service_host(tmp_path, head)
@@ -228,6 +244,15 @@ def test_consumer_step_materializes_the_published_files_at_workflow_sha(tmp_path
     planted = workspace / CONSUMER_SUBDIR
     planted.mkdir(parents=True)
     (planted / "caller-planted.txt").write_text("caller tree\n", encoding="utf-8")
+    caller_before = {
+        str(p.relative_to(workspace)): p.read_bytes()
+        for p in workspace.rglob("*") if p.is_file()
+    }
+    dest = host["runner_temp"] / CONSUMER_SUBDIR
+    dest.mkdir(parents=True)
+    (dest / "runner-residue.txt").write_text("stale consumer\n", encoding="utf-8")
+    github_env = tmp_path / "github-env"
+    github_env.write_bytes(b"")
 
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     step = _named(_quality_steps(), CHECKOUT_STEP_NAME)
@@ -240,6 +265,7 @@ def test_consumer_step_materializes_the_published_files_at_workflow_sha(tmp_path
         "GATE_FAKE_UPSTREAM": str(tmp_path / "upstream"),
         "RUNNER_TEMP": str(host["runner_temp"]),
         "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_ENV": str(github_env),
         # Resolved the way the runner resolves them: the two job-context
         # expressions to fixture values, everything else from the step itself.
         # The ref is the snapshot commit's real 40-hex SHA (byte-equal to the
@@ -257,14 +283,37 @@ def test_consumer_step_materializes_the_published_files_at_workflow_sha(tmp_path
     })
     host["runner_temp"].mkdir(parents=True, exist_ok=True)
 
+    cleanup = _named(_quality_steps(), "Remove stale gate source directories")
+    subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", cleanup["run"]],
+        env=env, check=True, capture_output=True, text=True,
+    )
     run = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
-        env=env, capture_output=True, text=True, timeout=300,
+        cwd=workspace, env=env, capture_output=True, text=True, timeout=300,
     )
     assert run.returncode == 0, f"{run.stderr}\n{run.stdout}"
 
-    dest = workspace / CONSUMER_SUBDIR
-    assert not (dest / "caller-planted.txt").exists()
+    assert not (dest / "runner-residue.txt").exists()
+    assert github_env.read_bytes() == b""
+    assert env["GITHUB_WORKSPACE"] == str(workspace)
+    assert not (planted / ".git").exists()
+    assert {
+        str(p.relative_to(workspace)): p.read_bytes()
+        for p in workspace.rglob("*") if p.is_file()
+    } == caller_before
+    entry = _named(_quality_steps(), QUALITY_STEP_NAME)
+    consumer_dir = entry["env"]["GATE_LEDGER_CONSUMER_DIR"].replace(
+        "${{ runner.temp }}", str(host["runner_temp"])
+    )
+    # Resolve the real quality-step env and hand it to a fresh caller subprocess.
+    received = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c",
+         'printf "%s\\n%s\\n" "$GITHUB_WORKSPACE" "$GATE_LEDGER_CONSUMER_DIR"'],
+        cwd=workspace, env={**env, "GATE_LEDGER_CONSUMER_DIR": consumer_dir},
+        check=True, capture_output=True, text=True,
+    )
+    assert received.stdout.splitlines() == [str(workspace), str(dest)]
     # The checkout pins the ref it was handed (PIN-mismatch guard ran) and the
     # materialized bytes are the PUBLISHED consumer, not the fixture's lineage.
     assert _git("rev-parse", "HEAD", cwd=dest) == snapshot_sha
