@@ -917,7 +917,7 @@ def test_workflow_sha_checkouts_use_centralized_bounded_retry():
                 assert_workflow_sha_checkout(step)
             if uses.startswith("actions/checkout"):
                 assert (step.get("with") or {}).get("ref") != "${{ job.workflow_sha }}"
-    assert len(sites) == 9
+    assert len(sites) == 10
     producer = next(
         step for step in disposition["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
@@ -3604,14 +3604,18 @@ def test_quality_removes_gate_sources_before_any_caller_check():
 
     assert names.index(stale_cleanup["name"]) < names.index(source_checkout["name"])
     assert names.index(source_checkout["name"]) < preflight_index < cleanup_index < first_caller_check
-    assert cleanup_index == preflight_index + 1 and names[cleanup_index + 1] == "Run scripts/gate-quality"
+    # gate-hub#1917: the ledger consumer checkout sits between the pre-caller
+    # cleanup and the quality entry, adjacent to its only consumer.
+    assert cleanup_index == preflight_index + 1
+    assert names[cleanup_index + 1] == "Checkout review-ledger consumer source at this workflow's own commit"
+    assert names[cleanup_index + 2] == "Run scripts/gate-quality"
     assert stale_cleanup["if"] == "always()"
     assert cleanup["if"] == "always()"
     assert 'rm -rf "$GITHUB_WORKSPACE/_gate-action-src"' in cleanup["run"]
     assert 'if [ -e "$GITHUB_WORKSPACE/_gate-action-src" ]; then' in cleanup["run"]
     assert 'if [ -e "$GITHUB_WORKSPACE/_gate-aggregator-src" ]; then' in cleanup["run"]
     assert 'rm -rf "$GITHUB_WORKSPACE/_gate-aggregator-src"' in stale_cleanup["run"]
-    assert "for path in _gate-action-src _gate-aggregator-src; do" in stale_cleanup["run"]
+    assert "for path in _gate-action-src _gate-aggregator-src _gate-ledger-consumer-src; do" in stale_cleanup["run"]
     assert 'if [ -e "$GITHUB_WORKSPACE/$path" ]; then' in stale_cleanup["run"]
 
     for name in (

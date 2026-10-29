@@ -600,7 +600,8 @@ jobs:
           set -euo pipefail
           rm -rf "$GITHUB_WORKSPACE/_gate-action-src"
           rm -rf "$GITHUB_WORKSPACE/_gate-aggregator-src"
-          for path in _gate-action-src _gate-aggregator-src; do
+          rm -rf "$GITHUB_WORKSPACE/_gate-ledger-consumer-src"
+          for path in _gate-action-src _gate-aggregator-src _gate-ledger-consumer-src; do
             if [ -e "$GITHUB_WORKSPACE/$path" ]; then
               echo "::error::gate source directory still exists after cleanup: $path"
               exit 1
@@ -730,12 +731,37 @@ jobs:
             exit 1
           fi
 
+      # gate-hub#1917 source provision: the review-ledger consumer is published
+      # with this reusable workflow, so required quality materializes exactly
+      # those four files from `job.workflow_sha` — never the caller tree, never
+      # a moving ref — and hands the absolute path to scripts/gate-quality via
+      # GATE_LEDGER_CONSUMER_DIR. Entry mode only: legacy quality never reads
+      # it. A missing sparse file or a wrong SHA fails the step before the
+      # quality entry; no fallback to main, v2 or registry_commit exists.
+      - name: Checkout review-ledger consumer source at this workflow's own commit
+        if: ${{ steps.quality-entry.outputs.mode == 'entry' }}
+        env:
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-ledger-consumer-src
+          GATE_CHECKOUT_SPARSE: |
+            .github/workflows/gate-v2.yml
+            .github/actions/review-ledger/action.yml
+            .github/actions/review-ledger/build_ledger.py
+            scripts/scrub_outbound.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
+
       - name: Run scripts/gate-quality
         id: run-quality
         if: ${{ steps.quality-entry.outputs.mode == 'entry' }}
         working-directory: ${{ github.workspace }}
         env:
           GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
+          GATE_LEDGER_CONSUMER_DIR: ${{ github.workspace }}/_gate-ledger-consumer-src
         # gate-hub#1696, redone after gate#363: the helper is invoked from the
         # plain `run:` block under the default `bash -e` shell. gate#361 put a
         # custom `shell:` template here and Actions — which splits `shell:` on
