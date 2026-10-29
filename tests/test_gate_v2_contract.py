@@ -3615,7 +3615,8 @@ def test_quality_removes_gate_sources_before_any_caller_check():
     assert 'if [ -e "$GITHUB_WORKSPACE/_gate-action-src" ]; then' in cleanup["run"]
     assert 'if [ -e "$GITHUB_WORKSPACE/_gate-aggregator-src" ]; then' in cleanup["run"]
     assert 'rm -rf "$GITHUB_WORKSPACE/_gate-aggregator-src"' in stale_cleanup["run"]
-    assert "for path in _gate-action-src _gate-aggregator-src _gate-ledger-consumer-src; do" in stale_cleanup["run"]
+    assert "for path in _gate-action-src _gate-aggregator-src; do" in stale_cleanup["run"]
+    assert "_gate-ledger-consumer-src" not in stale_cleanup["run"]
     assert 'if [ -e "$GITHUB_WORKSPACE/$path" ]; then' in stale_cleanup["run"]
 
     for name in (
