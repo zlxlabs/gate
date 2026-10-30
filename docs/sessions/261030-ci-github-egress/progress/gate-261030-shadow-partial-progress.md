@@ -143,3 +143,19 @@ PY
 - **本段结论**：提交 `5c5bcc0626831086c155f0093b108f71b317ef02` 与 `2c710dcf397c279ff24ce9f39369ac2fd8b2e0d1` 已推送至 `card/gate-20261030-01`；draft PR #391 (`https://github.com/zlxlabs/gate/pull/391`) 的 run `41086419668` 对 `2c710dcf397c279ff24ce9f39369ac2fd8b2e0d1` 结论为 SUCCESS，`test` 与 `actionlint` job 均 SUCCESS。远端 branch ref 核对匹配该 SHA。
 - **关键决策与已否决方案**：保持 PR 为 draft，未标 ready、未合并；PR 正文含 `Refs #390`。CI 判定采用 run 与 job 级结论，不凭 PR 聚合颜色推断。
 - **下一步唯一动作**：提交并推送这次最终进度记录，再等待新 head 对应 CI 终态。
+
+## 2026-10-30 — 真实大仓原始 diff 与解析输出核对
+
+- **当前阶段**：draft PR 当前 head 的 CI 已通过；补充核对原始 `git diff` 字节与函数实际返回值。
+- **本段结论**：旧/新方式的原始 diff stdout 字节数不同（6,449,020 vs 6,446,630），但生产 `parse_diff_added_lines` 返回映射逐项相等：1,181 个文件、65,535 条新增行；1195 条 `index` 行在替换 abbreviated object IDs 后一致。字节差仅在不同对象库规模下的 abbreviated OID 字段，不改变 `_inter_round_added_lines` 的返回输出。
+- **关键决策与已否决方案**：验收比较消费方使用的解析映射，而不是把 Git `index` 行的本地 abbreviated OID 长度当作输出语义；功能实现不变。报告如实列出原始 stdout 并非 byte-identical，避免过度声称。
+- **下一步唯一动作**：提交并推送本段证据，再核实新 PR head 的 CI。
+
+追加探针复用上一节的 PR #5887 / SHA 来源与安全 `GIT_CONFIG_COUNT` 凭据传递；两种 fetch 后均执行 `git diff -U0 -M <base>..<head>`，解析后比较 dict，另将 `index <oid>..<oid>` 的 OID 正则归一化后比较其余字段。输出：
+
+```text
+ghx_ledger_frame_parse_failed: no-request-frames
+old_raw_diff_bytes=6449020 new_raw_diff_bytes=6446630 raw_diff_identical=False
+parsed_added_line_maps_identical=True files=1181 added_lines=65535
+index_metadata_equal_after_oid_normalization=True index_rows=1195
+```
