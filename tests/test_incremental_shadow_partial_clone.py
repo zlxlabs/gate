@@ -101,6 +101,9 @@ def test_blob_none_fetch_matches_full_clone_diff_and_fetches_once(tmp_path, monk
     def recording_run_git(argv, **kwargs):
         calls.append(list(argv))
         result = real_run_git(argv, **kwargs)
+        if len(argv) > 1 and argv[1] == "init":
+            # Make explicit -M part of the contract, not an ambient default.
+            _git("-C", str(kwargs["cwd"]), "config", "diff.renames", "false")
         if len(argv) > 3 and argv[3] in {"fetch", "diff"}:
             repo_dir = Path(argv[2])
             object_files = (repo_dir / ".git" / "objects").rglob("*")

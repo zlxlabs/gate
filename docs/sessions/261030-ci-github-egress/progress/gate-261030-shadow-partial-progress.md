@@ -66,6 +66,29 @@ GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null 
 2002 passed in 293.40s (0:04:53)
 ```
 
+## 2026-10-30 — 红验与最终收口
+
+- **当前阶段**：实现已提交；正在提交测试判据加固与最终验证记录。
+- **本段结论**：测试明确将临时 partial clone 的默认 `diff.renames` 设为 false，因此必须由生产命令显式提供 `-M`。最小注入移除生产命令的 `-M` 后，改名断言按预期转红；恢复后指定 narrow 验证 98 passed。
+- **关键决策与已否决方案**：只在测试的临时仓库关闭隐式 rename detection，不改变生产 Git 配置；红验只改 `-M` 这一处，随后精确恢复，不使用 stash 或整文件 checkout。
+- **下一步唯一动作**：在最终小提交前重跑 card scope 检查，并提交测试判据与验证记录。
+
+红验原文（最小注入：生产 diff argv 移除 `-M`）：
+
+```text
+FAILED tests/test_incremental_shadow_partial_clone.py::test_blob_none_fetch_matches_full_clone_diff_and_fetches_once
+E       AssertionError: assert {'large.dat':...4, 5, 6, ...}} == {'large.dat':...ew.txt': {21}}
+E         Differing items:
+E         {'rename-new.txt': {1, 2, 3, 4, 5, 6, ...}} != {'rename-new.txt': {21}}
+1 failed in 2.75s
+```
+
+恢复 `-M` 后：
+
+```text
+98 passed in 40.05s
+```
+
 ### 大仓规模探针完整复现命令
 
 ```sh
