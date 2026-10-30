@@ -18,9 +18,10 @@ latest pointer (gate#309 last-writer-wins race).  The candidate run set is
 this PR's head-branch ``pull_request`` runs, enumerated with the same
 full-list-or-None semantics as the aggregator's ``_pr_target_run_ids``
 (INV-A4: a history that cannot be fully listed yields ``history_truncated``,
-never a partial count).  Git fetches are bounded shallow fetches of exact
-SHAs against a throwaway repo, never blob-filtered (gate#302).  No retries
-anywhere: a failed archive is skipped and recorded as
+never a partial count).  Git fetches are bounded shallow fetches of exact SHAs against a throwaway
+repo with ``blob:none`` (gate#390): ``git diff`` batch-prefetches the
+needed blobs, unlike ``git grep``'s per-object lazy reads that timed out in
+gate#302.  No retries anywhere: a failed archive is skipped and recorded as
 ``silo_archives_partial``; everything else degrades the whole payload.
 
 The script always writes ``shadow.json`` (even for skips, degrades and
@@ -65,7 +66,8 @@ LEDGER_OBJECT_NAME = "ledger.jsonl"
 MAX_HISTORY_RUNS = 50
 RUNS_PAGE_SIZE = 100
 GIT_SETUP_TIMEOUT_S = 30
-GIT_FETCH_TIMEOUT_S = 300  # `timeout 300 git fetch --depth 1 origin <sha>`, never blob-filtered (gate#302).
+GIT_FETCH_TIMEOUT_S = 300  # `timeout 300 git fetch --depth 1 --filter=blob:none origin <prev> <head>`.
+# gate#390: diff batch-prefetches blobs; unlike git grep's lazy reads (gate#302).
 GIT_DIFF_TIMEOUT_S = 120  # design §8: full-tree `git diff -U0 -M` upper bound.
 SILO_TIMEOUT_S = 120  # same per-object bound neighbor_evidence.py uses for silo gets.
 GH_API_TIMEOUT_S = 30
@@ -328,9 +330,11 @@ def _run_git(argv: list[str], *, cwd: Path | None = None, timeout_s: float) -> s
 def _inter_round_added_lines(
     prev_head: str, head_sha: str, *, token: str, remote_url: str,
 ) -> dict[str, set[int]]:
-    """Shallow-fetch both heads into a throwaway repo and parse
-    ``git diff -U0 -M prev..head`` new-side added lines (§2.4).  Any failure
-    raises _DiffUnavailable with ``diff_fetch_timeout``/``diff_failed``."""
+    """Shallow-fetch both heads once without blobs, then parse
+    ``git diff -U0 -M prev..head`` new-side added lines (§2.4).  Git diff
+    batch-prefetches required blobs; unlike git grep's per-object lazy reads
+    (gate#302), this path is validated for gate#390.  Any failure raises
+    _DiffUnavailable with ``diff_fetch_timeout``/``diff_failed``."""
     repo_dir: Path | None = None
     try:
         repo_dir = Path(tempfile.mkdtemp(prefix="gate-incremental-shadow-"))
@@ -343,20 +347,22 @@ def _inter_round_added_lines(
         for argv in setup:
             if _run_git(argv, cwd=repo_dir, timeout_s=GIT_SETUP_TIMEOUT_S).returncode != 0:
                 raise _DiffUnavailable("diff_failed")
-        for sha in (prev_head, head_sha):
-            try:
-                proc = _run_git(
-                    ["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", sha],
-                    timeout_s=GIT_FETCH_TIMEOUT_S,
-                )
-            except subprocess.TimeoutExpired:
-                raise _DiffUnavailable("diff_fetch_timeout") from None
-            except OSError:
-                raise _DiffUnavailable("diff_failed") from None
-            if proc.returncode != 0:
-                # Includes force-pushed-away prev heads (§4.2): anchors
-                # from Silo archives still apply, the diff does not.
-                raise _DiffUnavailable("diff_failed")
+        try:
+            proc = _run_git(
+                [
+                    "git", "-C", str(repo_dir), "fetch", "--depth", "1",
+                    "--filter=blob:none", "origin", prev_head, head_sha,
+                ],
+                timeout_s=GIT_FETCH_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            raise _DiffUnavailable("diff_fetch_timeout") from None
+        except OSError:
+            raise _DiffUnavailable("diff_failed") from None
+        if proc.returncode != 0:
+            # Includes force-pushed-away prev heads (§4.2): anchors
+            # from Silo archives still apply, the diff does not.
+            raise _DiffUnavailable("diff_failed")
         try:
             diff = _run_git(
                 ["git", "-C", str(repo_dir), "diff", "-U0", "-M", f"{prev_head}..{head_sha}"],
