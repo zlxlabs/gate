@@ -136,3 +136,10 @@ print(f'added_line_sets_identical={old[-1] == new[-1]}')
 print(f'object_bytes_reduction={(1-new[3]/old[2])*100:.2f}%')
 PY
 ```
+
+## 2026-10-30 — draft PR 与代码提交 CI
+
+- **当前阶段**：实现与测试已推送，draft PR 已创建；记录该代码提交的 CI 结论，准备推送本段进度记录。
+- **本段结论**：提交 `5c5bcc0626831086c155f0093b108f71b317ef02` 与 `2c710dcf397c279ff24ce9f39369ac2fd8b2e0d1` 已推送至 `card/gate-20261030-01`；draft PR #391 (`https://github.com/zlxlabs/gate/pull/391`) 的 run `41086419668` 对 `2c710dcf397c279ff24ce9f39369ac2fd8b2e0d1` 结论为 SUCCESS，`test` 与 `actionlint` job 均 SUCCESS。远端 branch ref 核对匹配该 SHA。
+- **关键决策与已否决方案**：保持 PR 为 draft，未标 ready、未合并；PR 正文含 `Refs #390`。CI 判定采用 run 与 job 级结论，不凭 PR 聚合颜色推断。
+- **下一步唯一动作**：提交并推送这次最终进度记录，再等待新 head 对应 CI 终态。
