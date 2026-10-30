@@ -159,3 +159,27 @@ old_raw_diff_bytes=6449020 new_raw_diff_bytes=6446630 raw_diff_identical=False
 parsed_added_line_maps_identical=True files=1181 added_lines=65535
 index_metadata_equal_after_oid_normalization=True index_rows=1195
 ```
+
+## 2026-10-30 — 分类器解析单测补充
+
+- **当前阶段**：按任务卡补入既有 `tests/test_incremental_shadow.py` 的 rename 新增行解析用例；实现无变化。
+- **本段结论**：新增 `test_parse_rename_with_added_lines_uses_new_path`，显式锁定 `-M` diff 中新增行映射到 rename 后路径；指定 narrow 验证 99 passed。
+- **关键决策与已否决方案**：单测只覆盖纯解析契约；真实 fetch argv、partial clone、force-push、懒取失败仍由新增真实 Git 集成测试覆盖，未将网络逻辑塞进纯分类器单测。
+- **下一步唯一动作**：跑最终全量测试，再提交并等待最终 PR head CI。
+
+```text
+uv run --python 3.12 --with pytest,PyYAML,diff-cover,coverage python -m pytest -q tests/test_incremental_shadow_partial_clone.py tests/test_incremental_shadow.py tests/test_incremental_shadow_wiring.py
+99 passed in 61.89s (0:01:01)
+```
+
+## 2026-10-30 — 最终全量验证
+
+- **当前阶段**：最终工作树全量测试通过；准备最后提交并推送 PR 分支。
+- **本段结论**：在无个人 Git hook 的 CI-like 环境中，Verify-Command 全量测试 2003 passed；本地裸命令仍会被全局 `core.hooksPath` 的 detached checkout guard 干扰，详见上文。
+- **关键决策与已否决方案**：仅通过环境覆盖全局 hook 路径来模拟 CI runner；没有改测试、hook 配置文件或生产代码来绕过本机 guard。
+- **下一步唯一动作**：执行末次 scope 检查，提交单测与本记录，再等最新 PR head 的 CI。
+
+```text
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null uv run --python 3.12 --with pytest,PyYAML,diff-cover,coverage python -m pytest -q
+2003 passed in 379.13s (0:06:19)
+```
