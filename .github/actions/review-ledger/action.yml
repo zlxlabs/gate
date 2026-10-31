@@ -15,14 +15,6 @@ inputs:
   # Optional: callers that omit it keep the older ledger shape. When set
   # (gate-v2), fail-loud G3 projection. Empty/absent must not add the field.
   terminal-path: { required: false, default: "" }
-  # Optional: incremental blocking shadow payload (card G2; design
-  # gate-hub docs/designs/convergence-incremental-blocking-shadow.md §5).
-  # Written by the ledger job's "Compute incremental blocking shadow" step;
-  # the io script always writes it (even for skipped/degraded runs). An
-  # unreadable/rejected payload is dropped by build_ledger.py with one
-  # GATE-INCREMENTAL-SHADOW-UNAVAILABLE line — the field is observational
-  # and must never fail the row.
-  shadow-path: { required: false, default: "" }
   # Optional sidecar; omitted callers retain the historical ledger-only output.
   record-output: { required: false, default: "" }
   codex-expected: { required: true }
@@ -50,7 +42,6 @@ runs:
           --preflight-path "${{ inputs.preflight-path }}" \
           --install-path "${{ inputs.install-path }}" \
           --terminal-path "${{ inputs.terminal-path }}" \
-          --shadow-path "${{ inputs.shadow-path }}" \
           --output "$RUNNER_TEMP/review-ledger/ledger.jsonl" \
           --repository "$GITHUB_REPOSITORY" \
           --pr-number "${{ github.event.pull_request.number }}" \

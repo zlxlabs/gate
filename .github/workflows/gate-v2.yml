@@ -3294,51 +3294,6 @@ jobs:
             --prefix "$ARTIFACT_PREFIX" \
             --dest "$DEST"
 
-      - name: Compute incremental blocking shadow
-        if: >-
-          success() &&
-          steps.resolve-ledger-artifacts.outcome == 'success' &&
-          steps.read-primary-audit-for-ledger.outcome == 'success' &&
-          (steps.download-gate-terminal-for-ledger.outcome == 'skipped' ||
-          steps.download-gate-terminal-for-ledger.outcome == 'success')
-        # Card G2 (design: gate-hub
-        # docs/designs/convergence-incremental-blocking-shadow.md §2/§5/§8).
-        # Observational-only candidate-rule shadow: any failure degrades the
-        # shadow payload — never the ledger row, never any job conclusion
-        # (the only sanctioned fail-open; §8). The io script always writes
-        # shadow.json and exits 0; continue-on-error + the `|| echo` guard
-        # only cover an invocation that cannot even start (broken checkout),
-        # mirroring the aggregate render-invocation guard.
-        continue-on-error: true
-        timeout-minutes: 5
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GATE_SHADOW_IO: ${{ github.workspace }}/_gate-aggregator-src/.github/actions/gate-aggregator/incremental_shadow_io.py
-          GATE_SHADOW_AUDIT: ${{ runner.temp }}/primary-audit/primary-review-audit.json
-          GATE_SHADOW_TERMINAL: ${{ runner.temp }}/gate-terminal/gate-terminal.json
-          GATE_SHADOW_OUT: ${{ runner.temp }}/incremental-shadow/shadow.json
-          GATE_SHADOW_REPOSITORY: ${{ github.repository }}
-          GATE_SHADOW_REPOSITORY_ID: ${{ github.repository_id }}
-          GATE_SHADOW_PR: ${{ github.event.pull_request.number }}
-          GATE_SHADOW_RUN_ID: ${{ github.run_id }}
-          GATE_SHADOW_HEAD: ${{ github.event.pull_request.head.sha }}
-          GATE_SHADOW_REVIEW_EXPECTED: ${{ steps.resolve-ledger-artifacts.outputs.review_expected }}
-        run: |
-          echo "::notice::step-start: Compute incremental blocking shadow"
-          set -euo pipefail
-          mkdir -p "$(dirname "$GATE_SHADOW_OUT")"
-          python3 "$GATE_SHADOW_IO" \
-            --audit-path "$GATE_SHADOW_AUDIT" \
-            --terminal-path "$GATE_SHADOW_TERMINAL" \
-            --shadow-out "$GATE_SHADOW_OUT" \
-            --repository "$GATE_SHADOW_REPOSITORY" \
-            --repository-id "$GATE_SHADOW_REPOSITORY_ID" \
-            --pr-number "$GATE_SHADOW_PR" \
-            --run-id "$GATE_SHADOW_RUN_ID" \
-            --head-sha "$GATE_SHADOW_HEAD" \
-            --review-expected "$GATE_SHADOW_REVIEW_EXPECTED" \
-            || echo "GATE-INCREMENTAL-SHADOW-UNAVAILABLE: reason=invocation_failed"
-
       - name: Mark Build v2 review effectiveness ledger start
         if: >-
           success() &&
@@ -3363,7 +3318,6 @@ jobs:
           preflight-path: ${{ runner.temp }}/review-ledger-input/pr-size-preflight.json
           install-path: ${{ runner.temp }}/review-ledger-input/install-result.json
           terminal-path: ${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != '' && format('{0}/gate-terminal/gate-terminal.json', runner.temp) || '' }}
-          shadow-path: ${{ runner.temp }}/incremental-shadow/shadow.json
           record-output: ${{ runner.temp }}/review-ledger/review-record-v1.json
           codex-expected: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
           codex-waived: false

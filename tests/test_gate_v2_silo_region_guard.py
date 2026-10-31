@@ -349,12 +349,11 @@ def test_ledger_build_if_requires_resolve_audit_and_terminal_outcomes():
     assert "steps.read-primary-audit-for-ledger.outcome == 'success'" in condition
     assert "steps.download-gate-terminal-for-ledger.outcome == 'success'" in condition
     assert "steps.download-gate-terminal-for-ledger.outcome == 'skipped'" in condition
-    for name in (
-        "Compute incremental blocking shadow",
-        "Mark Build v2 review effectiveness ledger start",
-    ):
-        step = next(candidate for candidate in ledger_steps if candidate.get("name") == name)
-        assert step["if"] == condition
+    start = next(
+        candidate for candidate in ledger_steps
+        if candidate.get("name") == "Mark Build v2 review effectiveness ledger start"
+    )
+    assert start["if"] == condition
 
 
 def _minimal_workflow_from_real_text() -> str:
