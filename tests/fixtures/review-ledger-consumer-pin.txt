@@ -1,0 +1,15 @@
+# zlxlabs/gate-hub#2071: the two byte-level digests that zlxlabs/gate-hub has
+# approved for this repo's review-ledger consumer. gate-hub recomputes them with
+# scripts/ci/review_ledger_contract_joint.py:verify_chain() and rejects any sha
+# that is not in its approved set, so changing the files below without being
+# registered there turns every gate-hub PR red the moment @v2 moves.
+#
+# Order of operations when you touch either file:
+#   1. append the new digest to gate-hub's approved set, merge it there
+#   2. then update this record
+#
+# action:   .github/actions/review-ledger/action.yml
+# checkout: the ledger job's step containing
+#           GATE_CHECKOUT_PATH: _gate-aggregator-src in .github/workflows/gate-v2.yml
+action: 26f84e101423d59bac2727709d41f80818c892503fec98119e0f72c9c2cff317
+checkout: 9deb5f9d533f5da1784b4a1166ba831cf88bcc9c3411ed3981de4b9c1cb58bc0
