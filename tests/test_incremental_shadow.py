@@ -110,6 +110,22 @@ def test_parse_rename_only_yields_no_lines():
     assert _module().parse_diff_added_lines(diff) == {}
 
 
+def test_parse_rename_with_added_lines_uses_new_path():
+    diff = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 75%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+        "--- a/old.py\n"
+        "+++ b/new.py\n"
+        "@@ -2 +2,2 @@\n"
+        "-old line\n"
+        "+changed line\n"
+        "+added line\n"
+    )
+    assert _module().parse_diff_added_lines(diff) == {"new.py": {2, 3}}
+
+
 def test_parse_invalid_input():
     with pytest.raises(ValueError, match=r"^incremental_shadow_invalid_input: diff_text"):
         _module().parse_diff_added_lines(None)  # type: ignore[arg-type]
