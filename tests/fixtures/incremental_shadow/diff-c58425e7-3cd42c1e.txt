@@ -1,8 +1,0 @@
-diff --git a/scripts/ci/canary-checkout-prewarm.sh b/scripts/ci/canary-checkout-prewarm.sh
-+++ b/scripts/ci/canary-checkout-prewarm.sh
-@@ -92,5 +92,5 @@
-+<redacted>
-+<redacted>
-+<redacted>
-+<redacted>
-+<redacted>

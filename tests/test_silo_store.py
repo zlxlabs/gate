@@ -1446,7 +1446,6 @@ def test_gate_workflow_writes_live_review_record_bytes_to_versioned_silo_key(tmp
         "preflight-path": str(_REPO_ROOT / "tests/fixtures/quality-ledger-input/pr-size-preflight.json"),
         "install-path": str(_REPO_ROOT / "tests/fixtures/quality-ledger-input/install-result.json"),
         "terminal-path": "",
-        "shadow-path": str(runner_temp / "incremental-shadow/shadow.json"),
         "record-output": str(record_path),
         "codex-expected": "true",
         "codex-waived": "false",
