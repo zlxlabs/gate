@@ -930,6 +930,10 @@ jobs:
 
       # Install dependencies for every tier in legacy mode; keep the step's
       # existing continue-on-error behavior and report its structured result.
+      # Cache telemetry (gate-hub 卡 C): self du -sb 差 → cache_new_bytes。uv-per-slot:
+      # 0→hit, >0→miss, 量不到/负差→null。host-shared: cache_hit 一律 null（差值含并发
+      # 写入，只是上界，不是本 job 下载量）。遥测失败 fail-open：取不到字节才打
+      # INSTALL-CACHE-TELEMETRY-UNAVAILABLE；status 与本步骤退出码不变。
       - name: Install dependencies
         id: install
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
@@ -937,18 +941,35 @@ jobs:
         env:
           UV_CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}
           INSTALL_RESULT_PATH: ${{ runner.temp }}/install-result.json
+          GATE_RUNNER_LANE: ${{ inputs.runner }}
         run: |
           start=$(date +%s)
           ecosystem="none"
           status="skipped"
+          cache_dir=
+          cache_before=
+          cache_scope=null
+          cache_new_bytes=null
+          measure_cache_before() {
+            cache_before=
+            if [ "${GATE_RUNNER_LANE:-}" = "self" ] && [ -n "$1" ]; then
+              cache_before=$(du -sb "$1" 2>/dev/null | cut -f1) || true
+            fi
+          }
           if [ -f uv.lock ]; then
             ecosystem="uv"
+            cache_dir=${UV_CACHE_DIR:-}
+            measure_cache_before "$cache_dir"
             if uv sync --frozen; then status="ok"; else status="failed"; fi
           elif [ -f package-lock.json ]; then
             ecosystem="npm"
+            cache_dir=${npm_config_cache:-}
+            measure_cache_before "$cache_dir"
             if npm ci; then status="ok"; else status="failed"; fi
           elif [ -f pnpm-lock.yaml ]; then
             ecosystem="pnpm"
+            cache_dir=${pnpm_config_store_dir:-}
+            measure_cache_before "$cache_dir"
             if pnpm install --frozen-lockfile; then status="ok"; else status="failed"; fi
           elif [ -f go.sum ]; then
             ecosystem="go-skipped"
@@ -964,8 +985,36 @@ jobs:
               false) cache_hit=false ;;
             esac
           fi
-          printf '{"ecosystem":"%s","status":"%s","duration_s":%s,"cache_hit":%s}\n' \
-            "$ecosystem" "$status" "$((end - start))" "$cache_hit" | tee "$INSTALL_RESULT_PATH"
+          if [ "${GATE_RUNNER_LANE:-}" = "self" ]; then
+            case "$ecosystem" in
+              uv)       cache_scope=uv-per-slot ;;
+              npm|pnpm) cache_scope=host-shared ;;  # cache_new_bytes 含并发写入，只是上界
+            esac
+            if [ -n "$cache_dir" ] && [ -n "$cache_before" ]; then
+              cache_after=$(du -sb "$cache_dir" 2>/dev/null | cut -f1) || true
+              if [ -n "$cache_after" ]; then
+                cache_new_bytes=$((cache_after - cache_before))
+                if [ "$cache_new_bytes" -lt 0 ]; then
+                  cache_new_bytes=null
+                elif [ "$cache_scope" = "uv-per-slot" ]; then
+                  if [ "$cache_new_bytes" -eq 0 ]; then cache_hit=true; else cache_hit=false; fi
+                fi
+              fi
+            fi
+            case "$ecosystem" in
+              uv|npm|pnpm)
+                if [ "$cache_new_bytes" = null ]; then
+                  echo "INSTALL-CACHE-TELEMETRY-UNAVAILABLE lane=self ecosystem=$ecosystem cache_dir=${cache_dir:-unset}"
+                fi ;;
+            esac
+          fi
+          runner_name="${RUNNER_NAME//\"/\'}"
+          case "$cache_scope" in
+            null) cache_scope_json=null ;;
+            *)    cache_scope_json="\"$cache_scope\"" ;;
+          esac
+          printf '{"ecosystem":"%s","status":"%s","duration_s":%s,"cache_hit":%s,"cache_scope":%s,"runner_name":"%s","cache_new_bytes":%s}\n' \
+            "$ecosystem" "$status" "$((end - start))" "$cache_hit" "$cache_scope_json" "$runner_name" "$cache_new_bytes" | tee "$INSTALL_RESULT_PATH"
           [ "$status" != "failed" ]
 
       - name: Tests

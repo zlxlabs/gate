@@ -4440,7 +4440,7 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     publish = next(s for s in quality["steps"] if s.get("name") == "Publish v2 review ledger inputs")
     download = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Download v2 review ledger inputs")
     install_step = next(s for s in quality["steps"] if s.get("id") == "install")
-    printf = "printf '{\"ecosystem\":\"%s\",\"status\":\"%s\",\"duration_s\":%s,\"cache_hit\":%s}\\n'"
+    printf = "printf '{\"ecosystem\":\"%s\",\"status\":\"%s\",\"duration_s\":%s,\"cache_hit\":%s,\"cache_scope\":%s,\"runner_name\":\"%s\",\"cache_new_bytes\":%s}\\n'"
     assert printf in install_step["run"]
 
     repo, base, head = _repo(tmp_path, 1)
@@ -4471,8 +4471,8 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
 
     live_install = tmp_path / "live-install.json"
     subprocess.run(
-        ["bash", "-c", f"ecosystem=uv; status=ok; start=0; end=1; cache_hit=true; {printf} "
-         '"$ecosystem" "$status" "$((end - start))" "$cache_hit" | tee "$INSTALL_RESULT_PATH"'],
+        ["bash", "-c", f'ecosystem=uv; status=ok; start=0; end=1; cache_hit=true; cache_scope=uv-per-slot; cache_scope_json="\\"uv-per-slot\\""; RUNNER_NAME=gatehub-a1b2c3d4e5f6-slot-3; cache_new_bytes=0; {printf} '
+         '"$ecosystem" "$status" "$((end - start))" "$cache_hit" "$cache_scope_json" "$RUNNER_NAME" "$cache_new_bytes" | tee "$INSTALL_RESULT_PATH"'],
         env={**os.environ, "INSTALL_RESULT_PATH": str(live_install)},
         check=True,
     )
