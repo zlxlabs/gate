@@ -930,10 +930,10 @@ jobs:
 
       # Install dependencies for every tier in legacy mode; keep the step's
       # existing continue-on-error behavior and report its structured result.
-      # Cache telemetry (gate-hub 卡 C, docs/sessions/261104-cache-tier/design.md):
-      # self-only du -sb 前后差。差为 0 → hit、>0 → miss、量不到 → null（绝不写
-      # 0/false 代替）。遥测失败 fail-open：只把新字段写 null 并打一行
-      # INSTALL-CACHE-TELEMETRY-UNAVAILABLE，status 与本步骤退出码不变。
+      # Cache telemetry (gate-hub 卡 C): self du -sb 差 → cache_new_bytes。uv-per-slot:
+      # 0→hit, >0→miss, 量不到/负差→null。host-shared: cache_hit 一律 null（差值含并发
+      # 写入，只是上界，不是本 job 下载量）。遥测失败 fail-open：取不到字节才打
+      # INSTALL-CACHE-TELEMETRY-UNAVAILABLE；status 与本步骤退出码不变。
       - name: Install dependencies
         id: install
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
@@ -988,16 +988,16 @@ jobs:
           if [ "${GATE_RUNNER_LANE:-}" = "self" ]; then
             case "$ecosystem" in
               uv)       cache_scope=uv-per-slot ;;
-              npm|pnpm) cache_scope=host-shared ;;
+              npm|pnpm) cache_scope=host-shared ;;  # cache_new_bytes 含并发写入，只是上界
             esac
             if [ -n "$cache_dir" ] && [ -n "$cache_before" ]; then
               cache_after=$(du -sb "$cache_dir" 2>/dev/null | cut -f1) || true
               if [ -n "$cache_after" ]; then
                 cache_new_bytes=$((cache_after - cache_before))
-                if [ "$cache_new_bytes" -ge 0 ]; then
-                  if [ "$cache_new_bytes" -eq 0 ]; then cache_hit=true; else cache_hit=false; fi
-                else
+                if [ "$cache_new_bytes" -lt 0 ]; then
                   cache_new_bytes=null
+                elif [ "$cache_scope" = "uv-per-slot" ]; then
+                  if [ "$cache_new_bytes" -eq 0 ]; then cache_hit=true; else cache_hit=false; fi
                 fi
               fi
             fi

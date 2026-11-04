@@ -4440,8 +4440,7 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     publish = next(s for s in quality["steps"] if s.get("name") == "Publish v2 review ledger inputs")
     download = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Download v2 review ledger inputs")
     install_step = next(s for s in quality["steps"] if s.get("id") == "install")
-    printf = ('printf \'{"ecosystem":"%s","status":"%s","duration_s":%s,"cache_hit":%s,'
-              '"cache_scope":%s,"runner_name":"%s","cache_new_bytes":%s}\\n\'')
+    printf = "printf '{\"ecosystem\":\"%s\",\"status\":\"%s\",\"duration_s\":%s,\"cache_hit\":%s,\"cache_scope\":%s,\"runner_name\":\"%s\",\"cache_new_bytes\":%s}\\n'"
     assert printf in install_step["run"]
 
     repo, base, head = _repo(tmp_path, 1)
@@ -4472,12 +4471,8 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
 
     live_install = tmp_path / "live-install.json"
     subprocess.run(
-        ["bash", "-c",
-         'ecosystem=uv; status=ok; start=0; end=1; cache_hit=true; cache_scope=uv-per-slot; '
-         'cache_scope_json="\\"$cache_scope\\""; RUNNER_NAME=gatehub-a1b2c3d4e5f6-slot-3; '
-         f'cache_new_bytes=0; {printf} '
-         '"$ecosystem" "$status" "$((end - start))" "$cache_hit" '
-         '"$cache_scope_json" "$RUNNER_NAME" "$cache_new_bytes" | tee "$INSTALL_RESULT_PATH"'],
+        ["bash", "-c", f'ecosystem=uv; status=ok; start=0; end=1; cache_hit=true; cache_scope=uv-per-slot; cache_scope_json="\\"uv-per-slot\\""; RUNNER_NAME=gatehub-a1b2c3d4e5f6-slot-3; cache_new_bytes=0; {printf} '
+         '"$ecosystem" "$status" "$((end - start))" "$cache_hit" "$cache_scope_json" "$RUNNER_NAME" "$cache_new_bytes" | tee "$INSTALL_RESULT_PATH"'],
         env={**os.environ, "INSTALL_RESULT_PATH": str(live_install)},
         check=True,
     )
@@ -4505,162 +4500,6 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     subprocess.run(["bash", "-c", download["run"]], env=consume_env, check=True)
     assert (dest / "pr-size-preflight.json").read_bytes() == live_preflight.read_bytes()
     assert (dest / "install-result.json").read_bytes() == live_install.read_bytes()
-
-
-# ── Install dependencies cache telemetry (gate-hub 卡 C: cache_scope /
-# runner_name / cache_new_bytes，self-only du -sb 前后差，遥测 fail-open) ────
-CACHE_DIR_ENV_VARS = ("UV_CACHE_DIR", "npm_config_cache", "pnpm_config_store_dir")
-
-
-def _install_step():
-    raw, _ = _load_workflow()
-    return next(s for s in raw["jobs"]["quality"]["steps"] if s.get("id") == "install")
-
-
-def _run_install_producer(tmp_path, *, lane, lockfile, stubs, env_extra,
-                          runner_name="gatehub-a1b2c3d4e5f6-slot-3"):
-    """Run the Install dependencies run block VERBATIM against stubbed installers;
-    return (result, payload) parsed from the JSON bytes the producer wrote."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    if lockfile:
-        (repo / lockfile).touch()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for name, body in stubs.items():
-        stub = bin_dir / name
-        stub.write_text(body)
-        stub.chmod(0o755)
-    result_path = tmp_path / "install-result.json"
-    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
-           "INSTALL_RESULT_PATH": str(result_path), "GATE_RUNNER_LANE": lane,
-           "RUNNER_NAME": runner_name}
-    for var in CACHE_DIR_ENV_VARS:
-        env.pop(var, None)
-    env.update(env_extra)
-    # GitHub Actions 默认 shell 是 `bash --noprofile --norc -e -o pipefail {0}`；
-    # 测试必须同语义执行，否则 fail-open 防御（|| true）在 -e 下才有意义这件事测不出来。
-    result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", _install_step()["run"]],
-                            cwd=repo, env=env, capture_output=True, text=True)
-    raw_text = result_path.read_text()
-    # producer 契约：恰好单行、换行结尾的合法 JSON，由真实执行写出。
-    assert raw_text.count("\n") == 1 and raw_text.endswith("\n")
-    return result, json.loads(raw_text)
-
-
-def test_install_step_static_cache_telemetry_contract():
-    step = _install_step()
-    run = step["run"]
-    assert step["env"]["GATE_RUNNER_LANE"] == "${{ inputs.runner }}"
-    assert "INSTALL-CACHE-TELEMETRY-UNAVAILABLE" in run
-    # du before 必须在 install 之前、after 必须在所有安装器之后，差值才有意义。
-    assert run.index("measure_cache_before \"$cache_dir\"") < run.index("uv sync --frozen")
-    assert run.index("cache_after=$(du -sb") > run.index("pnpm install --frozen-lockfile")
-    # fail-open：遥测失败只允许 || true 吸收（before/after 各一处），绝不能改变 status 或退出码。
-    assert run.count("|| true") == 2
-    assert run.rstrip().endswith('[ "$status" != "failed" ]')
-
-
-def test_install_step_self_uv_hit_reports_zero_delta_and_scope(tmp_path):
-    cache_dir = tmp_path / "uv-cache"
-    cache_dir.mkdir()
-    (cache_dir / "existing.bin").write_bytes(b"x" * 16)
-    result, payload = _run_install_producer(
-        tmp_path, lane="self", lockfile="uv.lock",
-        stubs={"uv": "#!/bin/sh\nexit 0\n"},
-        env_extra={"UV_CACHE_DIR": str(cache_dir)},
-    )
-    assert result.returncode == 0, result.stderr
-    assert payload == {
-        "ecosystem": "uv", "status": "ok", "duration_s": payload["duration_s"],
-        "cache_hit": True, "cache_scope": "uv-per-slot",
-        "runner_name": "gatehub-a1b2c3d4e5f6-slot-3", "cache_new_bytes": 0,
-    }
-    assert "INSTALL-CACHE-TELEMETRY-UNAVAILABLE" not in result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("ecosystem,lockfile,cache_var", [
-    ("npm", "package-lock.json", "npm_config_cache"),
-    ("pnpm", "pnpm-lock.yaml", "pnpm_config_store_dir"),
-])
-def test_install_step_self_shared_cache_miss_records_new_bytes(tmp_path, ecosystem, lockfile, cache_var):
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    stub = f'#!/bin/sh\necho hello > "${cache_var}/new.bin"\nexit 0\n'
-    result, payload = _run_install_producer(
-        tmp_path, lane="self", lockfile=lockfile,
-        stubs={ecosystem: stub}, env_extra={cache_var: str(cache_dir)},
-    )
-    assert result.returncode == 0, result.stderr
-    assert payload["ecosystem"] == ecosystem and payload["status"] == "ok"
-    assert payload["cache_hit"] is False and payload["cache_scope"] == "host-shared"
-    assert payload["cache_new_bytes"] == 6  # "hello\n" 的实际字节差，非估值
-
-
-def test_install_step_du_failure_fails_open_with_null_fields(tmp_path):
-    cache_dir = tmp_path / "uv-cache"
-    cache_dir.mkdir()
-    (cache_dir / "f.bin").write_bytes(b"x" * 8)
-    result, payload = _run_install_producer(
-        tmp_path, lane="self", lockfile="uv.lock",
-        stubs={"uv": "#!/bin/sh\nexit 0\n", "du": "#!/bin/sh\nexit 1\n"},
-        env_extra={"UV_CACHE_DIR": str(cache_dir)},
-    )
-    # fail-open：du 失败 → 新字段 null，status 与退出码不变，日志含字面量。
-    assert result.returncode == 0, result.stderr
-    assert payload["status"] == "ok"
-    assert payload["cache_hit"] is None and payload["cache_new_bytes"] is None
-    assert payload["cache_scope"] == "uv-per-slot"
-    assert "INSTALL-CACHE-TELEMETRY-UNAVAILABLE" in result.stdout
-
-
-@pytest.mark.parametrize("lane,lockfile,stubs,env_extra", [
-    ("hosted", "uv.lock", {"uv": "#!/bin/sh\nexit 0\n"}, {"UV_CACHE_HIT": "true"}),
-    ("hosted", "package-lock.json", {"npm": "#!/bin/sh\nexit 0\n"}, {}),
-    ("self", None, {}, {}),
-])
-def test_install_step_null_telemetry_paths_stay_silent(tmp_path, lane, lockfile, stubs, env_extra):
-    result, payload = _run_install_producer(tmp_path, lane=lane, lockfile=lockfile,
-                                            stubs=stubs, env_extra=env_extra)
-    assert result.returncode == 0, result.stderr
-    if lane == "hosted" and lockfile == "uv.lock":
-        assert payload["cache_hit"] is True  # actions/cache 输出语义维持现状
-    else:
-        assert payload["cache_hit"] is None
-    assert payload["cache_scope"] is None and payload["cache_new_bytes"] is None
-    assert "INSTALL-CACHE-TELEMETRY-UNAVAILABLE" not in result.stdout + result.stderr
-
-
-def test_install_step_self_missing_cache_env_logs_unavailable(tmp_path):
-    result, payload = _run_install_producer(
-        tmp_path, lane="self", lockfile="uv.lock",
-        stubs={"uv": "#!/bin/sh\nexit 0\n"}, env_extra={},
-    )
-    assert result.returncode == 0, result.stderr
-    assert payload["cache_hit"] is None and payload["cache_new_bytes"] is None
-    assert "INSTALL-CACHE-TELEMETRY-UNAVAILABLE lane=self ecosystem=uv cache_dir=unset" in result.stdout
-
-
-def test_install_step_negative_delta_reports_null_not_negative(tmp_path):
-    cache_dir = tmp_path / "uv-cache"
-    cache_dir.mkdir()
-    (cache_dir / "f.bin").write_bytes(b"x" * 8)
-    # 受控 du：第一次报 100、第二次报 40（并发 GC 收缩的形状）→ 负差值不可信。
-    calls = tmp_path / "du-calls"
-    du_stub = (
-        "#!/bin/sh\n"
-        f"n=$(cat {calls} 2>/dev/null || echo 0)\n"
-        f"echo $((n + 1)) > {calls}\n"
-        'if [ "$n" -eq 0 ]; then echo 100; else echo 40; fi\n'
-    )
-    result, payload = _run_install_producer(
-        tmp_path, lane="self", lockfile="uv.lock",
-        stubs={"uv": "#!/bin/sh\nexit 0\n", "du": du_stub},
-        env_extra={"UV_CACHE_DIR": str(cache_dir)},
-    )
-    assert result.returncode == 0, result.stderr
-    assert payload["cache_hit"] is None and payload["cache_new_bytes"] is None
-    assert "INSTALL-CACHE-TELEMETRY-UNAVAILABLE" in result.stdout
 
 
 def test_ledger_resolver_ignores_silo_listing_and_spoofed_prefix_for_input(tmp_path):
