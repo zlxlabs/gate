@@ -85,7 +85,13 @@ def _run_entry(tmp_path: Path, cwd: Path, env_extra=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     _install_helper(tmp_path)
     output = tmp_path / "github-output"
-    env = {"GITHUB_OUTPUT": str(output), "RUNNER_TEMP": str(tmp_path)}
+    artifact = tmp_path / "gate-quality"
+    artifact.mkdir(parents=True, exist_ok=True)
+    env = {
+        "GITHUB_OUTPUT": str(output),
+        "RUNNER_TEMP": str(tmp_path),
+        "GATE_ARTIFACT_DIR": str(artifact),
+    }
     if env_extra:
         env.update(env_extra)
     completed = _run_step_as_actions("run-quality", tmp_path, cwd=cwd, env_extra=env)

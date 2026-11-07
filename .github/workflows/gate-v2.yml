@@ -770,6 +770,8 @@ jobs:
         # before the job started. No `shell:` key is allowed on this step
         # (pinned by tests/test_gate_v2_caller_checks_signal.py).
         run: |
+          rm -rf "${GATE_ARTIFACT_DIR:?}/junit" "${GATE_ARTIFACT_DIR:?}/gate-quality-result.json"
+          mkdir -p "${GATE_ARTIFACT_DIR:?}/junit"
           . "${RUNNER_TEMP}/gate_record_termination.sh"
           gate_run_and_record ./scripts/gate-quality
 
@@ -1021,18 +1023,183 @@ jobs:
         id: run-tests
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
         run: |
+          rm -rf "${RUNNER_TEMP:?}/gate-tested-evidence-junit"
+          mkdir -p "${RUNNER_TEMP:?}/gate-tested-evidence-junit"
           . "${RUNNER_TEMP}/gate_record_termination.sh"
           run_tests() {
             if   [ -f Makefile ] && grep -qE '^test:' Makefile; then make test
             elif [ -f package.json ]; then npm test --if-present
             elif [ -f pyproject.toml ]; then
+              junitxml="${RUNNER_TEMP:?}/gate-tested-evidence-junit/pytest.xml"
               if   command -v uv >/dev/null;     then
-                if [ -f uv.lock ]; then uv run --frozen pytest -q; else uv run pytest -q; fi
-              elif command -v pytest >/dev/null; then pytest -q
+                if [ -f uv.lock ]; then uv run --frozen pytest -q --junitxml="$junitxml"; else uv run pytest -q --junitxml="$junitxml"; fi
+              elif command -v pytest >/dev/null; then pytest -q --junitxml="$junitxml"
               else echo "no python test runner on this runner — skipping (runs on self-hosted)"; fi
             else echo "no tests detected"; fi
           }
           gate_run_and_record run_tests
+
+      - name: Emit tested evidence
+        id: emit-tested-evidence
+        if: always()
+        continue-on-error: true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          QUALITY_MODE: ${{ steps.quality-entry.outputs.mode }}
+          RUN_QUALITY_OUTCOME: ${{ steps.run-quality.outcome }}
+          RUN_TESTS_OUTCOME: ${{ steps.run-tests.outcome }}
+          GATE_ARTIFACT_DIR: ${{ runner.temp }}/gate-quality
+          LEGACY_JUNIT_DIR: ${{ runner.temp }}/gate-tested-evidence-junit
+        run: |
+          python3 - <<'PY' || echo "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"
+          import json, os, re, sys, traceback, xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          SHA = re.compile(r"^[0-9a-f]{40}$")
+          WARN = "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"
+
+          def _summary(reason):
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if not path:
+                  raise RuntimeError("GITHUB_STEP_SUMMARY missing")
+              with open(path, "a", encoding="utf-8") as fh:
+                  fh.write("tested-evidence: not_emitted reason=%s\n" % reason)
+
+          def _status(case):
+              if case.find("failure") is not None:
+                  return "failure"
+              if case.find("error") is not None:
+                  return "error"
+              if case.find("skipped") is not None:
+                  return "skipped"
+              return "passed"
+
+          def _counts(cases):
+              tests = fail = err = skip = 0
+              for case in cases:
+                  tests += 1
+                  st = _status(case)
+                  if st == "failure":
+                      fail += 1
+                  elif st == "error":
+                      err += 1
+                  elif st == "skipped":
+                      skip += 1
+              return tests, fail, err, skip
+
+          def _parse_file(path):
+              root = ET.parse(path).getroot()
+              tag = root.tag.split("}")[-1]
+              if tag not in ("testsuite", "testsuites"):
+                  raise ValueError("root")
+              totals = _counts(list(root.iter("testcase")))
+              for suite in root.iter("testsuite"):
+                  sub = _counts(list(suite.iter("testcase")))
+                  mapping = {
+                      "tests": sub[0], "failures": sub[1],
+                      "errors": sub[2], "skipped": sub[3],
+                  }
+                  for attr, actual in mapping.items():
+                      raw = suite.get(attr)
+                      if raw is None:
+                          continue
+                      if int(raw) != actual:
+                          raise ValueError("contradiction")
+              return totals
+
+          def _parse_dir(raw_dir):
+              if not raw_dir:
+                  return "junit_missing"
+              directory = Path(raw_dir)
+              if not directory.is_dir():
+                  return "junit_missing"
+              files = sorted(p for p in directory.rglob("*.xml") if p.is_file())
+              if not files:
+                  return "junit_missing"
+              tests = fail = err = skip = 0
+              for file in files:
+                  try:
+                      part = _parse_file(file)
+                  except (ET.ParseError, ValueError, OSError, TypeError):
+                      return "junit_invalid"
+                  tests += part[0]
+                  fail += part[1]
+                  err += part[2]
+                  skip += part[3]
+              if tests < 1:
+                  return "junit_empty"
+              if fail or err:
+                  return "junit_failed"
+              if skip >= tests:
+                  return "junit_all_skipped"
+              return None
+
+          def _evaluate():
+              if os.environ.get("EVENT_NAME", "") != "pull_request":
+                  return "not_pull_request"
+              head = os.environ.get("HEAD_SHA", "")
+              merge = os.environ.get("GITHUB_SHA", "")
+              if not SHA.fullmatch(head) or not SHA.fullmatch(merge):
+                  return "invalid_sha"
+              mode = os.environ.get("QUALITY_MODE", "")
+              if mode == "entry":
+                  if os.environ.get("RUN_QUALITY_OUTCOME") != "success":
+                      return "step_not_success"
+                  artifact = os.environ.get("GATE_ARTIFACT_DIR", "")
+                  if not artifact:
+                      return "result_unqualified"
+                  path = Path(artifact) / "gate-quality-result.json"
+                  try:
+                      result = json.loads(path.read_text(encoding="utf-8"))
+                  except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                      return "result_unqualified"
+                  if not isinstance(result, dict):
+                      return "result_unqualified"
+                  if (
+                      result.get("schema") != "gate-quality-result/v1"
+                      or result.get("stage") != "tests"
+                      or result.get("outcome") != "passed"
+                      or result.get("evidence") != "junit"
+                  ):
+                      return "result_unqualified"
+                  reason = _parse_dir(str(Path(artifact) / "junit"))
+                  evidence_mode = "entry"
+              elif mode == "legacy":
+                  if os.environ.get("RUN_TESTS_OUTCOME") != "success":
+                      return "step_not_success"
+                  reason = _parse_dir(os.environ.get("LEGACY_JUNIT_DIR", ""))
+                  evidence_mode = "pytest"
+              else:
+                  return "step_not_success"
+              if reason:
+                  return reason
+              marker = "GATE-TESTED-" + "EVIDENCE-V1"
+              sys.stdout.write(
+                  marker
+                  + " head_sha="
+                  + head
+                  + " merge_sha="
+                  + merge
+                  + " mode="
+                  + evidence_mode
+                  + "\n"
+              )
+              return None
+
+          def main():
+              try:
+                  reason = _evaluate()
+                  if reason:
+                      _summary(reason)
+              except Exception:
+                  sys.stdout.write(WARN + "\n")
+                  traceback.print_exc()
+              return 0
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
 
       - name: Checkout gate actions for diff-coverage advisory
         if: always()
