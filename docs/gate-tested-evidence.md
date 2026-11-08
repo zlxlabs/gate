@@ -45,3 +45,19 @@ GATE-TESTED-EVIDENCE-V1 head_sha=<pull_request.head.sha> merge_sha=<GITHUB_SHA> 
 只认 **Emit tested evidence 步骤日志内唯一一条整行**匹配上述格式。多条或冲突判 unknown。不要用整份 job 日志做前缀扫描：测试输出里出现 `GATE-TESTED-EVIDENCE-V1` 字样不让 quality 失败，也不构成证据。
 
 legacy 的 `make test` / `npm test` 不注入 reporter，不打证据行，consumer 侧 unknown 是预期。
+
+## v2 抬升资格
+
+`scripts/v2_tag_promotion_evidence.py` 选 canary 验证过的 main 提交时，在 run conclusion=success、gate-v2 引用 sha 一致、primary job success 之后，还要求该 canary run **恰好一个** `quality` job（job 名等于 `quality` 或以 ` / quality` 结尾）conclusion=success，且其 job 日志的 Emit 步骤输出区间内**恰有一行**整行匹配
+
+```text
+GATE-TESTED-EVIDENCE-V1 head_sha=<40hex> merge_sha=<40hex> mode=pytest
+```
+
+`head_sha` 必须等于该 run 详情 API 的 `head_sha`（canary PR head，独立元数据，不从日志取）。`merge_sha` 只校验 40 位 hex 格式。只接受 `mode=pytest`（canary 走 gate 直跑 pytest）。
+
+日志定位与 consumer 匹配规则一致：按 `\n` 分行、去掉单个尾部 `\r`、剥离可选时间戳前缀、首行去 BOM；Emit 区间由唯一一行 `##[group]Run python3 - <<'PY' || echo "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"` 起，第一个 `##[endgroup]` 之后、下一个 `##[group]Run ` 之前。不对整份 job 日志做宽泛搜索。区间外（含测试输出）出现的同格式行不计。
+
+不满足则该 run 不合格，reason 写明：缺 quality job / 日志无 Emit 区间（区间头 0 或 2 次）/ 0 条 / 多条 / head 不符 / mode 不符 / 区间内出现 EMIT-FAILED。日志读取失败 fail-loud（`EvidenceQueryError`），不重试、不吞错。
+
+合并顺序：本判定依赖 ci-infra-canary 改走 gate 直跑 pytest 且其 PR 上已出现证据行；否则本仓 merge commit 自身没有合格 canary 运行，v2 不会抬升。

@@ -1,0 +1,7 @@
+2026-11-07T18:16:46.0556987Z ##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+2026-11-07T18:16:46.1695878Z ##[group]Run python3 - <<'PY' || echo "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"
+2026-11-07T18:16:46.1696557Z [36;1mpython3 - <<'PY' || echo "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"[0m
+2026-11-07T18:16:46.1697556Z [36;1mWARN = "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"[0m
+2026-11-07T18:16:46.1779831Z   LEGACY_JUNIT_DIR: /_work/_temp/gate-tested-evidence-junit
+2026-11-07T18:16:46.1780022Z ##[endgroup]
+2026-11-07T18:16:46.2003529Z ##[group]Run set -euo pipefail
