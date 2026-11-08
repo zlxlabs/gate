@@ -1,8 +1,0 @@
-﻿2026-11-08T06:15:23.4873024Z ##[group]Run rm -rf "${RUNNER_TEMP:?}/gate-tested-evidence-junit"
-2026-11-08T06:16:14.4649719Z ##[group]Run python3 - <<'PY' || echo "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"
-2026-11-08T06:16:14.4651022Z [36;1mpython3 - <<'PY' || echo "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"[0m
-2026-11-08T06:16:14.4653400Z [36;1mWARN = "::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"[0m
-2026-11-08T06:16:14.4756154Z   LEGACY_JUNIT_DIR: /_work/_temp/gate-tested-evidence-junit
-2026-11-08T06:16:14.4756363Z ##[endgroup]
-2026-11-08T06:16:14.5023956Z GATE-TESTED-EVIDENCE-V1 head_sha=7137bf4d4fa9b7f2bfcbfb6e75c05794668229b6 merge_sha=5fb2210dff377f9b4606f9b724c352e7decce622 mode=pytest
-2026-11-08T06:16:14.5092135Z ##[group]Run set -euo pipefail

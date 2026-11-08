@@ -15,21 +15,15 @@ from scripts import v2_tag_promotion_evidence as evidence
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
-POSITIVE_HEAD = "7137bf4d4fa9b7f2bfcbfb6e75c05794668229b6"
-QUALITY_JOB_ID = "10"
 FIXTURE_DIR = Path(__file__).parent / "fixtures/canary_referenced_workflows"
-# Boundary slices of real quality logs: job-128648744350 (pytest evidence)
-# and job-128486678343 (Emit ran, no evidence line).
-LOG_DIR = Path(__file__).parent / "fixtures/tested_evidence_logs"
 
 
 class FakeAPI:
-    def __init__(self, runs, details=None, jobs=None, logs=None):
+    def __init__(self, runs, details=None, jobs=None):
         self.calls = []
         self.runs = runs
         self.details = details or {}
         self.jobs = jobs or {}
-        self.logs = logs or {}
 
     def __call__(self, endpoint):
         self.calls.append(endpoint)
@@ -43,11 +37,6 @@ class FakeAPI:
         for run_id, jobs in self.jobs.items():
             if endpoint == f"repos/{evidence.CANARY_REPOSITORY}/actions/runs/{run_id}/jobs?per_page=100":
                 return {"jobs": jobs}
-        for job_id, text in self.logs.items():
-            if endpoint == (
-                f"repos/{evidence.CANARY_REPOSITORY}/actions/jobs/{job_id}/logs"
-            ):
-                return text
         raise AssertionError(f"unexpected API endpoint: {endpoint}")
 
 
@@ -64,41 +53,18 @@ def _gate_reference(sha):
     return {**real_reference, "sha": sha}
 
 
-def _detail(*, conclusion="success", gate_sha=SHA_A, refs=True, head_sha=POSITIVE_HEAD):
+def _detail(*, conclusion="success", gate_sha=SHA_A, refs=True):
     references = [] if refs else None
     if refs and gate_sha is not None:
         references = [_gate_reference(gate_sha)]
-    payload = {"conclusion": conclusion, "referenced_workflows": references}
-    if head_sha is not None:
-        payload["head_sha"] = head_sha
-    return payload
+    return {"conclusion": conclusion, "referenced_workflows": references}
 
 
-def _load_log(name):
-    return (LOG_DIR / name).read_bytes().decode("utf-8")
-
-
-def _positive_log():
-    return _load_log("quality-pytest-positive.log")
-
-
-def _no_evidence_log():
-    return _load_log("quality-no-evidence.log")
-
-
-def _quality_job(job_id=QUALITY_JOB_ID, conclusion="success", name="gate / quality"):
-    return {"id": int(job_id), "name": name, "conclusion": conclusion}
-
-
-def _success_jobs(quality_id=QUALITY_JOB_ID, quality_conclusion="success"):
+def _success_jobs():
     return [
         {"name": "gate / primary", "conclusion": "success"},
-        _quality_job(quality_id, quality_conclusion),
+        {"name": "gate / tested-evidence", "conclusion": "success"},
     ]
-
-
-def _success_logs(log=None, quality_id=QUALITY_JOB_ID):
-    return {str(quality_id): _positive_log() if log is None else log}
 
 
 def _select(api, candidates):
@@ -111,7 +77,6 @@ def test_latest_candidate_with_successful_gate_and_primary_is_selected():
         [_run(1)],
         {"1": _detail()},
         {"1": _success_jobs()},
-        _success_logs(),
     )
     result = _select(api, [SHA_A, SHA_B])
     assert result.selected_sha == SHA_A
@@ -136,12 +101,10 @@ def test_latest_candidate_with_successful_gate_and_primary_is_selected():
 def test_real_canary_payloads_select_the_referenced_gate_sha(
     run_id, fixture_name, candidate_sha
 ):
-    detail = {**_load_fixture(fixture_name), "head_sha": POSITIVE_HEAD}
     api = FakeAPI(
         [_run(run_id)],
-        {run_id: detail},
+        {run_id: _load_fixture(fixture_name)},
         {run_id: _success_jobs()},
-        _success_logs(),
     )
     result = _select(api, [candidate_sha])
     assert result.selected_sha == candidate_sha
@@ -153,7 +116,6 @@ def test_latest_without_evidence_falls_back_to_next_candidate():
         [_run(1)],
         {"1": _detail(gate_sha=SHA_B)},
         {"1": _success_jobs()},
-        _success_logs(),
     )
     result = _select(api, [SHA_A, SHA_B])
     assert result.selected_sha == SHA_B
@@ -193,7 +155,6 @@ def test_gate_references_must_all_match_candidate(gate_shas, expected_sha, reaso
         {
             "1": {
                 "conclusion": "success",
-                "head_sha": POSITIVE_HEAD,
                 "referenced_workflows": [
                     _gate_reference(sha)
                     for sha in gate_shas
@@ -201,7 +162,6 @@ def test_gate_references_must_all_match_candidate(gate_shas, expected_sha, reaso
             }
         },
         {"1": _success_jobs()},
-        _success_logs(),
     )
     result = _select(api, [SHA_A])
     assert result.selected_sha == expected_sha
@@ -334,7 +294,6 @@ def test_workflow_mismatch_is_ineligible_before_canary_evidence(monkeypatch):
         [_run(1)],
         {"1": _detail(gate_sha=SHA_B)},
         {"1": _success_jobs()},
-        _success_logs(),
     )
     result = evidence.select_latest_verified_commit([SHA_A, SHA_B], SHA_C, api)
     assert result.selected_sha == SHA_B
@@ -462,7 +421,7 @@ def test_v2_without_eligible_candidate_alerts_only_when_stale(
     age_hours, expected_exit, expects_error, monkeypatch, capsys
 ):
     api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
-    monkeypatch.setattr(evidence, "_api_call", api)
+    monkeypatch.setattr(evidence, "_api_json", api)
     monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
     stale_time = (
         datetime.now(timezone.utc)
@@ -494,7 +453,7 @@ def test_push_event_without_canary_terminal_state_awaits_instead_of_failing(
     monkeypatch, capsys
 ):
     api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
-    monkeypatch.setattr(evidence, "_api_call", api)
+    monkeypatch.setattr(evidence, "_api_json", api)
     monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
     assert evidence.main(
         [
@@ -520,7 +479,7 @@ def test_non_push_event_without_candidate_alerts_when_stale(
     event_name, monkeypatch, capsys
 ):
     api = FakeAPI([_run(1)], {"1": _detail(gate_sha=SHA_B)})
-    monkeypatch.setattr(evidence, "_api_call", api)
+    monkeypatch.setattr(evidence, "_api_json", api)
     monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
     assert evidence.main(
         [
@@ -554,9 +513,8 @@ def test_push_event_promotes_when_candidate_has_canary_success(monkeypatch, caps
         [_run(1)],
         {"1": _detail()},
         {"1": _success_jobs()},
-        _success_logs(),
     )
-    monkeypatch.setattr(evidence, "_api_call", api)
+    monkeypatch.setattr(evidence, "_api_json", api)
     monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
     assert evidence.main(
         [
@@ -580,7 +538,7 @@ def test_push_event_promotes_when_candidate_has_canary_success(monkeypatch, caps
 
 def test_push_event_with_failed_canary_still_alerts_when_stale(monkeypatch, capsys):
     api = FakeAPI([_run(1)], {"1": _detail(conclusion="failure", gate_sha=SHA_A)})
-    monkeypatch.setattr(evidence, "_api_call", api)
+    monkeypatch.setattr(evidence, "_api_json", api)
     monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
     assert evidence.main(
         [
@@ -601,190 +559,42 @@ def test_push_event_with_failed_canary_still_alerts_when_stale(monkeypatch, caps
     assert "::error::no eligible canary-verified main commit after " in output
 
 
-def _select_with_log(log, *, jobs=None, head_sha=POSITIVE_HEAD, quality_id=QUALITY_JOB_ID):
-    api = FakeAPI(
-        [_run(1)],
-        {"1": _detail(head_sha=head_sha)},
-        {"1": jobs if jobs is not None else _success_jobs(quality_id)},
-        {str(quality_id): log} if log is not None else {},
-    )
-    return _select(api, [SHA_A]), api
-
-
-def _log_body(line):
-    body = line[:-1] if line.endswith("\r") else line.lstrip("\ufeff")
-    match = evidence.LOG_TIMESTAMP_PREFIX.match(body)
-    return body[match.end() :] if match else body
-
-
-def _duplicate_emit_header(text):
-    extra = "2026-11-08T06:16:14.4649800Z " + evidence.EMIT_STEP_GROUP_HEADER
-    out = []
-    for line in text.split("\n"):
-        out.append(line)
-        if _log_body(line) == evidence.EMIT_STEP_GROUP_HEADER:
-            out.append(extra)
-    return "\n".join(out)
-
-
-def _duplicate_evidence_line(text):
-    out = []
-    for line in text.split("\n"):
-        out.append(line)
-        if evidence.TESTED_EVIDENCE_LINE.fullmatch(_log_body(line)):
-            out.append(line)
-    return "\n".join(out)
-
-
-def _insert_emit_failed(text):
-    failed = "2026-11-08T06:16:14.5024000Z ::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED\n"
-    return text.replace("GATE-TESTED-EVIDENCE-V1 head_sha=", failed + "2026-11-08T06:16:14.5023956Z GATE-TESTED-EVIDENCE-V1 head_sha=", 1)
-
-
-def _append_outside_evidence(text, head=SHA_B):
-    fake = f"2026-11-08T06:16:14.9999999Z GATE-TESTED-EVIDENCE-V1 head_sha={head} merge_sha={SHA_C} mode=pytest"
-    return text.rstrip("\n") + "\n" + fake + "\n"
-
-
-def test_positive_pytest_log_is_eligible_and_fetches_quality_logs():
-    jobs = [
-        {"name": "gate / primary", "conclusion": "success"},
-        _quality_job(name="quality"),
-    ]
-    result, api = _select_with_log(
-        _append_outside_evidence(_positive_log().replace("\n", "\r\n")),
-        jobs=jobs,
-    )
-    assert result.selected_sha == SHA_A
-    assert result.checked[0].eligible is True
-    assert any(
-        endpoint.endswith(f"/actions/jobs/{QUALITY_JOB_ID}/logs")
-        for endpoint in api.calls
-    )
-
 
 @pytest.mark.parametrize(
-    ("log", "jobs", "head_sha", "fragment"),
+    ("jobs", "fragment"),
     [
-        (_no_evidence_log(), None, POSITIVE_HEAD, "tested-evidence line count=0"),
         (
-            _duplicate_evidence_line(_positive_log()),
-            None,
-            POSITIVE_HEAD,
-            "tested-evidence line count=2",
-        ),
-        (
-            _positive_log(),
-            None,
-            SHA_C,
-            "tested-evidence head_sha=",
-        ),
-        (
-            _positive_log().replace("mode=pytest", "mode=entry", 1),
-            None,
-            POSITIVE_HEAD,
-            "tested-evidence mode='entry'",
-        ),
-        (
-            _insert_emit_failed(_positive_log()),
-            None,
-            POSITIVE_HEAD,
-            "tested-evidence EMIT-FAILED",
-        ),
-        (
-            _positive_log().replace(evidence.EMIT_STEP_GROUP_HEADER, "##[group]Run python3 - <<'NOT-EMIT'", 1),
-            None,
-            POSITIVE_HEAD,
-            "tested-evidence emit region count=0",
-        ),
-        (
-            _duplicate_emit_header(_positive_log()),
-            None,
-            POSITIVE_HEAD,
-            "tested-evidence emit region count=2",
-        ),
-        (
-            _append_outside_evidence(_no_evidence_log()),
-            None,
-            POSITIVE_HEAD,
-            "tested-evidence line count=0",
-        ),
-        (
-            _positive_log(),
             [{"name": "gate / primary", "conclusion": "success"}],
-            POSITIVE_HEAD,
-            "quality job is absent",
+            "tested-evidence job is absent",
         ),
         (
-            _positive_log(),
             [
                 {"name": "gate / primary", "conclusion": "success"},
-                _quality_job("10"),
-                _quality_job("11", name="other / quality"),
+                {"name": "gate / tested-evidence", "conclusion": "success"},
+                {"name": "other / tested-evidence", "conclusion": "success"},
             ],
-            POSITIVE_HEAD,
-            "quality job count=2",
+            "tested-evidence job count=2",
         ),
         (
-            None,
             [
                 {"name": "gate / primary", "conclusion": "success"},
-                _quality_job(conclusion="failure"),
+                {"name": "gate / tested-evidence", "conclusion": "failure"},
             ],
-            POSITIVE_HEAD,
-            "quality job conclusion='failure'",
+            "tested-evidence job conclusion='failure'",
+        ),
+        (
+            [
+                {"name": "gate / primary", "conclusion": "success"},
+                {"name": "tested-evidence", "conclusion": "skipped"},
+            ],
+            "tested-evidence job conclusion='skipped'",
         ),
     ],
 )
-def test_tested_evidence_ineligible_reasons(log, jobs, head_sha, fragment):
-    result, _api = _select_with_log(log, jobs=jobs, head_sha=head_sha)
+def test_tested_evidence_job_ineligible_reasons(jobs, fragment):
+    api = FakeAPI([_run(1)], {"1": _detail()}, {"1": jobs})
+    result = _select(api, [SHA_A])
     assert result.selected_sha is None
     assert result.checked[0].eligible is False
     assert fragment in result.checked[0].reason
-
-
-def test_quality_log_read_error_is_query_error():
-    class Api(FakeAPI):
-        def __call__(self, endpoint):
-            if endpoint.endswith("/logs"):
-                raise evidence.EvidenceQueryError(f"HTTP 404 for {endpoint}")
-            return super().__call__(endpoint)
-
-    api = Api(
-        [_run(1)],
-        {"1": _detail()},
-        {"1": _success_jobs()},
-        {},
-    )
-    with pytest.raises(evidence.EvidenceQueryError, match="HTTP 404"):
-        _select(api, [SHA_A])
-
-
-def test_quality_log_non_text_payload_is_query_error():
-    api = FakeAPI(
-        [_run(1)],
-        {"1": _detail()},
-        {"1": _success_jobs()},
-        {QUALITY_JOB_ID: {"not": "text"}},
-    )
-    with pytest.raises(evidence.EvidenceQueryError, match="expected text"):
-        _select(api, [SHA_A])
-
-
-def test_api_text_http_error_is_query_error(monkeypatch):
-    error = urllib.error.HTTPError(
-        "https://api.github.com", 404, "not found", {}, None
-    )
-
-    class BoomOpener:
-        def open(self, *args, **kwargs):
-            raise error
-
-    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-    monkeypatch.setattr(
-        evidence.urllib.request, "build_opener", lambda *args, **kwargs: BoomOpener()
-    )
-    with pytest.raises(evidence.EvidenceQueryError, match="HTTP 404"):
-        evidence._api_text(
-            f"repos/{evidence.CANARY_REPOSITORY}/actions/jobs/1/logs"
-        )
+    assert "tested-evidence" in result.checked[0].reason

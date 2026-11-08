@@ -24,16 +24,7 @@ GATE_WORKFLOW_REFERENCE = "zlxlabs/gate/.github/workflows/gate-v2.yml"
 # `primary` and it has no separate `name:`.  Actions may prefix it with the
 # caller job name, so _is_primary_job also accepts the documented suffix form.
 PRIMARY_JOB_ID = "primary"
-QUALITY_JOB_ID = "quality"
-EMIT_STEP_GROUP_HEADER = (
-    "##[group]Run python3 - <<'PY' || echo "
-    '"::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED"'
-)
-LOG_TIMESTAMP_PREFIX = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z ")
-TESTED_EVIDENCE_LINE = re.compile(
-    r"GATE-TESTED-EVIDENCE-V1 head_sha=([0-9a-f]{40}) "
-    r"merge_sha=([0-9a-f]{40}) mode=(entry|pytest)"
-)
+TESTED_EVIDENCE_JOB_ID = "tested-evidence"
 RUNS_PAGE_SIZE = 100
 JOBS_PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 60
@@ -102,58 +93,6 @@ def _api_json(endpoint: str) -> object:
         raise EvidenceQueryError(f"invalid JSON for {endpoint}") from exc
 
 
-class _StripAuthorizationRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Do not forward the GitHub token to the signed job-log URL."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new_req is None:
-            return None
-        filtered = {
-            key: value
-            for key, value in new_req.header_items()
-            if key.lower() != "authorization"
-        }
-        stripped = urllib.request.Request(new_req.full_url, headers=filtered)
-        stripped.method = new_req.get_method()
-        return stripped
-
-
-def _api_text(endpoint: str) -> str:
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        raise EvidenceQueryError("GITHUB_TOKEN is missing")
-    request = urllib.request.Request(
-        f"{API_BASE}/{endpoint}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    opener = urllib.request.build_opener(_StripAuthorizationRedirectHandler)
-    try:
-        with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            status = getattr(response, "status", 200)
-            if status < 200 or status >= 300:
-                raise EvidenceQueryError(f"HTTP {status} for {endpoint}")
-            body = response.read()
-    except urllib.error.HTTPError as exc:
-        raise EvidenceQueryError(f"HTTP {exc.code} for {endpoint}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise EvidenceQueryError(f"network error for {endpoint}: {exc}") from exc
-    try:
-        return body.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise EvidenceQueryError(f"invalid log text for {endpoint}") from exc
-
-
-def _api_call(endpoint: str) -> object:
-    if "/actions/jobs/" in endpoint and endpoint.endswith("/logs"):
-        return _api_text(endpoint)
-    return _api_json(endpoint)
-
-
 def _mapping(value: object, endpoint: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise EvidenceQueryError(f"invalid JSON shape for {endpoint}: expected object")
@@ -217,9 +156,9 @@ def _is_primary_job(name: object) -> bool:
     )
 
 
-def _is_quality_job(name: object) -> bool:
-    return name == QUALITY_JOB_ID or (
-        isinstance(name, str) and name.endswith(f" / {QUALITY_JOB_ID}")
+def _is_tested_evidence_job(name: object) -> bool:
+    return name == TESTED_EVIDENCE_JOB_ID or (
+        isinstance(name, str) and name.endswith(f" / {TESTED_EVIDENCE_JOB_ID}")
     )
 
 
@@ -233,73 +172,6 @@ def _jobs_for_run(run_id: str, api_reader: ApiReader) -> list[object]:
     if not isinstance(jobs, list):
         raise EvidenceQueryError(f"invalid JSON shape for {endpoint}: jobs")
     return jobs
-
-
-def _job_id(job: dict[str, object], endpoint: str) -> str:
-    value = job.get("id")
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise EvidenceQueryError(f"invalid job id in {endpoint}")
-    text = str(value)
-    if not text.isdigit() or int(text) <= 0:
-        raise EvidenceQueryError(f"invalid job id in {endpoint}")
-    return text
-
-
-def _log_lines(text: str) -> list[str]:
-    lines: list[str] = []
-    for raw in text.split("\n"):
-        if raw.endswith("\r"):
-            raw = raw[:-1]
-        match = LOG_TIMESTAMP_PREFIX.match(raw)
-        lines.append(raw[match.end() :] if match else raw)
-    if lines:
-        lines[0] = lines[0].lstrip("\ufeff")
-    return lines
-
-
-def _tested_evidence_reason(log_text: str, expected_head: str) -> str | None:
-    """Return why the quality log is ineligible, or None when it matches."""
-    lines = _log_lines(log_text)
-    starts = [
-        index for index, line in enumerate(lines) if line == EMIT_STEP_GROUP_HEADER
-    ]
-    if len(starts) != 1:
-        return f"tested-evidence emit region count={len(starts)}"
-    start = starts[0]
-    end = next(
-        (
-            index
-            for index in range(start + 1, len(lines))
-            if lines[index].startswith("##[group]Run ")
-        ),
-        len(lines),
-    )
-    region = lines[start:end]
-    try:
-        body_from = next(
-            index for index, line in enumerate(region) if line == "##[endgroup]"
-        ) + 1
-    except StopIteration:
-        return "tested-evidence emit region has no endgroup"
-    output = region[body_from:]
-    if any("GATE-TESTED-EVIDENCE-EMIT-FAILED" in line for line in output):
-        return "tested-evidence EMIT-FAILED in emit region"
-    hits = [
-        match
-        for match in (TESTED_EVIDENCE_LINE.fullmatch(line) for line in output)
-        if match
-    ]
-    if len(hits) != 1:
-        return f"tested-evidence line count={len(hits)}"
-    head_sha = hits[0].group(1)
-    mode = hits[0].group(3)
-    if head_sha != expected_head:
-        return (
-            f"tested-evidence head_sha={head_sha} != run head_sha={expected_head}"
-        )
-    if mode != "pytest":
-        return f"tested-evidence mode={mode!r}, required pytest"
-    return None
 
 
 def _candidate_result(
@@ -358,50 +230,28 @@ def _candidate_result(
             continue
         primary_conclusions = [job.get("conclusion") for job in primary_jobs]
         if all(conclusion == "success" for conclusion in primary_conclusions):
-            quality_jobs = [
+            tested_jobs = [
                 job
                 for job in jobs
-                if isinstance(job, dict) and _is_quality_job(job.get("name"))
+                if isinstance(job, dict) and _is_tested_evidence_job(job.get("name"))
             ]
-            if len(quality_jobs) != 1:
-                if not quality_jobs:
-                    reasons.append(f"run {run_id}: quality job is absent")
+            if len(tested_jobs) != 1:
+                if not tested_jobs:
+                    reasons.append(f"run {run_id}: tested-evidence job is absent")
                 else:
                     reasons.append(
-                        f"run {run_id}: quality job count={len(quality_jobs)}, "
-                        "required exactly one"
+                        f"run {run_id}: tested-evidence job count={len(tested_jobs)}"
                     )
                 continue
-            quality_job = quality_jobs[0]
-            if quality_job.get("conclusion") != "success":
+            tested_conclusion = tested_jobs[0].get("conclusion")
+            if tested_conclusion != "success":
                 reasons.append(
-                    f"run {run_id}: quality job conclusion="
-                    f"{quality_job.get('conclusion')!r}, required success"
+                    f"run {run_id}: tested-evidence job conclusion="
+                    f"{tested_conclusion!r}, required success"
                 )
-                continue
-            jobs_endpoint = (
-                f"repos/{CANARY_REPOSITORY}/actions/runs/{run_id}/jobs"
-                f"?per_page={JOBS_PAGE_SIZE}"
-            )
-            quality_job_id = _job_id(quality_job, jobs_endpoint)
-            run_head = _validate_sha(detail.get("head_sha"), "run head_sha")
-            log_endpoint = (
-                f"repos/{CANARY_REPOSITORY}/actions/jobs/{quality_job_id}/logs"
-            )
-            log_payload = api_reader(log_endpoint)
-            if not isinstance(log_payload, str):
-                raise EvidenceQueryError(
-                    f"invalid log payload for {log_endpoint}: expected text"
-                )
-            evidence_reason = _tested_evidence_reason(log_payload, run_head)
-            if evidence_reason:
-                reasons.append(f"run {run_id}: {evidence_reason}")
                 continue
             return CandidateResult(
-                candidate_sha,
-                True,
-                f"run {run_id}: gate-v2 and primary succeeded",
-                run_id,
+                candidate_sha, True, f"run {run_id}: gate-v2 and primary succeeded", run_id
             )
         if len(primary_conclusions) == 1 and primary_conclusions[0] == "skipped":
             reasons.append(f"run {run_id}: primary job conclusion=skipped, execution required")
@@ -473,7 +323,7 @@ def select_latest_verified_commit(
             ),
         )
 
-    api_reader = api_reader or _api_call
+    api_reader = api_reader or _api_json
     response_cache: dict[str, object] = {}
 
     def read_once(endpoint: str) -> object:
@@ -506,7 +356,7 @@ def _candidate_has_terminal_canary(
 ) -> bool:
     """True when a canary run that references this SHA has a non-null conclusion."""
 
-    api_reader = api_reader or _api_call
+    api_reader = api_reader or _api_json
     runs = _load_runs(api_reader)
     list_endpoint = (
         f"repos/{CANARY_REPOSITORY}/actions/workflows/"
