@@ -45,3 +45,11 @@ GATE-TESTED-EVIDENCE-V1 head_sha=<pull_request.head.sha> merge_sha=<GITHUB_SHA> 
 只认 **Emit tested evidence 步骤日志内唯一一条整行**匹配上述格式。多条或冲突判 unknown。不要用整份 job 日志做前缀扫描：测试输出里出现 `GATE-TESTED-EVIDENCE-V1` 字样不让 quality 失败，也不构成证据。
 
 legacy 的 `make test` / `npm test` 不注入 reporter，不打证据行，consumer 侧 unknown 是预期。
+
+## v2 抬升资格
+
+跨仓读 canary job 日志需要 canary 的 `actions:read`，v2-tag-sync 的 `github.token` 做不到。因此 **Emit 区间与证据行的严格判定在 canary 仓内完成**：`ci-infra-canary` 的 `gate.yml` 另有 job `tested-evidence`，用 canary 自己的 token 读同 run 的 `gate / quality` 日志；判定失败则该 job 红、整个 run 红。
+
+`scripts/v2_tag_promotion_evidence.py` 选 canary 验证过的 main 提交时，在 run conclusion=success、gate-v2 引用 sha 一致、primary job success 之后，只再查同一 jobs 列表：**恰好一个** job 名等于 `tested-evidence` 或以 ` / tested-evidence` 结尾，且 conclusion=success。gate 侧不再读日志。不满足则该 run 不合格，reason 区分 `tested-evidence job is absent` / `tested-evidence job count=<n>` / `tested-evidence job conclusion=<x>, required success`。
+
+合并顺序：依赖 canary 仓落地 `tested-evidence` job，且其 PR 上该 job 已绿过；否则本仓 merge commit 自身没有合格 canary 运行，v2 不会抬升。

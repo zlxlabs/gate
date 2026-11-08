@@ -24,6 +24,7 @@ GATE_WORKFLOW_REFERENCE = "zlxlabs/gate/.github/workflows/gate-v2.yml"
 # `primary` and it has no separate `name:`.  Actions may prefix it with the
 # caller job name, so _is_primary_job also accepts the documented suffix form.
 PRIMARY_JOB_ID = "primary"
+TESTED_EVIDENCE_JOB_ID = "tested-evidence"
 RUNS_PAGE_SIZE = 100
 JOBS_PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 60
@@ -155,6 +156,12 @@ def _is_primary_job(name: object) -> bool:
     )
 
 
+def _is_tested_evidence_job(name: object) -> bool:
+    return name == TESTED_EVIDENCE_JOB_ID or (
+        isinstance(name, str) and name.endswith(f" / {TESTED_EVIDENCE_JOB_ID}")
+    )
+
+
 def _jobs_for_run(run_id: str, api_reader: ApiReader) -> list[object]:
     endpoint = (
         f"repos/{CANARY_REPOSITORY}/actions/runs/{run_id}/jobs"
@@ -223,6 +230,26 @@ def _candidate_result(
             continue
         primary_conclusions = [job.get("conclusion") for job in primary_jobs]
         if all(conclusion == "success" for conclusion in primary_conclusions):
+            tested_jobs = [
+                job
+                for job in jobs
+                if isinstance(job, dict) and _is_tested_evidence_job(job.get("name"))
+            ]
+            if len(tested_jobs) != 1:
+                if not tested_jobs:
+                    reasons.append(f"run {run_id}: tested-evidence job is absent")
+                else:
+                    reasons.append(
+                        f"run {run_id}: tested-evidence job count={len(tested_jobs)}"
+                    )
+                continue
+            tested_conclusion = tested_jobs[0].get("conclusion")
+            if tested_conclusion != "success":
+                reasons.append(
+                    f"run {run_id}: tested-evidence job conclusion="
+                    f"{tested_conclusion!r}, required success"
+                )
+                continue
             return CandidateResult(
                 candidate_sha, True, f"run {run_id}: gate-v2 and primary succeeded", run_id
             )

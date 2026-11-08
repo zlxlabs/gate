@@ -60,6 +60,13 @@ def _detail(*, conclusion="success", gate_sha=SHA_A, refs=True):
     return {"conclusion": conclusion, "referenced_workflows": references}
 
 
+def _success_jobs():
+    return [
+        {"name": "gate / primary", "conclusion": "success"},
+        {"name": "gate / tested-evidence", "conclusion": "success"},
+    ]
+
+
 def _select(api, candidates):
     with patch.object(evidence, "workflows_match_main_tip", return_value=True):
         return evidence.select_latest_verified_commit(candidates, SHA_C, api)
@@ -69,7 +76,7 @@ def test_latest_candidate_with_successful_gate_and_primary_is_selected():
     api = FakeAPI(
         [_run(1)],
         {"1": _detail()},
-        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+        {"1": _success_jobs()},
     )
     result = _select(api, [SHA_A, SHA_B])
     assert result.selected_sha == SHA_A
@@ -97,7 +104,7 @@ def test_real_canary_payloads_select_the_referenced_gate_sha(
     api = FakeAPI(
         [_run(run_id)],
         {run_id: _load_fixture(fixture_name)},
-        {run_id: [{"name": "gate / primary", "conclusion": "success"}]},
+        {run_id: _success_jobs()},
     )
     result = _select(api, [candidate_sha])
     assert result.selected_sha == candidate_sha
@@ -108,7 +115,7 @@ def test_latest_without_evidence_falls_back_to_next_candidate():
     api = FakeAPI(
         [_run(1)],
         {"1": _detail(gate_sha=SHA_B)},
-        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+        {"1": _success_jobs()},
     )
     result = _select(api, [SHA_A, SHA_B])
     assert result.selected_sha == SHA_B
@@ -154,7 +161,7 @@ def test_gate_references_must_all_match_candidate(gate_shas, expected_sha, reaso
                 ],
             }
         },
-        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+        {"1": _success_jobs()},
     )
     result = _select(api, [SHA_A])
     assert result.selected_sha == expected_sha
@@ -286,7 +293,7 @@ def test_workflow_mismatch_is_ineligible_before_canary_evidence(monkeypatch):
     api = FakeAPI(
         [_run(1)],
         {"1": _detail(gate_sha=SHA_B)},
-        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+        {"1": _success_jobs()},
     )
     result = evidence.select_latest_verified_commit([SHA_A, SHA_B], SHA_C, api)
     assert result.selected_sha == SHA_B
@@ -505,7 +512,7 @@ def test_push_event_promotes_when_candidate_has_canary_success(monkeypatch, caps
     api = FakeAPI(
         [_run(1)],
         {"1": _detail()},
-        {"1": [{"name": "gate / primary", "conclusion": "success"}]},
+        {"1": _success_jobs()},
     )
     monkeypatch.setattr(evidence, "_api_json", api)
     monkeypatch.setattr(evidence, "workflows_match_main_tip", lambda *_: True)
@@ -550,3 +557,44 @@ def test_push_event_with_failed_canary_still_alerts_when_stale(monkeypatch, caps
     output = capsys.readouterr().err
     assert "V2-TAG-SYNC-AWAITING-CANARY" not in output
     assert "::error::no eligible canary-verified main commit after " in output
+
+
+
+@pytest.mark.parametrize(
+    ("jobs", "fragment"),
+    [
+        (
+            [{"name": "gate / primary", "conclusion": "success"}],
+            "tested-evidence job is absent",
+        ),
+        (
+            [
+                {"name": "gate / primary", "conclusion": "success"},
+                {"name": "gate / tested-evidence", "conclusion": "success"},
+                {"name": "other / tested-evidence", "conclusion": "success"},
+            ],
+            "tested-evidence job count=2",
+        ),
+        (
+            [
+                {"name": "gate / primary", "conclusion": "success"},
+                {"name": "gate / tested-evidence", "conclusion": "failure"},
+            ],
+            "tested-evidence job conclusion='failure'",
+        ),
+        (
+            [
+                {"name": "gate / primary", "conclusion": "success"},
+                {"name": "tested-evidence", "conclusion": "skipped"},
+            ],
+            "tested-evidence job conclusion='skipped'",
+        ),
+    ],
+)
+def test_tested_evidence_job_ineligible_reasons(jobs, fragment):
+    api = FakeAPI([_run(1)], {"1": _detail()}, {"1": jobs})
+    result = _select(api, [SHA_A])
+    assert result.selected_sha is None
+    assert result.checked[0].eligible is False
+    assert fragment in result.checked[0].reason
+    assert "tested-evidence" in result.checked[0].reason
