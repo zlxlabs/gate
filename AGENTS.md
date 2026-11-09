@@ -2,6 +2,10 @@
 
 risk-tier: personal
 
+verify-remote: ci.yml
+
+verify-remote-main: ci.yml
+
 本仓是个人自用的多 Agent 开发门禁（CI gate）。write 权限只有 owner 本人与其派出的 agent，
 没有其他人类协作者，也不对外提供服务。
 
