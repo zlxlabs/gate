@@ -3575,7 +3575,7 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
     assert_workflow_sha_checkout(
         checkout,
         path="_gate-action-src",
-        sparse=[".github/actions", "scripts/gate_source.py", "scripts/scrub_outbound.py"],
+        sparse=[".github/actions", "scripts/gate_source.py", "scripts/scrub_outbound.py", "scripts/install_result_telemetry.py"],
     )
     names = [step.get("name") for step in steps]
     assert names.index(checkout["name"]) < names.index("PR size preflight")
@@ -3608,7 +3608,7 @@ def test_quality_removes_gate_sources_before_any_caller_check():
     # cleanup and the quality entry, adjacent to its only consumer.
     assert cleanup_index == preflight_index + 1
     assert names[cleanup_index + 1] == "Checkout review-ledger consumer source at this workflow's own commit"
-    assert names[cleanup_index + 2] == "Run scripts/gate-quality"
+    assert names[cleanup_index + 2:cleanup_index + 4] == ["Start entry install-result telemetry", "Run scripts/gate-quality"]
     assert stale_cleanup["if"] == "always()"
     assert cleanup["if"] == "always()"
     assert 'rm -rf "$GITHUB_WORKSPACE/_gate-action-src"' in cleanup["run"]
@@ -3665,7 +3665,7 @@ def test_v2_aggregator_jobs_do_not_execute_caller_quality_code():
         )
 
 
-SHARED_ACTION_MODULES = ("scripts/gate_source.py", "scripts/scrub_outbound.py")
+SHARED_ACTION_MODULES = ("scripts/gate_source.py", "scripts/scrub_outbound.py", "scripts/install_result_telemetry.py")
 
 
 def test_quality_action_sparse_checkout_excludes_tests_tree():
@@ -4440,8 +4440,8 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     publish = next(s for s in quality["steps"] if s.get("name") == "Publish v2 review ledger inputs")
     download = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Download v2 review ledger inputs")
     install_step = next(s for s in quality["steps"] if s.get("id") == "install")
+    assert 'telemetry finish "$status"' in install_step["run"]
     printf = "printf '{\"ecosystem\":\"%s\",\"status\":\"%s\",\"duration_s\":%s,\"cache_hit\":%s,\"cache_scope\":%s,\"runner_name\":\"%s\",\"cache_new_bytes\":%s}\\n'"
-    assert printf in install_step["run"]
 
     repo, base, head = _repo(tmp_path, 1)
     (repo / "资料").mkdir()
