@@ -979,18 +979,13 @@ jobs:
           }
           telemetry start
           status="skipped"
-          ecosystem="none"
           if [ -f uv.lock ]; then
-            ecosystem="uv"
             if uv sync --frozen; then status="ok"; else status="failed"; fi
           elif [ -f package-lock.json ]; then
-            ecosystem="npm"
             if npm ci; then status="ok"; else status="failed"; fi
           elif [ -f pnpm-lock.yaml ]; then
-            ecosystem="pnpm"
             if pnpm install --frozen-lockfile; then status="ok"; else status="failed"; fi
           elif [ -f go.sum ]; then
-            ecosystem="go-skipped"
             echo "go.sum detected but the only registered Go repo runs tests inside an isolated docker container (host module cache unreachable) — skipping host-side predownload, see legacy gate.yml"
           else
             echo "no supported lockfile at repo root — skipping predownload"
