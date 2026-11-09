@@ -4440,8 +4440,8 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     publish = next(s for s in quality["steps"] if s.get("name") == "Publish v2 review ledger inputs")
     download = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Download v2 review ledger inputs")
     install_step = next(s for s in quality["steps"] if s.get("id") == "install")
+    assert 'telemetry finish "$status"' in install_step["run"]
     printf = "printf '{\"ecosystem\":\"%s\",\"status\":\"%s\",\"duration_s\":%s,\"cache_hit\":%s,\"cache_scope\":%s,\"runner_name\":\"%s\",\"cache_new_bytes\":%s}\\n'"
-    assert printf in install_step["run"]
 
     repo, base, head = _repo(tmp_path, 1)
     (repo / "资料").mkdir()

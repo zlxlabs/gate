@@ -31,6 +31,8 @@ def _run_install_producer(tmp_path, *, lane, lockfile, stubs, env_extra,
                           runner_name=RUNNER, pre_run=None):
     repo = tmp_path / "repo"
     repo.mkdir()
+    shutil.copy2(REPO_ROOT / "scripts" / "install_result_telemetry.py",
+                 tmp_path / "install_result_telemetry.py")
     if lockfile: (repo / lockfile).touch()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -41,6 +43,8 @@ def _run_install_producer(tmp_path, *, lane, lockfile, stubs, env_extra,
     result_path = tmp_path / "install-result.json"
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "INSTALL_RESULT_PATH": str(result_path), "GATE_RUNNER_LANE": lane,
+           "RUNNER_TEMP": str(tmp_path),
+           "GATE_INSTALL_TELEMETRY_STATE": str(tmp_path / "telemetry-start.json"),
            "RUNNER_NAME": runner_name}
     for var in CACHE_DIR_ENV_VARS:
         env.pop(var, None)
@@ -58,12 +62,12 @@ def test_install_step_static_cache_telemetry_contract():
     step = _install_step()
     run = step["run"]
     assert step["env"]["GATE_RUNNER_LANE"] == "${{ inputs.runner }}"
-    assert UNAVAILABLE in run
-    assert run.index("measure_cache_before \"$cache_dir\"") < run.index("uv sync --frozen")
-    assert run.index("cache_after=$(du -sb") > run.index("pnpm install --frozen-lockfile")
-    assert run.count("|| true") == 2
+    assert "install_result_telemetry.py" in run
+    assert run.index("telemetry start") < run.index("uv sync --frozen")
+    assert run.index("telemetry finish") > run.index("pnpm install --frozen-lockfile")
     assert run.rstrip().endswith('[ "$status" != "failed" ]')
-    assert 'elif [ "$cache_scope" = "uv-per-slot" ]; then' in run
+    helper = (REPO_ROOT / "scripts" / "install_result_telemetry.py").read_text()
+    assert '"uv-per-slot"' in helper and '"host-shared"' in helper
 
 
 def test_install_step_self_uv_hit_reports_zero_delta_and_scope(tmp_path):
@@ -120,6 +124,7 @@ def test_install_step_du_failure_fails_open_with_null_fields(tmp_path):
     assert payload["cache_hit"] is None and payload["cache_new_bytes"] is None
     assert payload["cache_scope"] == "uv-per-slot"
     assert UNAVAILABLE in result.stdout
+    assert "::warning::GATE-INSTALL-RESULT-DEGRADED" in result.stdout
 
 
 @pytest.mark.parametrize("lane,lockfile,stubs,env_extra", [

@@ -699,11 +699,13 @@ jobs:
             .github/actions
             scripts/gate_source.py
             scripts/scrub_outbound.py
+            scripts/install_result_telemetry.py
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
+          cp "$GITHUB_WORKSPACE/_gate-action-src/scripts/install_result_telemetry.py" "$RUNNER_TEMP/install_result_telemetry.py" || echo "::warning::GATE-INSTALL-RESULT-DEGRADED reason=helper-copy-failed"
 
       - name: PR size preflight
         id: pr-size-preflight
@@ -756,6 +758,17 @@ jobs:
           bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
 
+      - name: Start entry install-result telemetry
+        id: entry-install-result-start
+        if: ${{ steps.quality-entry.outputs.mode == 'entry' }}
+        continue-on-error: true
+        env:
+          GATE_INSTALL_TELEMETRY_STATE: ${{ runner.temp }}/install-result-telemetry-start.json
+          INSTALL_RESULT_PATH: ${{ runner.temp }}/install-result.json
+          GATE_RUNNER_LANE: ${{ inputs.runner }}
+        run: |
+          python3 "${RUNNER_TEMP}/install_result_telemetry.py" start || echo "::warning::GATE-INSTALL-RESULT-DEGRADED reason=start-helper-failed"
+
       - name: Run scripts/gate-quality
         id: run-quality
         if: ${{ steps.quality-entry.outputs.mode == 'entry' }}
@@ -774,6 +787,23 @@ jobs:
           mkdir -p "${GATE_ARTIFACT_DIR:?}/junit"
           . "${RUNNER_TEMP}/gate_record_termination.sh"
           gate_run_and_record ./scripts/gate-quality
+
+      - name: Finish entry install-result telemetry
+        id: entry-install-result-finish
+        if: ${{ always() && steps.quality-entry.outputs.mode == 'entry' }}
+        continue-on-error: true
+        env:
+          GATE_INSTALL_TELEMETRY_STATE: ${{ runner.temp }}/install-result-telemetry-start.json
+          INSTALL_RESULT_PATH: ${{ runner.temp }}/install-result.json
+          GATE_RUNNER_LANE: ${{ inputs.runner }}
+          QUALITY_OUTCOME: ${{ steps.run-quality.outcome }}
+        run: |
+          status=skipped
+          case "$QUALITY_OUTCOME" in
+            success) status=ok ;;
+            failure) status=failed ;;
+          esac
+          python3 "${RUNNER_TEMP}/install_result_telemetry.py" finish "$status" || echo "::warning::GATE-INSTALL-RESULT-DEGRADED reason=finish-helper-failed"
 
       - name: Render gate-quality result
         id: render-quality-result
@@ -932,10 +962,8 @@ jobs:
 
       # Install dependencies for every tier in legacy mode; keep the step's
       # existing continue-on-error behavior and report its structured result.
-      # Cache telemetry (gate-hub 卡 C): self du -sb 差 → cache_new_bytes。uv-per-slot:
-      # 0→hit, >0→miss, 量不到/负差→null。host-shared: cache_hit 一律 null（差值含并发
-      # 写入，只是上界，不是本 job 下载量）。遥测失败 fail-open：取不到字节才打
-      # INSTALL-CACHE-TELEMETRY-UNAVAILABLE；status 与本步骤退出码不变。
+      # Entry and legacy share scripts/install_result_telemetry.py for cache
+      # measurements and the install-result.json schema.
       - name: Install dependencies
         id: install
         if: ${{ steps.quality-entry.outputs.mode == 'legacy' }}
@@ -943,35 +971,23 @@ jobs:
         env:
           UV_CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}
           INSTALL_RESULT_PATH: ${{ runner.temp }}/install-result.json
+          GATE_INSTALL_TELEMETRY_STATE: ${{ runner.temp }}/install-result-telemetry-start.json
           GATE_RUNNER_LANE: ${{ inputs.runner }}
         run: |
-          start=$(date +%s)
-          ecosystem="none"
-          status="skipped"
-          cache_dir=
-          cache_before=
-          cache_scope=null
-          cache_new_bytes=null
-          measure_cache_before() {
-            cache_before=
-            if [ "${GATE_RUNNER_LANE:-}" = "self" ] && [ -n "$1" ]; then
-              cache_before=$(du -sb "$1" 2>/dev/null | cut -f1) || true
-            fi
+          telemetry() {
+            python3 "${RUNNER_TEMP}/install_result_telemetry.py" "$@" || echo "::warning::GATE-INSTALL-RESULT-DEGRADED reason=helper-failed"
           }
+          telemetry start
+          status="skipped"
+          ecosystem="none"
           if [ -f uv.lock ]; then
             ecosystem="uv"
-            cache_dir=${UV_CACHE_DIR:-}
-            measure_cache_before "$cache_dir"
             if uv sync --frozen; then status="ok"; else status="failed"; fi
           elif [ -f package-lock.json ]; then
             ecosystem="npm"
-            cache_dir=${npm_config_cache:-}
-            measure_cache_before "$cache_dir"
             if npm ci; then status="ok"; else status="failed"; fi
           elif [ -f pnpm-lock.yaml ]; then
             ecosystem="pnpm"
-            cache_dir=${pnpm_config_store_dir:-}
-            measure_cache_before "$cache_dir"
             if pnpm install --frozen-lockfile; then status="ok"; else status="failed"; fi
           elif [ -f go.sum ]; then
             ecosystem="go-skipped"
@@ -979,44 +995,7 @@ jobs:
           else
             echo "no supported lockfile at repo root — skipping predownload"
           fi
-          end=$(date +%s)
-          cache_hit=null
-          if [ "$ecosystem" = "uv" ]; then
-            case "${UV_CACHE_HIT:-}" in
-              true)  cache_hit=true ;;
-              false) cache_hit=false ;;
-            esac
-          fi
-          if [ "${GATE_RUNNER_LANE:-}" = "self" ]; then
-            case "$ecosystem" in
-              uv)       cache_scope=uv-per-slot ;;
-              npm|pnpm) cache_scope=host-shared ;;  # cache_new_bytes 含并发写入，只是上界
-            esac
-            if [ -n "$cache_dir" ] && [ -n "$cache_before" ]; then
-              cache_after=$(du -sb "$cache_dir" 2>/dev/null | cut -f1) || true
-              if [ -n "$cache_after" ]; then
-                cache_new_bytes=$((cache_after - cache_before))
-                if [ "$cache_new_bytes" -lt 0 ]; then
-                  cache_new_bytes=null
-                elif [ "$cache_scope" = "uv-per-slot" ]; then
-                  if [ "$cache_new_bytes" -eq 0 ]; then cache_hit=true; else cache_hit=false; fi
-                fi
-              fi
-            fi
-            case "$ecosystem" in
-              uv|npm|pnpm)
-                if [ "$cache_new_bytes" = null ]; then
-                  echo "INSTALL-CACHE-TELEMETRY-UNAVAILABLE lane=self ecosystem=$ecosystem cache_dir=${cache_dir:-unset}"
-                fi ;;
-            esac
-          fi
-          runner_name="${RUNNER_NAME//\"/\'}"
-          case "$cache_scope" in
-            null) cache_scope_json=null ;;
-            *)    cache_scope_json="\"$cache_scope\"" ;;
-          esac
-          printf '{"ecosystem":"%s","status":"%s","duration_s":%s,"cache_hit":%s,"cache_scope":%s,"runner_name":"%s","cache_new_bytes":%s}\n' \
-            "$ecosystem" "$status" "$((end - start))" "$cache_hit" "$cache_scope_json" "$runner_name" "$cache_new_bytes" | tee "$INSTALL_RESULT_PATH"
+          telemetry finish "$status"
           [ "$status" != "failed" ]
 
       - name: Tests
