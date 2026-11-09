@@ -40,8 +40,8 @@ def test_entry_mode_telemetry_brackets_quality_and_uses_ledger_upload_path():
     assert start["env"]["INSTALL_RESULT_PATH"] == "${{ runner.temp }}/install-result.json"
     assert finish["env"]["INSTALL_RESULT_PATH"] == start["env"]["INSTALL_RESULT_PATH"]
     assert start["env"]["GATE_INSTALL_TELEMETRY_STATE"] == finish["env"]["GATE_INSTALL_TELEMETRY_STATE"]
-    assert "install_result_telemetry.py start" in start["run"]
-    assert "install_result_telemetry.py finish" in finish["run"]
+    assert 'python3 "${RUNNER_TEMP}/install_result_telemetry.py" start' in start["run"]
+    assert 'python3 "${RUNNER_TEMP}/install_result_telemetry.py" finish "$status"' in finish["run"]
     assert "GATE-INSTALL-RESULT-DEGRADED" in start["run"]
     assert "GATE-INSTALL-RESULT-DEGRADED" in finish["run"]
     assert legacy["if"] == "${{ steps.quality-entry.outputs.mode == 'legacy' }}"

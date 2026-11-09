@@ -72,6 +72,7 @@ ENTRY_FILES = {
     "scripts/gate_bounded_retry.py": "各槽 checkout 与 MagicDNS",
     # 被多个入口导入的发布脱敏。
     "scripts/scrub_outbound.py": "被入口导入的脱敏库",
+    "scripts/install_result_telemetry.py": "quality 槽共享 install-result 遥测（标准库 + du）",
     # quality/primary 入口判定（review-expected 分类）。
     "scripts/classify_pr_reviewable_paths.py": "quality/primary 入口分类",
     # 本仓 CI 入口：同属“运行期装包计费”相邻面，纳入防漂移。
