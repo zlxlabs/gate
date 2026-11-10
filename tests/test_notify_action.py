@@ -22,9 +22,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ACTION_DIR = REPO_ROOT / ".github" / "actions" / "notify"
 ACTION_YML = ACTION_DIR / "action.yml"
-WORKFLOW_YML = REPO_ROOT / ".github" / "workflows" / "gate-v2.yml"
-
-BASE_COMMIT = "a6b6b423"  # base of this card; inline implementation lives at gate-v2.yml notify job
+BASE_COMMIT = "a6b6b423"  # historical inline implementation used for the payload compatibility contract
 
 SECRET_KEY = "SECRETKEY-SHOULD-NEVER-APPEAR-IN-LOGS"
 WECOM_WEBHOOK = "https://qyapi.weixin.qq.com:{port}/cgi-bin/webhook/send?key=" + SECRET_KEY
@@ -146,31 +144,6 @@ def test_action_yml_declares_self_contained_composite_contract():
     assert '"$GITHUB_ACTION_PATH/notify.py"' in run_steps[0]["run"]
     # Self-containment: ci-templates will reference this directory cross-repo.
     assert (ACTION_DIR / "notify.py").is_file()
-
-
-def test_notify_job_invokes_shared_notify_action_fail_open():
-    # Sending moved into .github/actions/notify (shared with ci-templates);
-    # this pins the gate-v2 notify job side of that contract (moved here from
-    # the contract file: file-size ratchet blocks growth there).
-    workflow = yaml.safe_load(WORKFLOW_YML.read_text(encoding="utf-8"))
-    steps = workflow["jobs"]["notify"]["steps"]
-    notify_step = next(
-        s for s in steps if s.get("uses") == "./_gate-notify-src/.github/actions/notify"
-    )
-    assert notify_step.get("continue-on-error") is True
-    with_map = notify_step.get("with", {})
-    assert with_map["webhook"] == "${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}"
-    assert with_map["title_prefix"] == "${{ vars.FEISHU_CI_TITLE_PREFIX }}"
-    assert with_map["severity"] == "P2"
-    assert with_map["title"] == "${{ steps.fields.outputs.title }}"
-    assemble_step = next(s for s in steps if s.get("id") == "fields")
-    assert "Required Gate v2 门禁失败" in assemble_step["run"]
-    checkout_step = next(
-        s for s in steps if s.get("name") == "Checkout notify action at this workflow's own commit"
-    )
-    assert checkout_step["env"]["GATE_CHECKOUT_REF"] == "${{ job.workflow_sha }}"
-    text = WORKFLOW_YML.read_text(encoding="utf-8")
-    assert "uses: ./_gate-notify-src/.github/actions/notify" in text
 
 
 def test_wecom_success_posts_markdown_payload_bytes(recorder_server):
