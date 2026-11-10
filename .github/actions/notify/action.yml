@@ -1,0 +1,43 @@
+name: 'CI notify (WeCom / Feishu)'
+description: >-
+  Send one CI notification, dispatching on the webhook hostname: exact
+  qyapi.weixin.qq.com -> WeCom markdown (errcode==0); open.feishu.cn /
+  open.larksuite.com -> Feishu interactive card (code==0). Unknown hosts,
+  non-https and oversize WeCom content fail loudly; missing webhook is a
+  ::warning skip. ci-templates consumes this cross-repo, so this directory
+  must stay self-contained (stdlib-only notify.py, no files outside it).
+inputs:
+  webhook:
+    description: 'Full webhook URL; empty/blank skips with a warning.'
+    required: false
+    default: ''
+  title_prefix:
+    description: 'Heading prefix; defaults to [zlxlabs·CI] when blank.'
+    required: false
+    default: ''
+  severity:
+    description: 'P0 / P1 / P2 / info.'
+    required: true
+  title:
+    description: 'Notification title (single line).'
+    required: true
+  body:
+    description: 'Multi-line markdown body.'
+    required: false
+    default: ''
+  links:
+    description: 'JSON array of {"text","url"}; first link renders primary (Feishu button / first WeCom link).'
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        NOTIFY_WEBHOOK: ${{ inputs.webhook }}
+        NOTIFY_TITLE_PREFIX: ${{ inputs.title_prefix }}
+        NOTIFY_SEVERITY: ${{ inputs.severity }}
+        NOTIFY_TITLE: ${{ inputs.title }}
+        NOTIFY_BODY: ${{ inputs.body }}
+        NOTIFY_LINKS: ${{ inputs.links }}
+      run: python3 "$GITHUB_ACTION_PATH/notify.py"

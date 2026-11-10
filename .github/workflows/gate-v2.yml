@@ -3761,7 +3761,9 @@ jobs:
   # the `gate` aggregator's own conclusion instead of the single legacy job.
   # Uses the same control-plane route as `gate`: default self-hosted, with the
   # fork guard and hosted fallback kept in the expression; the webhook POST is
-  # still fail-open and needs no special capability.
+  # still fail-open and needs no special capability. Sending itself lives in
+  # the shared .github/actions/notify action (WeCom/Feishu dispatch by webhook
+  # hostname) so ci-templates can reuse the one implementation cross-repo.
   notify:
     needs: gate
     if: failure()
@@ -3772,11 +3774,31 @@ jobs:
     # hosted)。2 分钟对一次 stdlib 的 webhook POST(自带 10 秒 socket 超时)绰绰有余。
     timeout-minutes: 2
     steps:
-      - name: Feishu 门禁失败卡 (P2, fail-open)
-        continue-on-error: true
+      # Composite `uses:` cannot take an expression, so the action is checked
+      # out at exactly this reusable workflow's own commit — same mechanism and
+      # bootstrap script as the gate-aggregator checkout above (the `job`
+      # context), into a notify-specific directory; ci-templates will consume
+      # the same directory cross-repo as zlxlabs/gate/.github/actions/notify@v2.
+      - name: Checkout notify action at this workflow's own commit
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
-          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
+          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
+          GATE_CHECKOUT_PATH: _gate-notify-src
+          GATE_CHECKOUT_SPARSE: |
+            .github/actions/notify/action.yml
+            .github/actions/notify/notify.py
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
+          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
+
+      # Assemble the card fields from the github context; the action itself is
+      # PR-agnostic. Same fallback values as the inline implementation this
+      # replaces.
+      - name: Resolve notify payload fields
+        id: fields
+        env:
           REPO:      ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE:  ${{ github.event.pull_request.title }}
@@ -3787,11 +3809,7 @@ jobs:
           RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 - <<'PY'
-          import json, os, urllib.request
-          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
-          if not hook:
-              print("no FEISHU_CI_WEBHOOK secret/var set — skip notify"); raise SystemExit(0)
-          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
+          import json, os
           repo    = os.environ["REPO"]
           pr      = os.environ.get("PR_NUMBER", "") or "?"
           title   = os.environ.get("PR_TITLE", "") or "(无标题)"
@@ -3804,42 +3822,28 @@ jobs:
                   f"**PR** #{pr} · {title}\n"
                   f"**分支** `{branch}`  ·  **commit** `{sha}`  ·  **tier** `{tier}`\n"
                   f"Required Gate v2 门禁失败(quality / primary review 其一未过)。点按钮看详情。")
-          card = {
-              "msg_type": "interactive",
-              "card": {
-                  "config": {"wide_screen_mode": True},
-                  "header": {"template": "orange",
-                             "title": {"tag": "plain_text", "content": f"🟠 {title_prefix} P2 门禁失败 · {repo}#{pr}"}},
-                  "elements": [
-                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
-                      {"tag": "action", "actions": [
-                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看 Run"},
-                           "type": "primary", "url": run_url},
-                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看 PR"},
-                           "type": "default", "url": pr_url},
-                      ]},
-                  ],
-              },
-          }
-          req = urllib.request.Request(
-              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
-          try:
-              with urllib.request.urlopen(req, timeout=10) as r:
-                  response_body = r.read(300).decode("utf-8", "replace")
-                  print("feishu resp:", r.status, response_body)
-                  try:
-                      response = json.loads(response_body)
-                  except (TypeError, ValueError):
-                      print("::error::Feishu response is not valid JSON")
-                      print("feishu notify failed: response body was not valid JSON")
-                  else:
-                      if isinstance(response, dict):
-                          code = response.get("code")
-                      else:
-                          code = None
-                      if not (isinstance(code, int) and not isinstance(code, bool) and code == 0):
-                          print(f"::error::Feishu business response rejected: code={code}")
-                          print(f"feishu notify failed: business code={code}")
-          except Exception as e:
-              print("feishu notify failed (swallowed):", e)
+          links = [
+              {"text": "查看 Run", "url": run_url},
+              {"text": "查看 PR", "url": pr_url},
+          ]
+          delimiter = "NOTIFY_EOF_" + os.environ.get("GITHUB_RUN_ID", "0")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"title=门禁失败 · {repo}#{pr}\n")
+              out.write(f"body<<{delimiter}\n{body}\n{delimiter}\n")
+              out.write("links=" + json.dumps(links, ensure_ascii=False) + "\n")
           PY
+
+      # P2 fail-open: the gate conclusion must not depend on the notification.
+      # Host allowlist, channel dispatch and success-code checks live inside
+      # the action and fail that step loud; continue-on-error keeps the job
+      # green as before. No retries, no fallback channel.
+      - name: 门禁失败通知 (P2, fail-open)
+        continue-on-error: true
+        uses: ./_gate-notify-src/.github/actions/notify
+        with:
+          webhook: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          severity: P2
+          title: ${{ steps.fields.outputs.title }}
+          body: ${{ steps.fields.outputs.body }}
+          links: ${{ steps.fields.outputs.links }}
