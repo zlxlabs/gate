@@ -1490,8 +1490,8 @@ def test_shadow_and_disposition_share_the_same_declaration_scripts(source_host):
     assert gate["GATE_SOURCE_BUDGET_SECS"] == "180"
 
 
-def test_every_workflow_bootstrap_shares_the_one_script():
-    for path, expected in ((WORKFLOW, 10), (DISPOSITION_WORKFLOW, 1)):
+def test_every_workflow_bootstrap_shares_the_one_script():  # noqa: gate-v2 11 sites = 10 + notify job's _gate-notify-src checkout (same bootstrap + bounded-retry mechanism; composite uses: cannot take an expression)
+    for path, expected in ((WORKFLOW, 11), (DISPOSITION_WORKFLOW, 1)):
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         runs = [
             step["run"] for job in raw["jobs"].values()

@@ -36,3 +36,13 @@
   - 首轮本机验证暴露两处测试缺陷已修：飞书测试未把服务器响应设为 {"code":0} 形状；
     checkout 站点计数断言未跟随新增站点。
 - **下一步唯一动作**：commit + push + 开 draft PR。
+
+## 段 3 — 续修第 1 轮：两个登记类守卫跟随（CI run 42759000591）
+
+- **当前阶段**：implementing（续修轮）
+- **本段结论**：远程 CI 红两枚均为登记类漂移：test_no_runtime_install 入口闭集缺 notify 两文件、
+  test_gate_source bootstrap 计数 10→11。按两清单既有格式登记（notify 槽注释块含跨仓共用与
+  仅标准库理由；计数注释逐点说明第 11 站 = notify job 的 _gate-notify-src 检出）。
+  未改生产代码。本机全量 Verify-Command：1962 passed in 778.69s。
+- **关键决策与已否决方案**：无（登记类跟随，无设计决策）。
+- **下一步唯一动作**：追加提交推送 PR #401，报告收尾。
