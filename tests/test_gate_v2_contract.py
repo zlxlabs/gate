@@ -917,7 +917,10 @@ def test_workflow_sha_checkouts_use_centralized_bounded_retry():
                 assert_workflow_sha_checkout(step)
             if uses.startswith("actions/checkout"):
                 assert (step.get("with") or {}).get("ref") != "${{ job.workflow_sha }}"
-    assert len(sites) == 10
+    # 10 pre-existing sites plus the notify action checkout (shared notify
+    # action card, checked out at this workflow's own commit for the same
+    # composite-uses-cannot-take-expressions reason).
+    assert len(sites) == 11
     producer = next(
         step for step in disposition["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
@@ -3990,29 +3993,9 @@ def test_notify_webhook_secret_first_var_fallback():
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
 
 
-def test_notify_validates_feishu_business_response():
-    text = WORKFLOW.read_text()
-    assert "response = json.loads(response_body)" in text
-    assert "code = response.get(\"code\")" in text
-    assert (
-        "if not (isinstance(code, int) and not isinstance(code, bool) and code == 0):"
-        in text
-    )
-    assert "::error::Feishu business response rejected: code=" in text
-    assert "except (TypeError, ValueError):" in text
-    assert "::error::Feishu response is not valid JSON" in text
-
-
-@pytest.mark.parametrize("response_body", ['{"code": false}', '{"code": 0.0}'])
-def test_notify_rejects_non_integer_zero_response_codes(response_body):
-    text = WORKFLOW.read_text()
-    code = json.loads(response_body)["code"]
-    assert code == 0  # Both values pass Python's loose equality check.
-    assert not (isinstance(code, int) and not isinstance(code, bool) and code == 0)
-    assert (
-        "if not (isinstance(code, int) and not isinstance(code, bool) and code == 0):"
-        in text
-    )
+# notify job structure moved to tests/test_notify_action.py (the
+# workflow_sha-checkout site count test above was incremented to 11 for the
+# new notify action checkout); the file-size ratchet blocks growth here.
 
 
 # ── caller template ──────────────────────────────────────────────────────────

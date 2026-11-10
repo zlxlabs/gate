@@ -52,6 +52,11 @@ ENTRY_FILES = {
     ".github/actions/diff-coverage-advisory/action.yml": "quality 槽 advisory 包装器",
     # disposition 槽：receipt 铸造。
     ".github/actions/gate-disposition/issue_receipt.py": "disposition 槽 receipt 铸造",
+    # notify 槽：门禁失败通知（企微/飞书按 webhook 主机分派）。gate-v2 与
+    # ci-templates 跨仓共用（gate-261110 patrol-notify 卡 G），仅标准库、
+    # 无运行时安装；发送失败由调用方 continue-on-error 维持 fail-open。
+    ".github/actions/notify/action.yml": "notify 槽通知包装器（跨仓共用，composite 调同目录 notify.py）",
+    ".github/actions/notify/notify.py": "notify 槽通知发送本体（仅标准库，无运行时安装）",
     # quality 槽：仅调 git，无网络取包。
     ".github/actions/pr-size-preflight/preflight.py": "quality 槽 preflight 本体",
     ".github/actions/pr-size-preflight/action.yml": "quality 槽 preflight 包装器",
