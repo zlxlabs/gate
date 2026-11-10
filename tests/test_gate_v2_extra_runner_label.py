@@ -31,7 +31,7 @@ _GUARD_CONTROL = """(inputs.runner == 'self' && inputs.control_runner != 'github
 _GUARD_AUTHOR = """(inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"')"""
 _GUARD_CI = """(inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"')))"""
 PRE_CHANGE = {
-    **{job: (_GUARD_CONTROL, ["self-hosted", "linux", "codex"]) for job in ("classify_pr_paths", "gate", "ledger", "notify")},
+    **{job: (_GUARD_CONTROL, ["self-hosted", "linux", "codex"]) for job in ("classify_pr_paths", "gate", "ledger")},
     **{job: (_GUARD_AUTHOR, ["self-hosted", "linux", "codex"]) for job in ("primary", "resolve_advisory", "ocr")},
     "quality": (_GUARD_CI, ["self-hosted", "linux", "ci"]),
 }
