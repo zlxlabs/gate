@@ -814,11 +814,12 @@ def test_silo_store_env_aligns_with_job_checkout_path():
         assert_workflow_sha_checkout(checkout_step, path=checkout_dir)
 
 
-def test_secrets_explicit_and_feishu_optional():
+def test_secrets_explicit_and_feishu_compatibility():
     code = "\n".join(ln for ln in WORKFLOW.read_text().splitlines() if not ln.lstrip().startswith("#"))
     assert "inherit" not in code
     _, trigger = _load_workflow()
     secrets = trigger["workflow_call"].get("secrets", {})
+    assert "FEISHU_CI_WEBHOOK" in secrets
     assert set(secrets.keys()) == {"FEISHU_CI_WEBHOOK", "SILO_ACCESS_KEY", "SILO_SECRET_KEY"}
     assert secrets["FEISHU_CI_WEBHOOK"].get("required") is False
     assert secrets["SILO_ACCESS_KEY"].get("required") is False
@@ -834,7 +835,7 @@ def test_control_runner_input_defaults_to_follow_runner():
 def test_all_required_jobs_present():
     raw, _ = _load_workflow()
     assert set(raw["jobs"].keys()) == {
-        "classify_pr_paths", "quality", "primary", "resolve_advisory", "ocr", "gate", "ledger", "notify",
+        "classify_pr_paths", "quality", "primary", "resolve_advisory", "ocr", "gate", "ledger",
     }
 
 
@@ -917,10 +918,7 @@ def test_workflow_sha_checkouts_use_centralized_bounded_retry():
                 assert_workflow_sha_checkout(step)
             if uses.startswith("actions/checkout"):
                 assert (step.get("with") or {}).get("ref") != "${{ job.workflow_sha }}"
-    # 10 pre-existing sites plus the notify action checkout (shared notify
-    # action card, checked out at this workflow's own commit for the same
-    # composite-uses-cannot-take-expressions reason).
-    assert len(sites) == 11
+    assert len(sites) == 10
     producer = next(
         step for step in disposition["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
@@ -2011,7 +2009,7 @@ def test_gate_and_notify_runs_on_use_the_same_guarded_control_plane_route():
     )
     workflow_text = WORKFLOW.read_text()
     assert "gate-control" not in workflow_text
-    for job_name in ("gate", "notify", "classify_pr_paths"):
+    for job_name in ("gate", "classify_pr_paths"):
         runs_on = str(raw["jobs"][job_name]["runs-on"])
         assert runs_on == expected
         assert FORK_GUARD in runs_on
@@ -3449,7 +3447,7 @@ def test_non_quality_jobs_do_not_use_ci_pool_label():
     # uncredentialed CI pool. Assert on parsed fromJSON labels, not bare
     # substring match (would false-positive on words containing "ci").
     raw, _ = _load_workflow()
-    for job_name in ("gate", "ledger", "notify", "primary", "resolve_advisory", "ocr", "classify_pr_paths"):
+    for job_name in ("gate", "ledger", "primary", "resolve_advisory", "ocr", "classify_pr_paths"):
         runs_on = str(raw["jobs"][job_name]["runs-on"])
         for labels in _fromjson_label_sets(runs_on):
             assert "ci" not in labels, (
@@ -3975,27 +3973,6 @@ def test_quality_entry_contract_covers_missing_non_executable_and_executable_sta
     assert legacy_steps
     for step in legacy_steps:
         assert f"{QUALITY_ENTRY_MODE} == 'legacy'" in str(step.get("if", ""))
-
-
-# ── notify job ────────────────────────────────────────────────────────────
-
-def test_notify_triggers_only_on_gate_failure():
-    raw, _ = _load_workflow()
-    notify = raw["jobs"]["notify"]
-    needs = notify.get("needs")
-    assert (needs if isinstance(needs, list) else [needs]) == ["gate"]
-    assert notify.get("if") == "failure()"
-
-
-def test_notify_webhook_secret_first_var_fallback():
-    text = WORKFLOW.read_text()
-    assert "secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK" in text
-    assert "vars.FEISHU_CI_TITLE_PREFIX" in text
-
-
-# notify job structure moved to tests/test_notify_action.py (the
-# workflow_sha-checkout site count test above was incremented to 11 for the
-# new notify action checkout); the file-size ratchet blocks growth here.
 
 
 # ── caller template ──────────────────────────────────────────────────────────

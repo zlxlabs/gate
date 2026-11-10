@@ -50,8 +50,6 @@
 #              Stage 4 piece, one fail-open PR comment per run reusing the
 #              same text — the reconciler / async-ledger parts of Stage 4
 #              remain future work, not this file).
-#   notify   — same fail-only Feishu notification semantics as legacy,
-#              triggered by `gate` (not by quality/primary individually).
 #
 # Concurrency uses job-level locks only, never a workflow-level group (a single
 # top-level cancel-in-progress: true would kill the gate panel writer). quality
@@ -127,10 +125,8 @@ on:
       extra_runner_label_ci: { type: string, default: "" }
       extra_runner_label_review: { type: string, default: "" }
     secrets:
+      # 保留兼容：caller 仍按名透传，当前无消费方（notify job 已删）
       FEISHU_CI_WEBHOOK:
-        # Optional: public repos MUST pass this as a repo SECRET (fork PR runs
-        # cannot read secrets — see the notify job); private repos may rely on
-        # the same-name repo VARIABLE fallback instead (see notify job below).
         required: false
       SILO_ACCESS_KEY:
         # Optional at the workflow_call schema so existing callers keep
@@ -3754,96 +3750,3 @@ jobs:
           printf '%s\n' "$result"
           printf '::warning::%s\n' "$result"
           exit 0
-
-  # ── notify (registry-routed, required-gate-failure only) ────────────────
-  # Same fail-only semantics as legacy gate.yml's notify job (see that file
-  # for the full webhook/fallback rationale, unchanged here), now triggered by
-  # the `gate` aggregator's own conclusion instead of the single legacy job.
-  # Uses the same control-plane route as `gate`: default self-hosted, with the
-  # fork guard and hosted fallback kept in the expression; the webhook POST is
-  # still fail-open and needs no special capability. Sending itself lives in
-  # the shared .github/actions/notify action (WeCom/Feishu dispatch by webhook
-  # hostname) so ci-templates can reuse the one implementation cross-repo.
-  notify:
-    needs: gate
-    if: failure()
-    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
-    # 迁到自建后必须自己兜住槽位占用:在 hosted 上卡死只是浪费 GitHub 的一次性沙箱,
-    # 在自建上卡死会按 GitHub 默认的 6 小时 job 超时占住 44 槽之一。本文件里其余
-    # 每个 job 都显式声明了 timeout-minutes,notify 此前是唯一例外(它当时还在
-    # hosted)。2 分钟对一次 stdlib 的 webhook POST(自带 10 秒 socket 超时)绰绰有余。
-    timeout-minutes: 2
-    steps:
-      # Composite `uses:` cannot take an expression, so the action is checked
-      # out at exactly this reusable workflow's own commit — same mechanism and
-      # bootstrap script as the gate-aggregator checkout above (the `job`
-      # context), into a notify-specific directory; ci-templates will consume
-      # the same directory cross-repo as zlxlabs/gate/.github/actions/notify@v2.
-      - name: Checkout notify action at this workflow's own commit
-        env:
-          GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
-          GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
-          GATE_CHECKOUT_PATH: _gate-notify-src
-          GATE_CHECKOUT_SPARSE: |
-            .github/actions/notify/action.yml
-            .github/actions/notify/notify.py
-          GATE_GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
-          python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
-
-      # Assemble the card fields from the github context; the action itself is
-      # PR-agnostic. Same fallback values as the inline implementation this
-      # replaces.
-      - name: Resolve notify payload fields
-        id: fields
-        env:
-          REPO:      ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE:  ${{ github.event.pull_request.title }}
-          PR_URL:    ${{ github.event.pull_request.html_url }}
-          BRANCH:    ${{ github.head_ref }}
-          SHA:       ${{ github.event.pull_request.head.sha }}
-          TIER:      ${{ inputs.tier }}
-          RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          repo    = os.environ["REPO"]
-          pr      = os.environ.get("PR_NUMBER", "") or "?"
-          title   = os.environ.get("PR_TITLE", "") or "(无标题)"
-          branch  = os.environ.get("BRANCH", "") or "?"
-          sha     = (os.environ.get("SHA", "") or "")[:12]
-          tier    = os.environ.get("TIER", "") or "?"
-          pr_url  = os.environ.get("PR_URL", "") or ""
-          run_url = os.environ["RUN_URL"]
-          body = (f"**仓库** `{repo}`\n"
-                  f"**PR** #{pr} · {title}\n"
-                  f"**分支** `{branch}`  ·  **commit** `{sha}`  ·  **tier** `{tier}`\n"
-                  f"Required Gate v2 门禁失败(quality / primary review 其一未过)。点按钮看详情。")
-          links = [
-              {"text": "查看 Run", "url": run_url},
-              {"text": "查看 PR", "url": pr_url},
-          ]
-          delimiter = "NOTIFY_EOF_" + os.environ.get("GITHUB_RUN_ID", "0")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"title=门禁失败 · {repo}#{pr}\n")
-              out.write(f"body<<{delimiter}\n{body}\n{delimiter}\n")
-              out.write("links=" + json.dumps(links, ensure_ascii=False) + "\n")
-          PY
-
-      # P2 fail-open: the gate conclusion must not depend on the notification.
-      # Host allowlist, channel dispatch and success-code checks live inside
-      # the action and fail that step loud; continue-on-error keeps the job
-      # green as before. No retries, no fallback channel.
-      - name: 门禁失败通知 (P2, fail-open)
-        continue-on-error: true
-        uses: ./_gate-notify-src/.github/actions/notify
-        with:
-          webhook: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
-          title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
-          severity: P2
-          title: ${{ steps.fields.outputs.title }}
-          body: ${{ steps.fields.outputs.body }}
-          links: ${{ steps.fields.outputs.links }}
