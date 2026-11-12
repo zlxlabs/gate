@@ -109,3 +109,38 @@ def test_real_producer_missing_credentials_stderr_maps_to_missing_credentials():
         assert result.returncode != 0
         assert message.encode("utf-8") in result.stderr
         assert _parse(result.stderr) == "missing_credentials"
+
+
+def test_real_producer_missing_source_stderr_maps_to_source_file_missing():
+    # 跨边界：缺源文件的判定也必须来自 silo_store.py 真实子进程的 stderr 字节；
+    # 四条 fail 文案都在 connect() 之前触发，无需网络与凭据。patrol 对 cancelled
+    # run 只跳过 source_file_missing，这里落错类会重新开单。
+    from tempfile import TemporaryDirectory
+
+    def producer_fail_stderr(argv: list[str]) -> bytes:
+        with TemporaryDirectory() as temp:
+            payload = Path(temp) / "probe"  # 仅占位，不写入，保持缺失
+            result = subprocess.run(
+                [sys.executable, str(PRODUCER), *argv],
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                     "SILO_BUCKET": "ci-artifacts"},
+                capture_output=True, check=False)
+        assert result.returncode != 0
+        return result.stderr
+
+    missing = "nonexistent-source-probe"
+    cases = (
+        (["put", "--tier", "d1", "--repo-id", "1", "--name", "reason-test",
+          "--file", missing], "put source is not a file:"),
+        (["put", "--tier", "d1", "--repo-id", "1", "--name", "reason-test",
+          "--file", missing, "--file", missing + "-2"],
+         "put requires at least one existing --file: all sources missing"),
+        (["put-dir", "--tier", "d3", "--repo-id", "1", "--name", "reason-test",
+          "--dir", missing], "put-dir source is empty or missing:"),
+        (["put-review-record", "--file", missing],
+         "put-review-record source is not a file:"),
+    )
+    for argv, message in cases:
+        stderr = producer_fail_stderr(argv)
+        assert message.encode("utf-8") in stderr
+        assert _parse(stderr) == "source_file_missing"

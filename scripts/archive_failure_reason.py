@@ -13,12 +13,26 @@ _OLD = re.compile(rb"s3_error_code=([A-Za-z_]+)")
 _MISSING_CREDENTIALS = tuple(
     text.encode("utf-8") for text in ("SILO_ACCESS_KEY 未传入", "SILO_SECRET_KEY 未传入")
 )
+# silo_store.py put/put-dir/put-review-record 缺源文件 fail() 文案
+# （silo_store.py :623/:730/:742/:777）。前缀匹配，路径部分不进匹配串；
+# 归入既有 reason source_file_missing（patrol 对 cancelled run 的过滤依赖它）。
+_MISSING_SOURCE_PREFIXES = tuple(
+    text.encode("utf-8")
+    for text in (
+        "put source is not a file:",
+        "put-dir source is empty or missing:",
+        "put-review-record source is not a file:",
+        "put requires at least one existing --file: all sources missing",
+    )
+)
 
 
 def extract_reason(output: bytes) -> str:
     for line in output.splitlines():
         if any(fragment in line for fragment in _MISSING_CREDENTIALS):
             return "missing_credentials"
+        if line.startswith(_MISSING_SOURCE_PREFIXES):
+            return "source_file_missing"
         if line.startswith(_PREFIX):
             try:
                 event = json.loads(line[len(_PREFIX) :])
