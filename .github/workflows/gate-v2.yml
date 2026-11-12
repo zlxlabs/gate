@@ -1885,13 +1885,15 @@ jobs:
           DIAGNOSTICS_DIR: ${{ runner.temp }}/primary-review-diagnostics
         run: |
           set -euo pipefail
-          if ! "$SILO_EXEC" put-dir \
+          if ! out="$($SILO_EXEC put-dir \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
             --dir "$DIAGNOSTICS_DIR" \
-            --empty skip; then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-diagnostics-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=put_dir_failed"
+            --empty skip 2>&1)"; then
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-diagnostics-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
             exit 1
           fi
 
@@ -2569,12 +2571,14 @@ jobs:
           ADVISORY_DIR: ${{ runner.temp }}/shadow-events/advisory
         run: |
           set -euo pipefail
-          if ! "$SILO_EXEC" put-dir \
+          if ! out="$($SILO_EXEC put-dir \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --dir "$ADVISORY_DIR"; then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=advisory-event-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=put_dir_failed"
+            --dir "$ADVISORY_DIR" 2>&1)"; then
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=advisory-event-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
             exit 1
           fi
 
@@ -2826,12 +2830,14 @@ jobs:
           RECEIPT_DIR: ${{ runner.temp }}/convergence-receipt
         run: |
           set -euo pipefail
-          if ! "$SILO_EXEC" put-dir \
+          if ! out="$($SILO_EXEC put-dir \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --dir "$RECEIPT_DIR"; then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=convergence-receipt-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=put_dir_failed"
+            --dir "$RECEIPT_DIR" 2>&1)"; then
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=convergence-receipt-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
             exit 1
           fi
 
@@ -2967,12 +2973,14 @@ jobs:
           PANEL_PATH: ${{ runner.temp }}/gate-status-panel-delivery.json
         run: |
           set -euo pipefail
-          if ! "$SILO_EXEC" put \
+          if ! out="$($SILO_EXEC put \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$PANEL_PATH"; then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-status-panel-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME reason=put_failed"
+            --file "$PANEL_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-status-panel-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
             exit 1
           fi
 
@@ -3608,12 +3616,14 @@ jobs:
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl reason=missing_credentials"
             exit 1
           fi
-          if ! "$SILO_EXEC" put \
+          if ! out="$($SILO_EXEC put \
             --tier archive \
             --repo-id "${{ github.repository_id }}" \
             --name "$ARTIFACT_NAME" \
-            --file "$LEDGER_PATH"; then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl reason=put_failed"
+            --file "$LEDGER_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=review-ledger-archive key=archive/${{ github.repository_id }}/$ARTIFACT_NAME/ledger.jsonl reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
             exit 1
           fi
           if ! "$SILO_EXEC" get --key \
@@ -3653,12 +3663,14 @@ jobs:
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=missing_credentials"
             exit 1
           fi
-          if ! "$SILO_EXEC" put \
+          if ! out="$($SILO_EXEC put \
             --tier archive \
             --repo-id "$REPO_ID" \
             --name "$ARTIFACT_NAME" \
-            --file "$AUDIT_PATH"; then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=put_failed"
+            --file "$AUDIT_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=primary-audit-archive key=archive/$REPO_ID/$ARTIFACT_NAME/primary-review-audit.json reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
             exit 1
           fi
           if ! "$SILO_EXEC" get --key \
@@ -3690,12 +3702,14 @@ jobs:
             echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive key=archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json reason=missing_credentials"
             exit 1
           fi
-          if ! "$SILO_EXEC" put \
+          if ! out="$($SILO_EXEC put \
             --tier archive \
             --repo-id "$REPO_ID" \
             --name "$ARTIFACT_NAME" \
-            --file "$TERMINAL_PATH"; then
-            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive key=archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json reason=put_failed"
+            --file "$TERMINAL_PATH" 2>&1)"; then
+            reason=$(printf '%s' "$out" | python3 "${SILO_STORE%/*}/archive_failure_reason.py" || true)
+            echo "::warning::GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive key=archive/$REPO_ID/$ARTIFACT_NAME/gate-terminal.json reason=${reason:-unclassified}"
+            printf '%s\n' "$out" >&2
             exit 1
           fi
           if ! "$SILO_EXEC" get --key \
