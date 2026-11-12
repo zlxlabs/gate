@@ -1160,11 +1160,11 @@ def test_gate_workflow_archives_audit_and_terminal_source_bytes(tmp_path):
             assert missing_source.returncode != 0
             assert f"GATE-ARCHIVE-DEFERRED kind={deferred_kind} " in missing_source.stdout
             # audit archive checks its own source file; terminal archive relies
-            # on silo_store's fail-loud put
+            # on silo_store's fail-loud put (producer precheck -> unclassified)
             if source_env_name == "AUDIT_PATH":
                 assert "reason=source_file_missing" in missing_source.stdout
             else:
-                assert "reason=put_failed" in missing_source.stdout
+                assert "reason=unclassified" in missing_source.stdout
                 assert "put source is not a file" in missing_source.stderr
 
         server.get_status = 403
