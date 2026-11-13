@@ -162,7 +162,220 @@ env:
   GATE_HTTP_LOW_SPEED_TIME: "20"
 
 jobs:
+  # gate#404 G2: behavior_replay counterevidence needs a place to actually run
+  # the caller's pytest nodeid, and that place must NOT be the control job
+  # (git-source-service + Silo + gate-disposition environment).  replay-plan
+  # classifies the input and guards the PR identity; replay runs green/red
+  # evidence only.  Neither job judges the result or issues receipts — that
+  # stays with control (G3 wires the verdict).
+  replay-plan:
+    # No caller code runs here (pure input classification + PR identity guard),
+    # so it must not depend on a hosted-runner quota: the literal-grep path used
+    # to be reachable with self-hosted runners only.
+    runs-on: [self-hosted, linux, ci]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      behavior: ${{ steps.classify.outputs.behavior }}
+      head_sha: ${{ steps.classify.outputs.head_sha }}
+      nodeid: ${{ steps.classify.outputs.nodeid }}
+      runs_on: ${{ steps.guard.outputs.runs_on }}
+    steps:
+      # behavior=true only for disposition=false-positive whose
+      # counterevidence_json parses to a JSON object with kind=behavior_replay.
+      # Everything else — literal grep, deferred, empty, or unparseable JSON —
+      # is behavior=false and this job still succeeds: unparseable JSON is
+      # reported by control's existing path, not here.
+      - name: Classify counterevidence as behavior_replay
+        id: classify
+        env:
+          DISPOSITION_KIND: ${{ inputs.disposition }}
+          COUNTEREVIDENCE_JSON: ${{ inputs.counterevidence_json }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+
+          kind = os.environ.get("DISPOSITION_KIND", "")
+          try:
+              payload = json.loads(os.environ.get("COUNTEREVIDENCE_JSON", ""))
+          except json.JSONDecodeError:
+              payload = None
+          behavior = (
+              kind == "false-positive"
+              and isinstance(payload, dict)
+              and payload.get("kind") == "behavior_replay"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("behavior=" + ("true" if behavior else "false") + "\n")
+          if not behavior:
+              sys.exit(0)
+          head_sha = payload.get("head_sha")
+          nodeid = payload.get("nodeid")
+          patch = payload.get("patch")
+          problems = []
+          if (
+              not isinstance(head_sha, str)
+              or len(head_sha) != 40
+              or any(c not in "0123456789abcdef" for c in head_sha)
+          ):
+              problems.append("head_sha must be 40 lowercase hex chars")
+          if (
+              not isinstance(nodeid, str)
+              or not nodeid
+              or "::" not in nodeid
+              or nodeid.startswith("-")
+              or any(ord(c) < 0x20 or ord(c) == 0x7F for c in nodeid)
+          ):
+              problems.append("nodeid must be non-empty, contain '::', start with neither '-' nor a control character")
+          unified = patch.get("unified_diff") if isinstance(patch, dict) else None
+          claimed = patch.get("sha256") if isinstance(patch, dict) else None
+          digest = (
+              hashlib.sha256(unified.encode("utf-8")).hexdigest()
+              if isinstance(unified, str)
+              else None
+          )
+          if not isinstance(claimed, str) or claimed != digest:
+              problems.append("patch.sha256 must equal sha256(patch.unified_diff)")
+          if problems:
+              print("::error::behavior_replay_input_invalid: " + "; ".join(problems), file=sys.stderr)
+              sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("head_sha=" + head_sha + "\n")
+              out.write("nodeid=" + nodeid + "\n")
+          PY
+
+      # Same-repo human PR heads only (mirrors quality's binding rule): a fork
+      # head or a Bot author has no canonical primary review to bind the
+      # replay to, so behavior evidence is rejected before any checkout.
+      - name: Guard PR identity and pick the runner slot
+        id: guard
+        if: steps.classify.outputs.behavior == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pr_json="$RUNNER_TEMP/behavior-pr.json"
+          gh api "repos/$GH_REPO/pulls/$PR_NUMBER" > "$pr_json"
+          python3 - "$pr_json" <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              pull = json.load(fh)
+          head_repo = (pull.get("head") or {}).get("repo") or {}
+          author_type = (pull.get("user") or {}).get("type")
+          expected = os.environ["EXPECTED_REPOSITORY"]
+          if head_repo.get("full_name") != expected or author_type == "Bot":
+              print(
+                  "::error::behavior_unreviewed_or_fork: behavior replay needs a same-repository"
+                  " human PR head; head.repo.full_name=%r user.type=%r"
+                  % (head_repo.get("full_name"), author_type),
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("runs_on=" + json.dumps(["self-hosted", "linux", "ci"]) + "\n")
+          PY
+
+  replay:
+    needs: replay-plan
+    if: needs.replay-plan.outputs.behavior == 'true'
+    # Same slot class as quality's ci lane, never git-source-service, no
+    # environment, no secrets, no Silo.  Evidence producer only.
+    runs-on: ${{ fromJSON(needs.replay-plan.outputs.runs_on) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.replay-plan.outputs.head_sha }}
+          path: replay-worktree
+          persist-credentials: false
+
+      # Evidence only: baseline (no patch) then red (patch applied).  A nonzero
+      # pytest exit code is EXPECTED on red and never fails this job; only an
+      # apply failure does — and the upload below still runs first (always()).
+      # Both pytest invocations must run inside the checked-out worktree: nodeids
+      # are relative to the repository root, and the patch is applied there.
+      # Evidence paths stay absolute under RUNNER_TEMP, so the working-directory
+      # switch does not move them.
+      - name: Replay counterevidence nodeid green then red
+        working-directory: replay-worktree
+        env:
+          COUNTEREVIDENCE_JSON: ${{ inputs.counterevidence_json }}
+          REPLAY_HEAD_SHA: ${{ needs.replay-plan.outputs.head_sha }}
+          REPLAY_NODEID: ${{ needs.replay-plan.outputs.nodeid }}
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/behavior-replay"
+          mkdir -p "$evidence_dir"
+          worktree="$GITHUB_WORKSPACE/replay-worktree"
+          export REPLAY_PATCH_FILE="$evidence_dir/replay.patch"
+          python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["COUNTEREVIDENCE_JSON"])
+          patch = payload["patch"]["unified_diff"]
+          with open(os.environ["REPLAY_PATCH_FILE"], "wb") as fh:
+              fh.write(patch.encode("utf-8"))
+          PY
+          baseline_xml="$evidence_dir/baseline.xml"
+          red_xml="$evidence_dir/red.xml"
+          set +e
+          python3 -m pytest -p no:cacheprovider -q --junitxml="$baseline_xml" -- "$REPLAY_NODEID"
+          baseline_rc=$?
+          red_rc=""
+          apply_ok=true
+          if git -C "$worktree" apply --check "$REPLAY_PATCH_FILE"; then
+            git -C "$worktree" apply "$REPLAY_PATCH_FILE"
+            python3 -m pytest -p no:cacheprovider -q --junitxml="$red_xml" -- "$REPLAY_NODEID"
+            red_rc=$?
+          else
+            apply_ok=false
+            echo "::error::behavior_patch_apply_failed: git apply --check rejected replay.patch on $REPLAY_HEAD_SHA" >&2
+          fi
+          set -e
+          python3 - "$evidence_dir/exit_codes.json" "$baseline_rc" "$red_rc" "$apply_ok" <<'PY'
+          import json
+          import sys
+
+          dest, baseline_rc, red_rc, apply_ok = sys.argv[1:5]
+          with open(dest, "w", encoding="utf-8") as fh:
+              json.dump(
+                  {
+                      "baseline": int(baseline_rc),
+                      "red": None if red_rc == "" else int(red_rc),
+                      "apply_ok": apply_ok == "true",
+                  },
+                  fh,
+              )
+          PY
+          [ "$apply_ok" = true ] || exit 1
+
+      - name: Upload behavior replay evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/behavior-replay/
+          retention-days: 90
+          if-no-files-found: ignore
+
   control:
+    needs: [replay-plan, replay]
+    if: ${{ !cancelled() && needs.replay-plan.result == 'success' && (needs.replay.result == 'success' || needs.replay.result == 'skipped') }}
     # Keep the environment so any future protection can be configured in GitHub.
     environment:
       name: gate-disposition
