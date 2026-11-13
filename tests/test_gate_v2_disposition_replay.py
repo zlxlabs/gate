@@ -195,6 +195,45 @@ def test_only_replay_job_uses_upload_artifact():
     assert "upload-artifact" not in yaml.safe_dump(top_level)
 
 
+def test_control_downloads_replay_artifact_only_on_behavior_path():
+    control = _job("control")
+    fetch_replay = _step(control, "Fetch behavior replay evidence")
+    fetch_head = _step(control, "Fetch caller head for counterevidence rerun")
+    assert fetch_replay["if"] == "${{ needs.replay-plan.outputs.behavior == 'true' }}"
+    assert fetch_head["if"] == "${{ needs.replay-plan.outputs.behavior != 'true' }}"
+    assert str(fetch_replay.get("uses", "")).startswith(
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+    )
+    assert fetch_replay["with"]["name"] == (
+        "gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert fetch_replay["with"]["path"] == "${{ runner.temp }}/behavior-replay"
+    canonical = _step(control, "Fetch canonical quality junit")
+    assert canonical["if"] == "${{ needs.replay-plan.outputs.behavior == 'true' }}"
+    assert "${{ inputs." not in canonical["run"]
+    assert "${{ needs." not in canonical["run"]
+    assert "behavior_canonical_junit_missing" in canonical["run"]
+    assert 'gh run download "$PRIMARY_RUN_ID"' in canonical["run"]
+    assert "gate-quality-junit-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}" in canonical["run"]
+
+
+def test_control_sparse_lists_behavior_counterevidence_module():
+    listed = _job("control")
+    checkout = _step(listed, "Checkout disposition producer")
+    sparse = checkout["env"]["GATE_CHECKOUT_SPARSE"]
+    assert ".github/actions/gate-aggregator/behavior_counterevidence.py" in sparse
+
+
+def test_control_new_run_steps_do_not_expand_inputs_or_needs():
+    control = _job("control")
+    for step in control["steps"]:
+        run_text = step.get("run")
+        if run_text is None:
+            continue
+        assert "${{ inputs." not in run_text
+        assert "${{ needs." not in run_text
+
+
 def _classify_code() -> str:
     plan = _job("replay-plan")
     return _heredoc_blocks(_step(plan, "Classify counterevidence as behavior_replay")["run"])[0]

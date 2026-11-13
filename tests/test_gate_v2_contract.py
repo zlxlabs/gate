@@ -38,6 +38,14 @@ DISPOSITION_CALLER_PIN = "__PINNED_GATE_SHA__"
 # gate#278: the disposition entry point materializes its tools below the
 # workspace, exactly like every gate-v2 workflow_sha checkout site.
 DISPOSITION_CHECKOUT_SUBDIR = "_gate-disposition-src"
+DISPOSITION_PRODUCER_SPARSE = [
+    ".github/actions/gate-disposition/issue_receipt.py",
+    ".github/actions/gate-aggregator/convergence.py",
+    ".github/actions/gate-aggregator/counterevidence_argv.py",
+    ".github/actions/gate-aggregator/behavior_counterevidence.py",
+    "scripts/silo_store.py",
+    "scripts/silo_exec.sh",
+]
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 PREFLIGHT_SCRIPT = REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
 ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
@@ -618,14 +626,7 @@ def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
         for step in raw["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
     )
-    listed = set(_sparse_env_paths(checkout))
-    assert listed == {
-        ".github/actions/gate-disposition/issue_receipt.py",
-        ".github/actions/gate-aggregator/convergence.py",
-        ".github/actions/gate-aggregator/counterevidence_argv.py",
-        "scripts/silo_store.py",
-        "scripts/silo_exec.sh",
-    }
+    assert set(_sparse_env_paths(checkout)) == set(DISPOSITION_PRODUCER_SPARSE)
     helper = BOUNDED_RETRY_HELPER.read_text(encoding="utf-8")
     assert '["sparse-checkout", "init", "--no-cone"]' in helper
     assert '"--no-cone"' in helper
@@ -638,13 +639,7 @@ def test_disposition_checkout_uses_reusable_workflow_identity():
         for step in raw["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
     )
-    assert_workflow_sha_checkout(checkout, path=DISPOSITION_CHECKOUT_SUBDIR, sparse=[
-        ".github/actions/gate-disposition/issue_receipt.py",
-        ".github/actions/gate-aggregator/convergence.py",
-        ".github/actions/gate-aggregator/counterevidence_argv.py",
-        "scripts/silo_store.py",
-        "scripts/silo_exec.sh",
-    ])
+    assert_workflow_sha_checkout(checkout, path=DISPOSITION_CHECKOUT_SUBDIR, sparse=DISPOSITION_PRODUCER_SPARSE)
     assert not any(step.get("name") == "Require 40-hex gate_ref" for step in raw["jobs"]["control"]["steps"])
     assert "inputs." + "gate_ref" not in DISPOSITION_WORKFLOW.read_text()
 

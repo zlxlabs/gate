@@ -243,3 +243,64 @@ def _patch_text_rules(parsed: dict, finding_file: str, finding_line: int) -> str
     if parsed["net_changed"] > PATCH_MAX_NET_CHANGED_LINES:
         return "behavior_patch_too_many_lines"
     return None
+
+
+# Shared with issue_receipt (junit @type) and convergence (gate_replay.red_failure_type).
+ALLOWED_FAILURE_TYPES = frozenset({"AssertionError", "Failed"})
+ENVIRONMENT_FAILURE_MARKERS = (
+    "Timeout",
+    "TimeoutError",
+    "OSError",
+    "PermissionError",
+    "ConnectionError",
+)
+_GATE_REPLAY_FIELDS = (
+    "contract_version",
+    "replay_run_id",
+    "replay_run_attempt",
+    "canonical_outcome",
+    "baseline_outcome",
+    "red_outcome",
+    "red_failure_type",
+    "canonical_xml_sha256",
+    "baseline_xml_sha256",
+    "red_xml_sha256",
+    "exit_codes",
+)
+
+
+def behavior_gate_replay_reason(evidence: object) -> str | None:
+    """Return a stable reason_code unless gate-written replay evidence is complete.
+
+    Syntactic only: no filesystem, Git, or test execution.
+    """
+
+    if not isinstance(evidence, dict):
+        return "counterevidence_required"
+    replay = evidence.get("gate_replay")
+    if not isinstance(replay, dict):
+        return "behavior_replay_missing"
+    if any(field not in replay for field in _GATE_REPLAY_FIELDS):
+        return "behavior_replay_incomplete"
+    if replay.get("contract_version") != BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION:
+        return "behavior_contract_version_invalid"
+    if not isinstance(replay.get("replay_run_id"), str) or not replay["replay_run_id"]:
+        return "behavior_replay_incomplete"
+    if not isinstance(replay.get("replay_run_attempt"), str) or not replay["replay_run_attempt"]:
+        return "behavior_replay_incomplete"
+    for key in ("canonical_xml_sha256", "baseline_xml_sha256", "red_xml_sha256"):
+        digest = replay.get(key)
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            return "behavior_replay_incomplete"
+    if not isinstance(replay.get("exit_codes"), dict):
+        return "behavior_replay_incomplete"
+    if replay.get("canonical_outcome") != "passed":
+        return "behavior_canonical_not_passed"
+    if replay.get("baseline_outcome") != "passed":
+        return "behavior_baseline_not_passed"
+    if replay.get("red_outcome") != "failure":
+        return "behavior_red_not_failure"
+    failure_type = replay.get("red_failure_type")
+    if not isinstance(failure_type, str) or failure_type not in ALLOWED_FAILURE_TYPES:
+        return "behavior_red_not_assertion"
+    return None

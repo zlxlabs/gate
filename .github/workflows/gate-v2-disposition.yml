@@ -9,7 +9,7 @@ on:
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
       disposition: { description: "false-positive or deferred; omitted legacy calls are rejected without evidence", required: false, type: string }
-      counterevidence_json: { description: "JSON object with command, output, result=refuted, and pointer for false-positive", required: false, type: string }
+      counterevidence_json: { description: "false-positive JSON. kind omitted/literal_grep: command, output, result=refuted, pointer. kind=behavior_replay: nodeid, patch, finding_id, primary_run_id, primary_run_attempt, head_sha, runner, result=refuted, pointer", required: false, type: string }
       tracking_issue: { description: "same-repository issue number (#N) or issues URL for deferred", required: false, type: string }
       gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
   workflow_call:
@@ -20,7 +20,7 @@ on:
       finding_id: { description: "exact current-audit finding id", required: true, type: string }
       reason: { description: "reason for the false-positive disposition", required: true, type: string }
       disposition: { description: "false-positive or deferred; omitted legacy calls are rejected without evidence", required: false, type: string }
-      counterevidence_json: { description: "JSON object with command, output, result=refuted, and pointer for false-positive", required: false, type: string }
+      counterevidence_json: { description: "false-positive JSON. kind omitted/literal_grep: command, output, result=refuted, pointer. kind=behavior_replay: nodeid, patch, finding_id, primary_run_id, primary_run_attempt, head_sha, runner, result=refuted, pointer", required: false, type: string }
       tracking_issue: { description: "same-repository issue number (#N) or issues URL for deferred", required: false, type: string }
       gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
     secrets:
@@ -418,6 +418,12 @@ jobs:
             echo "::error::DISPOSITION_INPUT_PREFLIGHT_FAILED: false-positive disposition with an empty counterevidence_json. $hint" >&2
             exit 1
           fi
+          if [ "$kind" = false-positive ] && [ -n "${DISPOSITION_COUNTEREVIDENCE_JSON:-}" ]; then
+            python3 -c 'import json,os,sys; raw=os.environ.get("DISPOSITION_COUNTEREVIDENCE_JSON",""); payload=json.loads(raw) if raw.lstrip()[:1]=="{" else None; ok=isinstance(payload,dict) and payload.get("kind")=="behavior_replay"; raise SystemExit(0 if (not ok) or (payload.get("nodeid") and payload.get("patch") not in (None,"")) else 1)' || {
+              echo "::error::DISPOSITION_INPUT_PREFLIGHT_FAILED: behavior_replay JSON needs kind, nodeid and patch. $hint" >&2
+              exit 1
+            }
+          fi
 
       - name: Checkout disposition producer
         env:
@@ -431,6 +437,7 @@ jobs:
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
             .github/actions/gate-aggregator/counterevidence_argv.py
+            .github/actions/gate-aggregator/behavior_counterevidence.py
             scripts/silo_store.py
             scripts/silo_exec.sh
           GATE_GITHUB_TOKEN: ${{ github.token }}
@@ -559,6 +566,7 @@ jobs:
           echo "CURRENT_EPOCH=$epoch" >> "$GITHUB_ENV"
 
       - name: Fetch caller head for counterevidence rerun
+        if: ${{ needs.replay-plan.outputs.behavior != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           DISPOSITION_COUNTEREVIDENCE_JSON: ${{ inputs.counterevidence_json }}
@@ -646,6 +654,29 @@ jobs:
           fi
           echo "CALLER_HEAD_DIR=$repo_dir" >> "$GITHUB_ENV"
 
+      - name: Fetch behavior replay evidence
+        if: ${{ needs.replay-plan.outputs.behavior == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/behavior-replay
+
+      - name: Fetch canonical quality junit
+        if: ${{ needs.replay-plan.outputs.behavior == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
+          PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/behavior-canonical-junit"
+          mkdir -p "$dest"
+          name="gate-quality-junit-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
+          gh run download "$PRIMARY_RUN_ID" --name "$name" --dir "$dest" || {
+            echo "::error::behavior_canonical_junit_missing: artifact $name not on run $PRIMARY_RUN_ID attempt $PRIMARY_RUN_ATTEMPT" >&2
+            exit 1
+          }
+
       - name: Issue immutable disposition artifact
         id: disposition
         env:
@@ -660,6 +691,11 @@ jobs:
           DISPOSITION_APPROVER_ID: ${{ github.actor_id }}
           DISPOSITION_REPOSITORY: ${{ github.repository }}
           OUTPUT_DIR: ${{ runner.temp }}/gate-disposition-artifact
+          BEHAVIOR: ${{ needs.replay-plan.outputs.behavior }}
+          PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
+          PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
+          BEHAVIOR_REPLAY_DIR: ${{ runner.temp }}/behavior-replay
+          BEHAVIOR_CANONICAL_JUNIT_DIR: ${{ runner.temp }}/behavior-canonical-junit
         run: |
           set -euo pipefail
           mkdir -p "$OUTPUT_DIR"
@@ -669,6 +705,8 @@ jobs:
           test -n "$CURRENT_EPOCH"
           test -n "$DISPOSITION_APPROVER"
           test -n "$DISPOSITION_APPROVER_ID"
+          mode=""
+          if [ "${BEHAVIOR:-}" != true ]; then
           test -n "$CALLER_HEAD_DIR"
           eval "$GATE_SOURCE_DECIDE_SCRIPT"
           mode=$(cat "$RUNNER_TEMP/gate-source-mode")
@@ -707,6 +745,8 @@ jobs:
               fi
             fi
           fi
+          fi
+          CALLER_HEAD_DIR="${CALLER_HEAD_DIR:-}"
           approved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           output="$(python3 _gate-disposition-src/.github/actions/gate-disposition/issue_receipt.py issue \
             --output-dir "$OUTPUT_DIR" --audit-path "$AUDIT_PATH" \
@@ -722,7 +762,7 @@ jobs:
             --repo-dir "$CALLER_HEAD_DIR")"
           artifact_name="$(printf '%s' "$output" | jq -r '.artifact')"
           test -n "$artifact_name" && echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
-          if [ "$mode" = service ]; then
+          if [ "${BEHAVIOR:-}" != true ] && [ "$mode" = service ]; then
             flock --unlock "$source_lock_fd"
           fi
 
