@@ -115,12 +115,15 @@ def _finding_identity(finding: object) -> tuple[str, int, bool]:
 def _parse_unified_diff(text: str) -> tuple[dict | None, str | None]:
     paths: list[str] = []
     hunk_old_ranges: list[tuple[int, int]] = []
+    changed_old_lines: list[int] = []
     net_changed = 0
     has_dev_null = False
     has_forbidden_header = False
     in_hunk = False
     old_left = 0
     new_left = 0
+    old_pos = 0
+    last_old = 0
 
     for raw_line in text.splitlines():
         line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
@@ -132,15 +135,21 @@ def _parse_unified_diff(text: str) -> tuple[dict | None, str | None]:
                     return None, "behavior_patch_unparseable"
                 new_left -= 1
                 net_changed += 1
+                changed_old_lines.append(last_old)
                 continue
             if line.startswith("-"):
                 if old_left <= 0:
                     return None, "behavior_patch_unparseable"
+                changed_old_lines.append(old_pos)
+                last_old = old_pos
+                old_pos += 1
                 old_left -= 1
                 net_changed += 1
                 continue
             if old_left <= 0 or new_left <= 0:
                 return None, "behavior_patch_unparseable"
+            last_old = old_pos
+            old_pos += 1
             old_left -= 1
             new_left -= 1
             continue
@@ -172,6 +181,8 @@ def _parse_unified_diff(text: str) -> tuple[dict | None, str | None]:
             in_hunk = True
             old_left = old_count
             new_left = new_count
+            old_pos = old_start
+            last_old = old_start
             continue
 
     if in_hunk and (old_left != 0 or new_left != 0):
@@ -186,6 +197,7 @@ def _parse_unified_diff(text: str) -> tuple[dict | None, str | None]:
         {
             "paths": paths,
             "hunk_old_ranges": hunk_old_ranges,
+            "changed_old_lines": changed_old_lines,
             "net_changed": net_changed,
         },
         None,
@@ -224,6 +236,9 @@ def _patch_text_rules(parsed: dict, finding_file: str, finding_line: int) -> str
     window_hi = finding_line + LINE_WINDOW_TOLERANCE
     for lo, hi in parsed["hunk_old_ranges"]:
         if hi < window_lo or lo > window_hi:
+            return "behavior_patch_outside_line_window"
+    for old_line in parsed["changed_old_lines"]:
+        if old_line < window_lo or old_line > window_hi:
             return "behavior_patch_outside_line_window"
     if parsed["net_changed"] > PATCH_MAX_NET_CHANGED_LINES:
         return "behavior_patch_too_many_lines"

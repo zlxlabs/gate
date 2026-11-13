@@ -44,6 +44,9 @@ def test_vectors_cover_legal_and_boundary_cases():
     assert any(case["id"] == "allowed_line_window_boundary" for case in legal)
     assert any(case["id"] == "hunk_outside_window_plus5" for case in VECTORS["cases"])
     assert any(case["id"] == "patch_too_large_8193" for case in VECTORS["cases"])
+    assert any(case["id"] == "hunk_intersects_minus_outside_window" for case in VECTORS["cases"])
+    assert any(case["id"] == "hunk_intersects_plus_outside_window" for case in VECTORS["cases"])
+    assert any(case["id"] == "allowed_change_inside_wide_hunk" for case in legal)
 
 
 def _bindings(case: dict) -> tuple[object, str, str, str, str, object]:
