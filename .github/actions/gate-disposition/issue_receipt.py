@@ -21,6 +21,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 
 
 P1_SEVERITIES = frozenset({"major", "blocker"})
@@ -44,6 +45,20 @@ def _load_convergence():
 _CONVERGENCE = _load_convergence()
 SCHEMA_VERSION = _CONVERGENCE.DISPOSITION_RECEIPT_SCHEMA_VERSION
 _RERUN_EXCERPT_MAX = 2000
+
+
+def _load_behavior():
+    path = Path(__file__).resolve().parents[1] / "gate-aggregator" / "behavior_counterevidence.py"
+    spec = importlib.util.spec_from_file_location("gate_behavior_from_disposition", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"behavior counterevidence module is unavailable: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_BEHAVIOR = _load_behavior()
 
 
 def _require_head_objects(head_sha: str, pathspec: str, repo_dir: Path) -> None:
@@ -274,6 +289,178 @@ def _matching_finding(findings: list[dict[str, Any]], target: str) -> dict[str, 
     raise ValueError("finding_id must identify exactly one canonical audit finding")
 
 
+def _xml_files(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return sorted(path for path in directory.rglob("*.xml") if path.is_file())
+
+
+def _nodeid_identity(nodeid: str) -> tuple[str, str]:
+    parts = nodeid.split("::")
+    path = parts[0]
+    if path.endswith(".py"):
+        path = path[:-3]
+    module = path.replace("/", ".").replace("\\", ".")
+    if len(parts) == 2:
+        return module, parts[1]
+    if len(parts) >= 3:
+        return module + "." + ".".join(parts[1:-1]), parts[-1]
+    return module, ""
+
+
+def _nodeid_matches(case: ET.Element, nodeid: str) -> bool:
+    classname = case.get("classname") or ""
+    name = case.get("name") or ""
+    expected_class, expected_name = _nodeid_identity(nodeid)
+    if name != expected_name:
+        return False
+    if classname == expected_class:
+        return True
+    if classname.endswith("." + expected_class) or expected_class.endswith("." + classname):
+        return True
+    return classname.replace(".", "/") + ".py::" + name == nodeid
+
+
+def _cases_for_nodeid(xml_files: list[Path], nodeid: str) -> list[ET.Element]:
+    matches: list[ET.Element] = []
+    for path in xml_files:
+        root = ET.parse(path).getroot()
+        for case in root.iter("testcase"):
+            if _nodeid_matches(case, nodeid):
+                matches.append(case)
+    return matches
+
+
+def _case_outcome(case: ET.Element) -> str:
+    if case.find("failure") is not None:
+        return "failure"
+    if case.find("error") is not None:
+        return "error"
+    if case.find("skipped") is not None:
+        return "skipped"
+    return "passed"
+
+
+def _contains_env_marker(text: str) -> bool:
+    return any(marker in text for marker in _BEHAVIOR.ENVIRONMENT_FAILURE_MARKERS)
+
+
+def _reported_exception_type(element: ET.Element) -> str:
+    # pytest 9 junit omits @type; the exception class is the last "path:line: Type" token.
+    attr = element.get("type") or ""
+    if attr:
+        return attr
+    text = (element.text or "").strip()
+    if not text:
+        return ""
+    return text.rsplit(":", 1)[-1].strip()
+
+
+def _judge_passed(cases: list[ET.Element], *, not_green: str) -> str | None:
+    if len(cases) != 1:
+        return "behavior_nodeid_not_collected"
+    if _case_outcome(cases[0]) != "passed":
+        return not_green
+    return None
+
+
+def _judge_red(cases: list[ET.Element]) -> tuple[str | None, str]:
+    if len(cases) != 1:
+        return "behavior_nodeid_not_collected", ""
+    case = cases[0]
+    if case.find("error") is not None:
+        return "behavior_red_is_error", ""
+    if case.find("skipped") is not None:
+        return "behavior_red_skipped", ""
+    failure = case.find("failure")
+    if failure is None:
+        return "behavior_red_not_failure", ""
+    failure_type = _reported_exception_type(failure)
+    message = failure.get("message") or ""
+    if failure_type not in _BEHAVIOR.ALLOWED_FAILURE_TYPES:
+        return "behavior_red_not_assertion", failure_type
+    if _contains_env_marker(failure_type) or _contains_env_marker(message):
+        return "behavior_red_not_assertion", failure_type
+    return None, failure_type
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _issue_behavior_counterevidence(
+    args: argparse.Namespace,
+    envelope: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    finding_id: str,
+    head_sha: str,
+    matching: dict[str, Any],
+) -> dict[str, Any]:
+    primary_run_id = str(_required(args, envelope, "primary_run_id", "PRIMARY_RUN_ID"))
+    primary_run_attempt = str(_required(args, envelope, "primary_run_attempt", "PRIMARY_RUN_ATTEMPT"))
+    reason = _BEHAVIOR.behavior_counterevidence_reason(
+        payload, finding_id, primary_run_id, primary_run_attempt, head_sha, matching,
+    )
+    if reason is not None:
+        raise ValueError(reason)
+    replay_dir = Path(_required(args, envelope, "behavior_replay_dir", "BEHAVIOR_REPLAY_DIR"))
+    canonical_dir = Path(
+        _required(args, envelope, "behavior_canonical_junit_dir", "BEHAVIOR_CANONICAL_JUNIT_DIR"),
+    )
+    canonical_xmls = _xml_files(canonical_dir)
+    if not canonical_xmls:
+        raise ValueError("behavior_canonical_junit_missing")
+    baseline_xml = replay_dir / "baseline.xml"
+    red_xml = replay_dir / "red.xml"
+    exit_path = replay_dir / "exit_codes.json"
+    if not baseline_xml.is_file() or not red_xml.is_file():
+        raise ValueError("behavior_replay_no_junit")
+    if not exit_path.is_file():
+        raise ValueError("behavior_replay_timeout")
+    exit_codes = json.loads(exit_path.read_text(encoding="utf-8"))
+    if not isinstance(exit_codes, dict) or exit_codes.get("apply_ok") is not True:
+        raise ValueError("behavior_patch_apply_failed")
+    nodeid = payload["nodeid"]
+    canonical_cases = _cases_for_nodeid(canonical_xmls, nodeid)
+    canonical_reason = _judge_passed(
+        canonical_cases, not_green="behavior_canonical_not_passed",
+    )
+    if canonical_reason is not None:
+        raise ValueError(canonical_reason)
+    baseline_cases = _cases_for_nodeid([baseline_xml], nodeid)
+    baseline_reason = _judge_passed(
+        baseline_cases, not_green="behavior_baseline_not_green",
+    )
+    if baseline_reason is not None:
+        raise ValueError(baseline_reason)
+    if exit_codes.get("baseline") != 0:
+        raise ValueError("behavior_baseline_not_green")
+    red_cases = _cases_for_nodeid([red_xml], nodeid)
+    red_reason, failure_type = _judge_red(red_cases)
+    if red_reason is not None:
+        raise ValueError(red_reason)
+    if type(exit_codes.get("red")) is not int or exit_codes["red"] == 0:
+        raise ValueError("behavior_red_not_failure")
+    replay_run_id = str(_required(args, envelope, "replay_run_id", "GITHUB_RUN_ID"))
+    replay_run_attempt = str(_required(args, envelope, "replay_run_attempt", "GITHUB_RUN_ATTEMPT"))
+    issued = dict(payload)
+    issued["gate_replay"] = {
+        "contract_version": _BEHAVIOR.BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION,
+        "replay_run_id": replay_run_id,
+        "replay_run_attempt": replay_run_attempt,
+        "canonical_outcome": "passed",
+        "baseline_outcome": "passed",
+        "red_outcome": "failure",
+        "red_failure_type": failure_type,
+        "canonical_xml_sha256": _sha256_file(canonical_xmls[0]),
+        "baseline_xml_sha256": _sha256_file(baseline_xml),
+        "red_xml_sha256": _sha256_file(red_xml),
+        "exit_codes": exit_codes,
+    }
+    return issued
+
+
 def _read_scope(args: argparse.Namespace, envelope: dict[str, Any], *, repository_id: str, pr_number: int, head_sha: str) -> dict[str, Any]:
     raw_scope = _required(args, envelope, "scope_json", "DISPOSITION_SCOPE_JSON")
     scope = json.loads(raw_scope) if isinstance(raw_scope, str) else raw_scope
@@ -350,27 +537,35 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         if counterevidence_raw is None or counterevidence_raw == "":
             raise ValueError("counterevidence_required")
         counterevidence = json.loads(counterevidence_raw) if isinstance(counterevidence_raw, str) else counterevidence_raw
-        if not isinstance(counterevidence, dict) or any(
-            not isinstance(counterevidence.get(field), str) or not counterevidence[field].strip()
-            for field in COUNTEREVIDENCE_FIELDS
-        ):
+        if not isinstance(counterevidence, dict):
             raise ValueError("counterevidence_required")
-        if counterevidence["result"] != "refuted":
-            raise ValueError("counterevidence_result_not_refuted")
-        match_expectation = counterevidence.get("match_expectation", "present")
-        try:
-            argv = shlex.split(counterevidence["command"])
-        except ValueError as exc:
-            raise ValueError("counterevidence_command_not_allowlisted") from exc
-        argv_reason = _CONVERGENCE.counterevidence_argv_reason(argv, head_sha)
-        if argv_reason is not None:
-            raise ValueError(argv_reason)
-        repo_dir = Path(_required(args, envelope, "repo_dir", "DISPOSITION_REPO_DIR"))
-        counterevidence = dict(counterevidence)
-        counterevidence["gate_rerun"] = rerun_counterevidence(
-            counterevidence["command"], head_sha, repo_dir,
-            match_expectation=match_expectation, base_sha=scope["base_sha"],
-        )
+        if counterevidence.get("kind") == "behavior_replay":
+            counterevidence = _issue_behavior_counterevidence(
+                args, envelope, counterevidence, finding_id=finding_id,
+                head_sha=head_sha, matching=matching,
+            )
+        else:
+            if any(
+                not isinstance(counterevidence.get(field), str) or not counterevidence[field].strip()
+                for field in COUNTEREVIDENCE_FIELDS
+            ):
+                raise ValueError("counterevidence_required")
+            if counterevidence["result"] != "refuted":
+                raise ValueError("counterevidence_result_not_refuted")
+            match_expectation = counterevidence.get("match_expectation", "present")
+            try:
+                argv = shlex.split(counterevidence["command"])
+            except ValueError as exc:
+                raise ValueError("counterevidence_command_not_allowlisted") from exc
+            argv_reason = _CONVERGENCE.counterevidence_argv_reason(argv, head_sha)
+            if argv_reason is not None:
+                raise ValueError(argv_reason)
+            repo_dir = Path(_required(args, envelope, "repo_dir", "DISPOSITION_REPO_DIR"))
+            counterevidence = dict(counterevidence)
+            counterevidence["gate_rerun"] = rerun_counterevidence(
+                counterevidence["command"], head_sha, repo_dir,
+                match_expectation=match_expectation, base_sha=scope["base_sha"],
+            )
     else:
         if not isinstance(tracking_issue, str):
             raise ValueError("tracking_issue_invalid")

@@ -1,10 +1,4 @@
-"""Pure canonical clean-streak convergence evaluator.
-
-This module deliberately has no filesystem, network, subprocess, environment,
-or GitHub dependencies.  The caller owns I/O and supplies immutable canonical
-primary evidence and receipts.  All state returned here is derived from those
-inputs and can therefore be replayed in a different process.
-"""
+"""Pure canonical clean-streak convergence evaluator. Caller owns I/O; returned state is derived from immutable evidence."""
 
 from __future__ import annotations
 
@@ -64,9 +58,6 @@ COUNTEREVIDENCE_ARGV_CONTRACT_VERSION = _COUNTEREVIDENCE_ARGV.COUNTEREVIDENCE_AR
 COUNTEREVIDENCE_ARGV_TEMPLATE = _COUNTEREVIDENCE_ARGV.COUNTEREVIDENCE_ARGV_TEMPLATE
 counterevidence_argv_reason = _COUNTEREVIDENCE_ARGV.counterevidence_argv_reason
 
-# This is intentionally local to the public gate repository.  The private
-# policy source is represented only by Scope.policy_version/policy_digest in
-# this increment; no policy file is parsed here.
 _POLICY_BY_TIER = {
     "personal": (1, 3),
     "internal": (2, 5),
@@ -1329,10 +1320,19 @@ def _approved_at_has_time(value: Any) -> bool:
     return True
 
 
+def _behavior_gate_replay_reason(evidence: dict[str, Any]) -> str | None:
+    spec = importlib.util.spec_from_file_location("gbc", Path(__file__).with_name("behavior_counterevidence.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.behavior_gate_replay_reason(evidence)
+
+
 def _counterevidence_reason(receipt: DispositionReceipt) -> str | None:
     evidence = receipt.counterevidence
     if not isinstance(evidence, dict):
         return "counterevidence_required"
+    if evidence.get("kind") == "behavior_replay":
+        return _behavior_gate_replay_reason(evidence)
     fields = ("command", "output", "result", "pointer")
     if any(not isinstance(evidence.get(field), str) or not evidence[field].strip() for field in fields):
         return "counterevidence_required"
