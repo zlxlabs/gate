@@ -112,10 +112,29 @@ def _pr_json(*, head_full_name: str = REPOSITORY, user_type: str = "User") -> di
 def test_replay_jobs_do_not_run_on_git_source_service():
     plan = _job("replay-plan")
     replay = _job("replay")
-    assert plan["runs-on"] == "ubuntu-latest"
+    assert plan["runs-on"] == ["self-hosted", "linux", "ci"]
     assert "needs.replay-plan.outputs.runs_on" in replay["runs-on"]
     for job in (plan, replay):
         assert "git-source-service" not in " ".join(_string_values(job))
+
+
+def test_replay_plan_does_not_use_hosted_runner():
+    # No caller code runs in replay-plan, so it must stay on the self-hosted
+    # ci slot: a hosted-runner quota outage must not stall the literal-grep
+    # disposition path (r1).
+    assert "ubuntu-latest" not in _job("replay-plan")["runs-on"]
+
+
+def test_replay_pytest_runs_in_checked_out_worktree():
+    # nodeids are relative to the repository root; both pytest calls must run
+    # in the checkout directory, not the workspace root (r1).
+    replay = _job("replay")
+    checkout = next(
+        step for step in replay["steps"] if step.get("uses", "").startswith("actions/checkout")
+    )
+    run_step = _step(replay, "Replay counterevidence nodeid green then red")
+    assert run_step.get("working-directory") == checkout["with"]["path"]
+    assert run_step["run"].count("python3 -m pytest") == 2
 
 
 def test_replay_jobs_have_no_credentials_or_environment():
@@ -241,6 +260,23 @@ def test_plan_classifier_skips_non_behavior_inputs(tmp_path, kind, countereviden
     proc, outputs = _classify(tmp_path, kind=kind, counterevidence=counterevidence)
     assert proc.returncode == 0, proc.stderr
     assert outputs["behavior"] == "false"
+
+
+def test_plan_classifier_rejects_control_chars_in_nodeid(tmp_path):
+    # A newline in nodeid would let a caller forge extra GITHUB_OUTPUT lines
+    # (e.g. overwrite head_sha=) because classify writes nodeid raw (r1).
+    proc, outputs = _classify(
+        tmp_path,
+        kind="false-positive",
+        counterevidence=json.dumps(
+            _behavior_payload(nodeid="tests/a.py::t\nhead_sha=" + "0" * 40)
+        ),
+    )
+    assert proc.returncode != 0
+    assert "behavior_replay_input_invalid" in proc.stderr
+    output_text = (tmp_path / "github-output").read_text(encoding="utf-8")
+    assert "nodeid=" not in output_text
+    assert output_text.count("head_sha=") <= 1
 
 
 @pytest.mark.parametrize(

@@ -169,7 +169,10 @@ jobs:
   # evidence only.  Neither job judges the result or issues receipts — that
   # stays with control (G3 wires the verdict).
   replay-plan:
-    runs-on: ubuntu-latest
+    # No caller code runs here (pure input classification + PR identity guard),
+    # so it must not depend on a hosted-runner quota: the literal-grep path used
+    # to be reachable with self-hosted runners only.
+    runs-on: [self-hosted, linux, ci]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -226,8 +229,9 @@ jobs:
               or not nodeid
               or "::" not in nodeid
               or nodeid.startswith("-")
+              or any(ord(c) < 0x20 or ord(c) == 0x7F for c in nodeid)
           ):
-              problems.append("nodeid must be non-empty, contain '::', and not start with '-'")
+              problems.append("nodeid must be non-empty, contain '::', start with neither '-' nor a control character")
           unified = patch.get("unified_diff") if isinstance(patch, dict) else None
           claimed = patch.get("sha256") if isinstance(patch, dict) else None
           digest = (
@@ -302,7 +306,12 @@ jobs:
       # Evidence only: baseline (no patch) then red (patch applied).  A nonzero
       # pytest exit code is EXPECTED on red and never fails this job; only an
       # apply failure does — and the upload below still runs first (always()).
+      # Both pytest invocations must run inside the checked-out worktree: nodeids
+      # are relative to the repository root, and the patch is applied there.
+      # Evidence paths stay absolute under RUNNER_TEMP, so the working-directory
+      # switch does not move them.
       - name: Replay counterevidence nodeid green then red
+        working-directory: replay-worktree
         env:
           COUNTEREVIDENCE_JSON: ${{ inputs.counterevidence_json }}
           REPLAY_HEAD_SHA: ${{ needs.replay-plan.outputs.head_sha }}
