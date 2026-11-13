@@ -171,11 +171,19 @@ def contract_violations(baseline, current) -> list[str]:
     )
     old_permissions = _permission_declarations(baseline)
     new_permissions = _permission_declarations(current)
+    baseline_workflow_decl = old_permissions.get("workflow")
     for location in old_permissions:
         if location not in new_permissions:
             violations.append(f"permissions declaration removed at {location}")
     for location, current_decl in new_permissions.items():
-        old_decl = old_permissions.get(location, {})
+        old_decl = old_permissions.get(location)
+        is_new_location = old_decl is None and location not in old_permissions
+        if is_new_location and location.startswith("job:"):
+            # A new job inherits the workflow-level permissions, so the
+            # caller-granted ceiling is that declaration, not "nothing".
+            # Declaring fewer scopes than the ceiling is a reduction, not a
+            # compatibility break; only exceeding the ceiling is an expansion.
+            old_decl = baseline_workflow_decl
         old_map = _permission_map(old_decl)
         new_map = _permission_map(current_decl)
         for scope in sorted(set(old_map) | set(new_map)):
@@ -186,7 +194,7 @@ def contract_violations(baseline, current) -> list[str]:
                     f"permission expanded at {location}: {scope} "
                     f"{old_level}->{new_level}"
                 )
-            elif new_level < old_level:
+            elif new_level < old_level and not is_new_location:
                 violations.append(
                     f"permission restricted at {location}: {scope} "
                     f"{old_level}->{new_level}"
@@ -329,6 +337,39 @@ def test_contract_guard_rejects_permission_restriction():
     violations = contract_violations(baseline, current)
     assert "permission restricted at workflow: contents 2->1" in violations
     assert "permission restricted at workflow: issues 2->0" in violations
+
+
+def test_contract_guard_allows_new_job_permission_below_workflow_ceiling():
+    # gate#404: a new job-level permissions declaration that stays within the
+    # baseline workflow-level ceiling is a reduction (it drops actions:write),
+    # not a compatibility break, so the guard must stay silent.
+    baseline = {
+        "on": {"workflow_call": {}},
+        "permissions": {"actions": "write", "contents": "read", "pull-requests": "read"},
+        "jobs": {},
+    }
+    current = {
+        "on": {"workflow_call": {}},
+        "permissions": {"actions": "write", "contents": "read", "pull-requests": "read"},
+        "jobs": {"replay": {"permissions": {"contents": "read"}}},
+    }
+    assert contract_violations(baseline, current) == []
+
+
+def test_contract_guard_rejects_new_job_permission_above_workflow_ceiling():
+    baseline = {
+        "on": {"workflow_call": {}},
+        "permissions": {"contents": "read"},
+        "jobs": {},
+    }
+    current = {
+        "on": {"workflow_call": {}},
+        "permissions": {"contents": "read"},
+        "jobs": {"replay": {"permissions": {"issues": "write"}}},
+    }
+    assert "permission expanded at job:replay: issues 0->2" in contract_violations(
+        baseline, current
+    )
 
 
 def test_contract_guard_rejects_input_type_change():

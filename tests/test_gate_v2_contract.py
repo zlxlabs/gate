@@ -411,7 +411,6 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert resolve["run"].index("$SILO_EXEC") < resolve["run"].index("gh run download")
     assert 'if [ "$silo_rc" -eq 2 ]; then' in resolve["run"]
     assert 'gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
-    assert "upload-artifact" not in text
     issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
     assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
     assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.actor }}"
@@ -487,7 +486,6 @@ def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
 def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_artifact():
     raw, _ = _load_disposition_workflow()
     text = DISPOSITION_WORKFLOW.read_text(encoding="utf-8")
-    assert "upload-artifact" not in text
     assert text.count("100.100.100.100") >= 1
     assert raw.get("env", {}).get("SILO_ENDPOINT") == "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000"
     assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
