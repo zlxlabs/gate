@@ -8,9 +8,11 @@ replay jobs, and run their inline plan scripts offline against fixtures.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,10 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/gate-v2-disposition.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
+CONVERGENCE_SPARSE = ".github/actions/gate-aggregator/convergence.py"
+ARGV_SPARSE = ".github/actions/gate-aggregator/counterevidence_argv.py"
+BEHAVIOR_SPARSE = ".github/actions/gate-aggregator/behavior_counterevidence.py"
 REPOSITORY = "zlxlabs/repo"
 
 DIFF = (
@@ -371,6 +377,70 @@ def test_plan_guard_rejects_fork_and_bot(tmp_path, pull):
     proc = _guard(tmp_path, pull)
     assert proc.returncode != 0
     assert "behavior_unreviewed_or_fork" in proc.stderr
+
+
+def _sparse_env_values(node: object) -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        value = node.get("GATE_CHECKOUT_SPARSE")
+        if isinstance(value, str):
+            found.append(value)
+        for item in node.values():
+            found.extend(_sparse_env_values(item))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_sparse_env_values(item))
+    return found
+
+
+def _convergence_sparse_lists() -> list[tuple[str, list[str]]]:
+    listed: list[tuple[str, list[str]]] = []
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for index, sparse in enumerate(_sparse_env_values(raw)):
+            lines = [line.strip() for line in sparse.splitlines() if line.strip()]
+            if any(CONVERGENCE_SPARSE in line for line in lines):
+                listed.append((f"{path.relative_to(ROOT).as_posix()}#{index}", lines))
+    return listed
+
+
+def test_every_convergence_sparse_lists_argv_and_behavior_modules():
+    listed = _convergence_sparse_lists()
+    assert listed, "no workflow sparse list names gate-aggregator/convergence.py"
+    for label, lines in listed:
+        blob = "\n".join(lines)
+        assert ARGV_SPARSE in blob, label
+        assert BEHAVIOR_SPARSE in blob, label
+
+
+def _gate_v2_aggregator_sparse() -> list[str]:
+    raw = yaml.safe_load((ROOT / ".github/workflows/gate-v2.yml").read_text(encoding="utf-8"))
+    for sparse in _sparse_env_values(raw):
+        lines = [line.strip() for line in sparse.splitlines() if line.strip()]
+        if ARGV_SPARSE in lines and CONVERGENCE_SPARSE in lines:
+            return lines
+    raise AssertionError("gate-v2.yml has no aggregator sparse list")
+
+
+def test_gate_v2_aggregator_sparse_import_accepts_behavior_receipt(tmp_path):
+    from test_behavior_replay_verdict import _behavior_receipt
+
+    dest = tmp_path / "sparse"
+    for rel in _gate_v2_aggregator_sparse():
+        src = ROOT / rel
+        if not src.is_file():
+            continue
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(src.read_bytes())
+    module_path = dest / CONVERGENCE_SPARSE
+    spec = importlib.util.spec_from_file_location("gate_convergence_sparse_r1", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    receipt, _, _ = _behavior_receipt()
+    assert module._counterevidence_reason(receipt) is None
 
 
 def test_plan_guard_picks_self_hosted_slot_for_human_pr(tmp_path):
