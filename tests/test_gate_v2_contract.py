@@ -413,7 +413,7 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     assert "put-dir" in upload["run"]
     resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
     assert resolve["env"]["GH_REPO"] == "${{ github.repository }}"
-    assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"' in resolve["run"]
+    assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${audit_attempt}"' in resolve["run"]
     assert 'silo_key="d14/${GITHUB_REPOSITORY_ID}/${audit_name}/primary-review-audit.json"' in resolve["run"]
     assert '"$SILO_EXEC" get' in resolve["run"]
     assert resolve["run"].index("$SILO_EXEC") < resolve["run"].index("gh run download")

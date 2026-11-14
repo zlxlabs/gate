@@ -480,12 +480,75 @@ jobs:
             '.head.sha and .base.sha and (.head.repo.full_name == $repo) and ($id > 0)' \
             "$pr_json" > /dev/null
           head_sha="$(jq -r '.head.sha' "$pr_json")"
+          # gate#409: the audit is uploaded only by the attempt that actually ran
+          # the review; a rerun re-executes the aggregator without primary, so the
+          # caller-referenced attempt is not necessarily where the audit lives.
+          # Read the authoritative mapping — the gate terminal envelope uploaded on
+          # the referenced attempt (audit.source_attempt, cross-checked by the
+          # aggregator against the audit record itself) — instead of probing keys.
+          terminal_dir="$RUNNER_TEMP/current-gate-terminal"
+          mkdir -p "$terminal_dir"
+          terminal_name="gate-terminal-v1-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
+          terminal_key="d30/${GITHUB_REPOSITORY_ID}/${terminal_name}/gate-terminal.json"
+          terminal_path="$terminal_dir/gate-terminal.json"
+          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
+          set +e
+          "$SILO_EXEC" get --key "$terminal_key" --dest "$terminal_path"
+          terminal_rc=$?
+          set -e
+          if [ "$terminal_rc" -ne 0 ]; then
+            echo "::error::DISPOSITION-AUDIT-ATTEMPT-UNRESOLVED reason=terminal_fetch_failed rc=${terminal_rc} key=${terminal_key}" >&2
+            exit 1
+          fi
+          # The envelope's audit.source_attempt is authoritative: the aggregator
+          # only sets it after cross-checking it against the audit record's own
+          # run_attempt. Anything unresolvable fails fast — no probing of other
+          # attempts, no retries, no defaults.
+          audit_attempt="$(python3 - "$terminal_path" "$PRIMARY_RUN_ATTEMPT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          MARKER = "DISPOSITION-AUDIT-ATTEMPT-UNRESOLVED"
+
+
+          def fail(reason):
+              print(f"{MARKER} reason={reason}", file=sys.stderr)
+              raise SystemExit(1)
+
+
+          path = Path(sys.argv[1])
+          try:
+              referenced = int(sys.argv[2])
+          except ValueError:
+              fail(f"referenced_attempt_invalid value={sys.argv[2]!r}")
+          if referenced < 1:
+              fail(f"referenced_attempt_invalid value={sys.argv[2]!r}")
+          if not path.is_file():
+              fail(f"terminal_missing path={path}")
+          try:
+              envelope = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+              fail(f"terminal_unreadable path={path}")
+          if not isinstance(envelope, dict) or envelope.get("kind") != "gate_terminal" or envelope.get("schema_version") != 1:
+              fail("terminal_not_gate_terminal")
+          if envelope.get("run_attempt") != referenced:
+              fail(f"terminal_attempt_mismatch recorded={envelope.get('run_attempt')!r} referenced={referenced}")
+          audit = envelope.get("audit")
+          if not isinstance(audit, dict) or audit.get("available") is not True:
+              fail("audit_unavailable_in_terminal")
+          source = audit.get("source_attempt")
+          if type(source) is not int or source < 1:
+              fail(f"audit_source_attempt_invalid value={source!r}")
+          print(source)
+          PY
+          )"
+          echo "DISPOSITION-AUDIT-ATTEMPT-RESOLVED audit_attempt=${audit_attempt} run_attempt=${PRIMARY_RUN_ATTEMPT}"
           audit_dir="$RUNNER_TEMP/current-primary-audit"
           mkdir -p "$audit_dir"
-          audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
+          audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${audit_attempt}"
           silo_key="d14/${GITHUB_REPOSITORY_ID}/${audit_name}/primary-review-audit.json"
           dest="$audit_dir/primary-review-audit.json"
-          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "::error::SILO_ACCESS_KEY 未传入" >&2; exit 1; }
           set +e
           "$SILO_EXEC" get --key "$silo_key" --dest "$dest"
           silo_rc=$?
@@ -499,13 +562,15 @@ jobs:
           audit_path="$(find "$audit_dir" -type f -name '*.json' -print -quit)"
           test -n "$audit_path"
           audit_digest="$(sha256sum "$audit_path" | cut -d' ' -f1)"
-          jq -e --arg head "$head_sha" --argjson pr "$PR_NUMBER" --argjson run "$PRIMARY_RUN_ID" --argjson attempt "$PRIMARY_RUN_ATTEMPT" \
+          jq -e --arg head "$head_sha" --argjson pr "$PR_NUMBER" --argjson run "$PRIMARY_RUN_ID" --argjson attempt "$audit_attempt" \
             '.head_sha == $head and (.pr == $pr or .pr_number == $pr) and .run_id == $run and .run_attempt == $attempt' "$audit_path" > /dev/null
           {
             echo "AUDIT_PATH=$audit_path"
             echo "CURRENT_PR_PATH=$pr_json"
             echo "CURRENT_HEAD_SHA=$head_sha"
             echo "CURRENT_AUDIT_DIGEST=$audit_digest"
+            echo "AUDIT_SOURCE_ATTEMPT=$audit_attempt"
+            echo "DISPOSITION_REFERENCED_ATTEMPT=$PRIMARY_RUN_ATTEMPT"
           } >> "$GITHUB_ENV"
 
       - name: Construct canonical scope and derive epoch
