@@ -828,7 +828,7 @@ def test_control_runner_input_defaults_to_follow_runner():
 def test_all_required_jobs_present():
     raw, _ = _load_workflow()
     assert set(raw["jobs"].keys()) == {
-        "classify_pr_paths", "quality", "primary", "resolve_advisory", "ocr", "gate", "ledger",
+        "classify_pr_paths", "quality", "primary", "resolve_advisory", "ocr", "ocr_visibility", "gate", "ledger",
     }
 
 
