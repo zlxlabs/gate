@@ -2604,6 +2604,64 @@ jobs:
           printf '::warning::%s\n' "$result"
           exit 0
 
+  # ── ocr_visibility (gate#410: non-blocking observation) ─────────────────
+  # gate#410: when the ocr leg does not run on a non-draft PR, `gate / gate`
+  # still reports SUCCESS — consumers cannot tell "scanned, no findings"
+  # from "never scanned". This job emits exactly one line,
+  # GATE-OCR-SCAN-V1 scanned=... ocr_result=... reason=..., into the job log
+  # and the step summary. It is deliberately NOT in `gate`'s or `ledger`'s
+  # needs and is not a required check; consumers grep the line instead.
+  ocr_visibility:
+    needs: [classify_pr_paths, resolve_advisory, ocr]
+    if: ${{ always() && github.event.pull_request.draft != true }}
+    # Control-plane route follows classify_pr_paths (same expression verbatim);
+    # the job is pure observation and reads no secret.
+    runs-on: ${{ (inputs.runner == 'self' && inputs.control_runner != 'github-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Emit GATE-OCR-SCAN-V1 visibility line
+        env:
+          OCR_RESULT: ${{ needs.ocr.result }}
+          REVIEW_EXPECTED: ${{ needs.classify_pr_paths.outputs.review_expected }}
+          RESOLVE_ADVISORY_RESULT: ${{ needs.resolve_advisory.result }}
+          HAS_ADVISORY: ${{ needs.resolve_advisory.outputs.has_advisory }}
+          PR_AUTHOR_LOGIN: ${{ toJSON(github.event.pull_request.user.login) }}
+        run: |
+          set -euo pipefail
+          report_script="${RUNNER_TEMP:-/tmp}/ocr-visibility-report.py"
+          cat > "$report_script" <<'PYEOF'
+          import os
+
+          ocr_result = os.environ.get("OCR_RESULT", "")
+          review_expected = os.environ.get("REVIEW_EXPECTED", "")
+          resolve_advisory_result = os.environ.get("RESOLVE_ADVISORY_RESULT", "")
+          has_advisory = os.environ.get("HAS_ADVISORY", "")
+          author_login = os.environ.get("PR_AUTHOR_LOGIN", "")
+
+          if ocr_result == "success":
+              reason = "scanned"
+          elif review_expected == "false":
+              reason = "review_exempt"
+          elif resolve_advisory_result != "success":
+              reason = "resolve_advisory_" + resolve_advisory_result
+          elif has_advisory != "true":
+              reason = "no_advisory"
+          elif author_login == '"dependabot[bot]"':
+              reason = "bot_author"
+          else:
+              reason = "ocr_" + ocr_result
+
+          scanned = "true" if reason == "scanned" else "false"
+          line = "GATE-OCR-SCAN-V1 scanned=%s ocr_result=%s reason=%s" % (scanned, ocr_result, reason)
+          print(line)
+          if reason != "scanned" and reason != "review_exempt":
+              print("::warning::" + line)
+          PYEOF
+          output="$(python3 "$report_script")"
+          main_line="$(printf '%s\n' "$output" | grep '^GATE-OCR-SCAN-V1')"
+          printf '%s\n' "$main_line" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$output"
+
   # ── gate (final aggregator — required check) ────────────────────────────
   gate:
     name: ${{ format('gate{0}', github.event.pull_request.draft && ' (draft)' || '') }}
