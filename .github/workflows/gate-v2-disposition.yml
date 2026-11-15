@@ -331,16 +331,36 @@ jobs:
           with open(os.environ["REPLAY_PATCH_FILE"], "wb") as fh:
               fh.write(patch.encode("utf-8"))
           PY
+          # Same runner-selection ladder as legacy quality's pyproject branch
+          # (gate-v2.yml run-tests): uv (--frozen under uv.lock) > bare pytest
+          # > python3 -m pytest.  The ci slot host has no pytest installed
+          # (canary run 43685935055: both invocations died with "No module
+          # named pytest"), so the bare python3 fallback alone can never
+          # produce junit; baseline and red must go through this one function.
+          replay_pytest() {
+            local junitxml="$1"
+            if [ -f pyproject.toml ] && command -v uv >/dev/null 2>&1; then
+              if [ -f uv.lock ]; then
+                uv run --frozen pytest -p no:cacheprovider -q --junitxml="$junitxml" -- "$REPLAY_NODEID"
+              else
+                uv run pytest -p no:cacheprovider -q --junitxml="$junitxml" -- "$REPLAY_NODEID"
+              fi
+            elif command -v pytest >/dev/null 2>&1; then
+              pytest -p no:cacheprovider -q --junitxml="$junitxml" -- "$REPLAY_NODEID"
+            else
+              python3 -m pytest -p no:cacheprovider -q --junitxml="$junitxml" -- "$REPLAY_NODEID"
+            fi
+          }
           baseline_xml="$evidence_dir/baseline.xml"
           red_xml="$evidence_dir/red.xml"
           set +e
-          python3 -m pytest -p no:cacheprovider -q --junitxml="$baseline_xml" -- "$REPLAY_NODEID"
+          replay_pytest "$baseline_xml"
           baseline_rc=$?
           red_rc=""
           apply_ok=true
           if git -C "$worktree" apply --check "$REPLAY_PATCH_FILE"; then
             git -C "$worktree" apply "$REPLAY_PATCH_FILE"
-            python3 -m pytest -p no:cacheprovider -q --junitxml="$red_xml" -- "$REPLAY_NODEID"
+            replay_pytest "$red_xml"
             red_rc=$?
           else
             apply_ok=false
@@ -737,7 +757,7 @@ jobs:
           dest="$RUNNER_TEMP/behavior-canonical-junit"
           mkdir -p "$dest"
           name="gate-quality-junit-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
-          gh run download "$PRIMARY_RUN_ID" --name "$name" --dir "$dest" || {
+          gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$name" --dir "$dest" || {
             echo "::error::behavior_canonical_junit_missing: artifact $name not on run $PRIMARY_RUN_ID attempt $PRIMARY_RUN_ATTEMPT" >&2
             exit 1
           }

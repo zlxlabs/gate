@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -140,7 +141,62 @@ def test_replay_pytest_runs_in_checked_out_worktree():
     )
     run_step = _step(replay, "Replay counterevidence nodeid green then red")
     assert run_step.get("working-directory") == checkout["with"]["path"]
-    assert run_step["run"].count("python3 -m pytest") == 2
+    # gate#404: direct pytest invocations are gone; the single remaining
+    # `python3 -m pytest` is the fallback branch of the shared runner
+    # selection function (see test_replay_pytest_goes_through_shared_runner_selection).
+    pytest_lines = [
+        line
+        for line in run_step["run"].splitlines()
+        if "python3 -m pytest" in line and not line.strip().startswith("#")
+    ]
+    assert len(pytest_lines) == 1
+
+
+def test_every_gh_run_download_call_carries_repository_flag():
+    # gate#404 canary run 43685935055: the control job's workspace root is
+    # not a git checkout, so `gh run download` without -R dies with
+    # "fatal: not a git repository" on every caller and the behavior path
+    # always reports behavior_canonical_junit_missing.  Every call in this
+    # workflow must carry -R "$GITHUB_REPOSITORY".
+    offenders = [
+        line.strip()
+        for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+        if "gh run download" in line
+        and not line.strip().startswith("#")
+        and '-R "$GITHUB_REPOSITORY"' not in line
+    ]
+    assert offenders == []
+
+
+def test_replay_pytest_goes_through_shared_runner_selection():
+    # gate#404 canary run 43685935055: bare `python3 -m pytest` on the ci
+    # slot host died with "No module named pytest" for both baseline and
+    # red, producing no junit.  Both invocations must route through one
+    # runner-selection function with the same ladder as legacy quality's
+    # pyproject branch (gate-v2.yml run-tests): uv (--frozen under
+    # uv.lock) > uv run > bare pytest > python3 -m pytest.
+    run_text = _step(_job("replay"), "Replay counterevidence nodeid green then red")["run"]
+    lines = run_text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.rstrip().endswith("replay_pytest() {"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "}")
+    body = "\n".join(lines[start:end])
+    outside = "\n".join(lines[:start] + lines[end + 1 :])
+    # Four branches, same ladder as legacy quality.
+    assert "[ -f pyproject.toml ]" in body
+    assert "command -v uv" in body
+    assert "[ -f uv.lock ]" in body
+    assert "uv run --frozen pytest" in body
+    assert re.search(r"^\s*uv run pytest\b", body, re.MULTILINE)
+    assert "command -v pytest" in body
+    assert re.search(r"^\s*pytest -p no:cacheprovider\b", body, re.MULTILINE)
+    assert "python3 -m pytest -p no:cacheprovider" in body
+    # Baseline and red share the one function; nothing else invokes pytest.
+    calls = [line.strip() for line in lines if line.strip().startswith("replay_pytest ")]
+    assert calls == ['replay_pytest "$baseline_xml"', 'replay_pytest "$red_xml"']
+    assert not re.search(
+        r"(?m)^\s*(?:uv run (?:--frozen )?pytest\b|python3 -m pytest\b|pytest -p no:cacheprovider\b)",
+        outside,
+    )
 
 
 def test_replay_jobs_have_no_credentials_or_environment():
@@ -148,6 +204,11 @@ def test_replay_jobs_have_no_credentials_or_environment():
         job = _job(name)
         assert "environment" not in job
         assert "secrets." not in " ".join(_string_values(job))
+        # Full dump covers run-block text too (e.g. a stray $SILO_EXEC
+        # reference inside a script would pass the env-key scan below).
+        dump = yaml.dump(job)
+        assert "secrets." not in dump
+        assert "SILO_" not in dump
         env_keys = list(job.get("env", {}).keys())
         for step in job["steps"]:
             env_keys.extend(step.get("env", {}).keys())
@@ -219,7 +280,7 @@ def test_control_downloads_replay_artifact_only_on_behavior_path():
     assert "${{ inputs." not in canonical["run"]
     assert "${{ needs." not in canonical["run"]
     assert "behavior_canonical_junit_missing" in canonical["run"]
-    assert 'gh run download "$PRIMARY_RUN_ID"' in canonical["run"]
+    assert 'gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID"' in canonical["run"]
     assert "gate-quality-junit-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}" in canonical["run"]
 
 
