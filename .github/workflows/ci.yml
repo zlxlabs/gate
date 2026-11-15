@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # noble = 生产 runner 基底；26.04 的 uutils timeout 破 GNU 契约用例
     steps:
       - uses: actions/checkout@v4
       # The caller-contract guard diffs refs/tags/v2 against the working tree;
