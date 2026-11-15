@@ -3,9 +3,11 @@
 
 Junit §1.2: <failure>→fail/assertion (only hit shape); <error>+ImportError/No
 module→error/import; other <error>→error/collection; <skipped>→skip; no child→
-pass. <error> is never a hit. Error cases add optional `message`: first
-non-blank line of <error>'s message attr (else body), UTF-8-truncated to
-≤500 bytes on a char boundary; omitted when both are blank.
+pass. <error> is never a hit. Error cases add optional `message`: the first
+ImportError/ModuleNotFoundError/No-module line across <error>'s message attr
+and body (leading pytest `E ` prefix stripped), else first non-blank line of
+the attr (else body); UTF-8-truncated to ≤500 bytes on a char boundary; omitted
+when blank.
 
 §1.3 codes: this script does not produce run_not_found / not_completed (consumer
 owns those when no completed run exists). Missing in-run tree dir is
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,8 +43,11 @@ class TreeSnapshot:
     junit_unreadable: bool = False
 
 
+_IMPORT_RE = re.compile(r"ImportError|ModuleNotFoundError|No module")
+
+
 def _import_error(text: str) -> bool:
-    return "ImportError" in text or "ModuleNotFoundError" in text or "No module" in text
+    return _IMPORT_RE.search(text) is not None
 
 
 def map_junit_case(el: ET.Element) -> dict[str, Any]:
@@ -55,8 +61,14 @@ def map_junit_case(el: ET.Element) -> dict[str, Any]:
         text = f"{error.get('message') or ''}{error.text or ''}"
         kind = "import" if _import_error(text) else "collection"
         case: dict[str, Any] = {"id": case_id, "status": "error", "fail_kind": kind, "channel": "pytest"}
-        raw = error.get("message") or error.text or ""
-        line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+        lines = [error.get("message") or "", *(error.text or "").splitlines()]
+        hits = [ln for ln in lines if _IMPORT_RE.search(ln)]
+        hit = next((ln for ln in hits if re.match(r"^\s*E\s", ln)), hits[0] if hits else "")
+        if hit:
+            line = re.sub(r"^E\s+", "", hit.strip()).strip()
+        else:
+            raw = error.get("message") or error.text or ""
+            line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
         if line:
             case["message"] = line.encode("utf-8")[:500].decode("utf-8", errors="ignore")
         return case

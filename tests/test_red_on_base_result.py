@@ -203,3 +203,26 @@ def test_error_message_truncated_to_500_utf8_bytes(tmp_path):
     assert msg == "中" * 166  # 166×3=498 bytes fit; 167 would exceed 500
     assert len(msg.encode("utf-8")) <= 500
     assert msg.encode("utf-8").decode("utf-8") == msg
+
+
+def _collection_error_junit(tmp: Path) -> Path:
+    """Run real pytest on a module whose import fails at collection; junit is genuine."""
+    work = tmp / "coll"
+    work.mkdir()
+    (work / "broken_import.py").write_text(
+        "from foo_new import x\n\n\ndef test_one():\n    assert True\n", encoding="utf-8"
+    )
+    xml = tmp / "coll.xml"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", "broken_import.py", f"--junitxml={xml}", "-q", "-p", "no:cacheprovider"],
+        cwd=work, check=False, capture_output=True, text=True,
+    )
+    assert xml.is_file(), "pytest did not write junit for collection error"
+    return xml
+
+
+def test_collection_error_message_takes_import_body_line(tmp_path):
+    xml = _collection_error_junit(tmp_path)
+    case = parse_junit(xml)[0]
+    assert case["status"] == "error" and case["fail_kind"] == "import"
+    assert case["message"] == "ModuleNotFoundError: No module named 'foo_new'"
