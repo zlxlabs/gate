@@ -909,7 +909,8 @@ jobs:
         with:
           name: gate-quality-junit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-quality/junit/
-          retention-days: 90
+          # retention: 14 — 消费方 disposition control 下载 canonical junit；理由 同一次申诉还须解析 Silo d14 层主审审计（gate-v2.yml:1866 --tier d14），短于 14 天会让合法申诉失败
+          retention-days: 14
           if-no-files-found: ignore
 
       - name: Warn on junit upload failure
@@ -1021,7 +1022,8 @@ jobs:
         with:
           name: gate-quality-junit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate-tested-evidence-junit/
-          retention-days: 90
+          # retention: 14 — 消费方 disposition control 下载 canonical junit；理由 同一次申诉还须解析 Silo d14 层主审审计（gate-v2.yml:1866 --tier d14），短于 14 天会让合法申诉失败
+          retention-days: 14
           if-no-files-found: ignore
 
       - name: Warn on junit upload failure (legacy)

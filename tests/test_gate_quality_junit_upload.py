@@ -3,7 +3,7 @@
 The reusable quality job already passes GATE_ARTIFACT_DIR to the caller's
 scripts/gate-quality entry, but nothing read that directory before the
 runner temp vanished. These tests lock the GitHub artifact upload that
-keeps junit XML for 90 days, and the fail-open warning when that upload
+keeps junit XML for 14 days, and the fail-open warning when that upload
 fails (upload must not redden the required gate).
 
 Reads the real producer workflow callers consume via @v2 — never a
@@ -70,12 +70,12 @@ def test_junit_upload_follows_run_quality_and_always_runs_in_entry_mode():
     assert "always()" in str(upload.get("if", ""))
 
 
-def test_junit_upload_retains_caller_xml_for_ninety_days_without_failing_absent_files():
+def test_junit_upload_retains_caller_xml_for_fourteen_days_without_failing_absent_files():
     _index, upload = _junit_upload_step(_quality_steps())
     with_block = upload.get("with") or {}
     assert with_block.get("path") == JUNIT_PATH
     assert with_block.get("name") == JUNIT_NAME
-    assert with_block.get("retention-days") == 90
+    assert with_block.get("retention-days") == 14
     assert with_block.get("if-no-files-found") == "ignore"
     assert upload.get("continue-on-error") is True, (
         "upload failure must not change the quality conclusion"
@@ -140,12 +140,12 @@ def test_legacy_junit_upload_follows_run_tests_and_always_runs_in_legacy_mode():
     assert "always()" in str(upload.get("if", ""))
 
 
-def test_legacy_junit_upload_retains_xml_for_ninety_days_without_failing_absent_files():
+def test_legacy_junit_upload_retains_xml_for_fourteen_days_without_failing_absent_files():
     _index, upload = _legacy_junit_upload_step(_quality_steps())
     with_block = upload.get("with") or {}
     assert with_block.get("path") == LEGACY_JUNIT_PATH
     assert with_block.get("name") == JUNIT_NAME
-    assert with_block.get("retention-days") == 90
+    assert with_block.get("retention-days") == 14
     assert with_block.get("if-no-files-found") == "ignore"
     assert upload.get("continue-on-error") is True, (
         "upload failure must not change the quality conclusion"

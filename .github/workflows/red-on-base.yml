@@ -137,7 +137,8 @@ jobs:
           name: red-on-base-tree-${{ matrix.role }}-${{ inputs.dispatch_id }}
           path: ${{ runner.temp }}/red-on-base-tree/
           if-no-files-found: error
-          retention-days: 14
+          # retention: 3 — 消费方 同 run 的 result job 下载 tree；理由 验收窗口按天计，3 天覆盖跨日重试
+          retention-days: 3
 
   result:
     needs: tree
@@ -195,4 +196,5 @@ jobs:
           name: red-on-base-${{ inputs.dispatch_id }}
           path: ${{ runner.temp }}/red-on-base-result/result.json
           if-no-files-found: error
-          retention-days: 14
+          # retention: 3 — 消费方 调用方下载 red-on-base 结果；理由 验收窗口按天计，3 天覆盖跨日重试
+          retention-days: 3

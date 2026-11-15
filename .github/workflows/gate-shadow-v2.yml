@@ -1004,7 +1004,8 @@ jobs:
           name: shadow-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shadow-events
           if-no-files-found: error
-          retention-days: 30
+          # retention: 1 — 消费方 同 run 的 summary 按 pattern 下载；理由 仅本 run/attempt 消费，无跨 run 消费者
+          retention-days: 1
 
   # ── summary ──────────────────────────────────────────────────────────────
   summary:
