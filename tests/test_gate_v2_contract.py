@@ -704,22 +704,15 @@ def test_gate_v2_has_no_github_artifact_actions():
     assert "download-artifact" not in text
     raw, _ = _load_workflow()
     uploads = [
-        (job_name, step)
+        (job_name, step.get("id"), (step.get("with") or {}).get("path"))
         for job_name, job in raw["jobs"].items()
         for step in job.get("steps", [])
         if str(step.get("uses", "")).startswith("actions/upload-artifact@")
     ]
     assert uploads == [
-        (
-            "quality",
-            next(
-                step
-                for step in raw["jobs"]["quality"]["steps"]
-                if step.get("id") == "upload-quality-junit"
-            ),
-        )
+        ("quality", "upload-quality-junit", "${{ runner.temp }}/gate-quality/junit/"),
+        ("quality", "upload-quality-junit-legacy", "${{ runner.temp }}/gate-tested-evidence-junit/"),
     ], "GitHub artifact upload is only the quality-job junit retention path"
-    assert uploads[0][1]["with"]["path"] == "${{ runner.temp }}/gate-quality/junit/"
     assert raw.get("env", {}).get("SILO_ENDPOINT") == "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000"
     assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
     hold = REPO_ROOT / ".github" / "v2-tag-sync.hold"
