@@ -33,7 +33,8 @@
       "id": {"type": "string"},
       "status": {"enum": ["pass", "fail", "error", "skip"]},
       "fail_kind": {"anyOf": [{"type": "null"}, {"enum": ["assertion", "collection", "import", "environment", "timeout"]}]},
-      "channel": {"enum": ["pytest", "shell"]}
+      "channel": {"enum": ["pytest", "shell"]},
+      "message": {"type": "string", "maxLength": 500}
     }}
   }
 }

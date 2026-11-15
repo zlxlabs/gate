@@ -138,3 +138,68 @@ def test_insufficient_input_codes(tmp_path, code):
     doc = _synth(tmp_path / "x" if code == "artifact_missing" else c, tmp_path / "t")
     jsonschema.validate(doc, SCHEMA)
     assert doc["insufficient_code"] == code
+
+
+ERROR_JUNIT = (
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<testsuites><testsuite name="gate">'
+    '<testcase classname="newpkg" name="test_new"><error message="ModuleNotFoundError: No module named \'foo_new\'">Traceback …</error></testcase>'
+    '<testcase classname="newpkg" name="test_pass"/>'
+    '<testcase classname="newpkg" name="test_fail"><failure message="assert 1 == 2">assert 1 == 2</failure></testcase>'
+    '<testcase classname="newpkg" name="test_skip"><skipped message="todo"/></testcase>'
+    '</testsuite></testsuites>'
+)
+
+
+def test_error_case_message_survives_result_json_bytes(tmp_path):
+    c, t, out = tmp_path / "c", tmp_path / "t", tmp_path / "result.json"
+    for d, role, sha, tree in ((c, "contrast", C_SHA, C_TREE), (t, "tip", T_SHA, T_TREE)):
+        _tree(d, role=role, sha=sha, tree=tree)
+    (c / "junit.xml").write_text(ERROR_JUNIT, encoding="utf-8")
+    subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "red_on_base_result.py"),
+         "--dispatch-id", "dlg-msg", "--run-id", "1", "--run-attempt", "1",
+         "--contrast-sha", C_SHA, "--tip-sha", T_SHA, "--contrast-tree", C_TREE, "--tip-tree", T_TREE,
+         "--pytest-files", "[]", "--shell-files", "[]",
+         "--contrast-dir", str(c), "--tip-dir", str(t), "--out", str(out)],
+        check=True, capture_output=True, text=True,
+    )
+    raw = out.read_bytes()
+    doc = json.loads(raw)
+    jsonschema.validate(doc, SCHEMA)
+    cases = doc["trees"]["contrast"]["cases"]
+    err = next(x for x in cases if x["status"] == "error")
+    assert err["fail_kind"] == "import"
+    assert "No module named 'foo_new'" in err["message"]
+    assert b"No module named 'foo_new'" in raw
+    assert all("message" not in x for x in cases if x["status"] != "error")
+
+
+def test_error_message_blank_attr_takes_first_body_line(tmp_path):
+    xml = tmp_path / "body.xml"
+    xml.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites><testsuite name="gate">'
+        '<testcase classname="m" name="t1"><error message="">\n   \n  ImportError: cannot import name \'boom\'\n  during collection\n</error></testcase>'
+        '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    case = parse_junit(xml)[0]
+    assert case["fail_kind"] == "import"
+    assert case["message"] == "ImportError: cannot import name 'boom'"
+
+
+def test_error_message_truncated_to_500_utf8_bytes(tmp_path):
+    xml = tmp_path / "long.xml"
+    long_msg = "中" * 200
+    xml.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites><testsuite name="gate">'
+        '<testcase classname="m" name="t1"><error message="' + long_msg + '">body</error></testcase>'
+        '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    msg = parse_junit(xml)[0]["message"]
+    assert msg == "中" * 166  # 166×3=498 bytes fit; 167 would exceed 500
+    assert len(msg.encode("utf-8")) <= 500
+    assert msg.encode("utf-8").decode("utf-8") == msg

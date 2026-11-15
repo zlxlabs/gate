@@ -3,7 +3,9 @@
 
 Junit §1.2: <failure>→fail/assertion (only hit shape); <error>+ImportError/No
 module→error/import; other <error>→error/collection; <skipped>→skip; no child→
-pass. <error> is never a hit.
+pass. <error> is never a hit. Error cases add optional `message`: first
+non-blank line of <error>'s message attr (else body), UTF-8-truncated to
+≤500 bytes on a char boundary; omitted when both are blank.
 
 §1.3 codes: this script does not produce run_not_found / not_completed (consumer
 owns those when no completed run exists). Missing in-run tree dir is
@@ -52,7 +54,12 @@ def map_junit_case(el: ET.Element) -> dict[str, Any]:
     if error is not None:
         text = f"{error.get('message') or ''}{error.text or ''}"
         kind = "import" if _import_error(text) else "collection"
-        return {"id": case_id, "status": "error", "fail_kind": kind, "channel": "pytest"}
+        case: dict[str, Any] = {"id": case_id, "status": "error", "fail_kind": kind, "channel": "pytest"}
+        raw = error.get("message") or error.text or ""
+        line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+        if line:
+            case["message"] = line.encode("utf-8")[:500].decode("utf-8", errors="ignore")
+        return case
     if el.find("skipped") is not None:
         return {"id": case_id, "status": "skip", "fail_kind": None, "channel": "pytest"}
     return {"id": case_id, "status": "pass", "fail_kind": None, "channel": "pytest"}
