@@ -27,12 +27,39 @@ def _run_blocks(workflow: dict):
 
 def test_v2_workflows_have_no_package_manager_silo_calls():
     gate_text = GATE_WORKFLOW.read_text(encoding="utf-8")
-    disposition_text = DISPOSITION_WORKFLOW.read_text(encoding="utf-8")
     assert gate_text.count("uv run") == 2, "gate-v2 uv run lines must be caller install/test only"
-    assert disposition_text.count("uv run") == 0, "disposition must not run uv"
-    for workflow in (_load(GATE_WORKFLOW), _load(DISPOSITION_WORKFLOW)):
-        for run in _run_blocks(workflow):
-            assert 'python3 "$SILO_STORE"' not in run, "Silo commands must use SILO_EXEC"
+    # gate#404: the disposition replay job runs the CALLER's tests, so its
+    # runner-selection function may use uv exactly like legacy quality does
+    # in gate-v2.yml (--frozen under uv.lock, plus the bare fallback).  The
+    # replay job is credential-free and cannot reach gate-owned tools, and
+    # every other disposition job must stay at zero.
+    disposition = _load(DISPOSITION_WORKFLOW)
+    for job_name, job in disposition["jobs"].items():
+        runs = [step["run"] for step in job.get("steps", []) if "run" in step]
+        uv_calls = sum(run.count("uv run") for run in runs)
+        if job_name == "replay":
+            assert uv_calls == 2, (
+                "the only uv-run exception in gate-v2-disposition.yml is the "
+                "credential-free replay job that runs the caller's tests, and "
+                "it is pinned to --frozen and bare, one each; found "
+                f"{uv_calls}"
+            )
+            assert sum(run.count("uv run --frozen pytest") for run in runs) == 1, (
+                "replay must pin uv with --frozen exactly once"
+            )
+            assert sum(run.count("uv run pytest") for run in runs) == 1, (
+                "replay must keep exactly one bare uv run pytest fallback"
+            )
+        else:
+            assert uv_calls == 0, (
+                f"disposition job {job_name} must not run uv: the uv-run "
+                "exception covers only the credential-free replay job that "
+                "runs the caller's tests"
+            )
+    for run in _run_blocks(disposition):
+        assert 'python3 "$SILO_STORE"' not in run, "Silo commands must use SILO_EXEC"
+    for run in _run_blocks(_load(GATE_WORKFLOW)):
+        assert 'python3 "$SILO_STORE"' not in run, "Silo commands must use SILO_EXEC"
 
 
 def test_every_silo_sparse_checkout_includes_wrapper():
