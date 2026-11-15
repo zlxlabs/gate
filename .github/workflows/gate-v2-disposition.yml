@@ -390,7 +390,8 @@ jobs:
         with:
           name: gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/behavior-replay/
-          retention-days: 90
+          # retention: 1 — 消费方 同 run 的 control 下载 gate-behavior-replay；理由 仅本 run/attempt 消费
+          retention-days: 1
           if-no-files-found: ignore
 
   control:
