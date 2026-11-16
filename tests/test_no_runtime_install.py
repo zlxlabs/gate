@@ -61,6 +61,10 @@ ENTRY_FILES = {
     # quality 槽：仅调 git，无网络取包。
     ".github/actions/pr-size-preflight/preflight.py": "quality 槽 preflight 本体",
     ".github/actions/pr-size-preflight/action.yml": "quality 槽 preflight 包装器",
+    # quality 槽：caller 仓 upload-artifact 寿命 lint（gate-hub#2419），
+    # 仅纯标准库文本扫描，无网络、无取包。
+    ".github/actions/artifact-retention-lint/lint_retention.py": "quality 槽 retention lint 本体（纯标准库文本状态机）",
+    ".github/actions/artifact-retention-lint/action.yml": "quality 槽 retention lint 包装器",
     # public ui-evidence 评论 action（gate#314，gate-20261014-48）：private 版移植，
     # 纯评论发布，非门禁必经路径。
     ".github/actions/ui-evidence-publish/action.yml": "public ui-evidence 评论包装器",

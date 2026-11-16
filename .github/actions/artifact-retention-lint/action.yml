@@ -1,0 +1,19 @@
+name: Artifact retention lint
+description: |
+  Fail quality when any caller-repo actions/upload-artifact step lacks a
+  positive-integer retention-days literal, or declares > 7 days without a
+  matching `# retention: <N> — 消费方 …` exemption comment (gate-hub#2419).
+  Scans .github/workflows/*.y{a,}ml and every **/action.yml under scan-root.
+  Pure stdlib: the self-hosted runner's system python3 has no PyYAML.
+inputs:
+  scan-root:
+    description: Directory whose workflows and **/action.yml files are scanned.
+    required: false
+    default: .
+runs:
+  using: composite
+  steps:
+    - id: lint
+      shell: bash
+      run: |
+        python3 "$GITHUB_ACTION_PATH/lint_retention.py" "${{ inputs.scan-root }}"
