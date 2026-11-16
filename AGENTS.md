@@ -6,6 +6,8 @@ verify-remote: ci.yml
 
 verify-remote-main: ci.yml
 
+verify-remote-evidence: ci.yml / test :: MAIN-VERIFY-TESTED-EVIDENCE-V1 sha=(?P<sha>[0-9a-f]{40}) suite=pytest
+
 本仓是个人自用的多 Agent 开发门禁（CI gate）。write 权限只有 owner 本人与其派出的 agent，
 没有其他人类协作者，也不对外提供服务。
 

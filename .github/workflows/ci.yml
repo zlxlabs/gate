@@ -30,6 +30,18 @@ jobs:
       - name: Check internal uses pins
         run: python3 scripts/check_pinned_uses.py
 
+      # 已测证据行（agent-config ci-checks-v1 #5688）：run/job 级 success 区分不了
+      # 「测试确实跑过且通过」与「没跑」；消费方按 run head_sha=tip 选 run，故
+      # sha 在 pull_request 事件取 PR head sha、push 事件取 github.sha（PR 时
+      # checkout 是 merge ref，HEAD 为合并提交 sha，与 head_sha 不等，不可用）。
+      - name: Emit tested evidence
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          sha=${PR_HEAD_SHA:-$PUSH_SHA}
+          echo "MAIN-VERIFY-TESTED-EVIDENCE-V1 sha=${sha} suite=pytest"
+
   # actionlint (https://github.com/rhysd/actionlint) — an independent, complementary
   # static check on TOP of tests/test_gate*_contract.py. It catches a different class of
   # bug than the Python contract tests do: undefined context properties (typos like
