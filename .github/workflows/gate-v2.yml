@@ -716,10 +716,14 @@ jobs:
 
       # gate-hub#2419: block PRs whose upload-artifact steps lack a positive
       # integer retention-days literal or declare > 7 days without a matching
-      # `# retention:` exemption comment. Must run while _gate-action-src is
-      # still present; its outcome feeds caller-checks-outcome below.
+      # `# retention:` exemption comment; must run while _gate-action-src is
+      # still present. continue-on-error so a lint failure does not skip the
+      # caller's own quality steps below (quality-entry / tests) — the outcome
+      # still lands in caller-checks-outcome's failed/other_failed loops, so
+      # the PR goes red AND the author sees their test results in the same run.
       - name: Artifact retention lint
         id: artifact-retention-lint
+        continue-on-error: true
         uses: ./_gate-action-src/.github/actions/artifact-retention-lint
         with:
           scan-root: ${{ github.workspace }}

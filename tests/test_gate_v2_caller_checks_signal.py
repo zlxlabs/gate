@@ -358,6 +358,20 @@ def test_retention_lint_failure_outranks_test_signal(tmp_path):
     assert record["caller_checks"] == "failed"
 
 
+def test_retention_lint_step_uses_continue_on_error():
+    # A lint failure must NOT skip the caller's own quality steps (quality
+    # entry / tests): continue-on-error keeps the job flowing while the step
+    # outcome stays "failure". The PR still goes red because the outcome is
+    # referenced in BOTH loops of caller-checks-outcome (failed + other_failed).
+    step = _step("artifact-retention-lint")
+    assert step.get("continue-on-error") is True, (
+        "retention lint failure would skip every later non-always() quality "
+        "step; the author would never see their test results in the same run"
+    )
+    record = _step("caller-checks-outcome")
+    assert record["run"].count("$RETENTION_LINT_OUTCOME") == 2
+
+
 # ── e2e: SIGTERM'd subprocess → GITHUB_OUTPUT bytes → aggregate.py ───────
 
 def test_e2e_sigterm_make_reaches_quality_infra(tmp_path):
