@@ -714,6 +714,16 @@ jobs:
           warn-lines: ${{ inputs.pr_size_warn_lines }}
           token: ${{ github.token }}
 
+      # gate-hub#2419: block PRs whose upload-artifact steps lack a positive
+      # integer retention-days literal or declare > 7 days without a matching
+      # `# retention:` exemption comment. Must run while _gate-action-src is
+      # still present; its outcome feeds caller-checks-outcome below.
+      - name: Artifact retention lint
+        id: artifact-retention-lint
+        uses: ./_gate-action-src/.github/actions/artifact-retention-lint
+        with:
+          scan-root: ${{ github.workspace }}
+
       - name: Remove gate action source before caller checks
         if: always()
         run: |
@@ -1276,6 +1286,10 @@ jobs:
       # signal_terminated 仅当测试命令是唯一失败的业务步骤；其它步骤
       # （lint/install 等）只要有 failure，仍记 failed。PR size preflight
       # 单算一相（仍走 fail）；Diff coverage advisory 不计入业务相。
+      # gate-hub#2419: artifact retention lint is a business step too — its
+      # failure joins both the failed and other_failed loops below so it
+      # propagates as caller_checks=failed and cannot hide behind a
+      # signal_terminated test run.
       - name: Record caller checks outcome
         id: caller-checks-outcome
         if: always()
@@ -1287,6 +1301,7 @@ jobs:
           RUN_QUALITY_SIGNAL: ${{ steps.run-quality.outputs.signal }}
           RUN_QUALITY_EXIT_CODE: ${{ steps.run-quality.outputs.exit_code }}
           LINT_FORMAT_OUTCOME: ${{ steps.lint-format.outcome }}
+          RETENTION_LINT_OUTCOME: ${{ steps.artifact-retention-lint.outcome }}
           INSTALL_OUTCOME: ${{ steps.install.outcome }}
           RUN_TESTS_OUTCOME: ${{ steps.run-tests.outcome }}
           RUN_TESTS_TERMINATION: ${{ steps.run-tests.outputs.termination }}
@@ -1307,14 +1322,14 @@ jobs:
           echo "preflight_result=$preflight_result" >> "$GITHUB_OUTPUT"
           failed=0
           passed=0
-          for outcome in "$RUN_QUALITY_OUTCOME" "$LINT_FORMAT_OUTCOME" "$INSTALL_OUTCOME" "$RUN_TESTS_OUTCOME"; do
+          for outcome in "$RUN_QUALITY_OUTCOME" "$LINT_FORMAT_OUTCOME" "$RETENTION_LINT_OUTCOME" "$INSTALL_OUTCOME" "$RUN_TESTS_OUTCOME"; do
             case "$outcome" in
               failure) failed=1 ;;
               success) passed=1 ;;
             esac
           done
           other_failed=0
-          for outcome in "$LINT_FORMAT_OUTCOME" "$INSTALL_OUTCOME"; do
+          for outcome in "$LINT_FORMAT_OUTCOME" "$RETENTION_LINT_OUTCOME" "$INSTALL_OUTCOME"; do
             case "$outcome" in
               failure) other_failed=1 ;;
             esac

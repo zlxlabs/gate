@@ -3591,9 +3591,9 @@ def test_quality_removes_gate_sources_before_any_caller_check():
 
     assert names.index(stale_cleanup["name"]) < names.index(source_checkout["name"])
     assert names.index(source_checkout["name"]) < preflight_index < cleanup_index < first_caller_check
-    # gate-hub#1917: the ledger consumer checkout sits between the pre-caller
-    # cleanup and the quality entry, adjacent to its only consumer.
-    assert cleanup_index == preflight_index + 1
+    # gate-hub#2419: retention lint runs while _gate-action-src is present.
+    assert preflight_index < names.index("Artifact retention lint") < cleanup_index
+    assert cleanup_index == names.index("Artifact retention lint") + 1
     assert names[cleanup_index + 1] == "Checkout review-ledger consumer source at this workflow's own commit"
     assert names[cleanup_index + 2:cleanup_index + 4] == ["Start entry install-result telemetry", "Run scripts/gate-quality"]
     assert stale_cleanup["if"] == "always()"
@@ -4226,8 +4226,7 @@ def test_caller_checks_maps_action_payload_to_aggregator_state(tmp_path, outcome
         "PREFLIGHT_OUTCOME": outcome,
         "PREFLIGHT_STATUS": status,
         "RUN_QUALITY_OUTCOME": "success",
-        "LINT_FORMAT_OUTCOME": "success",
-        "INSTALL_OUTCOME": "success",
+        "LINT_FORMAT_OUTCOME": "success", "RETENTION_LINT_OUTCOME": "success", "INSTALL_OUTCOME": "success",
         "RUN_TESTS_OUTCOME": "success",
     })
     subprocess.run(["bash", "-c", record["run"]], env=env, check=True)
@@ -4271,7 +4270,8 @@ def test_real_preflight_payload_reaches_workflow_and_aggregator_cli(
     workflow_env.update({
         "GITHUB_OUTPUT": str(workflow_output), "PREFLIGHT_OUTCOME": "failure",
         "PREFLIGHT_STATUS": producer_lines["preflight-result"], "RUN_QUALITY_OUTCOME": "success",
-        "LINT_FORMAT_OUTCOME": "success", "INSTALL_OUTCOME": "success", "RUN_TESTS_OUTCOME": "success",
+        "LINT_FORMAT_OUTCOME": "success", "RETENTION_LINT_OUTCOME": "success", "INSTALL_OUTCOME": "success",
+        "RUN_TESTS_OUTCOME": "success",
     })
     subprocess.run(["bash", "-c", record["run"]], env=workflow_env, check=True)
     workflow_lines = dict(line.split("=", 1) for line in workflow_output.read_text().splitlines())

@@ -100,7 +100,8 @@ def _run_entry(tmp_path: Path, cwd: Path, env_extra=None):
 
 def _run_record(tmp_path: Path, *, tests_outcome="success", tests_out=None,
                 quality_outcome="success", quality_out=None,
-                lint_outcome="success", install_outcome="success"):
+                lint_outcome="success", install_outcome="success",
+                lint_retention_outcome="success"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     tests_out = tests_out or {}
     quality_out = quality_out or {}
@@ -115,6 +116,7 @@ def _run_record(tmp_path: Path, *, tests_outcome="success", tests_out=None,
             "RUN_QUALITY_SIGNAL": quality_out.get("signal", ""),
             "RUN_QUALITY_EXIT_CODE": quality_out.get("exit_code", ""),
             "LINT_FORMAT_OUTCOME": lint_outcome,
+            "RETENTION_LINT_OUTCOME": lint_retention_outcome,
             "INSTALL_OUTCOME": install_outcome,
             "RUN_TESTS_OUTCOME": tests_outcome,
             "RUN_TESTS_TERMINATION": tests_out.get("termination", ""),
@@ -312,6 +314,47 @@ def test_entry_failure_without_signal_stays_failed(tmp_path):
     record = _run_record(
         tmp_path / "record", quality_outcome="failure", quality_out=outputs, tests_outcome="skipped",
     )
+    assert record["caller_checks"] == "failed"
+
+
+# ── artifact retention lint feeds caller checks (gate-hub#2419) ───────────
+
+def test_retention_lint_step_is_wired_into_caller_checks():
+    steps = _load()["jobs"]["quality"]["steps"]
+    ids = [s.get("id") for s in steps]
+    lint_idx = ids.index("artifact-retention-lint")
+    preflight_idx = ids.index("pr-size-preflight")
+    remove_idx = next(
+        i for i, s in enumerate(steps)
+        if str(s.get("name", "")).startswith("Remove gate action source before caller checks")
+    )
+    # Must run while _gate-action-src is still present.
+    assert preflight_idx < lint_idx < remove_idx
+    step = steps[lint_idx]
+    assert step["uses"] == "./_gate-action-src/.github/actions/artifact-retention-lint"
+    assert step["with"]["scan-root"] == "${{ github.workspace }}"
+    record = _step("caller-checks-outcome")
+    assert record["env"]["RETENTION_LINT_OUTCOME"] == "${{ steps.artifact-retention-lint.outcome }}"
+    # The outcome must join BOTH the failed loop and the other_failed loop.
+    assert record["run"].count("$RETENTION_LINT_OUTCOME") == 2
+
+
+def test_retention_lint_failure_forces_caller_checks_failed(tmp_path):
+    record = _run_record(tmp_path / "record", lint_retention_outcome="failure")
+    assert record["caller_checks"] == "failed"
+
+
+def test_retention_lint_failure_outranks_test_signal(tmp_path):
+    cwd = tmp_path / "src"
+    _makefile(cwd, _SIGTERM_MAKE_RECIPE)
+    completed, outputs = _run_tests(tmp_path / "out", cwd)
+    assert outputs["termination"] == "signal_terminated"
+    record = _run_record(
+        tmp_path / "record", tests_outcome="failure", tests_out=outputs,
+        lint_retention_outcome="failure",
+    )
+    # A retention violation is other_failed: caller_checks must stay failed,
+    # never reclassify a red PR as quality infra.
     assert record["caller_checks"] == "failed"
 
 
