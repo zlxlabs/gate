@@ -2062,16 +2062,16 @@ jobs:
   advisor_shadow:
     # 影子期绝不进入 gate 判定；即使工具或编排失败也以成功结束并记录 error。
     needs: [classify_pr_paths]
-    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && !contains(fromJSON('["false"]'), needs.classify_pr_paths.outputs.review_expected) && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
     runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 20
-    continue-on-error: true
     outputs:
       verdict: ${{ steps.run-advisor-shadow.outputs.verdict }}
       exit_code: ${{ steps.run-advisor-shadow.outputs.exit_code }}
     steps:
       - name: Classify human-declared paths and run the shadow advisor
         id: run-advisor-shadow
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}

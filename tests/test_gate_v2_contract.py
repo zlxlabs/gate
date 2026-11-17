@@ -1320,7 +1320,7 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     for copy in copies:
         assert copy == primary_if
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert workflow_text.count(CLASSIFY_GUARD) == 7
+    assert workflow_text.count(CLASSIFY_GUARD) == 6
     assert "outputs.review_expected == 'true'" not in workflow_text
 
 
@@ -2484,10 +2484,10 @@ def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
     )
 
 
-def test_only_ocr_ledger_and_shadow_jobs_have_continue_on_error():
+def test_only_ocr_and_ledger_jobs_have_continue_on_error():
     raw, _ = _load_workflow()
     jobs = raw["jobs"]
-    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger", "advisor_shadow"}
+    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger"}
 
 
 def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
