@@ -57,7 +57,7 @@ def test_advisor_shadow_is_isolated_nonblocking_and_publishes_summary_contract()
     assert "][:5]" in run
     assert "summary.write(advisor_summary_text)" in run
     assert run.index("summary.write(advisor_summary_text)") < run.index(
-        "ADVISOR-SHADOW verdict={verdict}"
+        'summary.write("\\n".join(summary_lines) + "\\n")'
     )
     assert "ADVISOR-VERDICT (no_backdoor|backdoor|uncertain)" in run
     assert (
