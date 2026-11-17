@@ -51,6 +51,14 @@ def test_advisor_shadow_is_isolated_nonblocking_and_publishes_summary_contract()
     assert 'if gate_contents["truncated"]:' in run
     assert 'encoded_rules = "".join(blob["content"].split())' in run
     assert "scripts/review/review-advisor" in run
+    assert "stderr=subprocess.PIPE" in run
+    assert 'line.startswith("REVIEW-ADVISOR-ERROR")' in run
+    assert "line[:500]" in run
+    assert "][:5]" in run
+    assert "summary.write(advisor_summary_text)" in run
+    assert run.index("summary.write(advisor_summary_text)") < run.index(
+        "ADVISOR-SHADOW verdict={verdict}"
+    )
     assert "ADVISOR-VERDICT (no_backdoor|backdoor|uncertain)" in run
     assert (
         "ADVISOR-SHADOW verdict={verdict} exit={exit_code} "

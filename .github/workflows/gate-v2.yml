@@ -2094,6 +2094,8 @@ jobs:
           verdict = "error"
           exit_code = "1"
           summary_lines = []
+          advisor_summary_text = ""
+          advisor_error_lines = []
           stage = "classifier"
           try:
               hub_dir = Path(os.environ.get("GATE_HUB_DIR", "/opt/gate-hub"))
@@ -2197,10 +2199,16 @@ jobs:
                       advisor_env["GITHUB_STEP_SUMMARY"] = str(advisor_summary)
                       completed = subprocess.run(
                           ["python3", str(hub_dir / "scripts/review/review-advisor"), pr_number],
-                          env=advisor_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          timeout=1020,
+                          env=advisor_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                          text=True, timeout=1020,
                       )
+                      advisor_error_lines = [
+                          line[:500]
+                          for line in completed.stderr.splitlines()
+                          if line.startswith("REVIEW-ADVISOR-ERROR")
+                      ][:5]
                       raw_summary = advisor_summary.read_text(encoding="utf-8")
+                  advisor_summary_text = raw_summary
                   first_line = raw_summary.splitlines()[0] if raw_summary.splitlines() else ""
                   match = re.fullmatch(
                       r"ADVISOR-VERDICT (no_backdoor|backdoor|uncertain)", first_line
@@ -2209,7 +2217,6 @@ jobs:
                       raise ValueError("review_advisor_summary_invalid")
                   verdict = match.group(1)
                   exit_code = str(completed.returncode)
-                  summary_lines.append(first_line)
           except Exception as exc:
               verdict = "error"
               exit_code = "1"
@@ -2222,10 +2229,14 @@ jobs:
                   file=sys.stderr,
               )
 
+          summary_lines.extend(advisor_error_lines)
           summary_lines.append(
               f"ADVISOR-SHADOW verdict={verdict} exit={exit_code} head={os.environ['HEAD_SHA']}"
           )
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write(advisor_summary_text)
+              if advisor_summary_text and not advisor_summary_text.endswith("\n"):
+                  summary.write("\n")
               summary.write("\n".join(summary_lines) + "\n")
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
               outputs.write(f"verdict={verdict}\nexit_code={exit_code}\n")
