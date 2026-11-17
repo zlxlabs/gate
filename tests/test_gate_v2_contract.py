@@ -821,7 +821,7 @@ def test_control_runner_input_defaults_to_follow_runner():
 def test_all_required_jobs_present():
     raw, _ = _load_workflow()
     assert set(raw["jobs"].keys()) == {
-        "classify_pr_paths", "quality", "primary", "resolve_advisory", "ocr", "ocr_visibility", "gate", "ledger",
+        "classify_pr_paths", "quality", "primary", "advisor_shadow", "resolve_advisory", "ocr", "ocr_visibility", "gate", "ledger",
     }
 
 
@@ -1320,7 +1320,7 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     for copy in copies:
         assert copy == primary_if
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert workflow_text.count(CLASSIFY_GUARD) == 6
+    assert workflow_text.count(CLASSIFY_GUARD) == 7
     assert "outputs.review_expected == 'true'" not in workflow_text
 
 
@@ -2484,10 +2484,10 @@ def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
     )
 
 
-def test_only_ocr_and_ledger_jobs_have_continue_on_error():
+def test_only_ocr_ledger_and_shadow_jobs_have_continue_on_error():
     raw, _ = _load_workflow()
     jobs = raw["jobs"]
-    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger"}
+    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger", "advisor_shadow"}
 
 
 def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
