@@ -2141,6 +2141,8 @@ jobs:
 
               stage = "base_human_review_paths"
               base_tree = gh_json(f"repos/{repository}/git/trees/{base_sha}")
+              if base_tree["truncated"]:
+                  raise ValueError("base_tree_truncated")
               gate_tree = next(
                   (item for item in base_tree["tree"] if item["path"] == ".gate"), None
               )
@@ -2151,6 +2153,8 @@ jobs:
                   gate_contents = gh_json(
                       f"repos/{repository}/git/trees/{gate_tree['sha']}"
                   )
+                  if gate_contents["truncated"]:
+                      raise ValueError("base_gate_tree_truncated")
                   rules_blob = next(
                       (item for item in gate_contents["tree"]
                        if item["path"] == "human-review-paths"), None
@@ -2161,8 +2165,9 @@ jobs:
                       blob = gh_json(f"repos/{repository}/git/blobs/{rules_blob['sha']}")
                       if blob["encoding"] != "base64":
                           raise ValueError("base_human_review_paths_encoding_invalid")
+                      encoded_rules = "".join(blob["content"].split())
                       human_review_paths_text = base64.b64decode(
-                          blob["content"], validate=True
+                          encoded_rules, validate=True
                       ).decode("utf-8")
 
               stage = "human_path_classification"

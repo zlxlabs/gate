@@ -47,6 +47,9 @@ def test_advisor_shadow_is_isolated_nonblocking_and_publishes_summary_contract()
     assert 'hit.startswith("human:declared:")' in run
     assert "if not declared_hits or len(declared_hits) != len(human_hits):" in run
     assert "ADVISOR-SHADOW skipped reason=hits_not_declared_only" in run
+    assert 'if base_tree["truncated"]:' in run
+    assert 'if gate_contents["truncated"]:' in run
+    assert 'encoded_rules = "".join(blob["content"].split())' in run
     assert "scripts/review/review-advisor" in run
     assert "ADVISOR-VERDICT (no_backdoor|backdoor|uncertain)" in run
     assert (
