@@ -2081,7 +2081,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GATE_HUB_DIR: /opt/gate-hub
         run: |
-          python3 - <<'PY'
+          gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
+          python3 - "$gate_hub_dir" <<'PY'
           import base64
           import json
           import os
@@ -2098,7 +2099,7 @@ jobs:
           advisor_error_lines = []
           stage = "classifier"
           try:
-              hub_dir = Path(os.environ.get("GATE_HUB_DIR", "/opt/gate-hub"))
+              hub_dir = Path(sys.argv[1])
               sys.path.insert(0, str(hub_dir / "scripts"))
               from review.risk_classification import classify_human_required
 

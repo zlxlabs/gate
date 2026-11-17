@@ -43,6 +43,9 @@ def test_advisor_shadow_is_isolated_nonblocking_and_publishes_summary_contract()
     }
 
     run = step["run"]
+    assert 'gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"' in run
+    assert 'python3 - "$gate_hub_dir" <<\'PY\'' in run
+    assert "hub_dir = Path(sys.argv[1])" in run
     assert "classify_human_required" in run
     assert 'hit.startswith("human:declared:")' in run
     assert "if not declared_hits or len(declared_hits) != len(human_hits):" in run

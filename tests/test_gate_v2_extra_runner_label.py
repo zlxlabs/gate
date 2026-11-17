@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # GATE_V2_WORKFLOW_PATH is a mutation hook for the red-verification run.
 WORKFLOW = Path(os.environ.get("GATE_V2_WORKFLOW_PATH") or REPO_ROOT / ".github/workflows/gate-v2.yml")
 CI_JOBS = ("quality",)
-REVIEW_JOBS = ("primary", "ledger")
+REVIEW_JOBS = ("primary", "ledger", "advisor_shadow")
 TARGET_JOBS = CI_JOBS + REVIEW_JOBS
 
 # The pre-#1724 runs-on parts, verbatim (base commit ea62830).
