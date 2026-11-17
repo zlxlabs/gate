@@ -40,6 +40,18 @@ GATE-TESTED-EVIDENCE-V1 head_sha=<pull_request.head.sha> merge_sha=<GITHUB_SHA> 
 
 脚本自身出错同样不把原本绿的 quality 打红，但必须出现可 grep 的 `::warning::GATE-TESTED-EVIDENCE-EMIT-FAILED`。
 
+## 入口脚本提前退出（docs-only 等）
+
+纯文档改动是否 docs-only 由 caller 的 `scripts/gate-quality` 自行判定并提前 `exit 0`，gate-v2 **不按路径短路 quality**。理由有二：其一，gate 是必需检查，若在 workflow 层按路径跳过（如 paths-ignore），整个工作流被跳过后必需检查会一直停在等待状态、PR 无法合并，而 job 内由入口脚本提前 `exit 0` 则 job 照常以 success 结束，不存在此问题；其二，测试本身可能就读这些文档，「是否纯文档」只有 caller 能判断。判定成立时 caller 向 `gate-quality-result.json` 写入：
+
+```json
+{"schema":"gate-quality-result/v1","mode":"docs-only","stage":"setup","outcome":"not_started","failed_nodeids":null,"evidence":"not_applicable","flake_signal":"undetermined"}
+```
+
+并在 stdout 打一行 `GATE-QUALITY-DOCS-ONLY sha=<head>`（caller 自留标记，gate 不解析）。
+
+gate 侧保证：该 result 全部用既有枚举值（stage=setup / outcome=not_started / evidence=not_applicable / mode 为任意字符串），Render 步骤校验通过并正常渲染 Summary；Emit 步骤因 result 不是 tests/passed/junit 判 `result_unqualified`，**不打** `GATE-TESTED-EVIDENCE-V1`，quality 不因此变红。gate 不保证：docs-only 判定本身的正确性（属 caller 职责），也不消费 `GATE-QUALITY-DOCS-ONLY` 标记。
+
 ## 给 consumer
 
 只认 **Emit tested evidence 步骤日志内唯一一条整行**匹配上述格式。多条或冲突判 unknown。不要用整份 job 日志做前缀扫描：测试输出里出现 `GATE-TESTED-EVIDENCE-V1` 字样不让 quality 失败，也不构成证据。
