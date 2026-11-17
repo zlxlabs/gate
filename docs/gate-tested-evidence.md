@@ -42,7 +42,7 @@ GATE-TESTED-EVIDENCE-V1 head_sha=<pull_request.head.sha> merge_sha=<GITHUB_SHA> 
 
 ## 入口脚本提前退出（docs-only 等）
 
-纯文档改动是否 docs-only 由 caller 的 `scripts/gate-quality` 自行判定并提前 `exit 0`，gate-v2 **不按路径短路 quality**：必需检查（lint 等）仍应挂起执行，且测试本身可能就读这些文档，路径判断交给 gate 会替 caller 做错决定。判定成立时 caller 向 `gate-quality-result.json` 写入：
+纯文档改动是否 docs-only 由 caller 的 `scripts/gate-quality` 自行判定并提前 `exit 0`，gate-v2 **不按路径短路 quality**。理由有二：其一，gate 是必需检查，若在 workflow 层按路径跳过（如 paths-ignore），整个工作流被跳过后必需检查会一直停在等待状态、PR 无法合并，而 job 内由入口脚本提前 `exit 0` 则 job 照常以 success 结束，不存在此问题；其二，测试本身可能就读这些文档，「是否纯文档」只有 caller 能判断。判定成立时 caller 向 `gate-quality-result.json` 写入：
 
 ```json
 {"schema":"gate-quality-result/v1","mode":"docs-only","stage":"setup","outcome":"not_started","failed_nodeids":null,"evidence":"not_applicable","flake_signal":"undetermined"}
