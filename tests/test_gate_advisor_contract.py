@@ -134,7 +134,8 @@ def test_advisor_job_enforces_the_verdict_with_no_continue_on_error():
 
 
 def _make_hub(tmp_path, *, classifier_mode=None, rule_hits="[]",
-              advisor_first_line=None, advisor_exit=0, advisor_error_lines=0):
+              advisor_first_line=None, advisor_exit=0, advisor_error_lines=0,
+              advisor_error_text=None):
     hub = tmp_path
     review = hub / "scripts" / "review"
     review.mkdir(parents=True)
@@ -160,6 +161,8 @@ def _make_hub(tmp_path, *, classifier_mode=None, rule_hits="[]",
             "error_lines = int(os.environ.get('FAKE_ADVISOR_ERROR_LINES', '0'))\n"
             "with open(os.environ['GITHUB_STEP_SUMMARY'], 'w', encoding='utf-8') as summary:\n"
             "    summary.write(first_line + '\\n\\n## Advisor report\\nadvisor body text\\n')\n"
+            "for line in os.environ.get('FAKE_ADVISOR_ERROR_TEXT', '').splitlines():\n"
+            "    sys.stderr.write(line + '\\n')\n"
             "for index in range(error_lines):\n"
             "    sys.stderr.write('REVIEW-ADVISOR-ERROR line-%02d %s\\n' % (index, 'x' * 600))\n"
             "sys.exit(int(os.environ.get('FAKE_ADVISOR_EXIT', '0')))\n",
@@ -273,12 +276,13 @@ def test_advisor_classify_publishes_declared_only_and_always_exits_zero(
 
 
 def _run_advisor(tmp_path, *, first_line=None, exit_code=0, error_lines=0,
-                 raising_stub=False):
+                 raising_stub=False, error_text=None):
     hub = _make_hub(
         tmp_path / "hub",
         advisor_first_line=None if raising_stub else first_line,
         advisor_exit=exit_code,
         advisor_error_lines=error_lines,
+        advisor_error_text=error_text,
     )
     if raising_stub:
         stub = hub / "scripts" / "review" / "review-advisor"
@@ -291,6 +295,7 @@ def _run_advisor(tmp_path, *, first_line=None, exit_code=0, error_lines=0,
             "FAKE_ADVISOR_FIRST_LINE": first_line or "",
             "FAKE_ADVISOR_EXIT": str(exit_code),
             "FAKE_ADVISOR_ERROR_LINES": str(error_lines),
+            "FAKE_ADVISOR_ERROR_TEXT": error_text or "",
             "REPOSITORY": "zlxlabs/caller", "PR_NUMBER": "42",
             "HEAD_SHA": HEAD_SHA, "GH_TOKEN": "stub-token",
         },
@@ -316,9 +321,12 @@ def test_advisor_job_succeeds_only_on_no_backdoor_with_exit_zero(
     proc, summary = _run_advisor(tmp_path, first_line=first_line, exit_code=exit_code)
     expected_verdict = PARSED_VERDICTS.get(first_line, "error")
     last_line = summary.strip().splitlines()[-1]
-    assert last_line == (
+    result_line = (
         f"ADVISOR-RESULT verdict={expected_verdict} exit={exit_code} head={HEAD_SHA}"
     )
+    assert last_line == result_line
+    # every outcome mirrors the result line into the job log (stdout)
+    assert result_line in proc.stdout
     if expect_success:
         assert proc.returncode == 0, proc.stderr
     else:
@@ -344,3 +352,29 @@ def test_advisor_job_fails_loudly_when_the_advisor_stub_raises(tmp_path):
     assert proc.returncode != 0
     last_line = summary.strip().splitlines()[-1]
     assert last_line == f"ADVISOR-RESULT verdict=error exit=1 head={HEAD_SHA}"
+    assert f"ADVISOR-RESULT verdict=error exit=1 head={HEAD_SHA}" in proc.stdout
+
+
+def test_advisor_job_logs_review_advisor_error_lines_as_warnings(tmp_path):
+    proc, summary = _run_advisor(
+        tmp_path, first_line="ADVISOR-VERDICT no_backdoor", exit_code=0,
+        error_text="REVIEW-ADVISOR-ERROR: x",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "::warning::REVIEW-ADVISOR-ERROR: x" in proc.stdout
+
+
+def test_advisor_job_never_lets_error_lines_inject_workflow_commands(tmp_path):
+    proc, summary = _run_advisor(
+        tmp_path, first_line="ADVISOR-VERDICT no_backdoor", exit_code=0,
+        error_text=(
+            "REVIEW-ADVISOR-ERROR: pwned%0A::error::annotation\r\n::error::raw-line"
+        ),
+    )
+    assert proc.returncode == 0, proc.stderr
+    # % is stripped so the runner cannot decode %0A into a fresh line
+    assert "::warning::REVIEW-ADVISOR-ERROR: pwned0A::error::annotation" in proc.stdout
+    log_lines = (proc.stdout + proc.stderr).splitlines()
+    assert not any(line.startswith("::error::") for line in log_lines)
+    # the summary keeps the raw stderr-derived line; only the log is sanitized
+    assert "REVIEW-ADVISOR-ERROR: pwned%0A::error::annotation" in summary

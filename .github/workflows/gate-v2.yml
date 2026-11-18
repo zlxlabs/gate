@@ -2275,6 +2275,17 @@ jobs:
                   f"::warning::ADVISOR error type={type(exc).__name__}",
                   file=sys.stderr,
               )
+          # Mirror failure reasons into the job log: the step summary is not
+          # readable via the REST API (agent-config#7717, gate-hub#2468).
+          # stderr-derived lines are stripped of %, CR and LF so the runner's
+          # workflow-command parser cannot be injected with extra commands.
+          result_line = (
+              f"ADVISOR-RESULT verdict={verdict} exit={exit_code} head={os.environ['HEAD_SHA']}"
+          )
+          for line in advisor_error_lines:
+              sanitized = line.replace("%", "").replace("\r", "").replace("\n", "")
+              print(f"::warning::{sanitized}")
+          print(result_line)
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
               if advisor_summary_text:
                   summary.write(advisor_summary_text)
@@ -2282,9 +2293,7 @@ jobs:
                       summary.write("\n")
               if advisor_error_lines:
                   summary.write("\n".join(advisor_error_lines) + "\n")
-              summary.write(
-                  f"ADVISOR-RESULT verdict={verdict} exit={exit_code} head={os.environ['HEAD_SHA']}\n"
-              )
+              summary.write(result_line + "\n")
           if verdict != "no_backdoor" or exit_code != "0":
               sys.exit(1)
           PY
