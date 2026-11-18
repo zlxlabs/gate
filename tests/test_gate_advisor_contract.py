@@ -61,7 +61,11 @@ def test_advisor_shadow_is_replaced_by_the_isolated_job_pair():
     jobs = _jobs()
     assert "advisor_shadow" not in jobs
     assert jobs["advisor_classify"]["needs"] == ["classify_pr_paths"]
-    assert jobs["advisor"]["needs"] == ["advisor_classify"]
+    # set equality: classify_pr_paths must be a DIRECT dependency (the needs
+    # context exposes direct dependencies only — an indirect reference there
+    # is a null-property bug actionlint correctly flags), and the pair stays
+    # out of every legacy job's needs.
+    assert set(jobs["advisor"]["needs"]) == {"classify_pr_paths", "advisor_classify"}
     for name, job in jobs.items():
         if name in ("advisor_classify", "advisor"):
             continue
