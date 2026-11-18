@@ -2058,6 +2058,191 @@ jobs:
           printf '::warning::%s\n' "$result"
           exit 0
 
+  # ── advisor_shadow (human:declared-only, never a required gate) ─────────
+  advisor_shadow:
+    # 影子期绝不进入 gate 判定；即使工具或编排失败也以成功结束并记录 error。
+    needs: [classify_pr_paths]
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && !contains(fromJSON('["false"]'), needs.classify_pr_paths.outputs.review_expected) && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    outputs:
+      verdict: ${{ steps.run-advisor-shadow.outputs.verdict }}
+      exit_code: ${{ steps.run-advisor-shadow.outputs.exit_code }}
+    steps:
+      - name: Classify human-declared paths and run the shadow advisor
+        id: run-advisor-shadow
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GATE_HUB_DIR: /opt/gate-hub
+        run: |
+          gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
+          python3 - "$gate_hub_dir" <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          verdict = "error"
+          exit_code = "1"
+          summary_lines = []
+          advisor_summary_text = ""
+          advisor_error_lines = []
+          stage = "classifier"
+          try:
+              hub_dir = Path(sys.argv[1])
+              sys.path.insert(0, str(hub_dir / "scripts"))
+              from review.risk_classification import classify_human_required
+
+              repository = os.environ["REPOSITORY"]
+              pr_number = os.environ["PR_NUMBER"]
+              base_sha = os.environ["BASE_SHA"]
+              head_sha = os.environ["HEAD_SHA"]
+
+              def gh_json(endpoint):
+                  result = subprocess.run(
+                      ["gh", "api", endpoint], check=True, capture_output=True,
+                      text=True, timeout=90,
+                  )
+                  return json.loads(result.stdout)
+
+              def pr_facts():
+                  facts = gh_json(f"repos/{repository}/pulls/{pr_number}")
+                  if facts["base"]["sha"] != base_sha or facts["head"]["sha"] != head_sha:
+                      raise ValueError("pull_request_sha_changed")
+                  return facts
+
+              stage = "pull_request_files"
+              initial_facts = pr_facts()
+              files_result = subprocess.run(
+                  ["gh", "api", "--paginate", "--jq", ".[] | @base64",
+                   f"repos/{repository}/pulls/{pr_number}/files?per_page=100"],
+                  check=True, capture_output=True, text=True, timeout=120,
+              )
+              changes = []
+              for line in files_result.stdout.splitlines():
+                  entry = json.loads(base64.b64decode(line, validate=True))
+                  path = entry["filename"]
+                  previous_path = entry.get("previous_filename")
+                  if not isinstance(path, str) or not path or (
+                      previous_path is not None and not isinstance(previous_path, str)
+                  ):
+                      raise ValueError("pull_request_file_path_invalid")
+                  changes.append((path, previous_path))
+              final_facts = pr_facts()
+              if final_facts["changed_files"] != initial_facts["changed_files"] or len(changes) != initial_facts["changed_files"]:
+                  raise ValueError("pull_request_file_listing_incomplete_or_changed")
+
+              stage = "base_human_review_paths"
+              base_tree = gh_json(f"repos/{repository}/git/trees/{base_sha}")
+              if base_tree["truncated"]:
+                  raise ValueError("base_tree_truncated")
+              gate_tree = next(
+                  (item for item in base_tree["tree"] if item["path"] == ".gate"), None
+              )
+              human_review_paths_text = None
+              if gate_tree is not None:
+                  if gate_tree["type"] != "tree":
+                      raise ValueError("base_gate_path_is_not_tree")
+                  gate_contents = gh_json(
+                      f"repos/{repository}/git/trees/{gate_tree['sha']}"
+                  )
+                  if gate_contents["truncated"]:
+                      raise ValueError("base_gate_tree_truncated")
+                  rules_blob = next(
+                      (item for item in gate_contents["tree"]
+                       if item["path"] == "human-review-paths"), None
+                  )
+                  if rules_blob is not None:
+                      if rules_blob["type"] != "blob":
+                          raise ValueError("base_human_review_paths_is_not_blob")
+                      blob = gh_json(f"repos/{repository}/git/blobs/{rules_blob['sha']}")
+                      if blob["encoding"] != "base64":
+                          raise ValueError("base_human_review_paths_encoding_invalid")
+                      encoded_rules = "".join(blob["content"].split())
+                      human_review_paths_text = base64.b64decode(
+                          encoded_rules, validate=True
+                      ).decode("utf-8")
+
+              stage = "human_path_classification"
+              classification = classify_human_required(
+                  tuple(changes), human_review_paths_text
+              )
+              rule_hits = classification["rule_hits"]
+              if not isinstance(rule_hits, list) or any(
+                  not isinstance(hit, str) for hit in rule_hits
+              ):
+                  raise ValueError("human_path_classifier_result_invalid")
+              human_hits = [hit for hit in rule_hits if hit.startswith("human:")]
+              declared_hits = [
+                  hit for hit in human_hits if hit.startswith("human:declared:")
+              ]
+              if not declared_hits or len(declared_hits) != len(human_hits):
+                  verdict = "skipped"
+                  exit_code = "skipped"
+                  summary_lines.append(
+                      "ADVISOR-SHADOW skipped reason=hits_not_declared_only"
+                  )
+              else:
+                  stage = "review_advisor"
+                  with tempfile.TemporaryDirectory(prefix="advisor-shadow-") as temp_dir:
+                      advisor_summary = Path(temp_dir) / "summary.md"
+                      advisor_env = os.environ.copy()
+                      advisor_env["GITHUB_STEP_SUMMARY"] = str(advisor_summary)
+                      completed = subprocess.run(
+                          ["python3", str(hub_dir / "scripts/review/review-advisor"), pr_number],
+                          env=advisor_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                          text=True, timeout=1020,
+                      )
+                      advisor_error_lines = [
+                          line[:500]
+                          for line in completed.stderr.splitlines()
+                          if line.startswith("REVIEW-ADVISOR-ERROR")
+                      ][:5]
+                      raw_summary = advisor_summary.read_text(encoding="utf-8")
+                  advisor_summary_text = raw_summary
+                  first_line = raw_summary.splitlines()[0] if raw_summary.splitlines() else ""
+                  match = re.fullmatch(
+                      r"ADVISOR-VERDICT (no_backdoor|backdoor|uncertain)", first_line
+                  )
+                  if match is None:
+                      raise ValueError("review_advisor_summary_invalid")
+                  verdict = match.group(1)
+                  exit_code = str(completed.returncode)
+          except Exception as exc:
+              verdict = "error"
+              exit_code = "1"
+              summary_lines.append(
+                  f"ADVISOR-SHADOW error reason={stage}_failed type={type(exc).__name__}"
+              )
+              print(
+                  f"::warning::ADVISOR-SHADOW error reason={stage}_failed "
+                  f"type={type(exc).__name__}",
+                  file=sys.stderr,
+              )
+
+          summary_lines.extend(advisor_error_lines)
+          summary_lines.append(
+              f"ADVISOR-SHADOW verdict={verdict} exit={exit_code} head={os.environ['HEAD_SHA']}"
+          )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write(advisor_summary_text)
+              if advisor_summary_text and not advisor_summary_text.endswith("\n"):
+                  summary.write("\n")
+              summary.write("\n".join(summary_lines) + "\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
+              outputs.write(f"verdict={verdict}\nexit_code={exit_code}\n")
+          PY
+
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
   resolve_advisory:
     # 与 primary 使用相同的 PR 作者及路由谓词，非法作者和 Dependabot 不创建评审任务。

@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # GATE_V2_WORKFLOW_PATH is a mutation hook for the red-verification run.
 WORKFLOW = Path(os.environ.get("GATE_V2_WORKFLOW_PATH") or REPO_ROOT / ".github/workflows/gate-v2.yml")
 CI_JOBS = ("quality",)
-REVIEW_JOBS = ("primary", "ledger")
+REVIEW_JOBS = ("primary", "ledger", "advisor_shadow")
 TARGET_JOBS = CI_JOBS + REVIEW_JOBS
 
 # The pre-#1724 runs-on parts, verbatim (base commit ea62830).
@@ -32,7 +32,7 @@ _GUARD_AUTHOR = """(inputs.runner == 'self' && github.event.pull_request.head.re
 _GUARD_CI = """(inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"')))"""
 PRE_CHANGE = {
     **{job: (_GUARD_CONTROL, ["self-hosted", "linux", "codex"]) for job in ("classify_pr_paths", "gate", "ledger")},
-    **{job: (_GUARD_AUTHOR, ["self-hosted", "linux", "codex"]) for job in ("primary", "resolve_advisory", "ocr")},
+    **{job: (_GUARD_AUTHOR, ["self-hosted", "linux", "codex"]) for job in ("primary", "resolve_advisory", "ocr", "advisor_shadow")},
     "quality": (_GUARD_CI, ["self-hosted", "linux", "ci"]),
 }
 
