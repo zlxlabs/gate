@@ -130,6 +130,10 @@ def test_advisor_job_enforces_the_verdict_with_no_continue_on_error():
     assert "except Exception" in run
 
 
+def test_advisor_step_declares_gh_repo_from_github_repository():
+    assert _advisor_step()["env"]["GH_REPO"] == "${{ github.repository }}"
+
+
 # ── execution-level contracts (stub gate-hub tree + stub gh) ─────────────
 
 
@@ -157,6 +161,10 @@ def _make_hub(tmp_path, *, classifier_mode=None, rule_hits="[]",
             "import os\n"
             "import sys\n"
             "\n"
+            "record_path = os.environ.get('FAKE_ADVISOR_ENV_RECORD')\n"
+            "if record_path:\n"
+            "    with open(record_path, 'w', encoding='utf-8') as record_file:\n"
+            "        record_file.write(os.environ.get('GH_REPO', ''))\n"
             "first_line = os.environ.get('FAKE_ADVISOR_FIRST_LINE', '')\n"
             "error_lines = int(os.environ.get('FAKE_ADVISOR_ERROR_LINES', '0'))\n"
             "with open(os.environ['GITHUB_STEP_SUMMARY'], 'w', encoding='utf-8') as summary:\n"
@@ -211,9 +219,15 @@ def _make_gh(tmp_path):
     return tmp_path
 
 
-def _run_step(step, tmp_path, *, extra_env, summary, output=None, bin_dir=None):
+def _run_step(step, tmp_path, *, extra_env, summary, output=None, bin_dir=None,
+              cwd=REPO_ROOT, github_expressions=None):
     env = dict(os.environ)
-    env.update(step.get("env") or {})
+    env.pop("GH_REPO", None)
+    for key, value in (step.get("env") or {}).items():
+        rendered = str(value)
+        for expr, replacement in (github_expressions or {}).items():
+            rendered = rendered.replace(expr, replacement)
+        env[key] = rendered
     env["GATE_HUB_DIR"] = str(tmp_path / "hub")
     env["GITHUB_STEP_SUMMARY"] = str(summary)
     if output is not None:
@@ -221,7 +235,7 @@ def _run_step(step, tmp_path, *, extra_env, summary, output=None, bin_dir=None):
     env.update(extra_env)
     if bin_dir is not None:
         env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
-    return subprocess.run(["bash", "-c", step["run"]], cwd=REPO_ROOT, env=env,
+    return subprocess.run(["bash", "-c", step["run"]], cwd=cwd, env=env,
                           capture_output=True, text=True, check=False)
 
 
@@ -378,3 +392,29 @@ def test_advisor_job_never_lets_error_lines_inject_workflow_commands(tmp_path):
     assert not any(line.startswith("::error::") for line in log_lines)
     # the summary keeps the raw stderr-derived line; only the log is sanitized
     assert "REVIEW-ADVISOR-ERROR: pwned%0A::error::annotation" in summary
+
+
+def test_advisor_step_passes_gh_repo_to_advisor_in_non_git_workdir(tmp_path):
+    repo_slug = "zlxlabs/agent-config"
+    workdir = tmp_path / "non-git-workdir"
+    workdir.mkdir()
+    assert subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=workdir, capture_output=True,
+    ).returncode != 0
+    _make_hub(tmp_path / "hub", advisor_first_line="ADVISOR-VERDICT no_backdoor")
+    gh_repo_file = tmp_path / "advisor-gh-repo.txt"
+    proc = _run_step(
+        _advisor_step(), tmp_path,
+        cwd=workdir,
+        github_expressions={"${{ github.repository }}": repo_slug},
+        extra_env={
+            "FAKE_ADVISOR_FIRST_LINE": "ADVISOR-VERDICT no_backdoor",
+            "FAKE_ADVISOR_ENV_RECORD": str(gh_repo_file),
+            "PR_NUMBER": "7717",
+            "HEAD_SHA": HEAD_SHA,
+            "GH_TOKEN": "stub-token",
+        },
+        summary=tmp_path / "summary.md",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert gh_repo_file.read_text(encoding="utf-8") == repo_slug
