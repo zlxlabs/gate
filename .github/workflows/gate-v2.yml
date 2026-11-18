@@ -2058,19 +2058,21 @@ jobs:
           printf '::warning::%s\n' "$result"
           exit 0
 
-  # ── advisor_shadow (human:declared-only, never a required gate) ─────────
-  advisor_shadow:
-    # 影子期绝不进入 gate 判定；即使工具或编排失败也以成功结束并记录 error。
+  # ── advisor_classify + advisor (enforcing pair; agent-config merge gate) ─
+  advisor_classify:
+    # 只做 human 路径分类且恒成功：human: 命中全部为 human:declared:* 时输出
+    # declared_only=true，否则 false；分类任何异常输出 error。declared_only
+    # != true 时 advisor 为 skipped（绝不静默运行），消费方（agent-config 合
+    # 并闸，check 名 gate / advisor）对 skipped/failure 一律找人。
     needs: [classify_pr_paths]
     if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && !contains(fromJSON('["false"]'), needs.classify_pr_paths.outputs.review_expected) && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
     runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 20
     outputs:
-      verdict: ${{ steps.run-advisor-shadow.outputs.verdict }}
-      exit_code: ${{ steps.run-advisor-shadow.outputs.exit_code }}
+      declared_only: ${{ steps.classify-declared.outputs.declared_only }}
     steps:
-      - name: Classify human-declared paths and run the shadow advisor
-        id: run-advisor-shadow
+      - name: Classify human-declared paths
+        id: classify-declared
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2078,7 +2080,6 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
           GATE_HUB_DIR: /opt/gate-hub
         run: |
           gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
@@ -2086,17 +2087,12 @@ jobs:
           import base64
           import json
           import os
-          import re
           import subprocess
           import sys
-          import tempfile
           from pathlib import Path
 
-          verdict = "error"
-          exit_code = "1"
-          summary_lines = []
-          advisor_summary_text = ""
-          advisor_error_lines = []
+          declared_only = "error"
+          detail = ""
           stage = "classifier"
           try:
               hub_dir = Path(sys.argv[1])
@@ -2186,61 +2182,111 @@ jobs:
               declared_hits = [
                   hit for hit in human_hits if hit.startswith("human:declared:")
               ]
-              if not declared_hits or len(declared_hits) != len(human_hits):
-                  verdict = "skipped"
-                  exit_code = "skipped"
-                  summary_lines.append(
-                      "ADVISOR-SHADOW skipped reason=hits_not_declared_only"
-                  )
-              else:
-                  stage = "review_advisor"
-                  with tempfile.TemporaryDirectory(prefix="advisor-shadow-") as temp_dir:
-                      advisor_summary = Path(temp_dir) / "summary.md"
-                      advisor_env = os.environ.copy()
-                      advisor_env["GITHUB_STEP_SUMMARY"] = str(advisor_summary)
-                      completed = subprocess.run(
-                          ["python3", str(hub_dir / "scripts/review/review-advisor"), pr_number],
-                          env=advisor_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                          text=True, timeout=1020,
-                      )
-                      advisor_error_lines = [
-                          line[:500]
-                          for line in completed.stderr.splitlines()
-                          if line.startswith("REVIEW-ADVISOR-ERROR")
-                      ][:5]
-                      raw_summary = advisor_summary.read_text(encoding="utf-8")
-                  advisor_summary_text = raw_summary
-                  first_line = raw_summary.splitlines()[0] if raw_summary.splitlines() else ""
-                  match = re.fullmatch(
-                      r"ADVISOR-VERDICT (no_backdoor|backdoor|uncertain)", first_line
-                  )
-                  if match is None:
-                      raise ValueError("review_advisor_summary_invalid")
-                  verdict = match.group(1)
-                  exit_code = str(completed.returncode)
-          except Exception as exc:
-              verdict = "error"
-              exit_code = "1"
-              summary_lines.append(
-                  f"ADVISOR-SHADOW error reason={stage}_failed type={type(exc).__name__}"
+              declared_only = (
+                  "true" if declared_hits and len(declared_hits) == len(human_hits)
+                  else "false"
               )
+          except Exception as exc:
+              declared_only = "error"
+              detail = f" reason={stage}_failed type={type(exc).__name__}"
               print(
-                  f"::warning::ADVISOR-SHADOW error reason={stage}_failed "
+                  f"::warning::ADVISOR-CLASSIFY error reason={stage}_failed "
                   f"type={type(exc).__name__}",
                   file=sys.stderr,
               )
 
-          summary_lines.extend(advisor_error_lines)
-          summary_lines.append(
-              f"ADVISOR-SHADOW verdict={verdict} exit={exit_code} head={os.environ['HEAD_SHA']}"
+          summary_line = (
+              f"ADVISOR-CLASSIFY declared_only={declared_only}{detail} "
+              f"head={os.environ['HEAD_SHA']}\n"
           )
+          print(summary_line, end="")
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
-              summary.write(advisor_summary_text)
-              if advisor_summary_text and not advisor_summary_text.endswith("\n"):
-                  summary.write("\n")
-              summary.write("\n".join(summary_lines) + "\n")
+              summary.write(summary_line)
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
-              outputs.write(f"verdict={verdict}\nexit_code={exit_code}\n")
+              outputs.write(f"declared_only={declared_only}\n")
+          PY
+
+  advisor:
+    # 顾问结论即本 job 结论：仅当 review-advisor 退出 0 且其 summary 首行为
+    # ADVISOR-VERDICT no_backdoor 时成功；backdoor / uncertain / 异常 / 首行
+    # 无法解析一律失败。declared_only != true（非 declared-only、分类 error、
+    # draft、fork、hosted、classifier 豁免）时本 job 为 skipped；无
+    # continue-on-error——agent-config 合并闸（check 名 gate / advisor）只认
+    # success 自动放行。
+    needs: [classify_pr_paths, advisor_classify]
+    if: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.advisor_classify.outputs.declared_only == 'true' && !contains(fromJSON('["false"]'), needs.classify_pr_paths.outputs.review_expected) && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
+    runs-on: ${{ (inputs.runner == 'self' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"') && (inputs.extra_runner_label_review != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_review))) || fromJSON('["self-hosted","linux","codex"]')) || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    steps:
+      - name: Run the enforcing advisor
+        id: run-advisor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GATE_HUB_DIR: /opt/gate-hub
+        run: |
+          gate_hub_dir="${GATE_HUB_DIR:-/opt/gate-hub}"
+          python3 - "$gate_hub_dir" <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          verdict = "error"
+          exit_code = "1"
+          advisor_summary_text = ""
+          advisor_error_lines = []
+          try:
+              hub_dir = Path(sys.argv[1])
+              pr_number = os.environ["PR_NUMBER"]
+              with tempfile.TemporaryDirectory(prefix="advisor-") as temp_dir:
+                  advisor_summary = Path(temp_dir) / "summary.md"
+                  advisor_env = os.environ.copy()
+                  advisor_env["GITHUB_STEP_SUMMARY"] = str(advisor_summary)
+                  completed = subprocess.run(
+                      ["python3", str(hub_dir / "scripts/review/review-advisor"), pr_number],
+                      env=advisor_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                      text=True, timeout=1020,
+                  )
+                  exit_code = str(completed.returncode)
+                  advisor_error_lines = [
+                      line[:500]
+                      for line in completed.stderr.splitlines()
+                      if line.startswith("REVIEW-ADVISOR-ERROR")
+                  ][:5]
+                  advisor_summary_text = advisor_summary.read_text(encoding="utf-8")
+              first_line = (
+                  advisor_summary_text.splitlines()[0]
+                  if advisor_summary_text.splitlines() else ""
+              )
+              match = re.fullmatch(
+                  r"ADVISOR-VERDICT (no_backdoor|backdoor|uncertain)", first_line
+              )
+              if match is None:
+                  raise ValueError("review_advisor_summary_invalid")
+              verdict = match.group(1)
+          except Exception as exc:
+              verdict = "error"
+              print(
+                  f"::warning::ADVISOR error type={type(exc).__name__}",
+                  file=sys.stderr,
+              )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              if advisor_summary_text:
+                  summary.write(advisor_summary_text)
+                  if not advisor_summary_text.endswith("\n"):
+                      summary.write("\n")
+              if advisor_error_lines:
+                  summary.write("\n".join(advisor_error_lines) + "\n")
+              summary.write(
+                  f"ADVISOR-RESULT verdict={verdict} exit={exit_code} head={os.environ['HEAD_SHA']}\n"
+              )
+          if verdict != "no_backdoor" or exit_code != "0":
+              sys.exit(1)
           PY
 
   # ── resolve_advisory (policy list before OCR matrix expansion) ──────────
