@@ -4237,7 +4237,7 @@ def test_caller_checks_maps_action_payload_to_aggregator_state(tmp_path, outcome
 @pytest.mark.parametrize(
     ("mode", "expected_status", "expected_classification", "expected_text"),
     [
-        ("unavailable", "unavailable", "review_unavailable", "merge-base-unavailable"),
+        ("unavailable", "unavailable", "review_unavailable", "git measurement failed"),
         ("blocked", "blocked", "ci_failure", "split the PR"),
     ],
 )

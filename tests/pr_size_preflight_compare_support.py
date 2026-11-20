@@ -73,6 +73,7 @@ def run_preflight_with_compare_stub(
     )
     producer_env = {
         **env,
+        "GITHUB_REPOSITORY": env.get("GITHUB_REPOSITORY", "fixture/repo"),
         "GH_TOKEN": "compare-test-token",
         "PREFLIGHT_COMPARE_SHA": merge_base_sha or "",
         "PREFLIGHT_COMPARE_HTTP_STATUS": str(http_status or 0),
