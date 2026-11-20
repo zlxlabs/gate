@@ -67,7 +67,9 @@ def run_preflight_with_compare_stub(
         "    if status: raise urllib.error.HTTPError(request.full_url, status, 'stub failure', {}, None)\n"
         "    return Response()\n"
         "urllib.request.urlopen = fake_urlopen\n"
-        "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        "script = sys.argv[1]\n"
+        "sys.argv = sys.argv[1:]\n"
+        "runpy.run_path(script, run_name='__main__')\n"
     )
     producer_env = {
         **env,
