@@ -759,7 +759,7 @@ def test_preflight_action_uses_the_service_for_an_absent_base(source_host, monke
     tree = _git("rev-parse", f"{base_sha}^{{tree}}", cwd=source_host["work"])
     advanced_base = _git("commit-tree", tree, "-p", base_sha, "-m", "base advanced", cwd=source_host["work"])
     _git("push", "--quiet", str(source_host["caller_bare"]), f"{advanced_base}:refs/heads/base", cwd=source_host["work"])
-    assert advanced_base != base_sha
+    assert _git("--git-dir", str(source_host["caller_bare"]), "for-each-ref", "--points-at", base_sha, "--format=%(refname)", "refs/heads") == ""
     workspace = source_host["tmp_path"] / "workspace"
     _git("clone", "--quiet", "--depth", "1", "--no-local", "--branch", "pr-1-merge", str(source_host["caller_bare"]), str(workspace))
     _git("remote", "set-url", "origin", f"https://github.com/{REPOSITORY}", cwd=workspace)
