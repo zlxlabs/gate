@@ -48,6 +48,7 @@ def _repo(tmp_path: Path, added_lines: int) -> tuple[Path, str, str]:
 
 
 def _stub_compare(module, monkeypatch, merge_base_sha: str) -> None:
+    monkeypatch.delenv("GATE_HUB_GIT_MIRROR_DIR", raising=False)
     monkeypatch.setenv("GH_TOKEN", "test-token")
     monkeypatch.setenv("GITHUB_REPOSITORY", "fixture/repo")
     monkeypatch.setattr(

@@ -18,7 +18,7 @@ GATE_ROOT = Path(__file__).resolve().parents[3]
 if str(GATE_ROOT) not in sys.path:
     sys.path.insert(0, str(GATE_ROOT))
 
-from scripts.gate_source import declared_mode, ensure_commits
+from scripts.gate_source import SourceError, declared_mode, ensure_commits
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
@@ -43,27 +43,35 @@ class MergeBaseUnavailableError(ValueError):
     """GitHub or shallow object retrieval could not provide the PR merge base."""
 
 
-def ensure_review_commits(repo: Path, base_sha: str, head_sha: str) -> None:
-    """Legacy endpoint materialization used by the gate-source contract test."""
-    try:
-        for sha in (base_sha, head_sha):
-            _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
-    except subprocess.CalledProcessError:
-        if declared_mode() == "service":
-            ensure_commits(repo, os.environ.get("GITHUB_REPOSITORY", ""), base_sha, head_sha)
-        else:
-            _git(repo, "fetch", "--no-tags", "origin", base_sha, head_sha)
-
-
-def ensure_review_diff_commits(repo: Path, head_sha: str, merge_base_sha: str) -> None:
-    """Fetch only missing trees needed by the merge-base-to-head diff."""
+def ensure_review_commits(repo: Path, head_sha: str, merge_base_sha: str) -> None:
+    """Make the two diff commits available through the declared source path."""
+    missing = []
     for sha in (head_sha, merge_base_sha):
         present = subprocess.run(
             ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
             cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
-        if present.returncode == 0:
-            continue
+        if present.returncode != 0:
+            missing.append(sha)
+    if not missing:
+        return
+    try:
+        mode = declared_mode()
+    except SourceError as error:
+        raise MergeBaseUnavailableError(
+            f"merge-base-unavailable: source mode unavailable: {error}"
+        ) from error
+    if mode == "service":
+        try:
+            ensure_commits(
+                repo, os.environ.get("GITHUB_REPOSITORY", ""), head_sha, merge_base_sha
+            )
+        except SourceError as error:
+            raise MergeBaseUnavailableError(
+                f"merge-base-unavailable: source service failed: {error}"
+            ) from error
+        return
+    for sha in missing:
         fetched = subprocess.run(
             ["git", "fetch", "--no-tags", "--depth=1", "origin", sha],
             cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
@@ -450,7 +458,7 @@ def main() -> int:
             token=os.environ.get("GH_TOKEN", ""),
             repository=repository,
         )
-        ensure_review_diff_commits(Path.cwd(), args.head_sha, merge_base_sha)
+        ensure_review_commits(Path.cwd(), args.head_sha, merge_base_sha)
         result = measure(
             Path.cwd(), args.base_sha, args.head_sha,
             merge_base_sha=merge_base_sha,

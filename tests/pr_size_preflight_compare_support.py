@@ -78,6 +78,7 @@ def run_preflight_with_compare_stub(
         "PREFLIGHT_COMPARE_SHA": merge_base_sha or "",
         "PREFLIGHT_COMPARE_HTTP_STATUS": str(http_status or 0),
     }
+    producer_env.pop("GATE_HUB_GIT_MIRROR_DIR", None)
     return subprocess.run(
         [sys.executable, "-c", launcher, str(script), *argv],
         cwd=cwd, env=producer_env, capture_output=True, text=True, check=check,
@@ -143,6 +144,7 @@ def assert_shallow_compare_preflight(tmp_path: Path, monkeypatch, module, module
     monkeypatch.chdir(shallow)
     monkeypatch.setenv("PATH", str(git_bin) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("GIT_FETCH_LOG", str(fetch_log))
+    monkeypatch.delenv("GATE_HUB_GIT_MIRROR_DIR", raising=False)
     monkeypatch.setenv("GH_TOKEN", "compare-test-token")
     monkeypatch.setenv("GITHUB_REPOSITORY", "owner/project")
     monkeypatch.setenv("PR_NUMBER", "0")
