@@ -122,9 +122,9 @@ def test_advisor_job_enforces_the_verdict_with_no_continue_on_error():
         "ADVISOR-RESULT verdict={verdict} exit={exit_code} "
         "head={os.environ['HEAD_SHA']}"
     ) in run
-    assert 'line.startswith("REVIEW-ADVISOR-ERROR")' in run
+    assert 'line.startswith(("ADVISOR-", "REVIEW-ADVISOR-"))' in run
     assert "line[:500]" in run
-    assert "][:5]" in run
+    assert "][:6]" in run
     # success ⇔ (advisor exit 0 AND first summary line no_backdoor)
     assert 'verdict != "no_backdoor" or exit_code != "0"' in run
     assert "except Exception" in run
@@ -347,7 +347,7 @@ def test_advisor_job_succeeds_only_on_no_backdoor_with_exit_zero(
         assert proc.returncode != 0
 
 
-def test_advisor_job_keeps_summary_text_and_at_most_five_truncated_errors(tmp_path):
+def test_advisor_job_keeps_summary_text_and_at_most_six_truncated_errors(tmp_path):
     proc, summary = _run_advisor(
         tmp_path, first_line="ADVISOR-VERDICT no_backdoor", exit_code=0,
         error_lines=7,
@@ -357,7 +357,7 @@ def test_advisor_job_keeps_summary_text_and_at_most_five_truncated_errors(tmp_pa
     error_lines = [
         ln for ln in summary.splitlines() if ln.startswith("REVIEW-ADVISOR-ERROR")
     ]
-    assert len(error_lines) == 5
+    assert len(error_lines) == 6
     assert all(len(line) == 500 for line in error_lines)
 
 
@@ -369,13 +369,24 @@ def test_advisor_job_fails_loudly_when_the_advisor_stub_raises(tmp_path):
     assert f"ADVISOR-RESULT verdict=error exit=1 head={HEAD_SHA}" in proc.stdout
 
 
-def test_advisor_job_logs_review_advisor_error_lines_as_warnings(tmp_path):
+def test_advisor_job_logs_advisor_reason_and_review_errors_but_not_regular_stderr(tmp_path):
+    reason_line = (
+        "ADVISOR-REASON verdict=no_backdoor reason=declared_only "
+        "evidence=tests/fixture"
+    )
     proc, summary = _run_advisor(
         tmp_path, first_line="ADVISOR-VERDICT no_backdoor", exit_code=0,
-        error_text="REVIEW-ADVISOR-ERROR: x",
+        error_lines=5,
+        error_text=f"{reason_line}\nordinary stderr line",
     )
     assert proc.returncode == 0, proc.stderr
-    assert "::warning::REVIEW-ADVISOR-ERROR: x" in proc.stdout
+    warnings = [line for line in proc.stdout.splitlines() if line.startswith("::warning::")]
+    assert len(warnings) == 6
+    assert warnings[0] == f"::warning::{reason_line}"
+    assert all(line.startswith("::warning::REVIEW-ADVISOR-ERROR") for line in warnings[1:])
+    assert "ordinary stderr line" not in proc.stdout + proc.stderr
+    assert reason_line in summary
+    assert "ordinary stderr line" not in summary
 
 
 def test_advisor_job_never_lets_error_lines_inject_workflow_commands(tmp_path):
