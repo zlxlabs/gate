@@ -2278,14 +2278,21 @@ jobs:
               )
           # Mirror failure reasons into the job log: the step summary is not
           # readable via the REST API (agent-config#7717, gate-hub#2468).
-          # stderr-derived lines are stripped of %, CR and LF so the runner's
-          # workflow-command parser cannot be injected with extra commands.
+          # Each untrusted summary line gets a fixed prefix and has %, CR and
+          # LF stripped so the runner cannot parse it as a workflow command.
           result_line = (
               f"ADVISOR-RESULT verdict={verdict} exit={exit_code} head={os.environ['HEAD_SHA']}"
           )
           for line in advisor_error_lines:
               sanitized = line.replace("%", "").replace("\r", "").replace("\n", "")
               print(f"::warning::{sanitized}")
+          if advisor_summary_text:
+              summary_lines = advisor_summary_text.splitlines()
+              for line in summary_lines[:40]:
+                  sanitized = line.replace("%", "").replace("\r", "").replace("\n", "")
+                  print(f"ADVISOR-SUMMARY: {sanitized[:500]}")
+              if len(summary_lines) > 40:
+                  print(f"ADVISOR-SUMMARY-TRUNCATED lines={len(summary_lines)}")
           print(result_line)
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
               if advisor_summary_text:

@@ -168,7 +168,10 @@ def _make_hub(tmp_path, *, classifier_mode=None, rule_hits="[]",
             "first_line = os.environ.get('FAKE_ADVISOR_FIRST_LINE', '')\n"
             "error_lines = int(os.environ.get('FAKE_ADVISOR_ERROR_LINES', '0'))\n"
             "with open(os.environ['GITHUB_STEP_SUMMARY'], 'w', encoding='utf-8') as summary:\n"
-            "    summary.write(first_line + '\\n\\n## Advisor report\\nadvisor body text\\n')\n"
+            "    if os.environ.get('FAKE_ADVISOR_SUMMARY_TEXT_SET') == '1':\n"
+            "        summary.write(os.environ['FAKE_ADVISOR_SUMMARY_TEXT'])\n"
+            "    else:\n"
+            "        summary.write(first_line + '\\n\\n## Advisor report\\nadvisor body text\\n')\n"
             "for line in os.environ.get('FAKE_ADVISOR_ERROR_TEXT', '').splitlines():\n"
             "    sys.stderr.write(line + '\\n')\n"
             "for index in range(error_lines):\n"
@@ -290,7 +293,7 @@ def test_advisor_classify_publishes_declared_only_and_always_exits_zero(
 
 
 def _run_advisor(tmp_path, *, first_line=None, exit_code=0, error_lines=0,
-                 raising_stub=False, error_text=None):
+                 raising_stub=False, error_text=None, summary_text=None):
     hub = _make_hub(
         tmp_path / "hub",
         advisor_first_line=None if raising_stub else first_line,
@@ -310,6 +313,8 @@ def _run_advisor(tmp_path, *, first_line=None, exit_code=0, error_lines=0,
             "FAKE_ADVISOR_EXIT": str(exit_code),
             "FAKE_ADVISOR_ERROR_LINES": str(error_lines),
             "FAKE_ADVISOR_ERROR_TEXT": error_text or "",
+            "FAKE_ADVISOR_SUMMARY_TEXT_SET": "1" if summary_text is not None else "0",
+            "FAKE_ADVISOR_SUMMARY_TEXT": summary_text or "",
             "REPOSITORY": "zlxlabs/caller", "PR_NUMBER": "42",
             "HEAD_SHA": HEAD_SHA, "GH_TOKEN": "stub-token",
         },
@@ -359,6 +364,51 @@ def test_advisor_job_keeps_summary_text_and_at_most_six_truncated_errors(tmp_pat
     ]
     assert len(error_lines) == 6
     assert all(len(line) == 500 for line in error_lines)
+
+
+def test_advisor_job_logs_sanitized_summary_lines_before_result(tmp_path):
+    summary_text = (
+        "ADVISOR-VERDICT backdoor\n理由行\n::add-mask::x\n%0A"
+    )
+    proc, _ = _run_advisor(
+        tmp_path, first_line="ADVISOR-VERDICT backdoor", summary_text=summary_text,
+    )
+    expected = (
+        "ADVISOR-SUMMARY: ADVISOR-VERDICT backdoor\n"
+        "ADVISOR-SUMMARY: 理由行\n"
+        "ADVISOR-SUMMARY: ::add-mask::x\n"
+        "ADVISOR-SUMMARY: 0A\n"
+        f"ADVISOR-RESULT verdict=backdoor exit=0 head={HEAD_SHA}\n"
+    )
+    assert proc.stdout.encode("utf-8") == expected.encode("utf-8")
+    assert proc.returncode != 0
+    assert not any(line.startswith("::") for line in proc.stdout.splitlines())
+
+    empty_proc, empty_summary = _run_advisor(
+        tmp_path / "empty", first_line="", summary_text="",
+    )
+    empty_result = f"ADVISOR-RESULT verdict=error exit=0 head={HEAD_SHA}"
+    assert empty_proc.stdout.encode("utf-8") == f"{empty_result}\n".encode("utf-8")
+    assert "ADVISOR-SUMMARY" not in empty_proc.stdout
+    assert empty_summary.strip().splitlines()[-1] == empty_result
+    assert empty_proc.returncode != 0
+
+
+def test_advisor_job_truncates_logged_summary_to_forty_lines(tmp_path):
+    summary_lines = ["ADVISOR-VERDICT no_backdoor", "x" * 600]
+    summary_lines.extend(f"理由行-{index}" for index in range(3, 46))
+    summary_text = "\n".join(summary_lines)
+    proc, _ = _run_advisor(
+        tmp_path, first_line="ADVISOR-VERDICT no_backdoor", summary_text=summary_text,
+    )
+    expected_lines = [
+        f"ADVISOR-SUMMARY: {line[:500]}" for line in summary_lines[:40]
+    ]
+    expected_lines.append("ADVISOR-SUMMARY-TRUNCATED lines=45")
+    expected_lines.append(f"ADVISOR-RESULT verdict=no_backdoor exit=0 head={HEAD_SHA}")
+    expected = "\n".join(expected_lines) + "\n"
+    assert proc.stdout.encode("utf-8") == expected.encode("utf-8")
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_advisor_job_fails_loudly_when_the_advisor_stub_raises(tmp_path):
