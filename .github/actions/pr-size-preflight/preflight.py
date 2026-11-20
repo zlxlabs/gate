@@ -39,6 +39,10 @@ def _git(repo: Path, *args: str) -> bytes:
     return subprocess.check_output(["git", *args], cwd=repo)
 
 
+class MergeBaseUnavailableError(ValueError):
+    """The PR endpoints have no common ancestor available in the local object graph."""
+
+
 def ensure_review_commits(repo: Path, base_sha: str, head_sha: str) -> None:
     """Make the exact PR endpoints available without requiring full history.
 
@@ -147,12 +151,24 @@ def measure(
     max_review_shards: int,
 ) -> dict[str, Any]:
     ensure_review_commits(repo, base_sha, head_sha)
-    patch = _git(repo, "diff", "--no-ext-diff", "--binary", base_sha, head_sha)
-    numstat = _git(repo, "diff", "--numstat", "-z", base_sha, head_sha)
+    try:
+        merge_base_sha = _git(repo, "merge-base", base_sha, head_sha).decode("ascii").strip()
+    except subprocess.CalledProcessError as error:
+        if error.returncode != 1:
+            raise
+        raise MergeBaseUnavailableError(
+            "merge-base-unavailable: no common ancestor is available for base and head"
+        ) from error
+    if not merge_base_sha:
+        raise MergeBaseUnavailableError(
+            "merge-base-unavailable: git returned no common ancestor for base and head"
+        )
+    patch = _git(repo, "diff", "--no-ext-diff", "--binary", merge_base_sha, head_sha)
+    numstat = _git(repo, "diff", "--numstat", "-z", merge_base_sha, head_sha)
     binary_by_path, additions, deletions, changed_files = _numstat_entries(numstat)
     paths = [
         raw_path.decode("utf-8", "surrogateescape")
-        for raw_path in _git(repo, "diff", "--name-only", "-z", base_sha, head_sha).split(b"\0")
+        for raw_path in _git(repo, "diff", "--name-only", "-z", merge_base_sha, head_sha).split(b"\0")
         if raw_path
     ]
     section_lines = _patch_sections(patch)
@@ -177,6 +193,7 @@ def measure(
         "schema_version": 1,
         "size_filter_contract": SIZE_FILTER_CONTRACT,
         "base_sha": base_sha,
+        "merge_base_sha": merge_base_sha,
         "head_sha": head_sha,
         "diff_lines": reviewable_lines,
         "reviewable_lines": reviewable_lines,
@@ -213,6 +230,7 @@ def build_unavailable_result(
         "schema_version": 1,
         "size_filter_contract": SIZE_FILTER_CONTRACT,
         "base_sha": base_sha,
+        "merge_base_sha": None,
         "head_sha": head_sha,
         "diff_lines": None,
         "reviewable_lines": None,
@@ -228,9 +246,13 @@ def build_unavailable_result(
         "preflight_result": "unavailable",
         "measurement_status": "unavailable",
         "measurement_error": (
-            f"git measurement failed (exit={error.returncode})"
-            if isinstance(error, subprocess.CalledProcessError)
-            else "git measurement validation failed"
+            str(error)
+            if isinstance(error, MergeBaseUnavailableError)
+            else (
+                f"git measurement failed (exit={error.returncode})"
+                if isinstance(error, subprocess.CalledProcessError)
+                else "git measurement validation failed"
+            )
         ),
         "thresholds": {
             "single_turn_lines": max_diff_lines,
@@ -424,7 +446,10 @@ def main() -> int:
             print(f"::warning::could not update PR size comment ({type(error).__name__}): {error}")
 
     if result["classification"] == "unavailable":
-        print("::error::PR size preflight unavailable: git measurement failed; infrastructure recovery is required")
+        print(
+            f"::error::PR size preflight unavailable: {result['measurement_error']}; "
+            "infrastructure recovery is required"
+        )
         return 1
     if result["classification"] == "blocked":
         print("::error::PR exceeds complete Codex review capacity; split it into small or stacked PRs")

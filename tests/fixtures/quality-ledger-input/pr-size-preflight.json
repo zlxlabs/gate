@@ -2,6 +2,7 @@
   "schema_version": 1,
   "size_filter_contract": "v1",
   "base_sha": "b9555703eb03445eb5edbb0625b63a7d5602e6b4",
+  "merge_base_sha": "b9555703eb03445eb5edbb0625b63a7d5602e6b4",
   "head_sha": "78080bd15c63c28d76f34c08ae5d3b45b578d3c8",
   "diff_lines": 7,
   "reviewable_lines": 7,

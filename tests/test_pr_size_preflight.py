@@ -76,6 +76,8 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
             ["git", "diff", "--no-ext-diff", "--binary", base, head], cwd=repo
         ).splitlines()
     )
+    assert result["base_sha"] == base
+    assert result["merge_base_sha"] == base
     assert result["reviewable_lines"] == expected_lines
     assert result["diff_lines"] == expected_lines
     assert result["raw_patch_lines"] == expected_lines
@@ -86,6 +88,60 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
     assert result["deletions"] == 1
     assert result["thresholds"]["hard_lines"] == 36
     assert result["classification"] in {"warning", "blocked"}
+
+
+def test_measurement_ignores_base_commits_after_pr_branch_point(tmp_path):
+    module = _module()
+    repo = tmp_path / "moving-base-repo"
+    repo.mkdir()
+    hooks = tmp_path / "empty-hooks"
+    hooks.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "core.hooksPath", str(hooks)], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "base_deleted.txt").write_text("deleted after fork\n")
+    (repo / "pr_target.txt").write_text("base value\n")
+    (repo / "base_modified.txt").write_text("before base advance\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "branch point"], cwd=repo, check=True)
+    fork_point = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    base_branch = subprocess.check_output(
+        ["git", "branch", "--show-current"], cwd=repo, text=True
+    ).strip()
+
+    subprocess.run(["git", "switch", "-qc", "pr"], cwd=repo, check=True)
+    (repo / "pr_target.txt").write_text("PR value\n")
+    (repo / "pr_only.py").write_text("first = 1\nsecond = 2\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "PR changes"], cwd=repo, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    subprocess.run(["git", "switch", "-q", base_branch], cwd=repo, check=True)
+    (repo / "base_deleted.txt").unlink()
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base deletes file"], cwd=repo, check=True)
+    (repo / "base_modified.txt").write_text("changed after branch point\n")
+    (repo / "base_only.txt").write_text("not part of PR\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base advances again"], cwd=repo, check=True)
+    base_tip = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    result = module.measure(repo, base_tip, head, max_diff_lines=20, warn_lines=40, max_review_shards=3)
+    expected_patch = subprocess.check_output(
+        ["git", "diff", "--no-ext-diff", "--binary", fork_point, head], cwd=repo
+    )
+
+    assert base_tip != fork_point
+    assert result["base_sha"] == base_tip
+    assert result["head_sha"] == head
+    assert result["merge_base_sha"] == fork_point
+    assert result["changed_files"] == 2
+    assert result["additions"] == 3
+    assert result["deletions"] == 1
+    assert result["changed_lines"] == 4
+    assert result["raw_patch_lines"] == len(expected_patch.splitlines())
+    assert result["reviewable_lines"] == len(expected_patch.splitlines())
 
 
 def test_cli_publishes_unavailable_for_measurement_validation_failure(tmp_path):
@@ -239,7 +295,7 @@ def test_u2028_does_not_change_byte_patch_line_count(tmp_path):
     assert result["classification"] == "single"
 
 
-def test_measurement_fetches_only_missing_pr_endpoints_from_a_shallow_clone(tmp_path):
+def test_measurement_reports_unavailable_when_shallow_endpoints_have_no_available_merge_base(tmp_path):
     module = _module()
     source, base, head = _repo(tmp_path, 20)
     remote = tmp_path / "remote.git"
@@ -251,13 +307,64 @@ def test_measurement_fetches_only_missing_pr_endpoints_from_a_shallow_clone(tmp_
         ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
     ).returncode != 0
 
-    result = module.measure(shallow, base, head, max_diff_lines=12, warn_lines=20, max_review_shards=3)
+    with pytest.raises(module.MergeBaseUnavailableError, match="merge-base-unavailable"):
+        module.measure(shallow, base, head, max_diff_lines=12, warn_lines=20, max_review_shards=3)
 
-    assert result["base_sha"] == base
-    assert result["head_sha"] == head
     assert subprocess.run(
         ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
     ).returncode == 0
+    assert subprocess.check_output(
+        ["git", "rev-parse", "--is-shallow-repository"], cwd=shallow, text=True
+    ).strip() == "true"
+
+
+def test_main_reports_merge_base_unavailable_for_unrelated_histories(tmp_path, monkeypatch):
+    module = _module()
+    repo = tmp_path / "unrelated-repo"
+    repo.mkdir()
+    hooks = tmp_path / "empty-hooks"
+    hooks.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "core.hooksPath", str(hooks)], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "base.txt").write_text("base root\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base root"], cwd=repo, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    subprocess.run(["git", "switch", "--orphan", "unrelated"], cwd=repo, check=True)
+    (repo / "base.txt").unlink(missing_ok=True)
+    (repo / "other.txt").write_text("unrelated root\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "unrelated root"], cwd=repo, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    result_path = tmp_path / "result.json"
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("PR_NUMBER", "0")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "preflight.py",
+            "--base-sha", base,
+            "--head-sha", head,
+            "--max-diff-lines", "20",
+            "--warn-lines", "40",
+            "--max-review-shards", "3",
+            "--output", str(result_path),
+        ],
+    )
+
+    assert module.main() == 1
+
+    result = json.loads(result_path.read_text())
+    assert result["base_sha"] == base
+    assert result["head_sha"] == head
+    assert result["merge_base_sha"] is None
+    assert result["classification"] == "unavailable"
+    assert "merge-base-unavailable" in result["measurement_error"]
 
 
 def test_git_measurement_failure_publishes_unavailable_payload_and_fails(tmp_path, monkeypatch):
@@ -524,6 +631,9 @@ def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, mon
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
+    producer_payload = json.loads(result_path.read_text())
+    assert producer_payload["base_sha"] == base
+    assert producer_payload["merge_base_sha"] == base
     assert b"reviewable-lines=10\n" in output_bytes
     assert b"preflight-result=success\n" in output_bytes
     assert b"excluded-files=" + expected_excluded + b"\n" in output_bytes
