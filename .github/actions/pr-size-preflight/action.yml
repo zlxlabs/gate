@@ -6,7 +6,9 @@ inputs:
   max-diff-lines: { required: true }
   warn-lines: { required: true }
   max-review-shards: { required: true }
-  token: { required: true }
+  token:
+    description: GitHub token for the compare API and sticky PR comment.
+    required: true
 outputs:
   reviewable-lines:
     description: Number of patch lines included in the review budget.

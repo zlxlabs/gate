@@ -185,19 +185,51 @@ def test_partially_covered_real_lcov_reports_non_hundred_percent(module, tmp_pat
     assert "100%" not in note
 
 
-def test_ensure_review_commits_fetches_missing_objects(module, monkeypatch):
-    calls: list[list[str]] = []
+def test_preflight_ensure_review_commits_fetches_merge_base_in_shallow_origin(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "preflight_for_fetch_contract", ROOT / ".github/actions/pr-size-preflight/preflight.py"
+    )
+    preflight = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(preflight)
+    repo = tmp_path / "preflight-origin"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "app.py").write_text("value = 1\n")
+    base = _commit_all(repo, "base")
+    (repo / "app.py").write_text("value = 2\n")
+    head = _commit_all(repo, "head")
+    remote = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "--bare", str(repo), str(remote)], check=True)
+    shallow = tmp_path / "shallow-origin"
+    branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=repo, text=True).strip()
+    subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", branch, remote.as_uri(), str(shallow)],
+        check=True,
+    )
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
+    ).returncode != 0
+    calls = []
+    real_run = subprocess.run
 
-    def fake_git(repo, *args):
-        calls.append(list(args))
-        if args[:2] == ("cat-file", "-e"):
-            raise subprocess.CalledProcessError(1, "git")
-        return b""
+    def record_git_run(args, **kwargs):
+        if args[:2] == ["git", "fetch"]:
+            calls.append(args)
+        return real_run(args, **kwargs)
 
-    monkeypatch.setattr(module, "_git", fake_git)
-    module.ensure_review_commits(Path("/tmp/repo"), "base", "head")
+    monkeypatch.setattr(preflight, "declared_mode", lambda: "origin")
+    monkeypatch.setattr(preflight.subprocess, "run", record_git_run)
 
-    assert any(call[:2] == ["fetch", "--no-tags"] for call in calls)
+    preflight.ensure_review_commits(shallow, head, base)
+
+    assert calls == [["git", "fetch", "--no-tags", "--depth=1", "origin", base]]
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
+    ).returncode == 0
+    assert subprocess.check_output(
+        ["git", "rev-parse", "--is-shallow-repository"], cwd=shallow, text=True
+    ).strip() == "true"
 
 
 def test_main_never_returns_nonzero_on_measure_failure(tmp_path, monkeypatch):

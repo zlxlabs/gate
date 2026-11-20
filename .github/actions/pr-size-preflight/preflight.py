@@ -18,7 +18,7 @@ GATE_ROOT = Path(__file__).resolve().parents[3]
 if str(GATE_ROOT) not in sys.path:
     sys.path.insert(0, str(GATE_ROOT))
 
-from scripts.gate_source import declared_mode, ensure_commits
+from scripts.gate_source import SourceError, declared_mode, ensure_commits
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
@@ -39,24 +39,50 @@ def _git(repo: Path, *args: str) -> bytes:
     return subprocess.check_output(["git", *args], cwd=repo)
 
 
-def ensure_review_commits(repo: Path, base_sha: str, head_sha: str) -> None:
-    """Make the exact PR endpoints available without requiring full history.
+class MergeBaseUnavailableError(ValueError):
+    """GitHub or shallow object retrieval could not provide the PR merge base."""
 
-    `actions/checkout` intentionally fetches only the workflow ref.  A PR diff is
-    nevertheless fully defined by its base and head commits, so fetch just those
-    objects when either is absent instead of making every Gate run clone every
-    branch and tag in the repository.  On a host that declares `service`, the two
-    objects come from the host source service instead of GitHub.
-    """
+
+def ensure_review_commits(repo: Path, head_sha: str, merge_base_sha: str) -> None:
+    """Make the two diff commits available through the declared source path."""
+    missing = []
+    for sha in (head_sha, merge_base_sha):
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+            cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        if present.returncode != 0:
+            missing.append(sha)
+    if not missing:
+        return
     try:
-        for sha in (base_sha, head_sha):
-            _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
-    except subprocess.CalledProcessError:
-        if declared_mode() == "service":
-            ensure_commits(repo, os.environ.get("GITHUB_REPOSITORY", ""), base_sha, head_sha)
-        else:
-            _git(repo, "fetch", "--no-tags", "origin", base_sha, head_sha)
-
+        mode = declared_mode()
+    except SourceError as error:
+        raise MergeBaseUnavailableError(
+            f"merge-base-unavailable: source mode unavailable: {error}"
+        ) from error
+    if mode == "service":
+        try:
+            ensure_commits(
+                repo, os.environ.get("GITHUB_REPOSITORY", ""), head_sha, merge_base_sha
+            )
+        except SourceError as error:
+            raise MergeBaseUnavailableError(
+                f"merge-base-unavailable: source service failed: {error}"
+            ) from error
+        return
+    for sha in missing:
+        fetched = subprocess.run(
+            ["git", "fetch", "--no-tags", "--depth=1", "origin", sha],
+            cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if fetched.returncode != 0:
+            detail = fetched.stderr.decode("utf-8", "replace").replace("\r", " ").replace("\n", " ").strip()
+            suffix = f": {detail[:240]}" if detail else ""
+            raise MergeBaseUnavailableError(
+                f"merge-base-unavailable: git fetch for {sha[:12]} failed "
+                f"(exit={fetched.returncode}){suffix}"
+            )
 
 def classify(diff_lines: int, max_diff_lines: int, warn_lines: int, max_review_shards: int) -> tuple[str, bool]:
     hard_lines = max_diff_lines * max_review_shards
@@ -142,17 +168,17 @@ def measure(
     base_sha: str,
     head_sha: str,
     *,
+    merge_base_sha: str,
     max_diff_lines: int,
     warn_lines: int,
     max_review_shards: int,
 ) -> dict[str, Any]:
-    ensure_review_commits(repo, base_sha, head_sha)
-    patch = _git(repo, "diff", "--no-ext-diff", "--binary", base_sha, head_sha)
-    numstat = _git(repo, "diff", "--numstat", "-z", base_sha, head_sha)
+    patch = _git(repo, "diff", "--no-ext-diff", "--binary", merge_base_sha, head_sha)
+    numstat = _git(repo, "diff", "--numstat", "-z", merge_base_sha, head_sha)
     binary_by_path, additions, deletions, changed_files = _numstat_entries(numstat)
     paths = [
         raw_path.decode("utf-8", "surrogateescape")
-        for raw_path in _git(repo, "diff", "--name-only", "-z", base_sha, head_sha).split(b"\0")
+        for raw_path in _git(repo, "diff", "--name-only", "-z", merge_base_sha, head_sha).split(b"\0")
         if raw_path
     ]
     section_lines = _patch_sections(patch)
@@ -177,6 +203,7 @@ def measure(
         "schema_version": 1,
         "size_filter_contract": SIZE_FILTER_CONTRACT,
         "base_sha": base_sha,
+        "merge_base_sha": merge_base_sha,
         "head_sha": head_sha,
         "diff_lines": reviewable_lines,
         "reviewable_lines": reviewable_lines,
@@ -207,12 +234,14 @@ def build_unavailable_result(
     warn_lines: int,
     max_review_shards: int,
     error: subprocess.CalledProcessError | ValueError,
+    merge_base_sha: str | None = None,
 ) -> dict[str, Any]:
     """Publish a failed git measurement as unavailable, never as a size decision."""
     return {
         "schema_version": 1,
         "size_filter_contract": SIZE_FILTER_CONTRACT,
         "base_sha": base_sha,
+        "merge_base_sha": merge_base_sha,
         "head_sha": head_sha,
         "diff_lines": None,
         "reviewable_lines": None,
@@ -228,9 +257,13 @@ def build_unavailable_result(
         "preflight_result": "unavailable",
         "measurement_status": "unavailable",
         "measurement_error": (
-            f"git measurement failed (exit={error.returncode})"
-            if isinstance(error, subprocess.CalledProcessError)
-            else "git measurement validation failed"
+            str(error)
+            if isinstance(error, MergeBaseUnavailableError)
+            else (
+                f"git measurement failed (exit={error.returncode})"
+                if isinstance(error, subprocess.CalledProcessError)
+                else "git measurement validation failed"
+            )
         ),
         "thresholds": {
             "single_turn_lines": max_diff_lines,
@@ -312,6 +345,36 @@ def _request(token: str, method: str, url: str, payload: dict[str, Any] | None =
     return json.loads(raw) if raw else None
 
 
+def compare_merge_base_sha(base_sha: str, head_sha: str, *, token: str, repository: str) -> str:
+    if not token:
+        raise MergeBaseUnavailableError("merge-base-unavailable: GitHub compare token is empty")
+    if not repository:
+        raise MergeBaseUnavailableError("merge-base-unavailable: GITHUB_REPOSITORY is empty")
+    url = f"https://api.github.com/repos/{repository}/compare/{base_sha}...{head_sha}"
+    try:
+        comparison = _request(token, "GET", url)
+    except urllib.error.HTTPError as error:
+        raise MergeBaseUnavailableError(
+            f"merge-base-unavailable: GitHub compare returned HTTP {error.code}"
+        ) from error
+    except urllib.error.URLError as error:
+        reason = str(error.reason).replace("\r", " ").replace("\n", " ")[:160]
+        raise MergeBaseUnavailableError(
+            f"merge-base-unavailable: GitHub compare request failed: {reason}"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise MergeBaseUnavailableError(
+            "merge-base-unavailable: GitHub compare returned invalid JSON"
+        ) from error
+    merge_base = comparison.get("merge_base_commit") if isinstance(comparison, dict) else None
+    sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
+    if not isinstance(sha, str) or not sha:
+        raise MergeBaseUnavailableError(
+            "merge-base-unavailable: GitHub compare response missing merge_base_commit.sha"
+        )
+    return sha
+
+
 def post_sticky_comment(result: dict[str, Any], *, token: str, repository: str, pr_number: int) -> None:
     body = scrub_for_publish(
         render_comment(result),
@@ -387,9 +450,18 @@ def main() -> int:
     if min(args.max_diff_lines, args.warn_lines, args.max_review_shards) <= 0:
         parser.error("all thresholds must be positive")
 
+    merge_base_sha: str | None = None
     try:
+        repository = os.environ.get("GITHUB_REPOSITORY", "")
+        merge_base_sha = compare_merge_base_sha(
+            args.base_sha, args.head_sha,
+            token=os.environ.get("GH_TOKEN", ""),
+            repository=repository,
+        )
+        ensure_review_commits(Path.cwd(), args.head_sha, merge_base_sha)
         result = measure(
             Path.cwd(), args.base_sha, args.head_sha,
+            merge_base_sha=merge_base_sha,
             max_diff_lines=args.max_diff_lines,
             warn_lines=args.warn_lines,
             max_review_shards=args.max_review_shards,
@@ -402,6 +474,7 @@ def main() -> int:
             warn_lines=args.warn_lines,
             max_review_shards=args.max_review_shards,
             error=error,
+            merge_base_sha=merge_base_sha,
         )
     result.update({
         "repository": os.environ.get("GITHUB_REPOSITORY", "unknown"),
@@ -424,7 +497,10 @@ def main() -> int:
             print(f"::warning::could not update PR size comment ({type(error).__name__}): {error}")
 
     if result["classification"] == "unavailable":
-        print("::error::PR size preflight unavailable: git measurement failed; infrastructure recovery is required")
+        print(
+            f"::error::PR size preflight unavailable: {result['measurement_error']}; "
+            "infrastructure recovery is required"
+        )
         return 1
     if result["classification"] == "blocked":
         print("::error::PR exceeds complete Codex review capacity; split it into small or stacked PRs")

@@ -27,6 +27,7 @@ from _gha_lint import (
     materialize_jobs_api_snippet_for_probe,
     probe_jobs_api_failure_exit_code,
 )
+from pr_size_preflight_compare_support import run_preflight_with_compare_stub
 from test_pr_size_preflight import _repo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -47,7 +48,6 @@ DISPOSITION_PRODUCER_SPARSE = [
     "scripts/silo_exec.sh",
 ]
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
-PREFLIGHT_SCRIPT = REPO_ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
 ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
 ADVISORY_EVENT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "advisory-shadow-event-v1.json"
 POST_ADVISORY_GH_API_PRODUCER_FIXTURE = """publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
@@ -4249,13 +4249,13 @@ def test_real_preflight_payload_reaches_workflow_and_aggregator_cli(
     producer_output = tmp_path / "producer-output"
     producer_env = os.environ.copy()
     producer_env.update({"GITHUB_OUTPUT": str(producer_output), "PR_NUMBER": "0"})
-    producer_env.pop("GH_TOKEN", None)
-    producer_base = "0" * 40 if mode == "unavailable" else base_sha
-    producer = subprocess.run(
-        [sys.executable, str(PREFLIGHT_SCRIPT), "--base-sha", producer_base, "--head-sha", head_sha,
+    producer = run_preflight_with_compare_stub(
+        ["--base-sha", base_sha, "--head-sha", head_sha,
          "--max-diff-lines", "1", "--warn-lines", "2", "--max-review-shards", "1",
          "--output", str(tmp_path / "pr-size-preflight.json")],
-        cwd=repo, env=producer_env, capture_output=True, text=True, check=False,
+        cwd=repo, env=producer_env,
+        merge_base_sha=base_sha if mode == "blocked" else None,
+        http_status=404 if mode == "unavailable" else None,
     )
     assert producer.returncode == 1
     producer_payload = json.loads((tmp_path / "pr-size-preflight.json").read_text())
@@ -4399,12 +4399,11 @@ def test_quality_publish_and_ledger_consume_roundtrip_fixture_bytes(tmp_path):
     live_preflight = tmp_path / "live-preflight.json"
     producer_env = {**os.environ, "GITHUB_OUTPUT": str(tmp_path / "preflight-github-output"),
                     "GITHUB_REPOSITORY": "spoof/from-pr-payload", "PR_NUMBER": "0"}
-    producer_env.pop("GH_TOKEN", None)
-    subprocess.run(
-        [sys.executable, str(PREFLIGHT_SCRIPT), "--base-sha", base, "--head-sha", head,
+    producer = run_preflight_with_compare_stub(
+        ["--base-sha", base, "--head-sha", head,
          "--max-diff-lines", "8000", "--warn-lines", "12000", "--max-review-shards", "8",
          "--output", str(live_preflight)],
-        cwd=repo, env=producer_env, check=True,
+        cwd=repo, env=producer_env, merge_base_sha=base, check=True,
     )
     preflight = live_preflight.read_text(encoding="utf-8")
     payload = json.loads(preflight)

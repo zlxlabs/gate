@@ -145,12 +145,11 @@ if os.environ.get("GATE_FAKE_CLIENT_PROBE_LOCK") == "1":
         sys.exit(7)
     fcntl.flock(probe, fcntl.LOCK_UN)
     os.close(probe)
-refs = subprocess.run(
-    ["git", "--git-dir", upstream, "for-each-ref", "--points-at", commit,
-     "--format=%(refname)", "refs/heads"],
+reachable = subprocess.run(
+    ["git", "--git-dir", upstream, "rev-list", "--all"],
     check=True, capture_output=True, text=True,
 ).stdout.split()
-if not refs:
+if commit not in reachable:
     emit("error", "SOURCE-PREPARE-FAILED", source=None)
     sys.exit(4)
 demand = "refs/demand/" + commit
@@ -160,7 +159,7 @@ warm = subprocess.run(
 ).returncode == 0
 subprocess.run(
     ["git", "-c", "advice.detachedHead=false", "--git-dir", mirror, "fetch", "--no-tags",
-     upstream, os.environ.get("GATE_FAKE_DEMAND_REF_TARGET", refs[0]) + ":" + demand],
+     upstream, os.environ.get("GATE_FAKE_DEMAND_REF_TARGET", commit) + ":" + demand],
     check=True, capture_output=True,
 )
 emit("ready", None, source="hit" if warm else "cold")
@@ -756,28 +755,29 @@ def test_ensure_commits_fails_loud_when_mirror_objects_cannot_be_borrowed(source
 
 
 def test_preflight_action_uses_the_service_for_an_absent_base(source_host, monkeypatch):
+    base_sha = source_host["base_sha"]
+    tree = _git("rev-parse", f"{base_sha}^{{tree}}", cwd=source_host["work"])
+    advanced_base = _git("commit-tree", tree, "-p", base_sha, "-m", "base advanced", cwd=source_host["work"])
+    _git("push", "--quiet", str(source_host["caller_bare"]), f"{advanced_base}:refs/heads/base", cwd=source_host["work"])
+    assert _git("--git-dir", str(source_host["caller_bare"]), "for-each-ref", "--points-at", base_sha, "--format=%(refname)", "refs/heads") == ""
     workspace = source_host["tmp_path"] / "workspace"
-    workspace.mkdir()
-    _git("init", "-q", cwd=workspace)
-    _git("remote", "add", "origin", str(source_host["caller_bare"]), cwd=workspace)
-    _git("fetch", "--no-tags", str(source_host["caller_bare"]),
-         f"{source_host['merge_sha']}:refs/demand/merge", cwd=workspace)
-    _git("checkout", "-q", "--force", "FETCH_HEAD", cwd=workspace)
+    _git("clone", "--quiet", "--depth", "1", "--no-local", "--branch", "pr-1-merge", str(source_host["caller_bare"]), str(workspace))
+    _git("remote", "set-url", "origin", f"https://github.com/{REPOSITORY}", cwd=workspace)
+    assert _git("rev-parse", "--is-shallow-repository", cwd=workspace) == "true"
+    assert subprocess.run(["git", "cat-file", "-e", f"{base_sha}^{{commit}}"], cwd=workspace, check=False).returncode != 0
     env = _env(source_host, workspace)
-    monkeypatch.setenv("PATH", f"{source_host['bin']}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("GATE_ARGV_LOG", str(source_host["argv_log"]))
-    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(source_host["mirror_root"]))
-    monkeypatch.setenv("GATE_FAKE_UPSTREAM", str(source_host["upstream"]))
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.chdir(workspace)
-
     spec = importlib.util.spec_from_file_location("preflight_service", PREFLIGHT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.ensure_review_commits(workspace, source_host["sibling_sha"], source_host["merge_sha"])
-
-    assert _git("cat-file", "-e", f"{source_host['sibling_sha']}^{{commit}}", cwd=workspace) == ""
-    assert any(str(source_host["mirror_root"]) in line for line in _argv(source_host))
+    import unittest.mock
+    ensure = unittest.mock.Mock(wraps=module.ensure_commits)
+    monkeypatch.setattr(module, "ensure_commits", ensure)
+    module.ensure_review_commits(workspace, source_host["head_sha"], base_sha)
+    assert ensure.call_args.args == (workspace, REPOSITORY, source_host["head_sha"], base_sha)
+    assert _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=workspace) == ""
     assert _network_argv(source_host) == []
 
 

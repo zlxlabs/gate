@@ -9,6 +9,13 @@ from pathlib import Path
 
 import pytest
 
+from pr_size_preflight_compare_support import (
+    assert_compare_http_error_unavailable,
+    assert_compare_response_without_merge_base,
+    assert_shallow_compare_preflight,
+    moving_base_repo,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "pr-size-preflight" / "preflight.py"
@@ -40,6 +47,16 @@ def _repo(tmp_path: Path, added_lines: int) -> tuple[Path, str, str]:
     return repo, base, head
 
 
+def _stub_compare(module, monkeypatch, merge_base_sha: str) -> None:
+    monkeypatch.delenv("GATE_HUB_GIT_MIRROR_DIR", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "fixture/repo")
+    monkeypatch.setattr(
+        module, "_request",
+        lambda token, method, url, payload=None: {"merge_base_commit": {"sha": merge_base_sha}},
+    )
+
+
 def _fixture_repo(tmp_path: Path) -> tuple[Path, str, str]:
     repo = tmp_path / "fixture-repo"
     repo.mkdir()
@@ -69,13 +86,18 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
     module = _module()
     repo, base, head = _repo(tmp_path, 20)
 
-    result = module.measure(repo, base, head, max_diff_lines=12, warn_lines=20, max_review_shards=3)
+    result = module.measure(
+        repo, base, head, merge_base_sha=base,
+        max_diff_lines=12, warn_lines=20, max_review_shards=3,
+    )
 
     expected_lines = len(
         subprocess.check_output(
             ["git", "diff", "--no-ext-diff", "--binary", base, head], cwd=repo
         ).splitlines()
     )
+    assert result["base_sha"] == base
+    assert result["merge_base_sha"] == base
     assert result["reviewable_lines"] == expected_lines
     assert result["diff_lines"] == expected_lines
     assert result["raw_patch_lines"] == expected_lines
@@ -88,7 +110,32 @@ def test_measurement_matches_codex_diff_and_records_capacity(tmp_path):
     assert result["classification"] in {"warning", "blocked"}
 
 
-def test_cli_publishes_unavailable_for_measurement_validation_failure(tmp_path):
+def test_measurement_ignores_base_commits_after_pr_branch_point(tmp_path):
+    module = _module()
+    repo, base_tip, head, fork_point = moving_base_repo(tmp_path)
+
+    result = module.measure(
+        repo, base_tip, head, merge_base_sha=fork_point,
+        max_diff_lines=20, warn_lines=40, max_review_shards=3,
+    )
+    expected_patch = subprocess.check_output(
+        ["git", "diff", "--no-ext-diff", "--binary", fork_point, head], cwd=repo
+    )
+
+    assert base_tip != fork_point
+    assert result["base_sha"] == base_tip
+    assert result["head_sha"] == head
+    assert result["merge_base_sha"] == fork_point
+    assert result["changed_files"] == 2
+    assert result["additions"] == 3
+    assert result["deletions"] == 1
+    assert result["changed_lines"] == 4
+    assert result["raw_patch_lines"] == len(expected_patch.splitlines())
+    assert result["reviewable_lines"] == len(expected_patch.splitlines())
+
+
+def test_cli_publishes_unavailable_for_measurement_validation_failure(tmp_path, monkeypatch):
+    module = _module()
     repo, base, head = _repo(tmp_path, 2)
     git_bin = tmp_path / "bin"
     git_bin.mkdir()
@@ -108,21 +155,27 @@ def test_cli_publishes_unavailable_for_measurement_validation_failure(tmp_path):
     output_path = tmp_path / "github-output"
     summary_path = tmp_path / "github-summary.md"
     result_path = tmp_path / "result.json"
-    env = os.environ.copy()
-    env.update({
-        "PATH": str(git_bin) + os.pathsep + env["PATH"],
-        "GITHUB_OUTPUT": str(output_path),
-        "GITHUB_STEP_SUMMARY": str(summary_path),
-        "PR_NUMBER": "0",
-    })
-    env.pop("GH_TOKEN", None)
-    completed = subprocess.run(
-        [sys.executable, str(MODULE_PATH), "--base-sha", base, "--head-sha", head,
-         "--max-diff-lines", "20", "--warn-lines", "40", "--max-review-shards", "3",
-         "--output", str(result_path)],
-        cwd=repo, env=env, capture_output=True, text=True, check=False,
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("PATH", str(git_bin) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "fixture/repo")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setenv("PR_NUMBER", "0")
+    monkeypatch.setattr(
+        module, "_request",
+        lambda *args, **kwargs: {"merge_base_commit": {"sha": base}},
     )
-    assert completed.returncode == 1
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "preflight.py", "--base-sha", base, "--head-sha", head,
+            "--max-diff-lines", "20", "--warn-lines", "40",
+            "--max-review-shards", "3", "--output", str(result_path),
+        ],
+    )
+    assert module.main() == 1
     result = json.loads(result_path.read_text())
     assert result["classification"] == "unavailable"
     assert result["preflight_result"] == "unavailable"
@@ -137,7 +190,10 @@ def test_size_filter_fixture_uses_real_git_diff_and_applies_r1_r2_r3(tmp_path):
 
     fixture_text = FIXTURE_PATH.read_text()
     assert fixture_text.startswith("diff --git ")
-    result = module.measure(repo, base, head, max_diff_lines=20, warn_lines=40, max_review_shards=3)
+    result = module.measure(
+        repo, base, head, merge_base_sha=base,
+        max_diff_lines=20, warn_lines=40, max_review_shards=3,
+    )
 
     assert result["size_filter_contract"] == "v1"
     assert result["raw_patch_lines"] == 5041
@@ -192,7 +248,10 @@ def test_size_filter_decodes_quoted_unicode_path_from_numstat_z(tmp_path):
     subprocess.run(["git", "commit", "-qm", "head"], cwd=repo, check=True)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
 
-    result = module.measure(repo, base, head, max_diff_lines=20, warn_lines=40, max_review_shards=3)
+    result = module.measure(
+        repo, base, head, merge_base_sha=base,
+        max_diff_lines=20, warn_lines=40, max_review_shards=3,
+    )
 
     assert result["excluded_files"] == [{"path": path, "rule": "R2", "raw_lines": 7}]
     assert "\\347" not in result["excluded_files"][0]["path"]
@@ -214,7 +273,10 @@ def test_size_filter_decodes_rename_paths_from_numstat_z(tmp_path):
     subprocess.run(["git", "commit", "-qm", "head"], cwd=repo, check=True)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
 
-    result = module.measure(repo, base, head, max_diff_lines=20, warn_lines=40, max_review_shards=3)
+    result = module.measure(
+        repo, base, head, merge_base_sha=base,
+        max_diff_lines=20, warn_lines=40, max_review_shards=3,
+    )
 
     assert result["excluded_files"] == [{"path": "docs/new.PDF", "rule": "R2", "raw_lines": 4}]
 
@@ -231,7 +293,10 @@ def test_u2028_does_not_change_byte_patch_line_count(tmp_path):
     )
     old_byte_lines = len(patch.splitlines())
 
-    result = module.measure(repo, base, head, max_diff_lines=old_byte_lines, warn_lines=20, max_review_shards=3)
+    result = module.measure(
+        repo, base, head, merge_base_sha=base,
+        max_diff_lines=old_byte_lines, warn_lines=20, max_review_shards=3,
+    )
 
     assert old_byte_lines == 7
     assert result["raw_patch_lines"] == old_byte_lines
@@ -239,25 +304,19 @@ def test_u2028_does_not_change_byte_patch_line_count(tmp_path):
     assert result["classification"] == "single"
 
 
-def test_measurement_fetches_only_missing_pr_endpoints_from_a_shallow_clone(tmp_path):
+def test_preflight_uses_compare_sha_to_measure_shallow_pr_without_history(tmp_path, monkeypatch):
     module = _module()
-    source, base, head = _repo(tmp_path, 20)
-    remote = tmp_path / "remote.git"
-    subprocess.run(["git", "clone", "--bare", str(source), str(remote)], check=True)
+    assert_shallow_compare_preflight(tmp_path, monkeypatch, module, MODULE_PATH)
 
-    shallow = tmp_path / "shallow"
-    subprocess.run(["git", "clone", "--depth", "1", remote.as_uri(), str(shallow)], check=True)
-    assert subprocess.run(
-        ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
-    ).returncode != 0
 
-    result = module.measure(shallow, base, head, max_diff_lines=12, warn_lines=20, max_review_shards=3)
+def test_main_reports_merge_base_unavailable_for_unrelated_histories(tmp_path, monkeypatch):
+    module = _module()
+    assert_compare_response_without_merge_base(tmp_path, monkeypatch, module)
 
-    assert result["base_sha"] == base
-    assert result["head_sha"] == head
-    assert subprocess.run(
-        ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=shallow, check=False
-    ).returncode == 0
+
+def test_compare_http_error_status_is_published_as_unavailable(tmp_path, monkeypatch):
+    module = _module()
+    assert_compare_http_error_unavailable(tmp_path, monkeypatch, module)
 
 
 def test_git_measurement_failure_publishes_unavailable_payload_and_fails(tmp_path, monkeypatch):
@@ -270,7 +329,7 @@ def test_git_measurement_failure_publishes_unavailable_payload_and_fails(tmp_pat
     monkeypatch.chdir(repo)
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
-    monkeypatch.delenv("GH_TOKEN", raising=False)
+    _stub_compare(module, monkeypatch, "0" * 40)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -292,7 +351,8 @@ def test_git_measurement_failure_publishes_unavailable_payload_and_fails(tmp_pat
     assert result["review_plan"] == "unavailable"
     assert result["reviewable"] is False
     assert result["measurement_status"] == "unavailable"
-    assert "git measurement" in result["measurement_error"]
+    assert result["merge_base_sha"] == "0" * 40
+    assert "git fetch" in result["measurement_error"]
     assert b"preflight-result=unavailable\n" in output_path.read_bytes()
     assert "infrastructure recovery" in summary_path.read_text()
 
@@ -496,7 +556,7 @@ def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, mon
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
     monkeypatch.setenv("GITHUB_REPOSITORY", "fixture/repo")
     monkeypatch.setenv("PR_NUMBER", "0")
-    monkeypatch.delenv("GH_TOKEN", raising=False)
+    _stub_compare(module, monkeypatch, base)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -524,6 +584,9 @@ def test_main_writes_action_outputs_and_summary_from_real_producer(tmp_path, mon
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
+    producer_payload = json.loads(result_path.read_text())
+    assert producer_payload["base_sha"] == base
+    assert producer_payload["merge_base_sha"] == base
     assert b"reviewable-lines=10\n" in output_bytes
     assert b"preflight-result=success\n" in output_bytes
     assert b"excluded-files=" + expected_excluded + b"\n" in output_bytes
@@ -559,7 +622,7 @@ def test_main_preserves_size_decision_when_sticky_comment_disconnects(
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
     monkeypatch.setenv("GITHUB_REPOSITORY", "fixture/repo")
     monkeypatch.setenv("PR_NUMBER", "1")
-    monkeypatch.setenv("GH_TOKEN", "token")
+    _stub_compare(module, monkeypatch, base)
     monkeypatch.setattr(module, "post_sticky_comment", fail_post)
     monkeypatch.setattr(
         sys,
