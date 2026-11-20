@@ -2257,8 +2257,8 @@ jobs:
                   advisor_error_lines = [
                       line[:500]
                       for line in completed.stderr.splitlines()
-                      if line.startswith("REVIEW-ADVISOR-ERROR")
-                  ][:5]
+                      if line.startswith(("ADVISOR-", "REVIEW-ADVISOR-"))
+                  ][:6]
                   advisor_summary_text = advisor_summary.read_text(encoding="utf-8")
               first_line = (
                   advisor_summary_text.splitlines()[0]
