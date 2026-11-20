@@ -1549,6 +1549,7 @@ jobs:
             scripts/scrub_outbound.py
             .github/actions/gate-aggregator/aggregate.py
             .github/actions/gate-aggregator/convergence.py
+            .github/actions/gate-aggregator/gate_action.py
             .github/actions/gate-aggregator/counterevidence_argv.py
             .github/actions/gate-aggregator/behavior_counterevidence.py
             .github/actions/gate-aggregator/neighbor_evidence.py
