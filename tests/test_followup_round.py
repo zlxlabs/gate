@@ -51,7 +51,7 @@ def _row(run_id, head, *, attempt=1):
 
 
 def _patch_history(monkeypatch, *, status="available", rows=()):
-    import aggregate
+    aggregate = FUP._load_aggregate()
 
     def fake_load(*, repository, repository_id, pr_number):
         prior = tuple(row["run_id"] for row in rows if row.get("_eligible_primary_round") is True)

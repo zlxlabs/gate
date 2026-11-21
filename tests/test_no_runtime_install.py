@@ -46,6 +46,7 @@ ENTRY_FILES = {
     ".github/actions/gate-aggregator/aggregate.py": "gate 槽聚合器",
     ".github/actions/gate-aggregator/convergence.py": "被聚合器载入的同目录模块",
     ".github/actions/gate-aggregator/gate_action.py": "gate_action 判定与覆盖规则模块（聚合器/convergence/签发器共享，file-size ratchet 拆分，dlg-20261120-180704-d7a06b seq=3）",
+    ".github/actions/gate-aggregator/followup_round.py": "primary 槽 follow-up 决策 CLI（gate-v2 注入步骤 python3 直执行，仅标准库+spec 加载仓内聚合器，dlg-20261121-105548-30ad72）",
     ".github/actions/gate-aggregator/counterevidence_argv.py": "被聚合器与回执签发器共享的 argv 契约",
     ".github/actions/gate-aggregator/behavior_counterevidence.py": "G1 并行 behavior_replay 句法契约（尚未接入 workflow，被 actions glob 发现）",
     ".github/actions/gate-aggregator/neighbor_evidence.py": "gate#297 邻域证据采集（subprocess/git/silo I/O 槽）",
