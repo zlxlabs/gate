@@ -41,7 +41,6 @@ NEIGHBOR_POLICY_SCOPE_FIELDS = (
     "policy_digest",
     "tier",
 )
-SEVERITY_P1 = P1_SEVERITIES
 SUPPORTED_TIERS = _GATE_ACTION.SUPPORTED_TIERS
 PRIMARY_VERDICTS = frozenset({"pass", "fail", "unavailable"})
 TERMINAL_DECISIONS = frozenset(
@@ -1842,11 +1841,12 @@ def evaluate_round(
     disposition_audit: DispositionAudit | None = None,
     processing_key: ProcessingKey,
     repository: str | None = None,
+    coverage_result: Mapping[str, Any] | None = None,
 ) -> RoundDecision:
     """Consume exactly one canonical primary observation.
 
-    A clean round has no current P1 findings left after active receipts are
-    validated against this exact primary audit.
+    A clean round has no remaining P1 findings after active receipts are
+    validated against this exact primary audit, and coverage is complete.
     """
 
     scope_errors = _scope_errors(scope) if isinstance(scope, Scope) else ["scope must be Scope"]
@@ -2061,7 +2061,7 @@ def evaluate_round(
         )
 
     eligible = recorded.eligible_rounds + 1
-    streak = recorded.clean_streak + 1 if not remaining_p1_ids else 0
+    streak = recorded.clean_streak + 1 if not remaining_p1_ids and ((coverage_result or {}).get("coverage") or {}).get("status") != "incomplete" else 0
     # The threshold is deliberately checked before the eligible cap.
     if streak >= policy.clean_rounds:
         terminal = "converged"
