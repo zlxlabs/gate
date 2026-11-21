@@ -132,6 +132,58 @@ def test_replay_plan_does_not_use_hosted_runner():
     assert "ubuntu-latest" not in _job("replay-plan")["runs-on"]
 
 
+def test_replay_publishes_evidence_artifact_name():
+    # gate#433: the name is declared by its producer and handed to the
+    # consumer verbatim via the job output; the upload step keeps building
+    # it from run_id/run_attempt, and control only ever references the
+    # output (see test_control_downloads_replay_artifact_only_on_behavior_path).
+    replay = _job("replay")
+    upload = _step(replay, "Upload behavior replay evidence")
+    assert upload["with"]["name"] == (
+        "gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    outputs = replay.get("outputs") or {}
+    assert outputs.get("evidence_artifact_name") == upload["with"]["name"]
+
+
+def _preflight_code() -> str:
+    plan = _job("replay-plan")
+    return _heredoc_blocks(
+        _step(plan, "Preflight canonical quality junit artifact")["run"]
+    )[0]
+
+
+def test_replay_plan_preflight_contract():
+    # gate#433: the canonical junit existence check runs in the earliest job,
+    # only on the behavior path, with the lookup failure and the missing
+    # artifact reported as two distinct errors; guidance text must tell the
+    # caller what to change. Existence-only: no nodeid parsing here.
+    plan = _job("replay-plan")
+    # The artifacts query needs the Actions scope; it is granted at the
+    # workflow level (actions: write, mirrored by caller templates) and the
+    # job inherits it — a job-level re-declaration would trip the
+    # caller-contract guard's expansion check (gate#433). The declaration
+    # must stay shape-compatible with the v2 baseline (contents +
+    # pull-requests only) and the workflow ceiling must cover actions.
+    assert plan["permissions"] == {"contents": "read", "pull-requests": "read"}
+    workflow_permissions = _workflow()["permissions"]
+    assert workflow_permissions.get("actions") in ("read", "write")
+    step = _step(plan, "Preflight canonical quality junit artifact")
+    assert step["if"] == "steps.classify.outputs.behavior == 'true'"
+    assert step["env"]["GH_REPO"] == "${{ github.repository }}"
+    assert step["env"]["PRIMARY_RUN_ID"] == "${{ inputs.primary_run_id }}"
+    assert step["env"]["PRIMARY_RUN_ATTEMPT"] == "${{ inputs.primary_run_attempt }}"
+    run_text = step["run"]
+    assert "behavior_canonical_junit_missing" in run_text
+    assert "behavior_canonical_junit_lookup_failed" in run_text
+    assert "GATE_ARTIFACT_DIR/junit" in run_text
+    assert "nodeid" not in run_text
+    # Paged lookup: per_page caps at 100 and stopping after page 1 would
+    # report a false missing on artifact-heavy primary runs.
+    assert "per_page=100" in run_text
+    assert "page=" in run_text
+
+
 def test_replay_pytest_runs_in_checked_out_worktree():
     # nodeids are relative to the repository root; both pytest calls must run
     # in the checkout directory, not the workspace root (r1).
@@ -272,9 +324,13 @@ def test_control_downloads_replay_artifact_only_on_behavior_path():
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
     )
     assert fetch_replay["with"]["name"] == (
-        "gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}"
+        "${{ needs.replay.outputs.evidence_artifact_name }}"
     )
     assert fetch_replay["with"]["path"] == "${{ runner.temp }}/behavior-replay"
+    # gate#433: the evidence name is the producer's declaration; control must
+    # not rebuild it from its own run_attempt (--failed reruns bump only
+    # control's attempt while the replay artifact keeps attempt 1).
+    assert "gate-behavior-replay-${{ github.run_id }}" not in yaml.safe_dump(control)
     canonical = _step(control, "Fetch canonical quality junit")
     assert canonical["if"] == "${{ needs.replay-plan.outputs.behavior == 'true' }}"
     assert "${{ inputs." not in canonical["run"]
@@ -438,6 +494,141 @@ def test_plan_guard_rejects_fork_and_bot(tmp_path, pull):
     proc = _guard(tmp_path, pull)
     assert proc.returncode != 0
     assert "behavior_unreviewed_or_fork" in proc.stderr
+
+
+def _preflight(
+    tmp_path: Path,
+    *,
+    pages: dict[str, dict],
+    gh_rc: int = 0,
+    run_id: str = "123",
+    attempt: str = "1",
+) -> tuple[subprocess.CompletedProcess, list[list[str]]]:
+    """Drive the replay-plan preflight heredoc against a fake gh.
+
+    The fake gh records argv (one JSON array per call) and serves one JSON
+    document per `page=N` query argument; gh_rc != 0 simulates a failing API
+    query on stderr. Returns the process and the recorded argv calls.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    pages_path = tmp_path / "gh-pages.json"
+    pages_path.write_text(json.dumps(pages), encoding="utf-8")
+    argv_log = tmp_path / "gh-argv.log"
+    fake = bin_dir / "gh"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"with open({json.dumps(str(argv_log))}, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        f"if {gh_rc} != 0:\n"
+        "    print('API rate limit exceeded', file=sys.stderr)\n"
+        f"    sys.exit({gh_rc})\n"
+        "url = next(a for a in sys.argv[1:] if a.startswith('repos/'))\n"
+        "query = url.split('?', 1)[1] if '?' in url else ''\n"
+        "params = dict(kv.split('=', 1) for kv in query.split('&') if kv)\n"
+        f"pages = json.load(open({json.dumps(str(pages_path))}, encoding='utf-8'))\n"
+        "print(json.dumps(pages.get(params.get('page', '1'), {'total_count': 0, 'artifacts': []})))\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    env = {
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "GH_REPO": REPOSITORY,
+        "GH_TOKEN": "fake-token",
+        "PRIMARY_RUN_ID": run_id,
+        "PRIMARY_RUN_ATTEMPT": attempt,
+    }
+    proc = _run_python(_preflight_code(), [], env)
+    calls = (
+        [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+        if argv_log.exists()
+        else []
+    )
+    return proc, calls
+
+
+def test_preflight_fails_with_guidance_when_junit_absent(tmp_path):
+    # gate#433 (a): no junit artifact on the primary run → replay-plan fails
+    # here instead of after a full replay job, with actionable guidance.
+    pages = {
+        "1": {
+            "total_count": 1,
+            "artifacts": [{"name": "gate-quality-audit-123-1", "expired": False}],
+        }
+    }
+    proc, calls = _preflight(tmp_path, pages=pages)
+    assert proc.returncode != 0
+    assert "behavior_canonical_junit_missing" in proc.stderr
+    assert "GATE_ARTIFACT_DIR/junit" in proc.stderr
+    assert calls == [
+        ["api", f"repos/{REPOSITORY}/actions/runs/123/artifacts?per_page=100&page=1"]
+    ]
+
+
+def test_preflight_passes_when_junit_present(tmp_path):
+    # gate#433 (b): artifact exists → preflight passes, single query.
+    pages = {
+        "1": {
+            "total_count": 1,
+            "artifacts": [{"name": "gate-quality-junit-123-1", "expired": False}],
+        }
+    }
+    proc, calls = _preflight(tmp_path, pages=pages)
+    assert proc.returncode == 0, proc.stderr
+    assert len(calls) == 1
+
+
+def test_preflight_treats_expired_junit_as_missing(tmp_path):
+    # An expired artifact cannot be downloaded, so control's authoritative
+    # fetch would fail anyway — same as absent, fail here instead.
+    pages = {
+        "1": {
+            "total_count": 1,
+            "artifacts": [{"name": "gate-quality-junit-123-1", "expired": True}],
+        }
+    }
+    proc, _ = _preflight(tmp_path, pages=pages)
+    assert proc.returncode != 0
+    assert "behavior_canonical_junit_missing" in proc.stderr
+
+
+def test_preflight_reports_lookup_failure_distinct_from_missing(tmp_path):
+    # gate#433 (c): the query itself failing is a different error than the
+    # artifact being absent — byte-distinct stderr, both fail-loud.
+    proc, calls = _preflight(tmp_path, pages={}, gh_rc=1)
+    assert proc.returncode != 0
+    assert "behavior_canonical_junit_lookup_failed" in proc.stderr
+    assert "behavior_canonical_junit_missing" not in proc.stderr
+    assert calls
+
+
+def test_preflight_paginates_beyond_first_hundred_artifacts(tmp_path):
+    # per_page caps at 100; stopping after page 1 would report a false
+    # missing on artifact-heavy primary runs.
+    first = {
+        "total_count": 101,
+        "artifacts": [{"name": f"other-{i}", "expired": False} for i in range(100)],
+    }
+    second = {
+        "total_count": 101,
+        "artifacts": [{"name": "gate-quality-junit-123-1", "expired": False}],
+    }
+    proc, calls = _preflight(tmp_path, pages={"1": first, "2": second})
+    assert proc.returncode == 0, proc.stderr
+    assert [call[-1] for call in calls] == [
+        f"repos/{REPOSITORY}/actions/runs/123/artifacts?per_page=100&page=1",
+        f"repos/{REPOSITORY}/actions/runs/123/artifacts?per_page=100&page=2",
+    ]
+
+
+def test_preflight_rejects_nonnumeric_run_id_as_lookup_failure(tmp_path):
+    # A non-numeric run id would reshape the query URL; fail as a lookup
+    # failure instead of silently querying a different resource.
+    proc, calls = _preflight(tmp_path, pages={}, run_id="123?foo=bar")
+    assert proc.returncode != 0
+    assert "behavior_canonical_junit_lookup_failed" in proc.stderr
+    assert calls == []
 
 
 def _sparse_env_values(node: object) -> list[str]:
