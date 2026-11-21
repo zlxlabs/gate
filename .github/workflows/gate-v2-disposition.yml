@@ -177,6 +177,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # gate#433: the preflight artifacts existence query needs the Actions
+      # read scope. GitHub sets every scope a job-level declaration omits to
+      # none (docs: Assigning permissions to jobs), so this MUST be declared
+      # here — the workflow-level actions:write ceiling only caps what the
+      # caller may grant, it is not inherited into the job. The declaration
+      # stays under that ceiling, which is what the caller-contract guard's
+      # job-level ceiling rule (gate#433) checks.
+      actions: read
     outputs:
       behavior: ${{ steps.classify.outputs.behavior }}
       head_sha: ${{ steps.classify.outputs.head_sha }}
@@ -286,6 +294,82 @@ jobs:
               out.write("runs_on=" + json.dumps(["self-hosted", "linux", "ci"]) + "\n")
           PY
 
+      # gate#433: whether the canonical quality junit exists is decidable
+      # before anything runs, so the check lives in the earliest job instead
+      # of surfacing only after replay has already burned a run. Bare
+      # existence only — the authoritative nodeid-passed verdict stays in
+      # control (issue_receipt.py). "Artifact not found" and "query itself
+      # failed" are two distinct errors: one means this caller cannot use
+      # behavior_replay at all, the other is an API problem.
+      - name: Preflight canonical quality junit artifact
+        if: steps.classify.outputs.behavior == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
+          PRIMARY_RUN_ATTEMPT: ${{ inputs.primary_run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          run_id = os.environ["PRIMARY_RUN_ID"]
+          attempt = os.environ["PRIMARY_RUN_ATTEMPT"]
+          repo = os.environ["GH_REPO"]
+          target = f"gate-quality-junit-{run_id}-{attempt}"
+          if not run_id.isdigit() or not attempt.isdigit():
+              print(
+                  "::error::behavior_canonical_junit_lookup_failed: primary_run_id and"
+                  " primary_run_attempt must be numeric, got %r/%r" % (run_id, attempt),
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          # Paged: the artifacts API caps per_page at 100 and a primary run can
+          # carry more artifacts than that; stopping after page 1 would report a
+          # false missing. expired=true cannot be downloaded, so control's
+          # authoritative fetch would fail anyway — same as absent.
+          page = 1
+          while True:
+              proc = subprocess.run(
+                  [
+                      "gh", "api",
+                      f"repos/{repo}/actions/runs/{run_id}/artifacts"
+                      f"?per_page=100&page={page}",
+                  ],
+                  capture_output=True,
+                  text=True,
+              )
+              if proc.returncode != 0:
+                  print(
+                      "::error::behavior_canonical_junit_lookup_failed: artifacts query"
+                      f" for run {run_id} failed: {proc.stderr.strip()}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              data = json.loads(proc.stdout)
+              artifacts = data.get("artifacts") or []
+              if any(
+                  a.get("name") == target and not a.get("expired") for a in artifacts
+              ):
+                  sys.exit(0)
+              total = data.get("total_count")
+              if not artifacts or (total is not None and page * 100 >= total):
+                  break
+              page += 1
+          print(
+              "::error::behavior_canonical_junit_missing: artifact " + target
+              + f" not on run {run_id} attempt {attempt}; the caller's quality entry must"
+              " write junit XML under $GATE_ARTIFACT_DIR/junit/ (entry mode) or go through"
+              f" the legacy pyproject path so the primary run uploads {target};"
+              " a caller whose quality lane produces no junit cannot use behavior_replay",
+              file=sys.stderr,
+          )
+          sys.exit(1)
+          PY
+
   replay:
     needs: replay-plan
     if: needs.replay-plan.outputs.behavior == 'true'
@@ -295,6 +379,14 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    # gate#433: the evidence name is declared by its producer and handed to
+    # the consumer verbatim. Control used to rebuild the name from its own
+    # run_attempt; gh run rerun --failed bumps only control's attempt while
+    # the replay artifact keeps attempt 1, and GitHub keeps outputs of jobs
+    # that are not re-run available to newly run jobs (docs: Re-running
+    # workflows and jobs).
+    outputs:
+      evidence_artifact_name: gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -744,8 +836,10 @@ jobs:
       - name: Fetch behavior replay evidence
         if: ${{ needs.replay-plan.outputs.behavior == 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # gate#433: name comes from the producer's job output, not control's
+        # own run_attempt (a --failed rerun bumps only control's attempt).
         with:
-          name: gate-behavior-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.replay.outputs.evidence_artifact_name }}
           path: ${{ runner.temp }}/behavior-replay
 
       - name: Fetch canonical quality junit
