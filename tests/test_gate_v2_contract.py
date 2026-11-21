@@ -42,6 +42,7 @@ DISPOSITION_CHECKOUT_SUBDIR = "_gate-disposition-src"
 DISPOSITION_PRODUCER_SPARSE = [
     ".github/actions/gate-disposition/issue_receipt.py",
     ".github/actions/gate-aggregator/convergence.py",
+    ".github/actions/gate-aggregator/gate_action.py",
     ".github/actions/gate-aggregator/counterevidence_argv.py",
     ".github/actions/gate-aggregator/behavior_counterevidence.py",
     "scripts/silo_store.py",
@@ -598,10 +599,8 @@ def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(t
     pr_path.write_text(json.dumps(pull), encoding="utf-8")
     # The module is loaded from the workflow's own checkout subdirectory, so the
     # only copy in existence has to be the one a sparse checkout leaves there.
-    workspace = _checkout_shaped_workspace(tmp_path, DISPOSITION_CHECKOUT_SUBDIR, [
-        ".github/actions/gate-aggregator/convergence.py",
-        ".github/actions/gate-aggregator/counterevidence_argv.py",
-    ])
+    workspace = _checkout_shaped_workspace(
+        tmp_path, DISPOSITION_CHECKOUT_SUBDIR, DISPOSITION_PRODUCER_SPARSE)
     result = subprocess.run(
         [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
         input=source,

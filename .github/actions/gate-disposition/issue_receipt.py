@@ -24,7 +24,6 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 
-P1_SEVERITIES = frozenset({"major", "blocker"})
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 TRACKING_ISSUE_URL = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)")
 COUNTEREVIDENCE_FIELDS = ("command", "output", "result", "pointer")
@@ -515,11 +514,7 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
     matching = _matching_finding(_audit_findings(audit), finding_id)
     stable_key = _CONVERGENCE.canonical_finding_key(matching)
     p1_matches = _CONVERGENCE.narrow_stable_key_matches_by_id(
-        [
-            (finding.get("id"), finding) for finding in _audit_findings(audit)
-            if finding.get("severity") in P1_SEVERITIES
-            and _CONVERGENCE.canonical_finding_key(finding) == stable_key
-        ],
+        _CONVERGENCE.coverable_matches(audit, stable_key),
         finding_id,
     )
     if len(p1_matches) > 1:
@@ -528,8 +523,8 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
             f"finding_id {finding_id!r} does not single out one of them, "
             "cannot determine the disposition target"
         )
-    if matching.get("severity") not in P1_SEVERITIES:
-        raise ValueError("finding_id must identify a P1 finding")
+    if (coverage_error := _CONVERGENCE.gate_coverable_error(audit, matching)) is not None:
+        raise ValueError(coverage_error)
     if disposition == "false-positive" and matching.get("trigger_kind") != "inferred":
         raise ValueError("finding_id must identify an inferred P1 finding")
     counterevidence = None
@@ -575,7 +570,10 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
                 raise ValueError("tracking_issue_invalid")
             if not isinstance(repository, str) or f"{match.group(1)}/{match.group(2)}".casefold() != repository.casefold():
                 raise ValueError("tracking_issue_repository_mismatch")
-        raise ValueError(_CONVERGENCE.DEFERRED_RECEIPT_REJECT_REASON)
+        # gate-hub#1072 ruling 4(a): legacy audits reject at every tier; a
+        # blocking-matrix-v1 audit allows only a must_respond finding.
+        if _CONVERGENCE.deferred_gate_rejected(audit, matching):
+            raise ValueError(_CONVERGENCE.DEFERRED_RECEIPT_REJECT_REASON)
     fields = {
         "schema_version": SCHEMA_VERSION,
         "disposition": disposition,

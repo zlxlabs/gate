@@ -70,7 +70,8 @@ def _allowlisted_ce(sha, *, relpath="src/lock.py", literal="locked-behavior", ou
     }
 
 
-def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=None):
+def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=None,
+           severity="major", gate_action=None, matrix=False):
     audit = {
         **SCOPE,
         "repository": REPOSITORY,
@@ -82,7 +83,7 @@ def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=
             "findings": [
                 {
                     "id": "finding-one",
-                    "severity": "major",
+                    "severity": severity,
                     "trigger_kind": trigger_kind,
                     "file": "src/guard.py",
                     "line": 12,
@@ -92,6 +93,11 @@ def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=
         },
         "tier": tier,
     }
+    if gate_action is not None:
+        audit["result"]["findings"][0]["gate_action"] = gate_action
+    if matrix:
+        version = matrix.get("version", 1) if isinstance(matrix, dict) else 1
+        audit["blocking_matrix"] = {"version": version, "tier": tier}
     if head_sha is not None:
         audit["head_sha"] = head_sha
     if base_sha is not None:
@@ -100,12 +106,14 @@ def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=
 
 
 def _issue(tmp_path, *, disposition=None, counterevidence=None, tracking_issue=None,
-           tier="personal", trigger_kind="inferred", head_sha=None, base_sha=None, repo_dir=None):
+           tier="personal", trigger_kind="inferred", head_sha=None, base_sha=None, repo_dir=None,
+           severity="major", gate_action=None, matrix=False):
     tmp_path.mkdir(parents=True, exist_ok=True)
     head_sha = head_sha or SCOPE["head_sha"]
     audit_path = tmp_path / "audit.json"
     audit_path.write_text(json.dumps(_audit(
         tier, trigger_kind=trigger_kind, head_sha=head_sha, base_sha=base_sha,
+        severity=severity, gate_action=gate_action, matrix=matrix,
     )))
     output_dir = tmp_path / "output"
     scope = {**SCOPE, "tier": tier, "head_sha": head_sha}

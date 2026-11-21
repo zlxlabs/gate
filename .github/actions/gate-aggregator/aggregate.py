@@ -132,6 +132,13 @@ assert _CONVERGENCE_SPEC and _CONVERGENCE_SPEC.loader
 _CONVERGENCE = importlib.util.module_from_spec(_CONVERGENCE_SPEC)
 sys.modules[_CONVERGENCE_SPEC.name] = _CONVERGENCE
 _CONVERGENCE_SPEC.loader.exec_module(_CONVERGENCE)
+_GATE_ACTION_SPEC = importlib.util.spec_from_file_location(
+    "gate_action_from_aggregate",
+    Path(__file__).with_name("gate_action.py"),
+)
+_GATE_ACTION = importlib.util.module_from_spec(_GATE_ACTION_SPEC)
+sys.modules[_GATE_ACTION_SPEC.name] = _GATE_ACTION
+_GATE_ACTION_SPEC.loader.exec_module(_GATE_ACTION)
 
 # gate#297: collector for NeighborEvidence (subprocess/git/silo I/O lives
 # there; this module and convergence.py stay out of that business).
@@ -1263,44 +1270,13 @@ def build_terminal_envelope(
     return envelope
 
 
-def _canonical_p1_findings(
-    audit: dict[str, Any],
-) -> Optional[tuple[tuple[str, str, str | None, str, int | None, str], ...]]:
-    """Project canonical P1 stable-key evidence."""
-    result = audit.get("result")
-    if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
-        return None
-    p1_findings: list[tuple[str, str, str | None, str, int | None, str]] = []
-    for finding in result["findings"]:
-        if not isinstance(finding, dict):
-            return None
-        severity = finding.get("severity")
-        if not isinstance(severity, str) or severity not in _CONVERGENCE.KNOWN_SEVERITIES:
-            return None
-        if severity not in _CONVERGENCE.P1_SEVERITIES:
-            continue
-        finding_id = finding.get("id")
-        if not isinstance(finding_id, str) or not finding_id:
-            return None
-        file = finding.get("file")
-        if "line" not in finding:
-            return None
-        line = finding["line"]
-        category = finding.get("category")
-        if not isinstance(file, str) or (line is not None and type(line) is not int) or not isinstance(category, str):
-            return None
-        trigger_kind = finding.get("trigger_kind")
-        if trigger_kind is not None and not isinstance(trigger_kind, str):
-            trigger_kind = None
-        p1_findings.append((finding_id, severity, trigger_kind, file, line, category))
-    return tuple(sorted(p1_findings, key=lambda item: item[0]))
-
-
 _CONVERGENCE_SCOPE_FIELDS = (
     "base_sha", "diff_digest", "policy_version", "policy_digest",
     "caller_sha", "reusable_workflow_sha",
 )
 
+
+_canonical_p1_findings = _GATE_ACTION.p1_findings
 
 def _convergence_scope_from_audit(
     audit: Any, identity: Identity,
@@ -1737,18 +1713,29 @@ def evaluate(
             p1_ids=p1_ids,
             p1_findings=p1_findings,
         )
+        # Blocking-matrix-v1 audits widen the receipt-coverable set to every
+        # finding whose gate_action is block/must_respond (including a saas
+        # minor). The round-convergence primary above stays P1-only; only the
+        # disposition projection below uses the widened set.
+        projection = _GATE_ACTION.disposition_projection(audit, primary)
+        disposition_ids, disposition_primary, gate_actions, invalid_note = (
+            projection if projection is not None else (p1_ids, primary, None, None)
+        )
+        if invalid_note:
+            outcome.notes.append(invalid_note)
         processing_key = _CONVERGENCE.ProcessingKey(
             identity.repository_id, identity.pr, identity.run_id, identity.run_attempt,
         )
         disposition_audit = _CONVERGENCE.record_dispositions(
-            p1_ids,
+            disposition_ids,
             waiver_receipts,
             scope=scope,
-            primary=primary,
+            primary=disposition_primary,
             audit_digest=audit_digest,
             legacy_raw_audit_digest=legacy_raw_audit_digest,
             repository=repository,
             neighbor_evidence=neighbor_evidence,
+            gate_actions=gate_actions,
         )
         outcome.disposition_audit = disposition_audit
         state = convergence_state or _CONVERGENCE.initial_state(scope)

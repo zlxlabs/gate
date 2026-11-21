@@ -6,16 +6,26 @@ import hashlib
 import importlib.util
 import json
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+_GATE_ACTION_SPEC = importlib.util.spec_from_file_location(
+    "gate_action_from_convergence",
+    Path(__file__).with_name("gate_action.py"),
+)
+_GATE_ACTION = importlib.util.module_from_spec(_GATE_ACTION_SPEC)
+sys.modules[_GATE_ACTION_SPEC.name] = _GATE_ACTION
+_GATE_ACTION_SPEC.loader.exec_module(_GATE_ACTION)
+
+
 
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
-P1_SEVERITIES = frozenset({"major", "blocker"})
-KNOWN_SEVERITIES = frozenset({"major", "blocker", "minor", "nit"})
+P1_SEVERITIES = _GATE_ACTION.P1_SEVERITIES
+KNOWN_SEVERITIES = _GATE_ACTION.KNOWN_SEVERITIES
 # Replay anchors (design §4.2): 187↔190 / 116↔118 / 37↔40. |Δline|<=4 covers
 # those pairs; |Δline|==5 must not match. Category is not part of neighbor identity.
 NEIGHBOR_LINE_TOLERANCE = 4
@@ -32,7 +42,7 @@ NEIGHBOR_POLICY_SCOPE_FIELDS = (
     "tier",
 )
 SEVERITY_P1 = P1_SEVERITIES
-SUPPORTED_TIERS = ("personal", "internal", "saas")
+SUPPORTED_TIERS = _GATE_ACTION.SUPPORTED_TIERS
 PRIMARY_VERDICTS = frozenset({"pass", "fail", "unavailable"})
 TERMINAL_DECISIONS = frozenset(
     {"collecting", "converged", "manual_required", "fail_closed"}
@@ -44,6 +54,19 @@ DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHE
 # gate-hub#1072 ruling 4(a): a deferred receipt may not release a P1 at any
 # tier — issuance and consumption share this single reason-code constant.
 DEFERRED_RECEIPT_REJECT_REASON = "deferred_not_allowed_for_tier"
+# Finding-level blocking-matrix contract v1 (gate-hub producer ⇄ gate
+# aggregator): gate_action values a receipt may release. "comment" findings
+# never need a receipt; "block" accepts only false-positive; "must_respond"
+# accepts false-positive or deferred (with a same-repo tracking issue).
+_canonical_json = _GATE_ACTION.canonical_json
+canonical_finding_key = _GATE_ACTION.canonical_finding_key
+_primary_finding_record = _GATE_ACTION.primary_finding_record
+_stable_primary_matches = _GATE_ACTION.stable_primary_matches
+gate_coverable = _GATE_ACTION.gate_coverable
+coverable_matches = _GATE_ACTION.coverable_matches
+gate_coverable_error = _GATE_ACTION.gate_coverable_error
+deferred_gate_rejected = _GATE_ACTION.deferred_gate_rejected
+GATE_ACTION_ISSUANCE_ERROR = _GATE_ACTION.GATE_ACTION_ISSUANCE_ERROR
 DISPOSITION_REASON_DISPLAY_MAX = 500
 COUNTEREVIDENCE_RERUN_TIMEOUT_S: int = 30
 _COUNTEREVIDENCE_ARGV_SPEC = importlib.util.spec_from_file_location(
@@ -426,15 +449,6 @@ class RoundDecision:
         return self.state.terminal_decision
 
 
-def _canonical_json(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-
 def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
@@ -454,35 +468,6 @@ CANONICAL_AUDIT_DIGEST_SCOPE_FIELDS = (
     "tier",
 )
 CANONICAL_AUDIT_DIGEST_FINDING_FIELDS = ("file", "line", "category", "severity")
-CANONICAL_FINDING_KEY_FIELDS = ("file", "line", "category", "severity")
-
-
-def canonical_finding_key(finding: Any) -> str:
-    """Return the sole canonical key for a finding disposition target.
-
-    The key contains exactly ``file``, ``line``, ``category``, and
-    ``severity`` in that order.  A missing field is encoded as the tagged
-    value ``["missing"]``; an explicit JSON ``null`` is ``["null"]``; every
-    other value, including the empty string, is encoded as ``["value", V]``.
-    Consequently missing, ``None``, and ``""`` never collapse to one key.
-    The compact JSON representation is deliberate: file paths may contain
-    slashes and delimiter characters, so artifact names must hash this full
-    key instead of embedding or reparsing it.
-    """
-
-    if not isinstance(finding, dict):
-        raise ValueError("canonical finding key requires an object")
-    components: dict[str, list[Any]] = {}
-    for field in CANONICAL_FINDING_KEY_FIELDS:
-        if field not in finding:
-            components[field] = ["missing"]
-        elif finding[field] is None:
-            components[field] = ["null"]
-        else:
-            components[field] = ["value", finding[field]]
-    return _canonical_json(components).decode("utf-8")
-
-
 def neighbor_finding_key(finding: Any) -> tuple[str, int] | None:
     """Return ``(file, line)`` when ``finding`` may join neighbor identity.
 
@@ -515,7 +500,7 @@ def _decode_canonical_finding_key(finding_key: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     decoded: dict[str, Any] = {}
-    for field in CANONICAL_FINDING_KEY_FIELDS:
+    for field in _GATE_ACTION.CANONICAL_FINDING_KEY_FIELDS:
         tagged = payload.get(field)
         if not isinstance(tagged, list) or not tagged:
             continue
@@ -591,33 +576,6 @@ def _receipt_audit_digest_matches(
     )
 
 
-def _primary_finding_record(finding: Any) -> dict[str, Any] | None:
-    """Normalize one primary tuple without reimplementing key serialization."""
-
-    if not isinstance(finding, tuple):
-        return None
-    # Expand-then-contract: canonical_primary receipts already published in
-    # the v2 artifact window may still carry the legacy three-field shape.
-    # TODO(gate#150): remove this branch after no retained canonical_primary
-    # receipt can be read back with a three-field p1_findings projection.
-    if len(finding) == 3:
-        return {
-            "id": finding[0],
-            "severity": finding[1],
-            "trigger_kind": finding[2],
-        }
-    if len(finding) == 6:
-        return {
-            "id": finding[0],
-            "severity": finding[1],
-            "trigger_kind": finding[2],
-            "file": finding[3],
-            "line": finding[4],
-            "category": finding[5],
-        }
-    return None
-
-
 def _current_p1_keys(primary: CanonicalPrimary) -> tuple[str, ...]:
     """List current P1 stable keys, or legacy ids for a v2 projection."""
 
@@ -630,22 +588,6 @@ def _current_p1_keys(primary: CanonicalPrimary) -> tuple[str, ...]:
         if keys:
             return tuple(keys)
     return tuple(primary.p1_ids)
-
-
-def _stable_primary_matches(
-    finding_key: str,
-    primary: CanonicalPrimary,
-) -> list[tuple[str, dict[str, Any]]]:
-    matches: list[tuple[str, dict[str, Any]]] = []
-    if not isinstance(primary.p1_findings, tuple):
-        return matches
-    for finding in primary.p1_findings:
-        record = _primary_finding_record(finding)
-        if record is None or len(finding) != 6 or record.get("severity") not in P1_SEVERITIES:
-            continue
-        if canonical_finding_key(record) == finding_key:
-            matches.append((record["id"], record))
-    return matches
 
 
 def _neighbor_primary_matches(
@@ -924,8 +866,14 @@ def validate_disposition_receipt(
     legacy_raw_audit_digest: str | None = None,
     repository: str | None = None,
     neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
+    gate_actions: Mapping[str, str] | None = None,
 ) -> DispositionStatus:
-    """Validate one receipt against the current canonical audit round."""
+    """Validate one receipt against the current canonical audit round.
+
+    ``gate_actions`` carries the blocking-matrix-v1 projection (finding_id →
+    gate_action) for audits that have ``blocking_matrix``; it is None for
+    legacy audits, where deferred receipts stay rejected unconditionally.
+    """
 
     if not isinstance(receipt, DispositionReceipt):
         return _disposition_status(
@@ -966,10 +914,11 @@ def validate_disposition_receipt(
         tracking_reason = _tracking_issue_reason(receipt.tracking_issue, repository)
         if tracking_reason is not None:
             return _disposition_status(receipt, valid=False, active=False, reason=tracking_reason)
-        return _disposition_status(
-            receipt, valid=False, active=False,
-            reason=DEFERRED_RECEIPT_REJECT_REASON,
-        )
+        if not _GATE_ACTION.deferred_release_allowed(receipt, primary=primary, gate_actions=gate_actions):
+            return _disposition_status(
+                receipt, valid=False, active=False,
+                reason=DEFERRED_RECEIPT_REJECT_REASON,
+            )
     target_field = "finding_key" if receipt.finding_key else "finding_id"
     required_text = ("repository_id", "epoch", "head_sha", "audit_digest", target_field, "reason")
     if any(not _nonempty_text(getattr(receipt, field)) for field in required_text):
@@ -1037,7 +986,7 @@ def validate_disposition_receipt(
 
     if receipt.finding_key:
         matches = narrow_stable_key_matches_by_id(
-            _stable_primary_matches(receipt.finding_key, primary), receipt.finding_id,
+            _stable_primary_matches(receipt.finding_key, primary, gate_actions), receipt.finding_id,
         )
         ambiguous = _ambiguous_finding_key_status(
             receipt, finding_key=receipt.finding_key, matches=matches,
@@ -1083,7 +1032,7 @@ def validate_disposition_receipt(
             stable_key = canonical_finding_key(stable_record)
             ambiguous = _ambiguous_finding_key_status(
                 receipt, finding_key=stable_key,
-                matches=_stable_primary_matches(stable_key, primary),
+                matches=_stable_primary_matches(stable_key, primary, gate_actions),
                 scope=scope, primary=primary,
             )
             if ambiguous is not None:
@@ -1092,10 +1041,18 @@ def validate_disposition_receipt(
     if isinstance(finding, dict):
         finding_severity = finding.get("severity")
         finding_trigger_kind = finding.get("trigger_kind")
+        resolved_id = finding.get("id")
     else:
         finding_severity = finding[1] if isinstance(finding, tuple) and len(finding) >= 2 else None
         finding_trigger_kind = finding[2] if isinstance(finding, tuple) and len(finding) >= 3 else None
-    if finding is None or finding_severity not in P1_SEVERITIES:
+        resolved_id = finding[0] if isinstance(finding, tuple) and finding else None
+    if finding is None or (
+        finding_severity not in P1_SEVERITIES
+        and not (
+            _GATE_ACTION.gate_covered(receipt.finding_id, gate_actions)
+            or _GATE_ACTION.gate_covered(resolved_id, gate_actions)
+        )
+    ):
         return _disposition_status(
             receipt, valid=False, active=False,
             reason="finding_not_current_p1",
@@ -1120,6 +1077,7 @@ def disposition_status(
     legacy_raw_audit_digest: str | None = None,
     repository: str | None = None,
     neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
+    gate_actions: Mapping[str, str] | None = None,
 ) -> DispositionStatus:
     """Return the observational status view used by ledger/human summaries."""
 
@@ -1131,6 +1089,7 @@ def disposition_status(
         legacy_raw_audit_digest=legacy_raw_audit_digest,
         repository=repository,
         neighbor_evidence=neighbor_evidence,
+        gate_actions=gate_actions,
     )
 
 
@@ -1144,6 +1103,7 @@ def record_dispositions(
     legacy_raw_audit_digest: str | None = None,
     repository: str | None = None,
     neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
+    gate_actions: Mapping[str, str] | None = None,
 ) -> DispositionAudit:
     """Validate receipts and return the current P1s they cover exactly."""
 
@@ -1165,6 +1125,7 @@ def record_dispositions(
                 legacy_raw_audit_digest=legacy_raw_audit_digest,
                 repository=repository,
                 neighbor_evidence=neighbor_evidence,
+                gate_actions=gate_actions,
             )
             statuses.append(status)
             rejected.append((status.receipt, status.reason_code))
@@ -1177,6 +1138,7 @@ def record_dispositions(
             legacy_raw_audit_digest=legacy_raw_audit_digest,
             repository=repository,
             neighbor_evidence=neighbor_evidence,
+            gate_actions=gate_actions,
         )
         if status.active and status.valid:
             payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -1191,7 +1153,7 @@ def record_dispositions(
                 target_id = status.matched_finding_id
             elif receipt.finding_key:
                 stable_matches = narrow_stable_key_matches_by_id(
-                    _stable_primary_matches(receipt.finding_key, primary), receipt.finding_id,
+                    _stable_primary_matches(receipt.finding_key, primary, gate_actions), receipt.finding_id,
                 )
                 if len(stable_matches) == 1:
                     target_id = stable_matches[0][0]
