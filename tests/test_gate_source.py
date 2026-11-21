@@ -251,7 +251,7 @@ def source_host(tmp_path):
         REPO_ROOT / ".github/actions/gate-disposition/issue_receipt.py",
         gate_work / ".github/actions/gate-disposition/issue_receipt.py",
     )
-    for name in ("aggregate.py", "convergence.py", "gate_action.py", "neighbor_evidence.py", "counterevidence_argv.py", "behavior_counterevidence.py"):
+    for name in ("aggregate.py", "convergence.py", "gate_action.py", "neighbor_evidence.py", "counterevidence_argv.py", "behavior_counterevidence.py", "carry_findings.py"):
         shutil.copy(
             REPO_ROOT / ".github/actions/gate-aggregator" / name,
             gate_work / ".github/actions/gate-aggregator" / name,
