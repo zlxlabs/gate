@@ -150,11 +150,6 @@ assert _NEIGHBOR_EVIDENCE_SPEC and _NEIGHBOR_EVIDENCE_SPEC.loader
 _NEIGHBOR_EVIDENCE = importlib.util.module_from_spec(_NEIGHBOR_EVIDENCE_SPEC)
 sys.modules[_NEIGHBOR_EVIDENCE_SPEC.name] = _NEIGHBOR_EVIDENCE
 _NEIGHBOR_EVIDENCE_SPEC.loader.exec_module(_NEIGHBOR_EVIDENCE)
-_CARRY_SPEC = importlib.util.spec_from_file_location(
-    "gate_carry_findings_from_aggregate", Path(__file__).with_name("carry_findings.py"))
-_CARRY = importlib.util.module_from_spec(_CARRY_SPEC)
-sys.modules[_CARRY_SPEC.name] = _CARRY
-_CARRY_SPEC.loader.exec_module(_CARRY)
 
 
 # The audit schema's complete verdict domain, including states not_expected
@@ -953,18 +948,23 @@ def _project_previous_dispositions(
 
 def _render_previous_context_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    for name in ("--repository-id", "--pr-number", "--run-id", "--run-attempt"):
-        parser.add_argument(name, required=True, type=int)
+    parser.add_argument("--repository-id", required=True, type=int)
+    parser.add_argument("--pr-number", required=True, type=int)
+    parser.add_argument("--run-id", required=True, type=int)
+    parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--previous-json", required=True)
     args = parser.parse_args(argv)
     previous = load_previous_round_findings(
         path=None, repository_id=args.repository_id, pr_number=args.pr_number,
         run_id=args.run_id, run_attempt=args.run_attempt,
     )
-    dispositions = _project_previous_dispositions(
-        repository_id=args.repository_id, pr_number=args.pr_number,
-    ) if previous["available"] else []
-    _CARRY.write_previous_context(previous, dispositions, args.previous_json)
+    dispositions = []
+    if previous["available"]:
+        dispositions = _project_previous_dispositions(
+            repository_id=args.repository_id, pr_number=args.pr_number,
+        )
+    previous = {**previous, "dispositions": dispositions}
+    Path(args.previous_json).write_text(json.dumps(previous, ensure_ascii=False) + "\n", encoding="utf-8")
     return 0
 
 

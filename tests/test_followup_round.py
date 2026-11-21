@@ -106,34 +106,15 @@ def test_unavailable_history_skips_conservatively(tmp_path, monkeypatch):
     assert line == "action=skip reason=history_unavailable"
 
 
-def test_producer_fixture_bytes_carry_open_findings_and_enable_treatment(tmp_path, monkeypatch):
+def test_producer_fixture_bytes_keep_legacy_shape_and_report_carry_missing(tmp_path, monkeypatch):
     # Producer contract: the committed fixture is the actual
-    # --render-previous-context output bytes (generated through AGG.main on a
-    # synthetic saas blocking-matrix ledger); its top-level open_findings is
-    # the merge-blocking subset of findings no approved receipt released
-    # (fp releases any covered finding; deferred releases only must_respond;
-    # comment never blocks), and it enables follow-up treatment (gate-hub
-    # _load_carry reads the same key).
+    # --render-previous-context output shape; follow-up must not silently
+    # activate on a carry-less file (gate-hub _load_carry would no-op it).
     payload = json.loads(PRODUCER_FIXTURE.read_text(encoding="utf-8"))
-    assert set(payload) == {
-        "available", "detail", "head_sha", "findings", "dispositions", "open_findings",
-    }
+    assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions"}
     assert payload["available"] is True and isinstance(payload["findings"], list)
-    assert all(isinstance(item, dict) for item in payload["open_findings"])
-    open_ids = {finding["id"] for finding in payload["open_findings"]}
-    expected_open = {
-        finding["id"] for finding in payload["findings"]
-        if finding.get("gate_action") in {"block", "must_respond"}
-    } - {"carry-fp-block", "carry-deferred-mr"}
-    assert open_ids == expected_open
-    assert "carry-comment-nit" not in open_ids
-    assert "carry-mr-minor-open" in open_ids
-    assert "carry-deferred-block" in open_ids
-    prev_head = payload["head_sha"]
-    rows = [_row(101, H1), _row(102, H2), _row(103, prev_head)]
-    assert _resolve(tmp_path, monkeypatch, rows=rows, carry=payload) == (
-        f"action=enable prev_head_sha={prev_head}"
-    )
+    rows = [_row(101, H1), _row(102, H2), _row(103, H3)]
+    assert _resolve(tmp_path, monkeypatch, rows=rows, carry=payload) == "action=skip reason=carry_missing"
 
 
 def test_carry_head_mismatch_skips(tmp_path, monkeypatch):
@@ -202,177 +183,6 @@ def _followup_shell_lines():
     return lines[start:end + 1]
 
 
-def _carry_gate_rerun(head_sha):
-    # Compact copy of test_gate_aggregator._gate_rerun: a counterevidence
-    # gate_rerun block that passes _counterevidence_reason's allowlist.
-    literal, pathspec = "locked-behavior", "src/lock.py"
-    argv = ["git", "grep", "-n", "-F", "-e", literal, head_sha, "--", pathspec]
-    excerpt = f"{pathspec}:1:{literal}"
-    return {
-        "argv": argv, "exit_code": 0, "match_count": 1,
-        "stdout_sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
-        "excerpt": excerpt,
-    }
-
-
-def _carry_receipt(repository_id, pr_number, head_sha, disposition, finding_id, **extra):
-    payload = {
-        "schema_version": 1, "kind": CONV.DISPOSITION_RECEIPT_KIND,
-        "disposition": disposition, "repository_id": repository_id, "pr_number": pr_number,
-        "epoch": "2026-11-01", "head_sha": head_sha, "audit_digest": "0" * 64,
-        "finding_id": finding_id, "finding_key": f"key-{finding_id}",
-        "reason": "carry fixture", "approver": "owner", "approver_id": 1,
-        "approved_at": "2026-11-01T00:00:00Z", "triggering_actor": "owner",
-        "triggering_actor_source": "session",
-    }
-    payload.update(extra)
-    return payload
-
-
-def _carry_producer_output(ledger, receipts, tmp_path, monkeypatch):
-    """Run the real --render-previous-context CLI over a fake Silo holding
-    ``ledger`` (the ledger-latest object) and ``receipts``; second consumer
-    of the fake-silo producer drive (test_gate_aggregator keeps the PR1063
-    variant). Returns (returncode, parsed payload)."""
-    aggregate = FUP._load_aggregate()
-    repository_id = ledger["primary_identity"]["repository_id"]
-    objects = [
-        (aggregate._ledger_latest_key(repository_id, ledger["pr_number"]),
-         json.dumps(ledger, ensure_ascii=False).encode("utf-8")),
-    ]
-    for receipt in receipts:
-        name = CONV.disposition_receipt_artifact_name(CONV.parse_disposition_receipt(receipt))
-        objects.append((
-            f"{aggregate.SILO_DISPOSITION_TIER}/{repository_id}/{name}/{name}.json",
-            json.dumps(receipt, ensure_ascii=False).encode("utf-8"),
-        ))
-    by_key = dict(objects)
-
-    def fake_silo_cli(argv, timeout_s):
-        if argv[0] == "list":
-            raise AssertionError("previous-round findings must not list Silo objects")
-        key = argv[argv.index("--key") + 1]
-        dest = argv[argv.index("--dest") + 1]
-        body = by_key.get(key)
-        if body is None:
-            return subprocess.CompletedProcess(argv, 2, stdout="", stderr="Silo object not found")
-        Path(dest).write_bytes(body)
-        return subprocess.CompletedProcess(argv, 0, stdout=dest, stderr="")
-
-    monkeypatch.setattr(aggregate, "_silo_configured", lambda: True)
-    monkeypatch.setattr(aggregate, "_silo_cli", fake_silo_cli)
-    monkeypatch.setattr(
-        aggregate, "_silo_objects_under",
-        lambda prefix, timeout_s: [(key, raw) for key, raw in objects if key.startswith(prefix)],
-    )
-    output = tmp_path / "previous-findings.json"
-    rc = aggregate.main([
-        "--render-previous-context",
-        "--repository-id", str(repository_id),
-        "--pr-number", str(ledger["pr_number"]),
-        "--run-id", str(ledger["run_id"] + 100),
-        "--run-attempt", str(ledger["run_attempt"]),
-        "--previous-json", str(output),
-    ])
-    return rc, json.loads(output.read_text(encoding="utf-8"))
-
-
-def test_render_previous_context_blocking_matrix_carry_semantics(tmp_path, monkeypatch):
-    """Blocking-matrix-v1 carry (gate-hub review-followup-incremental 2.1):
-    merge-blocking is gate_action-driven; deferred releases only
-    must_respond, false-positive releases any covered finding, and
-    comment-level findings never carry."""
-    head = "c10f2" * 8
-    findings = [
-        {"id": "carry-mr-minor-open", "severity": "minor", "file": "src/export.py", "line": 10,
-         "category": "correctness", "issue": "saas minor must_respond blocks merge",
-         "acceptance": "fix or respond", "gate_action": "must_respond"},
-        {"id": "carry-comment-nit", "severity": "nit", "file": "src/style.py", "line": 20,
-         "category": "style", "issue": "comment level never blocks", "acceptance": "n/a",
-         "gate_action": "comment"},
-        {"id": "carry-fp-block", "severity": "major", "file": "src/lock.py", "line": 30,
-         "category": "correctness", "issue": "released by false-positive receipt",
-         "acceptance": "n/a", "gate_action": "block"},
-        {"id": "carry-deferred-mr", "severity": "minor", "file": "src/queue.py", "line": 40,
-         "category": "reliability", "issue": "released by deferred receipt",
-         "acceptance": "n/a", "gate_action": "must_respond"},
-        {"id": "carry-deferred-block", "severity": "major", "file": "src/lease.py", "line": 50,
-         "category": "correctness", "issue": "deferred cannot release a block finding",
-         "acceptance": "n/a", "gate_action": "block"},
-    ]
-    ledger = {
-        "schema_version": 2, "pr_number": 77, "run_id": 300, "run_attempt": 1,
-        "head_sha": head,
-        "primary_identity": {
-            "repository_id": 301, "pr_number": 77, "run_id": 300, "run_attempt": 1,
-            "head_sha": head,
-        },
-        "review": {
-            "status": "fail", "verdict": "fail",
-            "blocking_matrix": {"version": 1, "tier": "saas"},
-            "result": {"verdict": "fail", "findings": findings},
-        },
-    }
-    fp = _carry_receipt(
-        301, 77, head, "false-positive", "carry-fp-block",
-        counterevidence={
-            "command": "git grep -n -F -e locked-behavior",
-            "output": "src/lock.py:1:locked-behavior", "result": "refuted",
-            "pointer": "src/lock.py:1", "gate_rerun": _carry_gate_rerun(head),
-        },
-    )
-    deferred_mr = _carry_receipt(301, 77, head, "deferred", "carry-deferred-mr", tracking_issue="#77")
-    deferred_block = _carry_receipt(301, 77, head, "deferred", "carry-deferred-block", tracking_issue="#78")
-    rc, payload = _carry_producer_output(ledger, [fp, deferred_mr, deferred_block], tmp_path, monkeypatch)
-
-    assert rc == 0
-    assert payload["available"] is True and payload["head_sha"] == head
-    assert payload["findings"] == findings  # findings stays verbatim
-    open_ids = [finding["id"] for finding in payload["open_findings"]]
-    assert "carry-mr-minor-open" in open_ids  # saas minor must_respond blocks merge
-    assert "carry-deferred-block" in open_ids  # deferred releases only must_respond
-    assert "carry-comment-nit" not in open_ids  # comment level never carries
-    assert "carry-fp-block" not in open_ids  # false-positive receipt releases
-    assert "carry-deferred-mr" not in open_ids  # deferred receipt releases must_respond
-    mr_open = next(f for f in payload["open_findings"] if f["id"] == "carry-mr-minor-open")
-    assert mr_open["gate_action"] == "must_respond" and mr_open["severity"] == "minor"
-    assert {"id", "severity", "file", "line", "issue", "gate_action"} <= set(mr_open)
-
-
-def test_render_previous_context_legacy_carry_deferred_does_not_release(tmp_path, monkeypatch, capsys):
-    """Legacy audit (no blocking_matrix): carry is P1-severity-only and a
-    deferred receipt releases nothing."""
-    head = "1e6a" * 10
-    findings = [
-        {"id": "carry-legacy-blocker-open", "severity": "blocker", "file": "src/core.py", "line": 1,
-         "category": "correctness", "issue": "unreleased blocker stays in carry", "acceptance": "fix"},
-        {"id": "carry-legacy-minor", "severity": "minor", "file": "src/minor.py", "line": 2,
-         "category": "style", "issue": "legacy minor never carries", "acceptance": "n/a"},
-        {"id": "carry-legacy-blocker-deferred", "severity": "blocker", "file": "src/old.py", "line": 3,
-         "category": "correctness", "issue": "deferred cannot release a legacy P1", "acceptance": "n/a"},
-    ]
-    ledger = {
-        "schema_version": 2, "pr_number": 78, "run_id": 301, "run_attempt": 1,
-        "head_sha": head,
-        "primary_identity": {
-            "repository_id": 301, "pr_number": 78, "run_id": 301, "run_attempt": 1,
-            "head_sha": head,
-        },
-        "review": {"status": "fail", "verdict": "fail",
-                   "result": {"verdict": "fail", "findings": findings}},
-    }
-    deferred = _carry_receipt(301, 78, head, "deferred", "carry-legacy-blocker-deferred", tracking_issue="#79")
-    rc, payload = _carry_producer_output(ledger, [deferred], tmp_path, monkeypatch)
-    out = capsys.readouterr().out
-
-    assert rc == 0
-    assert {finding["id"] for finding in payload["open_findings"]} == {
-        "carry-legacy-blocker-open", "carry-legacy-blocker-deferred",
-    }
-    assert all("gate_action" not in finding for finding in payload["open_findings"])
-    assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=0" in out
-
-
 def test_inject_step_wires_followup_env_and_skipped_line():
     step = _inject_step()
     run = step["run"]
@@ -414,14 +224,12 @@ def test_inject_step_wires_followup_env_and_skipped_line():
 def test_producer_bytes_flow_through_one_path_expression(tmp_path, monkeypatch):
     # The committed fixture is the actual --render-previous-context output
     # bytes; feed them to the decision exactly as the inject step would.
-    # With the carry produced (open_findings + head match) the same bytes
-    # that pre-c10f2 reported carry_missing now enable treatment.
     payload = json.loads(PRODUCER_FIXTURE.read_text(encoding="utf-8"))
     assert _resolve(
         tmp_path, monkeypatch,
         rows=[_row(101, H1), _row(102, H2), _row(103, payload["head_sha"])],
         carry=payload,
-    ) == f"action=enable prev_head_sha={payload['head_sha']}"
+    ) == "action=skip reason=carry_missing"
 
 
 def _run_shell_block(tmp_path, *, fake_line, stub_exit=0, name="case"):
