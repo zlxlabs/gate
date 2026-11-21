@@ -1543,6 +1543,10 @@ jobs:
           GATE_CHECKOUT_REPOSITORY: ${{ job.workflow_repository }}
           GATE_CHECKOUT_REF: ${{ job.workflow_sha }}
           GATE_CHECKOUT_PATH: _gate-silo-src
+          # The per-file lines are contract anchors (out-of-scope tests match
+          # them literally); the trailing directory entry additionally
+          # materializes followup_round.py for the follow-up decision below
+          # without failing checkouts whose source tree predates that file.
           GATE_CHECKOUT_SPARSE: |
             scripts/silo_store.py
             scripts/silo_exec.sh
@@ -1553,7 +1557,12 @@ jobs:
             .github/actions/gate-aggregator/counterevidence_argv.py
             .github/actions/gate-aggregator/behavior_counterevidence.py
             .github/actions/gate-aggregator/neighbor_evidence.py
+            .github/actions/gate-aggregator
           GATE_GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+          TIER: ${{ inputs.tier }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY_ID: ${{ github.repository_id }}
           RUN_ID: ${{ github.run_id }}
@@ -1580,6 +1589,20 @@ jobs:
             python3 _gate-silo-src/.github/actions/gate-aggregator/aggregate.py --render-previous-context \
               --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
               --previous-json "${RUNNER_TEMP}/previous-findings.json"
+            followup_decision="$(python3 _gate-silo-src/.github/actions/gate-aggregator/followup_round.py \
+              --repository "$REPOSITORY" --repository-id "$REPOSITORY_ID" --pr-number "$PR_NUMBER" \
+              --run-id "$RUN_ID" --tier "$TIER" --head-sha "$HEAD_SHA" \
+              --previous-json "${RUNNER_TEMP}/previous-findings.json")" \
+              || followup_decision="action=skip reason=decision_cli_failed"
+            followup_line="${followup_decision%%$'\n'*}"
+            case "$followup_line" in
+              "action=enable "*)
+                echo "REVIEW_FOLLOWUP_MODE=treatment" >> "$GITHUB_ENV"
+                echo "REVIEW_PREV_HEAD_SHA=${followup_line#*prev_head_sha=}" >> "$GITHUB_ENV"
+                ;;
+              "action=skip "*)
+                echo "GATE-FOLLOWUP-SKIPPED reason=${followup_line#action=skip reason=}" ;;
+            esac
           )
           inject_status=$?
           set -euo pipefail

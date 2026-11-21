@@ -1747,7 +1747,7 @@ def evaluate(
             waiver_receipts=waiver_receipts,
             disposition_audit=disposition_audit,
             processing_key=processing_key,
-            repository=repository,
+            repository=repository, coverage_result=audit.get("result"),
         )
         outcome.convergence_envelope = build_convergence_envelope(
             scope=scope,

@@ -1,0 +1,1 @@
+{"available": true, "detail": "", "head_sha": "a4c1a4c1a4c1a4c1a4c1a4c1a4c1a4c1a4c1a4c1", "findings": [{"id": "c10f-followup-fixture-1", "severity": "blocker", "file": "src/service.py", "line": 1250, "issue": "exported helper loses error context on retry (carried open finding from previous canonical round)"}], "dispositions": []}
