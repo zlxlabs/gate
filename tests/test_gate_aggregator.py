@@ -5371,10 +5371,11 @@ def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions"}
+    assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions", "open_findings"}
     assert payload["available"] is True
     assert payload["head_sha"] == ledger["head_sha"]
     assert payload["findings"] == ledger["review"]["result"]["findings"]
+    assert {finding["id"] for finding in payload["open_findings"]} <= {finding["id"] for finding in payload["findings"]}
     assert payload["findings"] and any(
         finding.get("id") == "reliability_alternates_survive_hard_kill"
         for finding in payload["findings"]
@@ -5825,10 +5826,7 @@ def test_render_previous_context_degrades_current_or_future_attempt(tmp_path, mo
     )
 
     assert rc == 0
-    assert payload == {
-        "available": False, "detail": "silo-ledger-latest-not-prior", "head_sha": None,
-        "findings": [], "dispositions": [],
-    }
+    assert payload == {"available": False, "detail": "silo-ledger-latest-not-prior", "head_sha": None, "findings": [], "dispositions": [], "open_findings": []}
     assert (
         "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger "
         "detail=silo-ledger-latest-not-prior"
@@ -5890,7 +5888,7 @@ def test_render_previous_context_writes_only_previous_findings_json(tmp_path, mo
     before = {path.name for path in tmp_path.iterdir()}
     rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, objects)
     assert rc == 0
-    assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions"}
+    assert set(payload) == {"available", "detail", "head_sha", "findings", "dispositions", "open_findings"}
     assert {path.name for path in tmp_path.iterdir()} - before == {"previous-findings.json"}
 
 
@@ -5973,10 +5971,7 @@ def test_render_previous_context_silo_unconfigured_has_complete_empty_contract(t
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert payload == {
-        "available": False, "detail": "silo-not-configured", "head_sha": None,
-        "findings": [], "dispositions": [],
-    }
+    assert payload == {"available": False, "detail": "silo-not-configured", "head_sha": None, "findings": [], "dispositions": [], "open_findings": []}
     assert "GATE-FINDING-RELATION-DEGRADED: source=previous-ledger detail=silo-not-configured" in out
 
 
