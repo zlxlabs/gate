@@ -186,10 +186,20 @@ def contract_violations(baseline, current) -> list[str]:
             old_decl = baseline_workflow_decl
         old_map = _permission_map(old_decl)
         new_map = _permission_map(current_decl)
+        # gate#433: for job-level declarations the caller-granted ceiling is
+        # the baseline workflow-level declaration, not the previous job
+        # declaration — GitHub sets scopes omitted from a job declaration to
+        # none, so the old job granted nothing for that scope either. An
+        # existing job adding a scope is therefore only an expansion when it
+        # exceeds max(previous job declaration, workflow ceiling).
+        job_ceiling_map = (
+            _permission_map(baseline_workflow_decl) if location.startswith("job:") else {}
+        )
         for scope in sorted(set(old_map) | set(new_map)):
             old_level = old_map.get(scope, 0)
             new_level = new_map.get(scope, 0)
-            if new_level > old_level:
+            ceiling = max(old_level, job_ceiling_map.get(scope, 0))
+            if new_level > ceiling:
                 violations.append(
                     f"permission expanded at {location}: {scope} "
                     f"{old_level}->{new_level}"
@@ -337,6 +347,63 @@ def test_contract_guard_rejects_permission_restriction():
     violations = contract_violations(baseline, current)
     assert "permission restricted at workflow: contents 2->1" in violations
     assert "permission restricted at workflow: issues 2->0" in violations
+
+
+def test_contract_guard_allows_existing_job_new_scope_below_workflow_ceiling():
+    # gate#433: an EXISTING job adding a scope to its declaration stays
+    # caller-compatible as long as it does not exceed the baseline
+    # workflow-level ceiling: GitHub sets unspecified scopes of a job-level
+    # declaration to none, so the old declaration granted nothing for the
+    # new scope either, and the workflow ceiling caps what any job can get.
+    # (replay-plan adding actions:read under an actions:write ceiling.)
+    baseline = {
+        "on": {"workflow_call": {}},
+        "permissions": {"actions": "write", "contents": "read", "pull-requests": "read"},
+        "jobs": {
+            "replay-plan": {
+                "permissions": {"contents": "read", "pull-requests": "read"}
+            }
+        },
+    }
+    current = {
+        "on": {"workflow_call": {}},
+        "permissions": {"actions": "write", "contents": "read", "pull-requests": "read"},
+        "jobs": {
+            "replay-plan": {
+                "permissions": {
+                    "actions": "read",
+                    "contents": "read",
+                    "pull-requests": "read",
+                }
+            }
+        },
+    }
+    assert contract_violations(baseline, current) == []
+
+
+def test_contract_guard_rejects_existing_job_new_scope_above_workflow_ceiling():
+    # gate#433 companion case: the ceiling rule must not swallow real
+    # expansions — a scope the baseline workflow never grants stays an
+    # expansion even on an existing job.
+    baseline = {
+        "on": {"workflow_call": {}},
+        "permissions": {"contents": "read"},
+        "jobs": {
+            "replay-plan": {"permissions": {"contents": "read"}}
+        },
+    }
+    current = {
+        "on": {"workflow_call": {}},
+        "permissions": {"contents": "read"},
+        "jobs": {
+            "replay-plan": {
+                "permissions": {"contents": "read", "issues": "write"}
+            }
+        },
+    }
+    assert "permission expanded at job:replay-plan: issues 0->2" in contract_violations(
+        baseline, current
+    )
 
 
 def test_contract_guard_allows_new_job_permission_below_workflow_ceiling():

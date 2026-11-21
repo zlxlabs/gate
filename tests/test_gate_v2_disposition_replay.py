@@ -159,13 +159,17 @@ def test_replay_plan_preflight_contract():
     # artifact reported as two distinct errors; guidance text must tell the
     # caller what to change. Existence-only: no nodeid parsing here.
     plan = _job("replay-plan")
-    # The artifacts query needs the Actions scope; it is granted at the
-    # workflow level (actions: write, mirrored by caller templates) and the
-    # job inherits it — a job-level re-declaration would trip the
-    # caller-contract guard's expansion check (gate#433). The declaration
-    # must stay shape-compatible with the v2 baseline (contents +
-    # pull-requests only) and the workflow ceiling must cover actions.
-    assert plan["permissions"] == {"contents": "read", "pull-requests": "read"}
+    # gate#433: the preflight artifacts query needs the Actions read scope.
+    # A job-level declaration sets every scope it omits to none (docs:
+    # Assigning permissions to jobs), so actions MUST be declared here even
+    # though the workflow ceiling grants actions:write; the caller-contract
+    # guard allows this because the declaration stays under that ceiling.
+    assert plan["permissions"].get("actions") in ("read", "write")
+    assert plan["permissions"].get("contents") == "read"
+    assert plan["permissions"].get("pull-requests") == "read"
+    # The guard's ceiling rule presupposes the workflow-level ceiling covers
+    # actions; if that ever disappears, both the guard and the job need to
+    # move together.
     workflow_permissions = _workflow()["permissions"]
     assert workflow_permissions.get("actions") in ("read", "write")
     step = _step(plan, "Preflight canonical quality junit artifact")

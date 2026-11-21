@@ -178,11 +178,13 @@ jobs:
       contents: read
       pull-requests: read
       # gate#433: the preflight artifacts existence query needs the Actions
-      # read scope, which the workflow-level ceiling already grants
-      # (actions: write; caller templates grant the same). Do NOT re-declare
-      # a job-level actions scope here: appending a scope to an existing
-      # job-level declaration trips the caller-contract guard's expansion
-      # check even though it is a reduction against the ceiling.
+      # read scope. GitHub sets every scope a job-level declaration omits to
+      # none (docs: Assigning permissions to jobs), so this MUST be declared
+      # here — the workflow-level actions:write ceiling only caps what the
+      # caller may grant, it is not inherited into the job. The declaration
+      # stays under that ceiling, which is what the caller-contract guard's
+      # job-level ceiling rule (gate#433) checks.
+      actions: read
     outputs:
       behavior: ${{ steps.classify.outputs.behavior }}
       head_sha: ${{ steps.classify.outputs.head_sha }}
