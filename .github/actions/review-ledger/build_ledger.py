@@ -43,7 +43,7 @@ PRIMARY_SPEC_FIELDS = ("spec_source", "pr_body_digest")
 PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
     "kind", "schema_version", "verdict", "attempts", "shadow_mode", "expected_shadows",
     "result", "cost", "tokens", "runtime", "not_expected_reason", "waiver", "risk",
-    "finding_relation", "intent_provenance",
+    "finding_relation", "intent_provenance", "blocking_matrix",
 }
 # Mirrors gate-hub scripts/review/contracts.py INTENT_PROVENANCE_FIELDS /
 # INTENT_SOURCE_VALUES / intent_provenance_error: the optional composite the
@@ -288,6 +288,12 @@ def _primary_identity(
             raise ValueError(
                 "canonical primary intent_provenance skipped_sources must be an array of non-empty strings"
             )
+    if "blocking_matrix" in audit and (
+        not isinstance(audit["blocking_matrix"], dict) or set(audit["blocking_matrix"]) != {"version", "tier"}
+        or not _strict_int(audit["blocking_matrix"]["version"]) or audit["blocking_matrix"]["version"] != 1
+        or audit["blocking_matrix"]["tier"] not in {"personal", "internal", "saas"}
+    ):
+        raise ValueError("canonical primary blocking_matrix must be exactly {version: 1, tier: declared tier}")
     if (
         isinstance(audit["repository_id"], bool) or not isinstance(audit["repository_id"], int)
         or audit["repository_id"] <= 0
@@ -319,9 +325,7 @@ def _primary_identity(
         if not isinstance(audit["spec_source"], str) or audit["spec_source"] not in {"live", "event_payload"}:
             raise ValueError("canonical primary spec_source is invalid")
         digest = audit["pr_body_digest"]
-        if digest != "empty" and (
-            not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{12}", digest)
-        ):
+        if digest != "empty" and (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{12}", digest)):
             raise ValueError("canonical primary pr_body_digest is invalid")
     expected = {"repository": repository, "pr": pr_number, "run_id": run_id, "head_sha": head_sha}
     expected.update(expected_identity or {})
@@ -343,9 +347,7 @@ def _primary_identity(
         raise ValueError("canonical primary reviewer must be None when no reviewer ran")
     if audit["shadow_mode"] != "detached":
         raise ValueError("canonical primary shadow_mode must be 'detached'")
-    if not isinstance(audit["expected_shadows"], list) or not all(
-        isinstance(name, str) and name for name in audit["expected_shadows"]
-    ):
+    if not isinstance(audit["expected_shadows"], list) or not all(isinstance(name, str) and name for name in audit["expected_shadows"]):
         raise ValueError("canonical primary expected_shadows must be an array of names")
     attempts = audit["attempts"]
     if not isinstance(attempts, list):
@@ -355,12 +357,10 @@ def _primary_identity(
     for attempt in attempts:
         if not isinstance(attempt, dict) or any(field not in attempt for field in required_attempt_fields):
             raise ValueError("canonical primary attempts have an invalid consumed shape")
-        if not isinstance(attempt["reviewer"], str) or not attempt["reviewer"]:
-            raise ValueError("canonical primary attempt reviewer must be a non-empty string")
+        if not isinstance(attempt["reviewer"], str) or not attempt["reviewer"]: raise ValueError("canonical primary attempt reviewer must be a non-empty string")
         if isinstance(attempt["exit_code"], bool) or not isinstance(attempt["exit_code"], int):
             raise ValueError("canonical primary attempt exit_code must be an integer")
-        if not isinstance(attempt["reason"], str):
-            raise ValueError("canonical primary attempt reason must be a string")
+        if not isinstance(attempt["reason"], str): raise ValueError("canonical primary attempt reason must be a string")
         if attempt["duration_s"] is None: raise ValueError("canonical primary attempt duration_s must be a number")
         _require_finite_nonnegative(attempt["duration_s"], "attempt duration_s")
         _require_finite_nonnegative(attempt["cost_usd"], "attempt cost_usd")
@@ -375,8 +375,7 @@ def _primary_identity(
             raise ValueError(f"canonical primary telemetry fields are missing: {sorted(missing)}")
     _require_finite_nonnegative(audit.get("cost"), "cost")
     tokens = audit.get("tokens")
-    if tokens is not None and not isinstance(tokens, list):
-        raise ValueError("canonical primary tokens must be an array or null")
+    if tokens is not None and not isinstance(tokens, list): raise ValueError("canonical primary tokens must be an array or null")
     runtime_present = "runtime" in audit
     runtime = audit.get("runtime")
     if runtime is not None:
