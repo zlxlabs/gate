@@ -1,6 +1,6 @@
 """Caller checkout stays on `actions/checkout` in this PR (gate-hub W3a narrowing).
 
-The five caller-checkout step groups — network-bytes measurement, prime step,
+The four caller-checkout step groups — network-bytes measurement, prime step,
 `actions/checkout`, trailing network-bytes measurement — must remain byte-equal
 to the origin/main baseline that predates the source-service work.  The baseline
 bytes live in ``tests/fixtures/caller-checkout-baseline/`` (extracted from the
@@ -24,7 +24,6 @@ CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 SITES = (
     (WORKFLOW, "quality"),
     (WORKFLOW, "primary"),
-    (WORKFLOW, "ocr"),
     (SHADOW_WORKFLOW, "classify_pr_paths"),
     (SHADOW_WORKFLOW, "shadow"),
 )

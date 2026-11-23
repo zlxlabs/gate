@@ -312,55 +312,13 @@ sys.exit(rc)
     panel.write_bytes(b'{"delivery":"producer bytes"}\n')
 
     jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
-    steps = jobs["primary"]["steps"] + jobs["ocr"]["steps"] + jobs["gate"]["steps"]
-    reviewer = "claude-glm-5-3"
-    post = next(step for step in jobs["ocr"]["steps"] if step.get("name") == "Post advisory PR comment")
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    gh = fake_bin / "gh"
-    gh.write_text('''#!/bin/sh
-case "$*" in
-  *"api user"*) echo '{"id":41898282,"login":"github-actions[bot]"}' ;;
-  *--paginate*) echo '[]' ;;
-  *"--method POST"*)
-    if [ "$FAKE_GH_MODE" = failure ]; then echo "HTTP 503" >&2; exit 1; fi
-    echo '{"id":77}' ;;
-  *) exit 2 ;;
-esac
-''', encoding="utf-8")
-    gh.chmod(0o755)
-    timeout = fake_bin / "timeout"
-    timeout.write_text('#!/bin/sh\nshift 2\nexec "$@"\n', encoding="utf-8"); timeout.chmod(0o755)
-    scrub = tmp_path / "_gate-scrub-src/scripts/scrub_outbound.py"
-    scrub.parent.mkdir(parents=True); scrub.write_text("import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n", encoding="utf-8")
-    advisories = []
-    for index, (mode, comment) in enumerate((("normal", b"review comment\n"), ("empty", b""), ("failure", b"review comment\n"))):
-        advisory = base / f"shadow-{mode}" / "advisory"
-        advisory.mkdir(parents=True)
-        current_run = str(int(run_id) + index)
-        event = advisory / f"shadow-review-v1-{repo_id}-{head}-{reviewer}-{current_run}-{attempt}.json"; event.write_bytes((REPO_ROOT / "tests/fixtures/advisory-shadow-event-v1.json").read_bytes())
-        comment_path = advisory / f"advisory-comment-{reviewer}.md"; comment_path.write_bytes(comment)
-        env = {**os.environ, **{key: str(value) for key, value in post["env"].items()},
-               "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}", "GH_TOKEN": "test",
-               "GITHUB_REPOSITORY": "zlxlabs/gate", "PR_NUMBER": "1", "REVIEWER": reviewer,
-               "REVIEW_SHADOW_EVENT_DIR": str(advisory.parent),
-               "GITHUB_STEP_SUMMARY": str(tmp_path / f"summary-{mode}.md"), "FAKE_GH_MODE": mode}
-        subprocess.run(["bash", "-euo", "pipefail", "-c", post["run"]], cwd=tmp_path, env=env,
-                       check=True, capture_output=True)
-        names = {path.name for path in advisory.iterdir()}
-        expected_names = {event.name, comment_path.name} if mode == "empty" else {
-            event.name, f"advisory-sticky-{reviewer}.md", f"advisory-sticky-{reviewer}.json",
-            f"advisory-delivery-{reviewer}.json"}
-        assert names == expected_names
-        assert mode == "empty" or json.loads((advisory / f"advisory-delivery-{reviewer}.json").read_bytes())["delivery"] == ("created" if mode == "normal" else "not_created")
-        advisories.append((advisory, f"advisory-event-{reviewer}-{current_run}-{attempt}"))
+    steps = jobs["primary"]["steps"] + jobs["gate"]["steps"]
 
     sources = [
         ("Archive primary review diagnostics permanently", primary, "DIAGNOSTICS_DIR", f"primary-review-diagnostics-v2-{repo_id}-{head}-{run_id}-{attempt}"),
         ("Archive convergence receipt permanently", convergence, "RECEIPT_DIR", f"gate-convergence-receipt-v1-{repo_id}-{head}-{run_id}-{attempt}"),
         ("Archive gate status panel delivery diagnostic permanently", panel, "PANEL_PATH", f"gate-status-panel-delivery-v1-{repo_id}-{head}-{run_id}-{attempt}"),
     ]
-    sources.extend(("Archive advisory review event permanently", source, "ADVISORY_DIR", name) for source, name in advisories)
     expected = {}
     for label, source, variable, name in sources:
         step = next(step for step in steps if step.get("name") == label)
@@ -384,7 +342,7 @@ esac
     puts = {key for method, key in saved["calls"] if method == "PUT"}
     gets = {key for method, key in saved["calls"] if method == "GET"}
     assert puts == gets == set(expected)
-    assert [args[0] for args in saved["argv"]] == ["put-dir", "put-dir", "put"] + ["put-dir"] * 3
+    assert [args[0] for args in saved["argv"]] == ["put-dir", "put-dir", "put"]
     assert saved["argv"][0][-2:] == ["--empty", "skip"]
     for key, payload in expected.items():
         if payload is None:

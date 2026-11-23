@@ -172,8 +172,15 @@ def contract_violations(baseline, current) -> list[str]:
     old_permissions = _permission_declarations(baseline)
     new_permissions = _permission_declarations(current)
     baseline_workflow_decl = old_permissions.get("workflow")
+    current_job_ids = set((current.get("jobs", {}) or {}).keys())
     for location in old_permissions:
-        if location not in new_permissions:
+        if location in new_permissions:
+            continue
+        # Retiring a whole job removes its declaration without breaking any
+        # surviving caller contract: the caller only needs the grant while the
+        # job exists (gate#2463). A surviving job dropping its own declaration,
+        # or the workflow-level declaration disappearing, is still a break.
+        if location == "workflow" or location.partition(":")[2] in current_job_ids:
             violations.append(f"permissions declaration removed at {location}")
     for location, current_decl in new_permissions.items():
         old_decl = old_permissions.get(location)
