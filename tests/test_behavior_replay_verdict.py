@@ -141,9 +141,13 @@ def _issue_behavior(tmp_path: Path, *, counterevidence, replay_dir, canonical_di
     ]
     env = {
         **os.environ, "PRIMARY_RUN_ID": "7", "PRIMARY_RUN_ATTEMPT": "1",
-        "BEHAVIOR_REPLAY_DIR": str(replay_dir), "BEHAVIOR_CANONICAL_JUNIT_DIR": str(canonical_dir),
+        "BEHAVIOR_REPLAY_DIR": str(replay_dir),
         "GITHUB_RUN_ID": "99", "GITHUB_RUN_ATTEMPT": "1",
     }
+    if canonical_dir is not None:
+        env["BEHAVIOR_CANONICAL_JUNIT_DIR"] = str(canonical_dir)
+    else:
+        env.pop("BEHAVIOR_CANONICAL_JUNIT_DIR", None)
     return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, env=env), output_dir
 
 
@@ -153,7 +157,8 @@ def _dirs_with_xmls(tmp_path: Path, *, canonical_xml, baseline_xml, red_xml, exi
     canon.mkdir(parents=True)
     (replay / "baseline.xml").write_bytes(baseline_xml.read_bytes())
     (replay / "red.xml").write_bytes(red_xml.read_bytes())
-    (canon / "junit.xml").write_bytes(canonical_xml.read_bytes())
+    if canonical_xml is not None:
+        (canon / "junit.xml").write_bytes(canonical_xml.read_bytes())
     (replay / "exit_codes.json").write_text(
         json.dumps({"baseline": exit_baseline, "red": 1, "apply_ok": apply_ok}),
     )
@@ -175,16 +180,23 @@ def xmls(tmp_path_factory):
         "error": make("error", SOURCES["error"]),
         "skip": make("skip", SOURCES["skip"]),
         "timeout": make("timeout", SOURCES["timeout"]),
+        "collection_error": make(
+            "collection_error", "def test_locked_behavior(:\n    pass\n",
+        ),
         "other": make("other", SOURCES["other"], "tests/test_other.py::test_other", "test_other.py"),
         "param_pass": make("param_pass", SOURCES["param_pass"], PARAM_NODEID),
         "param_fail": make("param_fail", SOURCES["param_fail"], PARAM_NODEID),
     }
 
 
-def _issue(tmp_path, xmls, red, *, nodeid=LOCK_NODEID, payload=None, canonical="passed", **dir_kw):
+def _issue(
+    tmp_path, xmls, red, *, nodeid=LOCK_NODEID, payload=None,
+    canonical="passed", baseline="passed", **dir_kw,
+):
     replay, canon = _dirs_with_xmls(
         tmp_path / "evidence",
-        canonical_xml=xmls[canonical], baseline_xml=xmls[canonical], red_xml=xmls[red],
+        canonical_xml=xmls[canonical] if canonical is not None else None,
+        baseline_xml=xmls[baseline], red_xml=xmls[red],
         **dir_kw,
     )
     return _issue_behavior(
@@ -241,8 +253,13 @@ def test_issuer_rejects_skip(tmp_path, xmls):
 
 
 def test_issuer_rejects_missing_nodeid(tmp_path, xmls):
-    result, _ = _issue(tmp_path, xmls, "other")
+    result, _ = _issue(tmp_path, xmls, "other", canonical=None)
     assert result.returncode != 0 and "behavior_nodeid_not_collected" in result.stderr
+
+
+def test_issuer_rejects_passed_red_nodeid(tmp_path, xmls):
+    result, _ = _issue(tmp_path, xmls, "passed", canonical=None)
+    assert result.returncode != 0 and "behavior_red_not_failure" in result.stderr
 
 
 def test_issuer_accepts_parametrized_nodeid(tmp_path, xmls):
@@ -258,16 +275,52 @@ def test_issuer_rejects_timeout_marker_in_message(tmp_path, xmls):
     assert result.returncode != 0 and "behavior_red_not_assertion" in result.stderr
 
 
-def test_issuer_rejects_missing_canonical_dir(tmp_path, xmls):
-    replay, _ = _dirs_with_xmls(
-        tmp_path / "evidence", canonical_xml=xmls["passed"], baseline_xml=xmls["passed"],
+@pytest.mark.parametrize("location", ["missing-dir", "empty-dir", "unset"])
+def test_issuer_signs_without_optional_canonical_junit(tmp_path, xmls, location):
+    replay, canon = _dirs_with_xmls(
+        tmp_path / "evidence", canonical_xml=None, baseline_xml=xmls["passed"],
         red_xml=xmls["assert"],
     )
-    result, _ = _issue_behavior(
+    canonical_dir = canon
+    if location == "missing-dir":
+        canon.rmdir()
+        canonical_dir = tmp_path / "missing-canonical"
+    elif location == "unset":
+        canonical_dir = None
+    result, output_dir = _issue_behavior(
         tmp_path / "issue", counterevidence=_payload(),
-        replay_dir=replay, canonical_dir=tmp_path / "missing-canonical",
+        replay_dir=replay, canonical_dir=canonical_dir,
     )
-    assert result.returncode != 0 and "behavior_canonical_junit_missing" in result.stderr
+    assert result.returncode == 0, result.stderr
+    artifact = json.loads(result.stdout)["artifact"]
+    receipt_bytes = (output_dir / artifact).read_bytes()
+    receipt = json.loads(receipt_bytes)
+    replay_evidence = receipt["counterevidence"]["gate_replay"]
+    assert replay_evidence["canonical_outcome"] == "absent"
+    assert replay_evidence["canonical_xml_sha256"] is None
+    assert BEHAVIOR.behavior_gate_replay_reason(receipt["counterevidence"]) is None
+    # Feed a contradictory canonical-present/non-passed record across the
+    # serialized receipt boundary; the consumer must still reject it.
+    contradictory = json.loads(receipt_bytes)
+    contradictory["counterevidence"]["gate_replay"]["canonical_outcome"] = "failure"
+    contradictory_wire = json.dumps(
+        contradictory, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    contradictory_receipt = json.loads(contradictory_wire)
+    assert BEHAVIOR.behavior_gate_replay_reason(
+        contradictory_receipt["counterevidence"],
+    ) == "behavior_canonical_not_passed"
+
+
+@pytest.mark.parametrize(
+    "canonical_key",
+    ["assert", "skip", "error"],
+    ids=["failure", "skipped", "error"],
+)
+def test_issuer_rejects_present_canonical_nonpassed(tmp_path, xmls, canonical_key):
+    result, _ = _issue(tmp_path, xmls, "assert", canonical=canonical_key)
+    assert result.returncode != 0
+    assert "behavior_canonical_not_passed" in result.stderr
 
 
 def test_issuer_rejects_author_forged_gate_replay(tmp_path, xmls):
@@ -306,15 +359,48 @@ def test_issuer_rejects_missing_exit_codes(tmp_path, xmls):
     assert result.returncode != 0 and "behavior_replay_timeout" in result.stderr
 
 
-def test_issuer_rejects_baseline_not_green(tmp_path, xmls):
-    result, _ = _issue(tmp_path, xmls, "assert", canonical="assert", exit_baseline=1)
+@pytest.mark.parametrize(
+    "baseline,exit_baseline,reason",
+    [
+        ("skip", 1, "behavior_baseline_not_green"),
+        ("error", 1, "behavior_baseline_not_green"),
+        ("collection_error", 2, "behavior_nodeid_not_collected"),
+        ("other", 0, "behavior_nodeid_not_collected"),
+    ],
+    ids=["skip", "fixture-error", "collection-error", "wrong-nodeid"],
+)
+def test_issuer_rejects_nonpassing_baseline_without_canonical(
+    tmp_path, xmls, baseline, exit_baseline, reason,
+):
+    result, _ = _issue(
+        tmp_path, xmls, "assert", canonical=None, baseline=baseline,
+        exit_baseline=exit_baseline,
+    )
     assert result.returncode != 0
-    assert "behavior_baseline_not_green" in result.stderr or "behavior_canonical_not_passed" in result.stderr
+    assert reason in result.stderr
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"head_sha": "b" * 40}, "behavior_head_sha_mismatch"),
+        ({"primary_run_attempt": "2"}, "behavior_primary_run_attempt_mismatch"),
+        ({"primary_run_id": "8"}, "behavior_primary_run_id_mismatch"),
+    ],
+    ids=["wrong-head", "wrong-attempt", "wrong-run"],
+)
+def test_issuer_rejects_wrong_primary_binding_without_canonical(tmp_path, xmls, changes, reason):
+    result, _ = _issue(
+        tmp_path, xmls, "assert", canonical=None, payload=_payload(**changes),
+    )
+    assert result.returncode != 0
+    assert reason in result.stderr
 
 
 def _gate_replay(**changes):
     body = {
-        "contract_version": 1, "replay_run_id": "99", "replay_run_attempt": "1",
+        "contract_version": BEHAVIOR.BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION,
+        "replay_run_id": "99", "replay_run_attempt": "1",
         "canonical_outcome": "passed", "baseline_outcome": "passed", "red_outcome": "failure",
         "red_failure_type": "AssertionError",
         "canonical_xml_sha256": "a" * 64, "baseline_xml_sha256": "b" * 64, "red_xml_sha256": "c" * 64,
@@ -322,6 +408,15 @@ def _gate_replay(**changes):
     }
     body.update(changes)
     return body
+
+
+@pytest.mark.parametrize("canonical_outcome", ["absent", None], ids=["absent", "null"])
+def test_behavior_consumer_accepts_optional_canonical_outcome(canonical_outcome):
+    replay = _gate_replay(
+        canonical_outcome=canonical_outcome,
+        canonical_xml_sha256=None,
+    )
+    assert BEHAVIOR.behavior_gate_replay_reason(replay) is None
 
 
 def _behavior_receipt(scope=None, *, primary=None):
@@ -368,7 +463,7 @@ def test_convergence_accepts_behavior_gate_replay():
         ({"baseline_outcome": "failure"}, "behavior_baseline_not_passed"),
         ({"red_outcome": "passed"}, "behavior_red_not_failure"),
         ({"red_failure_type": "TimeoutError"}, "behavior_red_not_assertion"),
-        ({"contract_version": 2}, "behavior_contract_version_invalid"),
+        ({"contract_version": 1}, "behavior_contract_version_invalid"),
     ],
     ids=["canonical", "baseline", "red-passed", "timeout-type", "version"],
 )

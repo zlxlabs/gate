@@ -13,7 +13,7 @@ import re
 
 
 # Increment when accepted payload shapes or rejection results change.
-BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION = 1
+BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION = 2
 
 PATCH_MAX_BYTES = 8192
 LINE_WINDOW_TOLERANCE = 4
@@ -288,14 +288,22 @@ def behavior_gate_replay_reason(evidence: object) -> str | None:
         return "behavior_replay_incomplete"
     if not isinstance(replay.get("replay_run_attempt"), str) or not replay["replay_run_attempt"]:
         return "behavior_replay_incomplete"
-    for key in ("canonical_xml_sha256", "baseline_xml_sha256", "red_xml_sha256"):
+    canonical_outcome = replay.get("canonical_outcome")
+    canonical_digest = replay.get("canonical_xml_sha256")
+    if canonical_outcome == "passed":
+        if not isinstance(canonical_digest, str) or _SHA256_RE.fullmatch(canonical_digest) is None:
+            return "behavior_replay_incomplete"
+    elif canonical_outcome in ("absent", None):
+        if canonical_digest is not None:
+            return "behavior_replay_incomplete"
+    else:
+        return "behavior_canonical_not_passed"
+    for key in ("baseline_xml_sha256", "red_xml_sha256"):
         digest = replay.get(key)
         if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
             return "behavior_replay_incomplete"
     if not isinstance(replay.get("exit_codes"), dict):
         return "behavior_replay_incomplete"
-    if replay.get("canonical_outcome") != "passed":
-        return "behavior_canonical_not_passed"
     if replay.get("baseline_outcome") != "passed":
         return "behavior_baseline_not_passed"
     if replay.get("red_outcome") != "failure":

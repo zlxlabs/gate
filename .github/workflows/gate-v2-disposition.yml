@@ -190,6 +190,7 @@ jobs:
       head_sha: ${{ steps.classify.outputs.head_sha }}
       nodeid: ${{ steps.classify.outputs.nodeid }}
       runs_on: ${{ steps.guard.outputs.runs_on }}
+      canonical_junit: ${{ steps.canonical.outputs.found }}
     steps:
       # behavior=true only for disposition=false-positive whose
       # counterevidence_json parses to a JSON object with kind=behavior_replay.
@@ -294,14 +295,10 @@ jobs:
               out.write("runs_on=" + json.dumps(["self-hosted", "linux", "ci"]) + "\n")
           PY
 
-      # gate#433: whether the canonical quality junit exists is decidable
-      # before anything runs, so the check lives in the earliest job instead
-      # of surfacing only after replay has already burned a run. Bare
-      # existence only — the authoritative nodeid-passed verdict stays in
-      # control (issue_receipt.py). "Artifact not found" and "query itself
-      # failed" are two distinct errors: one means this caller cannot use
-      # behavior_replay at all, the other is an API problem.
+      # Canonical quality JUnit is optional corroboration. Query failures are
+      # still fatal; a successful query with no artifact records found=false.
       - name: Preflight canonical quality junit artifact
+        id: canonical
         if: steps.classify.outputs.behavior == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -327,21 +324,27 @@ jobs:
                   file=sys.stderr,
               )
               sys.exit(1)
-          # Paged: the artifacts API caps per_page at 100 and a primary run can
-          # carry more artifacts than that; stopping after page 1 would report a
-          # false missing. expired=true cannot be downloaded, so control's
-          # authoritative fetch would fail anyway — same as absent.
           page = 1
+          found = False
           while True:
-              proc = subprocess.run(
-                  [
-                      "gh", "api",
-                      f"repos/{repo}/actions/runs/{run_id}/artifacts"
-                      f"?per_page=100&page={page}",
-                  ],
-                  capture_output=True,
-                  text=True,
-              )
+              try:
+                  proc = subprocess.run(
+                      [
+                          "gh", "api",
+                          f"repos/{repo}/actions/runs/{run_id}/artifacts"
+                          f"?per_page=100&page={page}",
+                      ],
+                      capture_output=True,
+                      text=True,
+                      timeout=30,
+                  )
+              except (OSError, subprocess.TimeoutExpired) as exc:
+                  print(
+                      "::error::behavior_canonical_junit_lookup_failed: artifacts query"
+                      f" for run {run_id} failed: {exc}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
               if proc.returncode != 0:
                   print(
                       "::error::behavior_canonical_junit_lookup_failed: artifacts query"
@@ -349,25 +352,35 @@ jobs:
                       file=sys.stderr,
                   )
                   sys.exit(1)
-              data = json.loads(proc.stdout)
-              artifacts = data.get("artifacts") or []
+              try:
+                  data = json.loads(proc.stdout)
+                  artifacts = data["artifacts"]
+                  total = data.get("total_count")
+                  if (
+                      not isinstance(data, dict)
+                      or not isinstance(artifacts, list)
+                      or (total is not None and (not isinstance(total, int) or isinstance(total, bool)))
+                      or any(not isinstance(artifact, dict) for artifact in artifacts)
+                  ):
+                      raise ValueError("unexpected artifacts API response shape")
+              except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                  print(
+                      "::error::behavior_canonical_junit_lookup_failed: invalid artifacts"
+                      f" response for run {run_id}: {exc}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
               if any(
-                  a.get("name") == target and not a.get("expired") for a in artifacts
+                  artifact.get("name") == target and not artifact.get("expired")
+                  for artifact in artifacts
               ):
-                  sys.exit(0)
-              total = data.get("total_count")
+                  found = True
+                  break
               if not artifacts or (total is not None and page * 100 >= total):
                   break
               page += 1
-          print(
-              "::error::behavior_canonical_junit_missing: artifact " + target
-              + f" not on run {run_id} attempt {attempt}; the caller's quality entry must"
-              " write junit XML under $GATE_ARTIFACT_DIR/junit/ (entry mode) or go through"
-              f" the legacy pyproject path so the primary run uploads {target};"
-              " a caller whose quality lane produces no junit cannot use behavior_replay",
-              file=sys.stderr,
-          )
-          sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("found=" + ("true" if found else "false") + "\n")
           PY
 
   replay:
@@ -843,7 +856,7 @@ jobs:
           path: ${{ runner.temp }}/behavior-replay
 
       - name: Fetch canonical quality junit
-        if: ${{ needs.replay-plan.outputs.behavior == 'true' }}
+        if: ${{ needs.replay-plan.outputs.behavior == 'true' && needs.replay-plan.outputs.canonical_junit == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           PRIMARY_RUN_ID: ${{ inputs.primary_run_id }}
@@ -854,7 +867,7 @@ jobs:
           mkdir -p "$dest"
           name="gate-quality-junit-${PRIMARY_RUN_ID}-${PRIMARY_RUN_ATTEMPT}"
           gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$name" --dir "$dest" || {
-            echo "::error::behavior_canonical_junit_missing: artifact $name not on run $PRIMARY_RUN_ID attempt $PRIMARY_RUN_ATTEMPT" >&2
+            echo "::error::behavior_canonical_junit_lookup_failed: artifact $name was found but download failed from run $PRIMARY_RUN_ID attempt $PRIMARY_RUN_ATTEMPT" >&2
             exit 1
           }
 

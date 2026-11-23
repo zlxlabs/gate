@@ -404,12 +404,10 @@ def _issue_behavior_counterevidence(
     if reason is not None:
         raise ValueError(reason)
     replay_dir = Path(_required(args, envelope, "behavior_replay_dir", "BEHAVIOR_REPLAY_DIR"))
-    canonical_dir = Path(
-        _required(args, envelope, "behavior_canonical_junit_dir", "BEHAVIOR_CANONICAL_JUNIT_DIR"),
+    canonical_dir_value = _value(
+        args, envelope, "behavior_canonical_junit_dir", "BEHAVIOR_CANONICAL_JUNIT_DIR",
     )
-    canonical_xmls = _xml_files(canonical_dir)
-    if not canonical_xmls:
-        raise ValueError("behavior_canonical_junit_missing")
+    canonical_xmls = _xml_files(Path(canonical_dir_value)) if canonical_dir_value else []
     baseline_xml = replay_dir / "baseline.xml"
     red_xml = replay_dir / "red.xml"
     exit_path = replay_dir / "exit_codes.json"
@@ -421,12 +419,13 @@ def _issue_behavior_counterevidence(
     if not isinstance(exit_codes, dict) or exit_codes.get("apply_ok") is not True:
         raise ValueError("behavior_patch_apply_failed")
     nodeid = payload["nodeid"]
-    canonical_cases = _cases_for_nodeid(canonical_xmls, nodeid)
-    canonical_reason = _judge_passed(
-        canonical_cases, not_green="behavior_canonical_not_passed",
-    )
-    if canonical_reason is not None:
-        raise ValueError(canonical_reason)
+    if canonical_xmls:
+        canonical_cases = _cases_for_nodeid(canonical_xmls, nodeid)
+        canonical_reason = _judge_passed(
+            canonical_cases, not_green="behavior_canonical_not_passed",
+        )
+        if canonical_reason is not None:
+            raise ValueError(canonical_reason)
     baseline_cases = _cases_for_nodeid([baseline_xml], nodeid)
     baseline_reason = _judge_passed(
         baseline_cases, not_green="behavior_baseline_not_green",
@@ -448,11 +447,11 @@ def _issue_behavior_counterevidence(
         "contract_version": _BEHAVIOR.BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION,
         "replay_run_id": replay_run_id,
         "replay_run_attempt": replay_run_attempt,
-        "canonical_outcome": "passed",
+        "canonical_outcome": "passed" if canonical_xmls else "absent",
         "baseline_outcome": "passed",
         "red_outcome": "failure",
         "red_failure_type": failure_type,
-        "canonical_xml_sha256": _sha256_file(canonical_xmls[0]),
+        "canonical_xml_sha256": _sha256_file(canonical_xmls[0]) if canonical_xmls else None,
         "baseline_xml_sha256": _sha256_file(baseline_xml),
         "red_xml_sha256": _sha256_file(red_xml),
         "exit_codes": exit_codes,
