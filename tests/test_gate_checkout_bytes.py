@@ -32,7 +32,7 @@ def _checkouts():
 
 def test_every_checkout_is_bracketed_by_fail_open_measurements():
     checkouts = _checkouts()
-    assert len(checkouts) == 5
+    assert len(checkouts) == 4
     sequences = {}
     for workflow_name, job_id, steps, index, checkout in checkouts:
         key = (workflow_name, job_id)

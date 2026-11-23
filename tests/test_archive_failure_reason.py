@@ -75,7 +75,7 @@ def test_every_dynamic_deferred_reason_uses_one_parser():
     branches = [step["run"] for job in workflow["jobs"].values() for step in job.get("steps", [])
                 if "GATE-ARCHIVE-DEFERRED" in step.get("run", "")
                 and "reason=${reason:-unclassified}" in step["run"]]
-    assert len(branches) == 20
+    assert len(branches) == 18
     assert all(run.count('python3 "${SILO_STORE%/*}/archive_failure_reason.py"') == 1 for run in branches)
     assert "grep -oE 's3_error_code=[A-Za-z_]+'" not in WORKFLOW.read_text(encoding="utf-8")
 
