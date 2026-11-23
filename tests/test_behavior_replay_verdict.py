@@ -227,7 +227,7 @@ def test_issuer_accepts_assert_failure_red(tmp_path, xmls):
     assert replay_obj["canonical_outcome"] == replay_obj["baseline_outcome"] == "passed"
     assert replay_obj["red_outcome"] == "failure"
     assert replay_obj["red_failure_type"] == "AssertionError"
-    assert replay_obj["contract_version"] == 1
+    assert replay_obj["contract_version"] == 2
     assert replay_obj["replay_run_id"] == "99"
 
 
@@ -263,7 +263,10 @@ def test_issuer_rejects_passed_red_nodeid(tmp_path, xmls):
 
 
 def test_issuer_accepts_parametrized_nodeid(tmp_path, xmls):
-    result, output_dir = _issue(tmp_path, xmls, "param_fail", nodeid=PARAM_NODEID, canonical="param_pass")
+    result, output_dir = _issue(
+        tmp_path, xmls, "param_fail", nodeid=PARAM_NODEID,
+        canonical="param_pass", baseline="param_pass",
+    )
     assert result.returncode == 0, result.stderr
     body = json.loads((output_dir / json.loads(result.stdout)["artifact"]).read_text())
     assert body["counterevidence"]["nodeid"] == PARAM_NODEID
@@ -416,7 +419,7 @@ def test_behavior_consumer_accepts_optional_canonical_outcome(canonical_outcome)
         canonical_outcome=canonical_outcome,
         canonical_xml_sha256=None,
     )
-    assert BEHAVIOR.behavior_gate_replay_reason(replay) is None
+    assert BEHAVIOR.behavior_gate_replay_reason({"gate_replay": replay}) is None
 
 
 def _behavior_receipt(scope=None, *, primary=None):
