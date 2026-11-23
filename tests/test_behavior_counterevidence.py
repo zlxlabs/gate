@@ -33,9 +33,9 @@ MOD = _load(MODULE_PATH, "gate_public_behavior_counterevidence")
 VECTORS = json.loads(VECTORS_PATH.read_text(encoding="utf-8"))
 
 
-def test_contract_version_is_1():
-    assert MOD.BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION == 1
-    assert VECTORS["contract_version"] == 1
+def test_contract_version_is_2():
+    assert MOD.BEHAVIOR_COUNTEREVIDENCE_CONTRACT_VERSION == 2
+    assert VECTORS["contract_version"] == 2
 
 
 def test_vectors_cover_legal_and_boundary_cases():

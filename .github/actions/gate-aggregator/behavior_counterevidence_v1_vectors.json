@@ -1,5 +1,5 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "finding_id": "p1",
   "primary_run_id": "1234567890",
   "primary_run_attempt": "1",
