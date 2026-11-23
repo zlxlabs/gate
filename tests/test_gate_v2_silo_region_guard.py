@@ -244,8 +244,6 @@ def test_guard_counts_every_expected_touchpoint():
         "Upload primary review diagnostics",
         "Archive primary review diagnostics permanently",
         "Archive raw primary review evidence permanently",
-        "Upload advisory review event",
-        "Archive advisory review event permanently",
         "Upload convergence receipt",
         "Archive convergence receipt permanently",
         "Upload gate terminal envelope",
@@ -264,7 +262,7 @@ def test_guard_counts_every_expected_touchpoint():
     ):
         assert expected in labels, f"guard no longer sees touchpoint {expected!r}; labels={labels}"
     # 每个 job 的 MagicDNS 准备步骤也在触点集合内
-    assert sum(1 for label in labels if label == "Resolve Silo hostname via MagicDNS") == 4
+    assert sum(1 for label in labels if label == "Resolve Silo hostname via MagicDNS") == 3
 
 
 def test_guard_rejects_bookkeeping_without_step_coe_even_when_job_coe_is_set():

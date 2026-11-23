@@ -22,11 +22,7 @@ import yaml
 
 from scripts import silo_store as silo_store
 from scripts import gate_bounded_retry as retry
-from _gha_lint import (
-    find_arithmetic_gha_expression_offenders,
-    materialize_jobs_api_snippet_for_probe,
-    probe_jobs_api_failure_exit_code,
-)
+from _gha_lint import find_arithmetic_gha_expression_offenders
 from pr_size_preflight_compare_support import run_preflight_with_compare_stub
 from test_pr_size_preflight import _repo
 
@@ -50,27 +46,6 @@ DISPOSITION_PRODUCER_SPARSE = [
 ]
 AGGREGATOR_SCRIPT = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 ABANDONED_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "primary-abandoned-run-34740209146.json"
-ADVISORY_EVENT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "advisory-shadow-event-v1.json"
-POST_ADVISORY_GH_API_PRODUCER_FIXTURE = """publish_deadline_ms=$(( $(date +%s%3N) + OCR_PUBLISH_BUDGET_SECONDS * 1000 ))
-gh_api() {
-  local remaining_ms request_timeout_ms request_timeout
-  remaining_ms=$(( publish_deadline_ms - $(date +%s%3N) ))
-  if [ "$remaining_ms" -le 0 ]; then
-    return 124
-  fi
-  request_timeout_ms=$(( OCR_GITHUB_TIMEOUT_SECONDS * 1000 ))
-  if [ "$request_timeout_ms" -gt "$remaining_ms" ]; then
-    request_timeout_ms="$remaining_ms"
-  fi
-  # GNU timeout accepts fractional seconds, but not an `ms` suffix.
-  printf -v request_timeout '%d.%03ds' "$(( request_timeout_ms / 1000 ))" "$(( request_timeout_ms % 1000 ))"
-  timeout --foreground "$request_timeout" gh api "$@"
-  local status=$?
-  if [ "$(( publish_deadline_ms - $(date +%s%3N) ))" -le 0 ]; then
-    return 124
-  fi
-  return "$status"
-}"""
 
 FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository"
 DRAFT_GUARD = "github.event.pull_request.draft != true"
@@ -147,73 +122,6 @@ def _load_workflow():
     raw = yaml.safe_load(WORKFLOW.read_text())
     trigger = raw.get("on", raw.get(True))
     return raw, trigger
-
-
-def _post_advisory_gh_api_producer() -> str:
-    raw, _ = _load_workflow()
-    step = next(s for s in raw["jobs"]["ocr"]["steps"] if s.get("name") == "Post advisory PR comment")
-    run = step["run"]
-    start = run.index("publish_deadline_ms=")
-    end = run.index("\n\nset +e", start)
-    producer = run[start:end]
-    assert producer == POST_ADVISORY_GH_API_PRODUCER_FIXTURE
-    return producer
-
-
-def _run_post_advisory_gh_api(tmp_path, *, budget_seconds: int, date_values: list[int]):
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    date_values_path = tmp_path / "date-values"
-    date_values_path.write_text("".join(f"{value}\n" for value in date_values), encoding="utf-8")
-    date_index_path = tmp_path / "date-index"
-    date_index_path.write_text("0\n", encoding="utf-8")
-    argv_path = tmp_path / "gh-argv"
-    argv_path.write_bytes(b"")
-    fake_date = fake_bin / "date"
-    fake_date.write_text(
-        "#!/bin/sh\n"
-        'index=$(cat "$GATE_TEST_DATE_INDEX")\n'
-        'line=$((index + 1))\n'
-        'value=$(sed -n "${line}p" "$GATE_TEST_DATE_VALUES")\n'
-        'printf "%s\\n" "$line" > "$GATE_TEST_DATE_INDEX"\n'
-        'printf "%s\\n" "$value"\n',
-        encoding="utf-8",
-    )
-    fake_gh = fake_bin / "gh"
-    fake_gh.write_text(
-        "#!/bin/sh\n"
-        'printf "%s\\0" "$@" >> "$GATE_TEST_GH_ARGV"\n'
-        'printf "{\\"ok\\":true}\\n"\n',
-        encoding="utf-8",
-    )
-    fake_date.chmod(0o755)
-    fake_gh.chmod(0o755)
-    timeout_binary = shutil.which("timeout")
-    assert timeout_binary is not None
-    timeout_version = subprocess.run([timeout_binary, "--version"], capture_output=True, text=True, check=True)
-    assert "GNU coreutils" in timeout_version.stdout
-    env = os.environ.copy()
-    env.update(
-        {
-            "PATH": f"{fake_bin}:{env['PATH']}",
-            "GATE_TEST_DATE_INDEX": str(date_index_path),
-            "GATE_TEST_DATE_VALUES": str(date_values_path),
-            "GATE_TEST_GH_ARGV": str(argv_path),
-            "OCR_GITHUB_TIMEOUT_SECONDS": "15",
-            "OCR_PUBLISH_BUDGET_SECONDS": str(budget_seconds),
-        }
-    )
-    assert shutil.which("timeout", path=env["PATH"]) == timeout_binary
-    shell = (
-        f"{_post_advisory_gh_api_producer()}\n"
-        "set +e\n"
-        "gh_api user\n"
-        "status=$?\n"
-        "printf 'gh_api_rc=%s\\n' \"$status\"\n"
-    )
-    proc = subprocess.run(["bash", "-x", "-c", shell], env=env, capture_output=True, text=True, timeout=5)
-    argv = argv_path.read_bytes().split(b"\0")
-    return proc, argv[:-1] if argv[-1:] == [b""] else argv
 
 
 def _evaluate_primary_result_expr(expression: str, raw_result: str) -> str:
@@ -723,7 +631,7 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
     raw, _ = _load_workflow()
     text = WORKFLOW.read_text(encoding="utf-8")
     assert text.count("100.100.100.100") >= 4
-    for job_name in ("primary", "ocr", "gate", "ledger"):
+    for job_name in ("primary", "gate", "ledger"):
         steps = raw["jobs"][job_name]["steps"]
         names = [step.get("name") for step in steps]
         assert "Resolve Silo hostname via MagicDNS" in names
@@ -765,19 +673,16 @@ def test_silo_touching_jobs_resolve_magicdns_before_s3():
     assert primary_dns["if"] == "always()"
     ledger_dns = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
     assert ledger_dns["if"] == "always()"
-    ocr_dns = next(s for s in raw["jobs"]["ocr"]["steps"] if s.get("name") == "Resolve Silo hostname via MagicDNS")
-    assert ocr_dns["if"] == "always() && matrix.reviewer != '__none__'"
 
 
 def test_silo_store_env_aligns_with_job_checkout_path():
     raw, _ = _load_workflow()
     checkout_dirs = {
         "primary": "_gate-silo-src",
-        "ocr": "_gate-silo-src",
         "gate": "_gate-aggregator-src",
         "ledger": "_gate-aggregator-src",
     }
-    for job_name in ("primary", "ocr", "gate", "ledger"):
+    for job_name in ("primary", "gate", "ledger"):
         job = raw["jobs"][job_name]
         silo_store_env = job.get("env", {}).get("SILO_STORE", "")
         checkout_dir = checkout_dirs[job_name]
@@ -820,7 +725,7 @@ def test_control_runner_input_defaults_to_follow_runner():
 def test_all_required_jobs_present():
     raw, _ = _load_workflow()
     assert set(raw["jobs"].keys()) == {
-        "classify_pr_paths", "quality", "primary", "advisor_classify", "advisor", "resolve_advisory", "ocr", "ocr_visibility", "gate", "ledger",
+        "classify_pr_paths", "quality", "primary", "advisor_classify", "advisor", "gate", "ledger",
     }
 
 
@@ -903,7 +808,7 @@ def test_workflow_sha_checkouts_use_centralized_bounded_retry():
                 assert_workflow_sha_checkout(step)
             if uses.startswith("actions/checkout"):
                 assert (step.get("with") or {}).get("ref") != "${{ job.workflow_sha }}"
-    assert len(sites) == 10
+    assert len(sites) == 8
     producer = next(
         step for step in disposition["jobs"]["control"]["steps"]
         if step.get("name") == "Checkout disposition producer"
@@ -1301,8 +1206,6 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     primary_if = raw["jobs"]["primary"]["if"]
     assert primary_if == REVIEW_EXPECTED_IF
     assert raw["jobs"]["primary"]["needs"] == [CLASSIFY_JOB_ID]
-    assert raw["jobs"]["resolve_advisory"]["needs"] == [CLASSIFY_JOB_ID]
-    assert raw["jobs"]["resolve_advisory"]["if"] == primary_if
     aggregate = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Aggregate required verdict")
     publish = next(s for s in raw["jobs"]["gate"]["steps"] if s.get("name") == "Publish gate status panel")
     resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
@@ -1319,7 +1222,7 @@ def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_i
     for copy in copies:
         assert copy == primary_if
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
-    assert workflow_text.count(CLASSIFY_GUARD) == 6
+    assert workflow_text.count(CLASSIFY_GUARD) == 5
     assert "outputs.review_expected == 'true'" not in workflow_text
 
 
@@ -1436,282 +1339,6 @@ def test_classify_listing_failure_does_not_output_false(tmp_path):
     assert "exit=42" in proc.stdout + proc.stderr + text or "listing PR files failed" in proc.stdout + proc.stderr
 
 
-def test_post_advisory_gh_api_uses_real_gnu_timeout_and_keeps_fifteen_second_cap(tmp_path):
-    proc, argv = _run_post_advisory_gh_api(
-        tmp_path, budget_seconds=120, date_values=[1000, 6000, 6001],
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "gh_api_rc=0" in proc.stdout
-    assert "+ timeout --foreground 15.000s gh api user" in proc.stderr
-    assert argv == [b"api", b"user"]
-
-
-def test_post_advisory_gh_api_keeps_subsecond_deadline_precision(tmp_path):
-    proc, argv = _run_post_advisory_gh_api(
-        tmp_path, budget_seconds=120, date_values=[1000, 120500, 120501],
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "gh_api_rc=0" in proc.stdout
-    assert "+ timeout --foreground 0.500s gh api user" in proc.stderr
-    assert argv == [b"api", b"user"]
-
-
-@pytest.mark.parametrize(
-    ("budget_seconds", "now_ms"),
-    [(0, 1000), (120, 121001)],
-    ids=["zero-budget", "expired-budget"],
-)
-def test_post_advisory_gh_api_skips_gh_for_zero_or_expired_budget(tmp_path, budget_seconds, now_ms):
-    proc, argv = _run_post_advisory_gh_api(
-        tmp_path, budget_seconds=budget_seconds, date_values=[1000, now_ms],
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "gh_api_rc=124" in proc.stdout
-    assert "timeout --foreground" not in proc.stderr
-    assert argv == []
-
-
-def test_ocr_uses_advisory_event_subdirectory_and_pr_write_permissions():
-    raw, _ = _load_workflow()
-    ocr = raw["jobs"]["ocr"]
-    assert ocr["permissions"] == {
-        "actions": "read",
-        "contents": "read",
-        "pull-requests": "write",
-    }
-
-    review_step = next(s for s in ocr["steps"] if s.get("name") == "Run OCR advisory review")
-    assert review_step["env"]["REVIEW_SHADOW_EVENT_DIR"] == "${{ runner.temp }}/shadow-events"
-    assert "REVIEW_SHADOW_ADVISORY_EVENT_DIR" not in review_step["env"]
-
-    comment_step = next(s for s in ocr["steps"] if s.get("name") == "Post advisory PR comment")
-    assert "REVIEW_SHADOW_EVENT_DIR/advisory/advisory-comment-${REVIEWER}.md" in comment_step["run"]
-    assert 'gate-v2-ocr-advisory:${REVIEWER}:v1' in comment_step["run"]
-    assert 'issues/$PR_NUMBER/comments?per_page=100' in comment_step["run"]
-    assert "gh_api user" in comment_step["run"]
-    assert "timeout --foreground" in comment_step["run"]
-    assert comment_step["env"]["OCR_GITHUB_TIMEOUT_SECONDS"] == 15
-    assert comment_step["env"]["OCR_PUBLISH_BUDGET_SECONDS"] == 120
-    assert 'case "$http_status" in' in comment_step["run"]
-    assert "403|404)" in comment_step["run"]
-    assert "workflow_id=41898282" in comment_step["run"]
-    assert "workflow_login='github-actions[bot]'" in comment_step["run"]
-    assert 'identity_source="actions_bot_fallback"' in comment_step["run"]
-    assert "identity_source: $identity_source" in comment_step["run"]
-    assert "((.user.id // null) != null)" in comment_step["run"]
-    assert "((.user.id // null) == null)" in comment_step["run"]
-    assert "--paginate --slurp" in comment_step["run"]
-    assert "owner_id" in comment_step["run"] and "WORKFLOW_LOGIN" in comment_step["run"]
-    assert '--method PATCH' in comment_step["run"]
-    assert '--method POST' in comment_step["run"]
-    assert '--method DELETE' in comment_step["run"]
-    assert "post verification" in comment_step["run"]
-    assert 'advisory-delivery-${REVIEWER}.json' in comment_step["run"]
-
-    upload_step = next(s for s in ocr["steps"] if s.get("name") == "Upload advisory review event")
-    assert upload_step["env"]["ADVISORY_DIR"] == "${{ runner.temp }}/shadow-events/advisory"
-    assert "--tier d3" in upload_step["run"]
-    assert "advisory-event-${{ matrix.reviewer }}-${{ github.run_id }}-${{ github.run_attempt }}" in upload_step["env"]["ARTIFACT_NAME"]
-    checkout_step = next(s for s in ocr["steps"] if s.get("name") == "Checkout outbound scrub at this workflow's own commit")
-    post_step = next(s for s in ocr["steps"] if s.get("name") == "Post advisory PR comment")
-    summary_step = next(s for s in ocr["steps"] if s.get("name") == "Record advisory terminal summary")
-    names = [step.get("name") for step in ocr["steps"]]
-    assert checkout_step["id"] == "checkout-advisory-scrub"
-    assert post_step["id"] == "post-advisory-comment"
-    assert summary_step["id"] == "advisory-terminal-summary"
-    assert names.index(summary_step["name"]) > names.index(post_step["name"])
-    assert names.index(summary_step["name"]) < names.index("Checkout silo store at this workflow's own commit")
-    assert summary_step["if"] == "always() && matrix.reviewer != '__none__'"
-    assert summary_step["env"]["SCRUB_CHECKOUT_OUTCOME"] == "${{ steps.checkout-advisory-scrub.outcome }}"
-    assert summary_step["env"]["COMMENT_STEP_OUTCOME"] == "${{ steps.post-advisory-comment.outcome }}"
-    assert "scrub_outbound.py" not in summary_step["run"]
-    assert "cat \"$event_path\"" not in summary_step["run"]
-
-
-def _advisory_terminal_summary_step():
-    raw, _ = _load_workflow()
-    return next(
-        step
-        for step in raw["jobs"]["ocr"]["steps"]
-        if step.get("name") == "Record advisory terminal summary"
-    )
-
-
-def _run_advisory_terminal_summary(tmp_path, *, event=None, delivery=None,
-                                   scrub_outcome="failure", post_outcome="failure"):
-    step = _advisory_terminal_summary_step()
-    runner_temp = tmp_path / "runner-temp"
-    advisory_dir = runner_temp / "shadow-events" / "advisory"
-    advisory_dir.mkdir(parents=True)
-    identity = {
-        "repository_id": "1258188460",
-        "head_sha": "h" * 40,
-        "run_id": "12345",
-        "run_attempt": "2",
-        "reviewer": "claude-glm-5-3",
-    }
-    if event is not None:
-        (advisory_dir / (
-            "shadow-review-v1-{repository_id}-{head_sha}-{reviewer}-{run_id}-{run_attempt}.json"
-            .format(**identity)
-        )).write_text(json.dumps(event), encoding="utf-8")
-    if delivery is not None:
-        (advisory_dir / "advisory-delivery-claude-glm-5-3.json").write_text(
-            json.dumps(delivery), encoding="utf-8"
-        )
-    summary = tmp_path / "summary.md"
-    expression_values = {
-        "${{ runner.temp }}": str(runner_temp),
-        "${{ github.repository_id }}": identity["repository_id"],
-        "${{ github.event.pull_request.head.sha }}": identity["head_sha"],
-        "${{ github.run_id }}": identity["run_id"],
-        "${{ github.run_attempt }}": identity["run_attempt"],
-        "${{ steps.checkout-advisory-scrub.outcome }}": scrub_outcome,
-        "${{ steps.post-advisory-comment.outcome }}": post_outcome,
-    }
-    run = step["run"]
-    for expression, value in expression_values.items():
-        run = run.replace(expression, value)
-    env = dict(os.environ)
-    env.update({
-        "GITHUB_STEP_SUMMARY": str(summary),
-        "REVIEWER": identity["reviewer"],
-        "REVIEW_SHADOW_EVENT_DIR": str(runner_temp / "shadow-events"),
-        "REVIEW_REPOSITORY_ID": identity["repository_id"],
-        "REVIEW_HEAD_SHA": identity["head_sha"],
-        "REVIEW_RUN_ID": identity["run_id"],
-        "REVIEW_RUN_ATTEMPT": identity["run_attempt"],
-        "SCRUB_CHECKOUT_OUTCOME": scrub_outcome,
-        "COMMENT_STEP_OUTCOME": post_outcome,
-    })
-    proc = subprocess.run(["bash", "-c", run], cwd=REPO_ROOT, env=env,
-                          capture_output=True, text=True, check=False)
-    return proc, summary.read_text(encoding="utf-8") if summary.exists() else ""
-
-
-def _producer_event_fixture():
-    return json.loads(ADVISORY_EVENT_FIXTURE.read_text(encoding="utf-8"))
-
-
-def test_advisory_terminal_summary_survives_scrub_checkout_failure_and_keeps_typed_status(tmp_path):
-    event = _producer_event_fixture()
-    proc, summary = _run_advisory_terminal_summary(
-        tmp_path, event=event, scrub_outcome="failure", post_outcome="failure",
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "Review artifact: `available`" in summary
-    assert "Review status: `auth_unavailable`" in summary
-    assert "Comment delivery: `unknown`" in summary
-    assert "Outbound scrub checkout: `failure`" in summary
-    assert "secret-token" not in summary
-
-
-def test_advisory_terminal_summary_distinguishes_missing_review_from_unknown_delivery(tmp_path):
-    proc, summary = _run_advisory_terminal_summary(
-        tmp_path, scrub_outcome="failure", post_outcome="failure",
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "Review artifact: `unavailable`" in summary
-    assert "Review status: `unavailable`" in summary
-    assert "Comment delivery: `unknown`" in summary
-    assert "Review artifact reason: `missing`" in summary
-
-
-@pytest.mark.parametrize("delivery", ["created", "updated", "not_created"])
-def test_advisory_terminal_summary_uses_only_current_delivery_whitelist(tmp_path, delivery):
-    proc, summary = _run_advisory_terminal_summary(
-        tmp_path, event=_producer_event_fixture(),
-        delivery={
-            "schema_version": 1,
-            "kind": "gate_v2_ocr_advisory_delivery",
-            "reviewer": "claude-glm-5-3",
-            "delivery": delivery,
-            "operation": "POST",
-            "body": "secret-token must never be printed",
-        },
-        scrub_outcome="success", post_outcome="success",
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert f"Comment delivery: `{delivery}`" in summary
-    assert "secret-token" not in summary
-
-
-def test_advisory_terminal_summary_rejects_stale_event_identity(tmp_path):
-    event = _producer_event_fixture()
-    event["head_sha"] = "x" * 40
-    proc, summary = _run_advisory_terminal_summary(
-        tmp_path, event=event, scrub_outcome="success", post_outcome="success",
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "Review artifact: `unavailable`" in summary
-    assert "Review artifact reason: `invalid`" in summary
-
-
-def test_advisory_terminal_summary_rejects_invalid_delivery_diagnostic(tmp_path):
-    proc, summary = _run_advisory_terminal_summary(
-        tmp_path, event=_producer_event_fixture(),
-        delivery={"delivery": "sent", "body": "secret-token"},
-        scrub_outcome="failure", post_outcome="failure",
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "Review artifact: `available`" in summary
-    assert "Comment delivery: `unknown`" in summary
-    assert "Delivery diagnostic: `invalid`" in summary
-    assert "secret-token" not in summary
-
-
-def test_advisory_terminal_summary_does_not_trust_delivery_when_scrub_checkout_failed(tmp_path):
-    proc, summary = _run_advisory_terminal_summary(
-        tmp_path, event=_producer_event_fixture(),
-        delivery={
-            "schema_version": 1,
-            "kind": "gate_v2_ocr_advisory_delivery",
-            "reviewer": "claude-glm-5-3",
-            "delivery": "created",
-        },
-        scrub_outcome="failure", post_outcome="success",
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "Comment delivery: `unknown`" in summary
-
-
-def test_advisory_event_upload_declares_three_day_retention():
-    raw, _ = _load_workflow()
-    upload = next(
-        step
-        for step in raw["jobs"]["ocr"]["steps"]
-        if step.get("name") == "Upload advisory review event"
-    )
-    assert "--tier d3" in upload["run"]
-    assert "$SILO_EXEC" in upload["run"]
-
-
-def test_ocr_resolve_job_id_uses_jq_arg_not_env_builtin():
-    # Same matrix-leg naming pattern as gate-shadow-v2.yml's shadow job — must pass
-    # JOB_NAME_SUFFIX via jq --arg and fail-loud with categorized diagnostics.
-    raw, _ = _load_workflow()
-    step = next(
-        s for s in raw["jobs"]["ocr"]["steps"]
-        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
-    )
-    assert step["env"]["REVIEWER"] == "${{ matrix.reviewer }}"
-    run = step["run"]
-    assert 'JOB_NAME_SUFFIX="${{ github.job }} ($REVIEWER)"' in run
-    assert "jq -r --arg suffix" in run
-    assert "env.JOB_NAME_SUFFIX" not in run
-    assert "matching name is empty because REVIEWER is unset" in run
-    assert "Jobs API call failed" in run
-    assert "(exit=${rc})" in run
-    assert "|| rc=$?" in run
-    assert "if ! api_json=" not in run
-    assert "err_preview" not in run
-    assert "api_err" not in run
-    assert "no matching job for JOB_NAME_SUFFIX=" in run
-    assert "timeout --foreground" in run
-    assert "${{ matrix.reviewer }}" not in run
-    assert raw["jobs"]["gate"]["needs"] == ["quality", "primary", "classify_pr_paths"]
-
-
 def test_aggregator_check_name_separates_draft_events():
     raw, _ = _load_workflow()
     assert "gate" in raw["jobs"]
@@ -1719,31 +1346,10 @@ def test_aggregator_check_name_separates_draft_events():
     assert gate.get("name") == GATE_AGGREGATOR_NAME_EXPRESSION
     assert gate["if"] == "always()"
     assert gate["needs"] == ["quality", "primary", "classify_pr_paths"]
+    assert raw["jobs"]["ledger"]["needs"] == ["quality", "primary", "gate", "classify_pr_paths"]
 
 
-def test_ocr_resolve_jobs_api_failure_probe_reports_exit_42(tmp_path):
-    raw, _ = _load_workflow()
-    step = next(
-        s for s in raw["jobs"]["ocr"]["steps"]
-        if s.get("name") == "Resolve numeric job id for REVIEW_JOB_ID"
-    )
-    gh_api_wrapper = (
-        'gh_api() {\n'
-        '  timeout --foreground "${OCR_GITHUB_TIMEOUT_SECONDS}s" gh api "$@"\n'
-        '}'
-    )
-    snippet = gh_api_wrapper + "\n" + materialize_jobs_api_snippet_for_probe(
-        step["run"],
-        start_prefix="jobs_api=",
-        end_prefix='if [ -z "$api_json" ]',
-    )
-    proc = probe_jobs_api_failure_exit_code(snippet, tmp_path, with_timeout_stub=True)
-    output = proc.stdout + proc.stderr
-    assert proc.returncode == 1, output
-    assert "exit=42" in output, output
-
-
-@pytest.mark.parametrize("job_name", ["primary", "ocr"])
+@pytest.mark.parametrize("job_name", ["primary"])
 def test_job_id_resolution_retries_with_timeout(job_name):
     raw, _ = _load_workflow()
     step = next(
@@ -1766,7 +1372,7 @@ def test_job_id_resolution_retries_with_timeout(job_name):
     assert "until true" not in run
 
 
-@pytest.mark.parametrize("job_name", ["primary", "ocr"])
+@pytest.mark.parametrize("job_name", ["primary"])
 def test_job_id_resolution_separates_api_failure_from_empty_result(job_name):
     raw, _ = _load_workflow()
     step = next(
@@ -2483,10 +2089,10 @@ def test_quality_exposes_ledger_input_upload_outcome_to_ledger():
     )
 
 
-def test_only_ocr_and_ledger_jobs_have_continue_on_error():
+def test_only_ledger_job_has_continue_on_error():
     raw, _ = _load_workflow()
     jobs = raw["jobs"]
-    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ocr", "ledger"}
+    assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ledger"}
 
 
 def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
@@ -3392,8 +2998,6 @@ def test_primary_job_if_gates_draft_fork_and_runner():
 def test_pr_author_source_guards_review_and_reaches_aggregator_as_json():
     raw, _ = _load_workflow()
     assert PR_AUTHOR_HUMAN_GUARD in str(raw["jobs"]["quality"]["runs-on"])
-    assert raw["jobs"]["resolve_advisory"]["if"] == REVIEW_EXPECTED_IF
-    assert PR_AUTHOR_HUMAN_GUARD in str(raw["jobs"]["ocr"]["if"])
     steps = raw["jobs"]["gate"]["steps"]
     aggregate = next(step for step in steps if step.get("name") == "Aggregate required verdict")
     assert aggregate["env"]["PR_AUTHOR_JSON"] == "${{ " + PR_AUTHOR_JSON + " }}"
@@ -3432,7 +3036,7 @@ def test_non_quality_jobs_do_not_use_ci_pool_label():
     # uncredentialed CI pool. Assert on parsed fromJSON labels, not bare
     # substring match (would false-positive on words containing "ci").
     raw, _ = _load_workflow()
-    for job_name in ("gate", "ledger", "primary", "resolve_advisory", "ocr", "classify_pr_paths"):
+    for job_name in ("gate", "ledger", "primary", "classify_pr_paths"):
         runs_on = str(raw["jobs"][job_name]["runs-on"])
         for labels in _fromjson_label_sets(runs_on):
             assert "ci" not in labels, (
@@ -4096,20 +3700,6 @@ def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
     text = DISPOSITION_CALLER_TEMPLATE.read_text()
     assert "pull-requests: write" not in text
     assert "environment:" not in text
-
-
-def test_ocr_job_timeout_and_internal_budget_follow_shadow_reserve_shape():
-    """gate-hub#859: OCR reviews ~4 min per selected file; the job must hand review-shadow
-    an explicit internal budget that leaves 2 minutes of job time for setup/upload, the
-    same reserve shape gate-shadow-v2.yml derives from shadow_timeout_minutes."""
-    raw, _ = _load_workflow()
-    ocr = raw["jobs"]["ocr"]
-    assert ocr["timeout-minutes"] == 20
-
-    review_step = next(s for s in ocr["steps"] if s.get("name") == "Run OCR advisory review")
-    internal_budget_s = review_step["env"]["REVIEW_GATE_TIMEOUT_S"]
-    assert internal_budget_s == 1080
-    assert internal_budget_s == (ocr["timeout-minutes"] - 2) * 60
 
 
 # ── gate#199 根治：quality 自带 caller_checks 证据链 ─────────────────────

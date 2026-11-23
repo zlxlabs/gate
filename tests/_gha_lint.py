@@ -192,7 +192,6 @@ def probe_jobs_api_failure_exit_code(
     script = f"set -euo pipefail\n{snippet}\n"
     env = os.environ.copy()
     env["PATH"] = ":".join(path_entries + [env.get("PATH", "")])
-    env["OCR_GITHUB_TIMEOUT_SECONDS"] = "15"
     return subprocess.run(
         ["bash", "-c", script],
         capture_output=True,

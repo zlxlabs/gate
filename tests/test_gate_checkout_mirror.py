@@ -219,7 +219,7 @@ def _mirror_signature(mirror_repo):
     }
 
 
-def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_consumer():
+def test_two_gate_checkouts_keep_action_and_byte_measurement_around_mirror_consumer():
     workflow = _workflow()
     script = workflow["env"]["GATE_CHECKOUT_MIRROR_SCRIPT"]
     assert "flock --shared" in script
@@ -236,7 +236,7 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
 
     jobs = workflow["jobs"]
     checkout_count = 0
-    for job_name in ("quality", "primary", "ocr"):
+    for job_name in ("quality", "primary"):
         steps = jobs[job_name]["steps"]
         checkout_indexes = [i for i, step in enumerate(steps) if step.get("uses", "").startswith(CHECKOUT_ACTION)]
         assert len(checkout_indexes) == 1
@@ -254,7 +254,7 @@ def test_three_gate_checkouts_keep_action_and_byte_measurement_around_mirror_con
         assert "GATE_CHECKOUT_RX_BYTES" in before["run"]
         assert "GATE-CHECKOUT-BYTES-V1" in after["run"]
         assert "refs/internal/gate-checkout-target" in after["run"]
-    assert checkout_count == 3
+    assert checkout_count == 2
 
 
 def test_shadow_checkouts_prime_from_the_same_script_and_keep_checkout_fallback():
