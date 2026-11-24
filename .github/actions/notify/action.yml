@@ -1,11 +1,10 @@
-name: 'CI notify (WeCom / Feishu)'
+name: 'CI notify (WeCom)'
 description: >-
-  Send one CI notification, dispatching on the webhook hostname: exact
-  qyapi.weixin.qq.com -> WeCom markdown (errcode==0); open.feishu.cn /
-  open.larksuite.com -> Feishu interactive card (code==0). Unknown hosts,
-  non-https and oversize WeCom content fail loudly; missing webhook is a
-  ::warning skip. ci-templates consumes this cross-repo, so this directory
-  must stay self-contained (stdlib-only notify.py, no files outside it).
+  Send one CI notification via WeCom markdown (exact hostname
+  qyapi.weixin.qq.com, errcode==0). Unknown hosts, non-https and oversize
+  WeCom content fail loudly; missing webhook is a ::warning skip.
+  ci-templates consumes this cross-repo, so this directory must stay
+  self-contained (stdlib-only notify.py, no files outside it).
 inputs:
   webhook:
     description: 'Full webhook URL; empty/blank skips with a warning.'
@@ -26,7 +25,7 @@ inputs:
     required: false
     default: ''
   links:
-    description: 'JSON array of {"text","url"}; first link renders primary (Feishu button / first WeCom link).'
+    description: 'JSON array of {"text","url"}; rendered as WeCom markdown links.'
     required: false
     default: ''
 runs:

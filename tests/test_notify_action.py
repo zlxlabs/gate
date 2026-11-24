@@ -1,4 +1,4 @@
-"""Tests for the shared .github/actions/notify action (WeCom / Feishu).
+"""Tests for the shared .github/actions/notify action (WeCom).
 
 The webhook POST is a process boundary: every send test asserts the actual
 bytes notify.py puts on the wire, captured by a local HTTP server. To keep the
@@ -22,11 +22,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ACTION_DIR = REPO_ROOT / ".github" / "actions" / "notify"
 ACTION_YML = ACTION_DIR / "action.yml"
-BASE_COMMIT = "a6b6b423"  # historical inline implementation used for the payload compatibility contract
 
 SECRET_KEY = "SECRETKEY-SHOULD-NEVER-APPEAR-IN-LOGS"
 WECOM_WEBHOOK = "https://qyapi.weixin.qq.com:{port}/cgi-bin/webhook/send?key=" + SECRET_KEY
-FEISHU_WEBHOOK = "https://open.feishu.cn:{port}/open-apis/bot/v2/hook/" + SECRET_KEY
 
 _INPUT_REF = re.compile(r"^\$\{\{\s*inputs\.(\w+)\s*\}\}$")
 
@@ -200,84 +198,6 @@ def test_wecom_truncates_oversized_content_to_4096_bytes(recorder_server):
     assert content.startswith("**🟠 [zlxlabs·CI] P2 t**")
 
 
-def _base_inline_feishu_card(title_prefix, repo, pr, body, run_url, pr_url):
-    """Byte-for-byte expectation of the inline gate-v2.yml implementation at
-    base {} (notify job, Feishu card step) for the same inputs.""".format(BASE_COMMIT)
-    return {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "template": "orange",
-                "title": {
-                    "tag": "plain_text",
-                    "content": f"🟠 {title_prefix} P2 门禁失败 · {repo}#{pr}",
-                },
-            },
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": body}},
-                {
-                    "tag": "action",
-                    "actions": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "查看 Run"},
-                            "type": "primary",
-                            "url": run_url,
-                        },
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "查看 PR"},
-                            "type": "default",
-                            "url": pr_url,
-                        },
-                    ],
-                },
-            ],
-        },
-    }
-
-
-def test_feishu_card_matches_base_inline_implementation(recorder_server):
-    recorder_server.response_body = b'{"code": 0, "msg": "success"}'
-    repo, pr, pr_title = "zlxlabs/demo", "123", "Fix the thing"
-    title = f"门禁失败 · {repo}#{pr}"
-    body = (
-        f"**仓库** `{repo}`\n"
-        f"**PR** #{pr} · {pr_title}\n"
-        f"**分支** `card/fix`  ·  **commit** `abc123def456`  ·  **tier** `personal`\n"
-        f"Required Gate v2 门禁失败(quality / primary review 其一未过)。点按钮看详情。"
-    )
-    run_url = "https://github.com/zlxlabs/demo/actions/runs/42"
-    pr_url = "https://github.com/zlxlabs/demo/pull/123"
-    proc = _run_action(
-        {
-            "webhook": FEISHU_WEBHOOK.format(port=recorder_server.port),
-            "title_prefix": "[zlxlabs·CI]",
-            "severity": "P2",
-            "title": title,
-            "body": body,
-            "links": json.dumps(
-                [
-                    {"text": "查看 Run", "url": run_url},
-                    {"text": "查看 PR", "url": pr_url},
-                ],
-                ensure_ascii=False,
-            ),
-        },
-        net="local",
-        local_port=recorder_server.port,
-    )
-    output = proc.stdout + proc.stderr
-    assert proc.returncode == 0, output
-    assert len(recorder_server.requests) == 1
-    expected = _base_inline_feishu_card("[zlxlabs·CI]", repo, pr, body, run_url, pr_url)
-    sent_bytes = recorder_server.requests[0]["body"]
-    assert json.loads(sent_bytes) == expected
-    # Same serializer settings as the inline implementation (default dumps).
-    assert sent_bytes == json.dumps(expected).encode("utf-8")
-
-
 def test_empty_webhook_skips_with_warning_and_sends_nothing(webhook_server):
     for value in ("", "   \n  "):
         proc = _run_action(
@@ -296,10 +216,12 @@ def test_empty_webhook_skips_with_warning_and_sends_nothing(webhook_server):
 @pytest.mark.parametrize(
     "webhook",
     [
-        # look-alike host (substring forgery), plain http, unrelated host
+        # look-alike host (substring forgery), plain http, unrelated host, retired Feishu/Lark hosts
         "https://qyapi.weixin.qq.com.evil.example/hook?key=" + SECRET_KEY,
         "http://qyapi.weixin.qq.com/hook?key=" + SECRET_KEY,
         "https://webhook.example.com/hook?key=" + SECRET_KEY,
+        "https://open.feishu.cn/open-apis/bot/v2/hook/" + SECRET_KEY,
+        "https://open.larksuite.com/open-apis/bot/v2/hook/" + SECRET_KEY,
     ],
 )
 def test_rejected_webhooks_send_nothing_and_leak_no_secret(recorder_server, webhook):
@@ -308,34 +230,34 @@ def test_rejected_webhooks_send_nothing_and_leak_no_secret(recorder_server, webh
         net="local",
         local_port=recorder_server.port,
     )
-    assert proc.returncode != 0
+    assert proc.returncode == 1
     output = proc.stdout + proc.stderr
     assert "::error title=notify-unknown-host::" in output
+    if webhook.startswith("https://"):
+        assert "仅支持 qyapi.weixin.qq.com" in output
     assert SECRET_KEY not in output
     assert webhook not in output  # only the hostname may be named, never the URL
     assert recorder_server.requests == []
 
 
 @pytest.mark.parametrize(
-    "response_status,response_body,webhook_template",
+    "response_status,response_body",
     [
-        (200, b'{"errcode": 93000, "errmsg": "invalid webhook"}', WECOM_WEBHOOK),
-        (200, b'{"errcode": false}', WECOM_WEBHOOK),
-        (200, b'{"errcode": 0.0}', WECOM_WEBHOOK),
-        (200, b'{"code": 19021, "msg": "hook disabled"}', FEISHU_WEBHOOK),
-        (200, b'{"code": 0.0}', FEISHU_WEBHOOK),
-        (500, b'{"errcode": 0}', WECOM_WEBHOOK),
-        (200, b'<html>gateway error</html>', WECOM_WEBHOOK),
+        (200, b'{"errcode": 93000, "errmsg": "invalid webhook"}'),
+        (200, b'{"errcode": false}'),
+        (200, b'{"errcode": 0.0}'),
+        (500, b'{"errcode": 0}'),
+        (200, b'<html>gateway error</html>'),
     ],
 )
 def test_failed_responses_fail_loud(
-    recorder_server, response_status, response_body, webhook_template
+    recorder_server, response_status, response_body
 ):
     recorder_server.response_status = response_status
     recorder_server.response_body = response_body
     proc = _run_action(
         {
-            "webhook": webhook_template.format(port=recorder_server.port),
+            "webhook": WECOM_WEBHOOK.format(port=recorder_server.port),
             "severity": "P2",
             "title": "t",
         },
