@@ -1245,17 +1245,31 @@ jobs:
         env:
           PREFLIGHT: ${{ runner.temp }}/pr-size-preflight.json
           INSTALL: ${{ runner.temp }}/install-result.json
+          PREFLIGHT_OUTCOME: ${{ steps.pr-size-preflight.outcome }}
+          ENTRY_INSTALL_RESULT_OUTCOME: ${{ steps.entry-install-result-finish.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json, os, sys
           from pathlib import Path
+          producer_outcomes = (
+              os.environ.get("PREFLIGHT_OUTCOME", ""),
+              os.environ.get("ENTRY_INSTALL_RESULT_OUTCOME", ""),
+              os.environ.get("INSTALL_OUTCOME", ""),
+          )
           bundle = {}
           for key, env_name in (("preflight", "PREFLIGHT"), ("install", "INSTALL")):
               path = Path(os.environ[env_name])
               if path.is_file():
                   bundle[key] = path.read_text(encoding="utf-8")
           if not bundle:
+              # gate-hub#2498: when every ledger input producer was skipped
+              # (upstream checkout failed first), an empty bundle is expected;
+              # any producer that ran but produced nothing stays fail-loud.
+              if all(outcome == "skipped" for outcome in producer_outcomes):
+                  print("::notice::review ledger input publish skipped: upstream step failed before ledger input producers ran")
+                  raise SystemExit(0)
               print("::error::review ledger input files missing", file=sys.stderr)
               raise SystemExit(1)
           payload = json.dumps(bundle, ensure_ascii=False, separators=(",", ":"))
@@ -1269,10 +1283,19 @@ jobs:
         if: always()
         env:
           LEDGER_INPUT_UPLOAD: ${{ steps.ledger-input-upload.outcome }}
+          LEDGER_INPUT_BUNDLE: ${{ steps.ledger-input-upload.outputs.bundle }}
+          PREFLIGHT_OUTCOME: ${{ steps.pr-size-preflight.outcome }}
+          ENTRY_INSTALL_RESULT_OUTCOME: ${{ steps.entry-install-result-finish.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
         run: |
           set -euo pipefail
-          if [ "$LEDGER_INPUT_UPLOAD" = "success" ]; then
+          # Published bundle + successful step = real publish. Step success with
+          # no bundle can only be the upstream-skipped notice exit in
+          # ledger-input-upload (gate-hub#2498). Everything else stays failure.
+          if [ "$LEDGER_INPUT_UPLOAD" = "success" ] && [ -n "$LEDGER_INPUT_BUNDLE" ]; then
             echo "ledger_input_upload=success" >> "$GITHUB_OUTPUT"
+          elif [ "${PREFLIGHT_OUTCOME:-}" = "skipped" ] && [ "${ENTRY_INSTALL_RESULT_OUTCOME:-}" = "skipped" ] && [ "${INSTALL_OUTCOME:-}" = "skipped" ]; then
+            echo "ledger_input_upload=upstream_skipped" >> "$GITHUB_OUTPUT"
           else
             echo "ledger_input_upload=failure" >> "$GITHUB_OUTPUT"
             echo "::error::review ledger input publish failed; gate / ledger will report the input missing"
@@ -2883,9 +2906,14 @@ jobs:
               name = f"{prefix}{current}"
               return current, f"d1/{repo_id}/{name}", name
 
+          # gate-hub#2498: quality's upstream checkout failed before any
+          # ledger input producer ran; the missing input artifact is expected.
+          quality_upstream_skipped = quality_upload == "upstream_skipped" and quality_result == "failure"
           if quality_upload == "success":
               input_artifact = github_fact_input_artifact()
           elif quality_short_circuited:
+              input_artifact = None
+          elif quality_upstream_skipped:
               input_artifact = None
           else:
               raise SystemExit(
@@ -2893,6 +2921,8 @@ jobs:
               )
           if quality_short_circuited and input_artifact is None:
               print("::notice::ledger input skipped: quality was short-circuited by primary failure (gate#105 A); preflight/install fields will be null")
+          if quality_upstream_skipped and input_artifact is None:
+              print("::notice::ledger input skipped: quality failed upstream before ledger input producers ran; preflight/install fields will be null")
 
           def parse_resolve(raw, missing_message, required):
               text = (raw or "").strip()
@@ -3037,7 +3067,7 @@ jobs:
           with open(output_path, "a", encoding="utf-8") as output:
               output.write(f"input_artifact_id={input_artifact[1] if input_artifact else ''}\n")
               output.write(f"input_source_attempt={input_artifact[0] if input_artifact else ''}\n")
-              output.write(f"input_short_circuited={'true' if quality_short_circuited and input_artifact is None else 'false'}\n")
+              output.write(f"input_short_circuited={'true' if (quality_short_circuited or quality_upstream_skipped) and input_artifact is None else 'false'}\n")
               output.write(f"terminal_artifact_id={terminal_artifact[1] if terminal_artifact else ''}\n")
               output.write(f"terminal_source_attempt={terminal_artifact[0] if terminal_artifact else ''}\n")
               output.write(f"review_expected={expected_text}\n")
