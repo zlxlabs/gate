@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Shared CI notify sender: WeCom markdown or Feishu interactive card.
+"""Shared CI notify sender: WeCom markdown.
 
 The channel is a property of the receiving webhook address: scheme must be
-https and the hostname matched exactly, never by substring:
-qyapi.weixin.qq.com -> WeCom markdown (success: errcode == 0, int);
-open.feishu.cn / open.larksuite.com -> Feishu card (success: code == 0, int).
+https and the hostname matched exactly to qyapi.weixin.qq.com (never by
+substring) -> WeCom markdown (success: errcode == 0, int).
 Anything else (http, unknown or look-alike hosts like
 qyapi.weixin.qq.com.evil.example) fails loudly WITHOUT sending; errors name
 the host, never the webhook value. A missing webhook is a ::warning + exit 0
@@ -19,18 +18,17 @@ import urllib.parse
 import urllib.request
 
 WECOM_HOST = "qyapi.weixin.qq.com"
-FEISHU_HOSTS = ("open.feishu.cn", "open.larksuite.com")
 MAX_WECOM_CONTENT_BYTES = 4096
 TRUNCATION_SUFFIX = "…（已截断）"
 HTTP_TIMEOUT_SECONDS = 10
 MAX_RESPONSE_BYTES = 65536
 
-# severity -> (icon, feishu header template colour)
+# severity -> icon
 SEVERITY_STYLES = {
-    "P0": ("🔴", "red"),
-    "P1": ("🟠", "orange"),
-    "P2": ("🟠", "orange"),
-    "info": ("🔵", "blue"),
+    "P0": "🔴",
+    "P1": "🟠",
+    "P2": "🟠",
+    "info": "🔵",
 }
 DEFAULT_TITLE_PREFIX = "[zlxlabs·CI]"
 
@@ -83,37 +81,7 @@ def _wecom_payload(heading: str, body: str, links: list[dict]) -> dict:
     return {"msgtype": "markdown", "markdown": {"content": content}}
 
 
-def _feishu_payload(heading: str, template: str, body: str, links: list[dict]) -> dict:
-    elements = [{"tag": "div", "text": {"tag": "lark_md", "content": body}}]
-    if links:
-        elements.append(
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": link["text"]},
-                        "type": "primary" if index == 0 else "default",
-                        "url": link["url"],
-                    }
-                    for index, link in enumerate(links)
-                ],
-            }
-        )
-    return {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "template": template,
-                "title": {"tag": "plain_text", "content": heading},
-            },
-            "elements": elements,
-        },
-    }
-
-
-def _post_and_check(webhook: str, payload: dict, success_key: str) -> int:
+def _post_and_check(webhook: str, payload: dict) -> int:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         webhook, data=data, headers={"Content-Type": "application/json"}
@@ -133,9 +101,9 @@ def _post_and_check(webhook: str, payload: dict, success_key: str) -> int:
     except (TypeError, ValueError):
         print("::error title=notify-bad-response::响应不是合法 JSON")
         return 1
-    code = response.get(success_key) if isinstance(response, dict) else None
+    code = response.get("errcode") if isinstance(response, dict) else None
     if not (isinstance(code, int) and not isinstance(code, bool) and code == 0):
-        print(f"::error title=notify-rejected::{success_key}={code}")
+        print(f"::error title=notify-rejected::errcode={code}")
         return 1
     return 0
 
@@ -147,14 +115,13 @@ def main() -> int:
         return 0
 
     severity = os.environ.get("NOTIFY_SEVERITY", "").strip()
-    style = SEVERITY_STYLES.get(severity)
-    if style is None:
+    icon = SEVERITY_STYLES.get(severity)
+    if icon is None:
         print(
             "::error title=notify-invalid-severity::"
             f"severity 必须是 P0/P1/P2/info，收到 {severity!r}"
         )
         return 1
-    icon, template = style
 
     parsed = urllib.parse.urlsplit(webhook)
     host = parsed.hostname or ""
@@ -164,15 +131,10 @@ def main() -> int:
             f"通知地址必须是 https，收到 {parsed.scheme or '无'} scheme（host={host or '无法解析'}）"
         )
         return 1
-    if host == WECOM_HOST:
-        success_key = "errcode"
-    elif host in FEISHU_HOSTS:
-        success_key = "code"
-    else:
+    if host != WECOM_HOST:
         print(
             "::error title=notify-unknown-host::"
-            f"不支持的通知地址主机 {host}（仅支持 {WECOM_HOST} / "
-            f"{FEISHU_HOSTS[0]} / {FEISHU_HOSTS[1]}）"
+            f"不支持的通知地址主机 {host}（仅支持 {WECOM_HOST}）"
         )
         return 1
 
@@ -181,11 +143,8 @@ def main() -> int:
     body = os.environ.get("NOTIFY_BODY", "")
     links = _parse_links(os.environ.get("NOTIFY_LINKS", ""))
 
-    if success_key == "errcode":
-        payload = _wecom_payload(heading, body, links)
-    else:
-        payload = _feishu_payload(heading, template, body, links)
-    return _post_and_check(webhook, payload, success_key)
+    payload = _wecom_payload(heading, body, links)
+    return _post_and_check(webhook, payload)
 
 
 if __name__ == "__main__":
