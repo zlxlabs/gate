@@ -43,7 +43,7 @@ PRIMARY_SPEC_FIELDS = ("spec_source", "pr_body_digest")
 PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
     "kind", "schema_version", "verdict", "attempts", "shadow_mode", "expected_shadows",
     "result", "cost", "tokens", "runtime", "not_expected_reason", "waiver", "risk",
-    "finding_relation", "intent_provenance", "blocking_matrix",
+    "finding_relation", "intent_provenance", "blocking_matrix", "sol_verify",
 }
 # Mirrors gate-hub scripts/review/contracts.py INTENT_PROVENANCE_FIELDS /
 # INTENT_SOURCE_VALUES / intent_provenance_error: the optional composite the
@@ -51,6 +51,14 @@ PRIMARY_ALLOWED_FIELDS = set(PRIMARY_IDENTITY_FIELDS) | {
 INTENT_PROVENANCE_FIELDS = (
     "intent_source", "task_id", "issue_numbers", "intent_chars", "skipped_sources",
 )
+# Mirrors gate-hub scripts/review/sol_verify_contract.py SECTION_FIELDS /
+# SECTION_SCHEMA_VERSION (§8.9 L2): the optional section gate-hub review-primary
+# attaches to canonical pass audits; deeper shape is that contract's job.
+SOL_VERIFY_FIELDS = frozenset({
+    "schema_version", "sol_leg", "verifier", "merged_finding_ids",
+    "released_finding_ids", "findings", "synthetic_finding_id",
+})
+SOL_VERIFY_SCHEMA_VERSION = "sol-verify-audit/v1"
 INTENT_SOURCE_VALUES = frozenset({"task_card_branch", "task_card_pr_body", "issue_body", "missing"})
 PRIMARY_VERDICTS = {"pass", "fail", "unavailable", "not_expected", "waived"}
 PRIMARY_REVIEWER_VERDICTS = {"pass", "fail", "unavailable"}
@@ -225,10 +233,7 @@ def _primary_identity(
         raise ValueError("invalid canonical primary_review schema/version or verdict")
     extra = set(audit) - PRIMARY_ALLOWED_FIELDS
     missing = set(PRIMARY_REQUIRED_IDENTITY_FIELDS) - set(audit)
-    if extra or missing:
-        raise ValueError(
-            f"invalid canonical primary envelope: extra={sorted(extra)}, missing={sorted(missing)}"
-        )
+    if extra or missing: raise ValueError(f"invalid canonical primary envelope: extra={sorted(extra)}, missing={sorted(missing)}")
     if "risk" in audit:
         risk = audit["risk"]
         risk_fields = {
@@ -261,39 +266,37 @@ def _primary_identity(
         provenance = audit["intent_provenance"]
         if not isinstance(provenance, dict):
             raise ValueError("canonical primary intent_provenance must be an object")
-        if set(provenance) != set(INTENT_PROVENANCE_FIELDS):
-            raise ValueError(
-                "canonical primary intent_provenance must hold exactly "
-                f"{sorted(INTENT_PROVENANCE_FIELDS)}"
-            )
+        if set(provenance) != set(INTENT_PROVENANCE_FIELDS): raise ValueError(f"canonical primary intent_provenance must hold exactly {sorted(INTENT_PROVENANCE_FIELDS)}")
         source = provenance["intent_source"]
-        if not isinstance(source, str) or source not in INTENT_SOURCE_VALUES:
-            raise ValueError(
-                f"canonical primary intent_provenance intent_source must be one of {sorted(INTENT_SOURCE_VALUES)}"
-            )
+        if not isinstance(source, str) or source not in INTENT_SOURCE_VALUES: raise ValueError(f"canonical primary intent_provenance intent_source must be one of {sorted(INTENT_SOURCE_VALUES)}")
         task_id = provenance["task_id"]
         if task_id is not None and (not isinstance(task_id, str) or not task_id):
             raise ValueError("canonical primary intent_provenance task_id must be non-empty text or null")
         issue_numbers = provenance["issue_numbers"]
-        if not isinstance(issue_numbers, list) or any(
-            type(number) is not int or number <= 0 for number in issue_numbers
-        ):
+        if not isinstance(issue_numbers, list) or any(type(number) is not int or number <= 0 for number in issue_numbers):
             raise ValueError("canonical primary intent_provenance issue_numbers must be an array of positive integers")
         if type(provenance["intent_chars"]) is not int or provenance["intent_chars"] < 0:
             raise ValueError("canonical primary intent_provenance intent_chars must be a non-negative integer")
         skipped = provenance["skipped_sources"]
-        if not isinstance(skipped, list) or any(
-            not isinstance(item, str) or not item for item in skipped
-        ):
-            raise ValueError(
-                "canonical primary intent_provenance skipped_sources must be an array of non-empty strings"
-            )
+        if not isinstance(skipped, list) or any(not isinstance(item, str) or not item for item in skipped):
+            raise ValueError("canonical primary intent_provenance skipped_sources must be an array of non-empty strings")
     if "blocking_matrix" in audit and (
         not isinstance(audit["blocking_matrix"], dict) or set(audit["blocking_matrix"]) != {"version", "tier"}
         or not _strict_int(audit["blocking_matrix"]["version"]) or audit["blocking_matrix"]["version"] != 1
         or audit["blocking_matrix"]["tier"] not in {"personal", "internal", "saas"}
     ):
         raise ValueError("canonical primary blocking_matrix must be exactly {version: 1, tier: declared tier}")
+    section = audit.get("sol_verify")
+    if "sol_verify" in audit and (
+        not isinstance(section, dict) or set(section) != SOL_VERIFY_FIELDS
+        or section["schema_version"] != SOL_VERIFY_SCHEMA_VERSION
+        or not isinstance(section["sol_leg"], dict) or not isinstance(section["verifier"], dict)
+        or not isinstance(section["findings"], list)
+        or not isinstance(section["merged_finding_ids"], list) or any(not isinstance(item, str) or not item for item in section["merged_finding_ids"])
+        or not isinstance(section["released_finding_ids"], list) or any(not isinstance(item, str) or not item for item in section["released_finding_ids"])
+        or not (section["synthetic_finding_id"] is None or isinstance(section["synthetic_finding_id"], str) and section["synthetic_finding_id"])
+    ):
+        raise ValueError("canonical primary sol_verify section shape is invalid")
     if (
         isinstance(audit["repository_id"], bool) or not isinstance(audit["repository_id"], int)
         or audit["repository_id"] <= 0
@@ -350,8 +353,7 @@ def _primary_identity(
     if not isinstance(audit["expected_shadows"], list) or not all(isinstance(name, str) and name for name in audit["expected_shadows"]):
         raise ValueError("canonical primary expected_shadows must be an array of names")
     attempts = audit["attempts"]
-    if not isinstance(attempts, list):
-        raise ValueError("canonical primary attempts must be an array of objects")
+    if not isinstance(attempts, list): raise ValueError("canonical primary attempts must be an array of objects")
     required_attempt_fields = ("reviewer", "exit_code", "reason", "duration_s", "cost_usd")
     attempt_durations = []
     for attempt in attempts:
@@ -385,9 +387,7 @@ def _primary_identity(
         _require_finite_nonnegative(runtime["duration_s"], "runtime duration_s")
     if not attempts and runtime is not None:
         raise ValueError("canonical primary runtime must be null when attempts are empty")
-    if attempts and (schema_version == 2 or runtime_present) and (
-        runtime is None or runtime["duration_s"] != sum(attempt_durations)
-    ):
+    if attempts and (schema_version == 2 or runtime_present) and (runtime is None or runtime["duration_s"] != sum(attempt_durations)):
         raise ValueError("canonical primary runtime must equal attempt duration sum")
     result = audit.get("result")
     if result is None:
@@ -585,8 +585,7 @@ def _validate_finding_relation(block: Any) -> dict[str, Any]:
     if not isinstance(items, list) or sum(counts[name] for name in _RELATION_VALUES) != len(items):
         raise ValueError("GATE-FINDING-RELATION-UNKNOWN: counts do not match items")
     for item in items:
-        if not isinstance(item, dict):
-            raise ValueError("GATE-FINDING-RELATION-UNKNOWN: item")
+        if not isinstance(item, dict): raise ValueError("GATE-FINDING-RELATION-UNKNOWN: item")
         relation = item.get("relation_to_previous")
         if relation not in _RELATION_VALUES:
             raise ValueError(f"GATE-FINDING-RELATION-UNKNOWN: {relation!r}")
