@@ -540,6 +540,11 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
             raise ValueError("rejected_requires_sol_verify_origin")
         if matching.get("category") in REJECTED_OWNER_CATEGORIES:
             raise ValueError("rejected_category_requires_owner")
+        # design 261122 §8.9: the soft landing releases only must_respond
+        # findings; the shared gate-hub#1072 helper also fails closed for
+        # legacy audits without a blocking matrix.
+        if _CONVERGENCE.deferred_gate_rejected(audit, matching):
+            raise ValueError("rejected_requires_must_respond")
     counterevidence = None
     if disposition == "false-positive":
         if counterevidence_raw is None or counterevidence_raw == "":

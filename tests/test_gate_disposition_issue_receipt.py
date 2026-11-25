@@ -780,7 +780,10 @@ def test_disposition_workflow_fetches_only_required_commits(tmp_path, expectatio
 
 def test_rejected_producer_issues_receipt_for_sol_verify_finding(tmp_path):
     """卡 1：rejected + 非空 reason + origin=sol_verify 的 major → 签发回执。"""
-    result, output_dir = _issue(tmp_path, disposition="rejected", origin="sol_verify")
+    result, output_dir = _issue(
+        tmp_path, disposition="rejected", origin="sol_verify",
+        tier="internal", matrix=True, gate_action="must_respond",
+    )
 
     assert result.returncode == 0, result.stderr
     artifact = json.loads(result.stdout)["artifact"]
@@ -799,20 +802,25 @@ def test_rejected_producer_issues_receipt_for_sol_verify_finding(tmp_path):
 def test_rejected_producer_bytes_consume_against_current_primary(tmp_path):
     """跨边界：producer 落盘回执字节被 required gate consumer 解析并覆盖 finding。"""
     convergence = _convergence_module()
-    result, output_dir = _issue(tmp_path, disposition="rejected", origin="sol_verify")
+    result, output_dir = _issue(
+        tmp_path, disposition="rejected", origin="sol_verify",
+        tier="internal", matrix=True, gate_action="must_respond",
+    )
     assert result.returncode == 0, result.stderr
     artifact = json.loads(result.stdout)["artifact"]
     raw_bytes = (output_dir / artifact).read_bytes()
     receipt = convergence.parse_disposition_receipt(json.loads(raw_bytes))
     assert receipt.disposition == "rejected"
-    scope = convergence.Scope(**SCOPE)
+    scope = convergence.Scope(**{**SCOPE, "tier": "internal"})
     primary = convergence.CanonicalPrimary(
         schema_version=1, repository_id=SCOPE["repository_id"], pr_number=SCOPE["pr_number"],
         head_sha=SCOPE["head_sha"], run_id=7, run_attempt=1, verdict="fail",
         p1_ids=("finding-one",),
         p1_findings=(("finding-one", "major", "inferred", "src/guard.py", 12, "correctness"),),
     )
-    audit_digest = convergence.canonical_audit_digest(_audit(origin="sol_verify"))
+    audit_digest = convergence.canonical_audit_digest(
+        _audit(origin="sol_verify", tier="internal", matrix=True, gate_action="must_respond"),
+    )
     status = convergence.validate_disposition_receipt(
         receipt, scope=scope, primary=primary, audit_digest=audit_digest,
     )
@@ -823,6 +831,43 @@ def test_rejected_producer_bytes_consume_against_current_primary(tmp_path):
     )
     assert audit.recorded_finding_ids == ("finding-one",)
     assert audit.remaining_p1_ids == ()
+
+
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+def test_rejected_producer_rejects_block_gate_action(tmp_path, tier):
+    """续修缺陷 2：blocking-matrix v1 下 gate_action=block 的 finding 不得 rejected。"""
+    result, output_dir = _issue(
+        tmp_path / tier, disposition="rejected", origin="sol_verify",
+        tier=tier, matrix=True, gate_action="block",
+    )
+
+    assert result.returncode != 0
+    assert "rejected_requires_must_respond" in result.stderr
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+def test_rejected_producer_issues_receipt_for_must_respond_matrix(tmp_path, tier):
+    """续修缺陷 2：must_respond finding 的 rejected 签发在三档 tier 均可用。"""
+    result, output_dir = _issue(
+        tmp_path / tier, disposition="rejected", origin="sol_verify",
+        tier=tier, matrix=True, gate_action="must_respond",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(
+        (output_dir / json.loads(result.stdout)["artifact"]).read_bytes()
+    )
+    assert payload["disposition"] == "rejected"
+
+
+def test_rejected_producer_fails_closed_on_legacy_audit_without_matrix(tmp_path):
+    """续修缺陷 2：无 blocking_matrix 的旧 audit 对 rejected fail closed。"""
+    result, output_dir = _issue(tmp_path, disposition="rejected", origin="sol_verify")
+
+    assert result.returncode != 0
+    assert "rejected_requires_must_respond" in result.stderr
+    assert not output_dir.exists()
 
 
 @pytest.mark.parametrize("origin", [None, "primary"])
