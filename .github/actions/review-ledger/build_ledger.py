@@ -501,9 +501,9 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
             if key not in item:
                 continue
             value = item[key]
-            if not isinstance(value, str) or not value or len(value) > 500:
+            if not isinstance(value, str) or (not value and not (key == "evidence_pointer" and (item.get("disposition_claim") or item.get("disposition") or "") == "rejected")) or len(value) > 500:
                 raise ValueError(f"disposition_receipt_consumption.resolved item has invalid {key}")
-            if key in {"disposition", "disposition_claim"} and value not in {"false-positive", "deferred"}:
+            if key in {"disposition", "disposition_claim"} and value not in {"false-positive", "deferred", "rejected"}:
                 raise ValueError(f"disposition_receipt_consumption.resolved item has invalid {key}")
             projected_item[key] = value
         projected.append(projected_item)
@@ -550,9 +550,9 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
             if key not in item:
                 continue
             value = item[key]
-            if not isinstance(value, str) or not value or len(value) > 500:
+            if not isinstance(value, str) or (not value and not (key == "evidence_pointer" and (item.get("disposition_claim") or item.get("disposition") or "") == "rejected")) or len(value) > 500:
                 raise ValueError(f"disposition_receipt_consumption.recorded item has invalid {key}")
-            if key in {"disposition", "disposition_claim"} and value not in {"false-positive", "deferred"}:
+            if key in {"disposition", "disposition_claim"} and value not in {"false-positive", "deferred", "rejected"}:
                 raise ValueError(f"disposition_receipt_consumption.recorded item has invalid {key}")
             projected_claim[key] = value
         projected_claims.append(projected_claim)

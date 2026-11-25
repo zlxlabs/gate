@@ -1677,6 +1677,11 @@ jobs:
           REVIEW_PRIMARY_AUDIT_PATH: ${{ runner.temp }}/primary-review-audit.json
           REVIEW_JOB_ID: ${{ steps.resolve-job-id.outputs.job_id }}
           REVIEW_RUN_MODE: PAYLOAD_ONLY
+          # gate-hub design 261122 §8.9 soft-landing master switch, forwarded
+          # verbatim from the CALLER repo variable (same shape as
+          # NET_SYSFS_ROOT). This repo never parses it: review-primary treats
+          # only the literal "1" as on; unset or any other value stays off.
+          SOL_VERIFIER_SOFT_LANDING: ${{ vars.SOL_VERIFIER_SOFT_LANDING }}
           # github.workflow_sha = the commit SHA of the CALLING (top-level,
           # per-repo caller) workflow file — the `github` context is always
           # associated with the caller, even inside a called reusable

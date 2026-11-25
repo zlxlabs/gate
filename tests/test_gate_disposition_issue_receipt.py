@@ -71,7 +71,7 @@ def _allowlisted_ce(sha, *, relpath="src/lock.py", literal="locked-behavior", ou
 
 
 def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=None,
-           severity="major", gate_action=None, matrix=False):
+           severity="major", gate_action=None, matrix=False, origin=None, category="correctness"):
     audit = {
         **SCOPE,
         "repository": REPOSITORY,
@@ -87,7 +87,8 @@ def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=
                     "trigger_kind": trigger_kind,
                     "file": "src/guard.py",
                     "line": 12,
-                    "category": "correctness",
+                    "category": category,
+                    **({"origin": origin} if origin is not None else {}),
                 }
             ]
         },
@@ -107,13 +108,15 @@ def _audit(tier="personal", *, trigger_kind="inferred", head_sha=None, base_sha=
 
 def _issue(tmp_path, *, disposition=None, counterevidence=None, tracking_issue=None,
            tier="personal", trigger_kind="inferred", head_sha=None, base_sha=None, repo_dir=None,
-           severity="major", gate_action=None, matrix=False):
+           severity="major", gate_action=None, matrix=False, origin=None, category="correctness",
+           reason="canonical evidence reviewed"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     head_sha = head_sha or SCOPE["head_sha"]
     audit_path = tmp_path / "audit.json"
     audit_path.write_text(json.dumps(_audit(
         tier, trigger_kind=trigger_kind, head_sha=head_sha, base_sha=base_sha,
         severity=severity, gate_action=gate_action, matrix=matrix,
+        origin=origin, category=category,
     )))
     output_dir = tmp_path / "output"
     scope = {**SCOPE, "tier": tier, "head_sha": head_sha}
@@ -125,7 +128,7 @@ def _issue(tmp_path, *, disposition=None, counterevidence=None, tracking_issue=N
         "--repository", REPOSITORY,
         "--repository-id", "123", "--pr-number", "42",
         "--head-sha", head_sha, "--finding-id", "finding-one",
-        "--reason", "canonical evidence reviewed", "--scope-json", json.dumps(scope),
+        "--reason", reason, "--scope-json", json.dumps(scope),
         "--approver", "owner", "--approver-id", "10",
         "--approved-at", "2026-09-25T09:00:00Z", "--triggering-actor", "owner",
     ]
@@ -773,3 +776,140 @@ def test_disposition_workflow_fetches_only_required_commits(tmp_path, expectatio
         audit_digest=convergence.canonical_audit_digest(_audit(head_sha=sha, base_sha=base_sha)),
     )
     assert rejected.reason_code == "epoch_mismatch_stale"
+
+
+def test_rejected_producer_issues_receipt_for_sol_verify_finding(tmp_path):
+    """卡 1：rejected + 非空 reason + origin=sol_verify 的 major → 签发回执。"""
+    result, output_dir = _issue(
+        tmp_path, disposition="rejected", origin="sol_verify",
+        tier="internal", matrix=True, gate_action="must_respond",
+    )
+
+    assert result.returncode == 0, result.stderr
+    artifact = json.loads(result.stdout)["artifact"]
+    payload_bytes = (output_dir / artifact).read_bytes()
+    payload = json.loads(payload_bytes)
+    assert payload_bytes == json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    assert payload["kind"] == "gate-disposition-receipt-v3"
+    assert payload["disposition"] == "rejected"
+    assert payload["reason"] == "canonical evidence reviewed"
+    assert "counterevidence" not in payload
+    assert "tracking_issue" not in payload
+
+
+def test_rejected_producer_bytes_consume_against_current_primary(tmp_path):
+    """跨边界：producer 落盘回执字节被 required gate consumer 解析并覆盖 finding。"""
+    convergence = _convergence_module()
+    result, output_dir = _issue(
+        tmp_path, disposition="rejected", origin="sol_verify",
+        tier="internal", matrix=True, gate_action="must_respond",
+    )
+    assert result.returncode == 0, result.stderr
+    artifact = json.loads(result.stdout)["artifact"]
+    raw_bytes = (output_dir / artifact).read_bytes()
+    receipt = convergence.parse_disposition_receipt(json.loads(raw_bytes))
+    assert receipt.disposition == "rejected"
+    scope = convergence.Scope(**{**SCOPE, "tier": "internal"})
+    primary = convergence.CanonicalPrimary(
+        schema_version=1, repository_id=SCOPE["repository_id"], pr_number=SCOPE["pr_number"],
+        head_sha=SCOPE["head_sha"], run_id=7, run_attempt=1, verdict="fail",
+        p1_ids=("finding-one",),
+        p1_findings=(("finding-one", "major", "inferred", "src/guard.py", 12, "correctness"),),
+    )
+    audit_digest = convergence.canonical_audit_digest(
+        _audit(origin="sol_verify", tier="internal", matrix=True, gate_action="must_respond"),
+    )
+    status = convergence.validate_disposition_receipt(
+        receipt, scope=scope, primary=primary, audit_digest=audit_digest,
+    )
+    assert (status.valid, status.active) == (True, True)
+    assert status.reason_code == "active_rejected"
+    audit = convergence.record_dispositions(
+        primary.p1_ids, (receipt,), scope=scope, primary=primary, audit_digest=audit_digest,
+    )
+    assert audit.recorded_finding_ids == ("finding-one",)
+    assert audit.remaining_p1_ids == ()
+
+
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+def test_rejected_producer_rejects_block_gate_action(tmp_path, tier):
+    """续修缺陷 2：blocking-matrix v1 下 gate_action=block 的 finding 不得 rejected。"""
+    result, output_dir = _issue(
+        tmp_path / tier, disposition="rejected", origin="sol_verify",
+        tier=tier, matrix=True, gate_action="block",
+    )
+
+    assert result.returncode != 0
+    assert "rejected_requires_must_respond" in result.stderr
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("tier", ["personal", "internal", "saas"])
+def test_rejected_producer_issues_receipt_for_must_respond_matrix(tmp_path, tier):
+    """续修缺陷 2：must_respond finding 的 rejected 签发在三档 tier 均可用。"""
+    result, output_dir = _issue(
+        tmp_path / tier, disposition="rejected", origin="sol_verify",
+        tier=tier, matrix=True, gate_action="must_respond",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(
+        (output_dir / json.loads(result.stdout)["artifact"]).read_bytes()
+    )
+    assert payload["disposition"] == "rejected"
+
+
+def test_rejected_producer_fails_closed_on_legacy_audit_without_matrix(tmp_path):
+    """续修缺陷 2：无 blocking_matrix 的旧 audit 对 rejected fail closed。"""
+    result, output_dir = _issue(tmp_path, disposition="rejected", origin="sol_verify")
+
+    assert result.returncode != 0
+    assert "rejected_requires_must_respond" in result.stderr
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("origin", [None, "primary"])
+def test_rejected_producer_rejects_finding_without_sol_verify_origin(tmp_path, origin):
+    """卡 2：主审 finding（无 origin）或非 sol_verify origin → 拒绝，不签发。"""
+    result, output_dir = _issue(tmp_path, disposition="rejected", origin=origin)
+
+    assert result.returncode != 0
+    assert "rejected_requires_sol_verify_origin" in result.stderr
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("category", ["test_integrity", "security"])
+def test_rejected_producer_rejects_owner_protected_categories(tmp_path, category):
+    """卡 3：test_integrity / security → 拒绝（owner 确认流程本卡不实现）。"""
+    result, output_dir = _issue(
+        tmp_path, disposition="rejected", origin="sol_verify", category=category,
+    )
+
+    assert result.returncode != 0
+    assert "rejected_category_requires_owner" in result.stderr
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("reason", ["   ", "\t\n"])
+def test_rejected_producer_rejects_blank_reason(tmp_path, reason):
+    """卡 4a：reason 全空白 → 拒绝（strip 校验对 rejected 同样生效）。"""
+    result, output_dir = _issue(
+        tmp_path, disposition="rejected", origin="sol_verify", reason=reason,
+    )
+
+    assert result.returncode != 0
+    assert "reason must be non-empty" in result.stderr
+    assert not output_dir.exists()
+
+
+def test_rejected_producer_rejects_empty_reason(tmp_path):
+    """卡 4b：reason 空串 → _required 既有机制拒绝（base 行为不变，回归守卫）。"""
+    result, output_dir = _issue(
+        tmp_path, disposition="rejected", origin="sol_verify", reason="",
+    )
+
+    assert result.returncode != 0
+    assert "reason is required" in result.stderr
+    assert not output_dir.exists()

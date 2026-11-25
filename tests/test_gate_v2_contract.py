@@ -1136,7 +1136,7 @@ def test_disposition_preflight_reads_the_same_inputs_as_the_receipt_step():
         # Legacy five-input caller: nothing to forward, rejected for any audit.
         (LEGACY_FIVE_INPUTS, 1, "counterevidence_required"),
         ({**LEGACY_FIVE_INPUTS, "disposition": "false-positive"}, 1, "counterevidence_required"),
-        ({**LEGACY_FIVE_INPUTS, "disposition": "yes-please"}, 1, "disposition must be false-positive or deferred"),
+        ({**LEGACY_FIVE_INPUTS, "disposition": "yes-please"}, 1, "disposition must be false-positive, deferred or rejected"),
         # The default empty disposition is the false-positive default, so it is
         # checked with counterevidence exactly as the receipt checks it.
         ({**LEGACY_FIVE_INPUTS, "counterevidence_json": VALID_COUNTEREVIDENCE}, 0, None),
