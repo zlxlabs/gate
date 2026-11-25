@@ -47,7 +47,7 @@ TERMINAL_DECISIONS = frozenset(
     {"collecting", "converged", "manual_required", "fail_closed"}
 )
 RECEIPT_KIND = "canonical_primary"
-DISPOSITION_KINDS = frozenset({"false-positive", "deferred"})
+DISPOSITION_KINDS = frozenset({"false-positive", "deferred", "rejected"})  # + "rejected" per gate-hub design 261122 §8.9: sol_verify origin only, owner-protected categories refused at issuance
 DISPOSITION_RECEIPT_SCHEMA_VERSION = 3
 DISPOSITION_RECEIPT_KIND = f"gate-disposition-receipt-v{DISPOSITION_RECEIPT_SCHEMA_VERSION}"
 # gate-hub#1072 ruling 4(a): a deferred receipt may not release a P1 at any
@@ -56,7 +56,7 @@ DEFERRED_RECEIPT_REJECT_REASON = "deferred_not_allowed_for_tier"
 # Finding-level blocking-matrix contract v1 (gate-hub producer ⇄ gate
 # aggregator): gate_action values a receipt may release. "comment" findings
 # never need a receipt; "block" accepts only false-positive; "must_respond"
-# accepts false-positive or deferred (with a same-repo tracking issue).
+# accepts false-positive, deferred or rejected (rejected: sol_verify origin only).
 _canonical_json = _GATE_ACTION.canonical_json
 canonical_finding_key = _GATE_ACTION.canonical_finding_key
 _primary_finding_record = _GATE_ACTION.primary_finding_record
