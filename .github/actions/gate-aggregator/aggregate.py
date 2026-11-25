@@ -831,8 +831,7 @@ def _previous_findings_from_silo(
     with tempfile.TemporaryDirectory(prefix="silo-ledger-latest-") as dest:
         target = Path(dest) / _LEDGER_LATEST_OBJECT
         proc = _silo_cli(["get", "--key", key, "--dest", str(target)], SILO_CLI_CALL_TIMEOUT_SECONDS)
-        if proc.returncode == 2:
-            raise RuntimeError("silo-ledger-latest-absent")
+        if proc.returncode == 2: raise RuntimeError("silo-ledger-latest-absent")
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or f"silo get failed: {key}").strip())
         raw = target.read_text(encoding="utf-8")
@@ -846,8 +845,7 @@ def _previous_findings_from_silo(
         parsed = (int(entry["run_id"]), int(entry["run_attempt"]))
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("silo-ledger-latest-unreadable") from exc
-    if parsed >= (run_id, run_attempt):
-        raise RuntimeError("silo-ledger-latest-not-prior")
+    if parsed >= (run_id, run_attempt): raise RuntimeError("silo-ledger-latest-not-prior")
     review = entry.get("review") if isinstance(entry.get("review"), dict) else {}
     result = review.get("result") if isinstance(review.get("result"), dict) else {}
     findings = result.get("findings") if isinstance(result.get("findings"), list) else []
@@ -889,16 +887,14 @@ def load_previous_round_findings(
                 "findings": payload["findings"],
             }
         return _degrade_previous_round("previous-findings-file-invalid")
-    if not _silo_configured():
-        return _degrade_previous_round("silo-not-configured")
+    if not _silo_configured(): return _degrade_previous_round("silo-not-configured")
     try:
         head_sha, findings = _previous_findings_from_silo(
             repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt,
         )
     except Exception as exc:
         detail = str(exc)
-        if detail in _LATEST_LEDGER_DEGRADE:
-            return _degrade_previous_round(detail)
+        if detail in _LATEST_LEDGER_DEGRADE: return _degrade_previous_round(detail)
         return _degrade_previous_round(f"silo-ledger-unreadable:{type(exc).__name__}")
     return {"available": True, "detail": "", "head_sha": head_sha, "findings": findings}
 
@@ -927,6 +923,11 @@ def _project_previous_dispositions(
                 dropped += 1
                 continue
             tracking_issue = _clip_text(receipt.tracking_issue)
+        elif receipt.disposition == "rejected":
+            # gate-hub#2644: rejected projects evidence-free; blank reason stays dropped.
+            if not receipt.reason.strip():
+                dropped += 1
+                continue
         else:
             dropped += 1
             continue
@@ -974,8 +975,7 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     parser.add_argument("--previous-findings-path", required=True)
     args = parser.parse_args(argv)
     audit_path = Path(args.audit_path)
-    if not audit_path.is_file():
-        return 0
+    if not audit_path.is_file(): return 0
     previous = load_previous_round_findings(
         path=args.previous_findings_path, repository_id=0, pr_number=0, run_id=0, run_attempt=0,
     )

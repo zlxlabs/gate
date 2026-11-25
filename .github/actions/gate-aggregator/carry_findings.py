@@ -10,7 +10,11 @@ is ``block`` or ``must_respond`` — a ``comment`` finding never blocks; a
 legacy finding without ``gate_action`` blocks on P1 severity only. A
 false-positive receipt releases any covered finding; a deferred receipt
 releases only a ``must_respond`` finding (legacy audits reject deferred
-outright). This is deliberately NOT ``build_finding_relation``'s union:
+outright); a rejected receipt releases only a ``must_respond`` finding
+with ``origin == "sol_verify"`` and a category outside the owner-protected
+{test_integrity, security} (gate-hub#2579 / design 261122 §8.9, mirroring
+issue_receipt.py's issuance guards; missing fields fail closed). This is
+deliberately NOT ``build_finding_relation``'s union:
 the source is the previous round's own carried findings, filtered.
 
 stdlib-only; loaded by aggregate.py via importlib spec (sibling-module
@@ -25,6 +29,8 @@ from typing import Any
 _BLOCKING_GATE_ACTIONS = frozenset({"block", "must_respond"})
 _KNOWN_GATE_ACTIONS = frozenset({"block", "must_respond", "comment"})
 _P1_SEVERITIES = frozenset({"major", "blocker"})
+_REJECTED_RELEASE_ORIGIN = "sol_verify"
+_REJECTED_PROTECTED_CATEGORIES = frozenset({"test_integrity", "security"})
 
 
 def _blocks_merge(finding: dict[str, Any]) -> bool:
@@ -35,12 +41,25 @@ def _blocks_merge(finding: dict[str, Any]) -> bool:
     return finding.get("severity") in _P1_SEVERITIES
 
 
+def _rejected_releases(finding: dict[str, Any]) -> bool:
+    """True when a rejected receipt may release this carried finding:
+    sol_verify origin only, must_respond only, owner-protected categories
+    never; a missing/invalid field fails closed."""
+    return (
+        finding.get("origin") == _REJECTED_RELEASE_ORIGIN
+        and finding.get("gate_action") == "must_respond"
+        and isinstance(finding.get("category"), str)
+        and finding["category"] not in _REJECTED_PROTECTED_CATEGORIES
+    )
+
+
 def _released_ids(findings: list[Any], dispositions: list[Any]) -> set[str]:
     """Finding ids an already-approved receipt releases from the carry.
 
     ``dispositions`` arrives pre-filtered by the projection's validity rules
     (refuted counterevidence for false-positive; a tracking issue for
-    deferred), so no receipt re-validation happens here.
+    deferred; a non-blank reason for rejected), so no receipt re-validation
+    happens here.
     """
     false_positives = {
         item["finding_id"] for item in dispositions
@@ -52,6 +71,11 @@ def _released_ids(findings: list[Any], dispositions: list[Any]) -> set[str]:
         if isinstance(item, dict) and item.get("disposition") == "deferred"
         and isinstance(item.get("finding_id"), str)
     }
+    rejected = {
+        item["finding_id"] for item in dispositions
+        if isinstance(item, dict) and item.get("disposition") == "rejected"
+        and isinstance(item.get("finding_id"), str)
+    }
     released: set[str] = set()
     for finding in findings:
         finding_id = finding.get("id") if isinstance(finding, dict) else None
@@ -59,7 +83,7 @@ def _released_ids(findings: list[Any], dispositions: list[Any]) -> set[str]:
             continue
         if finding_id in false_positives or (
             finding_id in deferred and finding.get("gate_action") == "must_respond"
-        ):
+        ) or (finding_id in rejected and _rejected_releases(finding)):
             released.add(finding_id)
     return released
 
