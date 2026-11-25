@@ -27,7 +27,11 @@ from xml.etree import ElementTree as ET
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 TRACKING_ISSUE_URL = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)")
 COUNTEREVIDENCE_FIELDS = ("command", "output", "result", "pointer")
-DISPOSITIONS = frozenset({"false-positive", "deferred"})
+DISPOSITIONS = frozenset({"false-positive", "deferred", "rejected"})
+# gate-hub design 261122 §8.4/§8.9: rejecting a test_integrity or security
+# finding requires owner confirmation; no owner-confirmation flow exists yet,
+# so issuance refuses these categories outright for rejected.
+REJECTED_OWNER_CATEGORIES = frozenset({"test_integrity", "security"})
 
 
 def _load_convergence():
@@ -490,7 +494,7 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
     reason = str(_required(args, envelope, "reason", "DISPOSITION_REASON"))
     disposition = _value(args, envelope, "disposition", "DISPOSITION_KIND") or "false-positive"
     if disposition not in DISPOSITIONS:
-        raise ValueError("disposition must be false-positive or deferred")
+        raise ValueError("disposition must be false-positive, deferred or rejected")
     repository = _value(args, envelope, "repository", "GITHUB_REPOSITORY")
     counterevidence_raw = _value(args, envelope, "counterevidence_json", "DISPOSITION_COUNTEREVIDENCE_JSON")
     tracking_issue = _value(args, envelope, "tracking_issue", "DISPOSITION_TRACKING_ISSUE")
@@ -526,6 +530,16 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
         raise ValueError(coverage_error)
     if disposition == "false-positive" and matching.get("trigger_kind") != "inferred":
         raise ValueError("finding_id must identify an inferred P1 finding")
+    if disposition == "rejected":
+        # gate-hub design 261122 §8.9: rejected is an evidence-free rejection
+        # exit ONLY for sol verifier findings. A primary-review finding (no
+        # origin) must never take this exit — it would open an evidence-free
+        # backdoor in the existing review gate — so origin is checked first
+        # and owner-protected categories second.
+        if matching.get("origin") != "sol_verify":
+            raise ValueError("rejected_requires_sol_verify_origin")
+        if matching.get("category") in REJECTED_OWNER_CATEGORIES:
+            raise ValueError("rejected_category_requires_owner")
     counterevidence = None
     if disposition == "false-positive":
         if counterevidence_raw is None or counterevidence_raw == "":
@@ -560,7 +574,10 @@ def _receipt_fields(args: argparse.Namespace, envelope: dict[str, Any]) -> dict[
                 counterevidence["command"], head_sha, repo_dir,
                 match_expectation=match_expectation, base_sha=scope["base_sha"],
             )
-    else:
+    elif disposition == "deferred":
+        # deferred's evidence contract is unchanged (gate-hub#1072 ruling 4(a));
+        # rejected never enters this branch — it was fully guarded above and
+        # its receipt carries just reason and auth fields.
         if not isinstance(tracking_issue, str):
             raise ValueError("tracking_issue_invalid")
         if re.fullmatch(r"#[1-9][0-9]*", tracking_issue) is None:
