@@ -1,4 +1,5 @@
 [
     {"path": ".github/actions/gate-aggregator/convergence.py", "ceiling": 2358, "reason": "存量基线 2026-11-25；锁现值不放大（gate-hub#2579 L3 需触碰）"},
+    {"path": ".github/actions/gate-aggregator/aggregate.py", "ceiling": 4145, "reason": "存量基线 2026-11-25；锁现值不放大（gate-hub#2579 L5b 需触碰）"},
     {"path": "tests/test_gate_v2_contract.py", "ceiling": 4067, "reason": "存量基线 2026-11-25；锁现值不放大（gate-hub#2579 L3 需触碰）"}
 ]
