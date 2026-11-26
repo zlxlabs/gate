@@ -7,6 +7,7 @@ import io
 import json
 import subprocess
 import sys
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -60,7 +61,7 @@ def _zip(payload: bytes, filename: str = quality_reuse.RECEIPT_FILENAME) -> byte
     return buffer.getvalue()
 
 
-def _api(zip_bytes: bytes, *, conclusion="success", run_id=321):
+def _api(zip_bytes: bytes, *, conclusion="success", run_id=321, job_names=("quality",)):
     artifact_name = quality_reuse.artifact_name_for(12345, 67, "a" * 40)
     def fetch(url: str, timeout: float) -> bytes:
         assert timeout > 0
@@ -70,7 +71,7 @@ def _api(zip_bytes: bytes, *, conclusion="success", run_id=321):
         if url.endswith("/actions/artifacts/88/zip"):
             return zip_bytes
         if "/actions/runs/" in url and "/jobs?" in url:
-            jobs = [] if conclusion is None else [{"name": "quality", "conclusion": conclusion}]
+            jobs = [] if conclusion is None else [{"name": name, "conclusion": conclusion} for name in job_names]
             return json.dumps({"jobs": jobs}).encode()
         raise AssertionError(f"unexpected API URL {url}")
     return fetch
@@ -139,14 +140,45 @@ def test_quality_job_must_be_authoritatively_successful(tmp_path, conclusion):
     assert not decision.reusable and decision.reason == "quality_job_not_success"
 
 
-@pytest.mark.parametrize("field,value,reason", [
-    ("caller_checks", "failed", "caller_checks_not_passed"),
-    ("preflight_result", "blocked", "preflight_blocked"),
+@pytest.mark.parametrize("job_names,expected", [
+    (("gate / quality",), True),
+    (("gate / quality", "caller / quality"), False),
+    (("fooquality",), False),
 ])
-def test_receipt_quality_gate_evidence_must_pass(tmp_path, field, value, reason):
-    payload = json.loads(_build_receipt(tmp_path, **{field: value}))
+def test_reusable_workflow_quality_job_name_shape(tmp_path, job_names, expected):
+    packed = _zip(_build_receipt(tmp_path))
+    decision = quality_reuse.lookup_reusable_quality(REQUEST, _api(packed, job_names=job_names))
+    assert decision.reusable is expected
+
+
+@pytest.mark.parametrize("preflight", ["", "success", "skipped"])
+def test_aggregator_reusable_preflight_values_round_trip(tmp_path, preflight):
+    payload = json.loads(_build_receipt(tmp_path, preflight_result=preflight))
+    assert payload["preflight_result"] == preflight
+    decision = quality_reuse.lookup_reusable_quality(REQUEST, _api(_zip(json.dumps(payload).encode())))
+    assert decision.reusable and decision.preflight_result == preflight
+
+
+@pytest.mark.parametrize("preflight,reason", [
+    ("blocked", "preflight_blocked"), ("unavailable", "preflight_not_reusable"),
+    ("cancelled", "preflight_not_reusable"), ("unknown", "receipt_preflight_invalid"),
+])
+def test_non_reusable_or_unknown_preflight_is_rejected(tmp_path, preflight, reason):
+    if preflight == "unknown":
+        payload = json.loads(_build_receipt(tmp_path))
+        payload["preflight_result"] = preflight
+        with pytest.raises(ValueError, match="receipt_preflight_invalid"):
+            quality_reuse.build_receipt(**{**VALUES, "preflight_result": preflight})
+    else:
+        payload = json.loads(_build_receipt(tmp_path, preflight_result=preflight))
     decision = quality_reuse.lookup_reusable_quality(REQUEST, _api(_zip(json.dumps(payload).encode())))
     assert not decision.reusable and decision.reason == reason
+
+
+def test_caller_checks_still_must_pass(tmp_path):
+    payload = json.loads(_build_receipt(tmp_path, caller_checks="failed"))
+    decision = quality_reuse.lookup_reusable_quality(REQUEST, _api(_zip(json.dumps(payload).encode())))
+    assert not decision.reusable and decision.reason == "caller_checks_not_passed"
 
 
 @pytest.mark.parametrize("mode,reason", [
@@ -204,6 +236,53 @@ def test_receipt_json_field_type_errors_fail_closed(tmp_path, field, value, reas
     payload[field] = value
     decision = quality_reuse.lookup_reusable_quality(REQUEST, _api(_zip(json.dumps(payload).encode())))
     assert not decision.reusable and decision.reason == reason
+
+
+def test_redirect_handler_strips_authorization_only_across_origins(monkeypatch):
+    base_redirect = urllib.request.HTTPRedirectHandler.redirect_request
+
+    def return_both_auth_maps(self, req, fp, code, msg, headers, newurl):
+        redirected = base_redirect(self, req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            redirected.add_unredirected_header("aUtHoRiZaTiOn", "Bearer secret-unredirected")
+        return redirected
+
+    monkeypatch.setattr(urllib.request.HTTPRedirectHandler, "redirect_request", return_both_auth_maps)
+    handler = quality_reuse._GitHubRedirectHandler()
+    request = urllib.request.Request("https://api.github.com/repos/x/y/actions/artifacts/1/zip",
+                                     headers={"Authorization": "Bearer secret"})
+    request.add_unredirected_header("aUtHoRiZaTiOn", "Bearer secret-unredirected")
+    redirected = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://blob.example.net/artifact?sig=redacted")
+    assert redirected is not None
+    for header_map in (redirected.headers, redirected.unredirected_hdrs):
+        assert all(key.lower() != "authorization" for key in header_map)
+
+    same_origin = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://api.github.com/repos/x/y/other")
+    assert same_origin is not None
+    assert any(key.lower() == "authorization" for key in same_origin.headers)
+    assert any(key.lower() == "authorization" for key in same_origin.unredirected_hdrs)
+
+
+def test_api_fetch_failure_does_not_leak_token(monkeypatch, tmp_path):
+    token = "ghs-never-print-this"
+    monkeypatch.setenv("GH_TOKEN", token)
+
+    class FailingOpener:
+        def open(self, request, timeout):
+            assert request.get_header("Authorization") == f"Bearer {token}"
+            raise OSError(f"redirect failed with {token}")
+
+    def build_opener(*handlers):
+        assert len(handlers) == 1 and isinstance(handlers[0], quality_reuse._GitHubRedirectHandler)
+        return FailingOpener()
+
+    monkeypatch.setattr(quality_reuse.urllib.request, "build_opener", build_opener)
+    result, stdout, output = _run_lookup(quality_reuse._api_fetch, tmp_path)
+    assert result == 0
+    assert "ghs-never-print-this" not in stdout and "ghs-never-print-this" not in output
+    assert "quality_reusable=false" in output and "reuse_reason=api_error" in output
 
 
 def test_artifact_name_and_receipt_validator_contract():

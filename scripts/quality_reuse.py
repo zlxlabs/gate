@@ -21,6 +21,8 @@ RECEIPT_KIND = "gate_quality_reuse"
 RECEIPT_FILENAME = "quality-reuse-receipt.json"
 API_ROOT = "https://api.github.com"
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+PREFLIGHT_RESULT_DOMAIN = ("", "success", "blocked", "unavailable", "skipped", "cancelled")
+REUSABLE_PREFLIGHT_RESULTS = ("", "success", "skipped")
 RECEIPT_FIELDS = {
     "kind", "schema_version", "repository_id", "pr_number", "head_sha", "base_sha",
     "merge_tree", "runner", "extra_runner_label_ci", "tier", "source_run_id",
@@ -114,9 +116,11 @@ def _receipt_error(payload: object) -> str:
     for field in ("head_sha", "base_sha", "merge_tree"):
         if not _valid_sha(payload[field]):
             return "receipt_sha_invalid"
-    for field in ("runner", "tier", "caller_checks", "preflight_result"):
+    for field in ("runner", "tier", "caller_checks"):
         if not _nonempty_string(payload[field]):
             return "receipt_string_invalid"
+    if not isinstance(payload["preflight_result"], str) or payload["preflight_result"] not in PREFLIGHT_RESULT_DOMAIN:
+        return "receipt_preflight_invalid"
     if not isinstance(payload["extra_runner_label_ci"], str) or any(char in payload["extra_runner_label_ci"] for char in "\r\n\x00"):
         return "receipt_string_invalid"
     return ""
@@ -141,8 +145,9 @@ def validate_receipt(payload: object, expected: ReuseRequest) -> tuple[bool, str
             return False, "receipt_mismatch"
     if payload["caller_checks"] != "passed":
         return False, "caller_checks_not_passed"
-    if payload["preflight_result"] == "blocked":
-        return False, "preflight_blocked"
+    if payload["preflight_result"] not in REUSABLE_PREFLIGHT_RESULTS:
+        reason = "preflight_blocked" if payload["preflight_result"] == "blocked" else "preflight_not_reusable"
+        return False, reason
     return True, "reusable"
 
 
@@ -153,13 +158,40 @@ def _json_bytes(raw: bytes) -> object:
         raise LookupFailure("json_invalid") from None
 
 
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname.lower() if parsed.hostname else None
+    try:
+        port = parsed.port
+    except ValueError:
+        return scheme, host, None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, host, port
+
+
+class _GitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        if _origin(req.full_url) != _origin(newurl):
+            for header_map in (redirected.headers, redirected.unredirected_hdrs):
+                for key in tuple(header_map):
+                    if key.lower() == "authorization":
+                        del header_map[key]
+        return redirected
+
+
 def _api_fetch(url: str, timeout: float) -> bytes:
     token = os.environ.get("GH_TOKEN", "")
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(_GitHubRedirectHandler())
+    with opener.open(request, timeout=timeout) as response:
         return response.read()
 
 
@@ -216,7 +248,7 @@ def _quality_success(fetcher: Fetch, repository: str, run_id: int, timeout: floa
     for job in jobs:
         if not isinstance(job, dict) or not isinstance(job.get("name"), str):
             raise LookupFailure("api_response_invalid")
-        if job["name"] == "quality":
+        if job["name"] == "quality" or job["name"].endswith(" / quality"):
             quality.append(job)
     return len(quality) == 1 and quality[0].get("conclusion") == "success"
 
