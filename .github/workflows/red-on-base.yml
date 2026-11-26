@@ -80,8 +80,8 @@ jobs:
           fi
           : >"$TREE_OUT/shell.jsonl"
           if [ -z "$step_insufficient" ]; then
-            python3 -c 'import json,os,sys; sys.stdout.write("\n".join(json.loads(os.environ["PYTEST_FILES_JSON"])))' >"$TREE_OUT/pytest_files.txt"
-            python3 -c 'import json,os,sys; sys.stdout.write("\n".join(json.loads(os.environ["SHELL_FILES_JSON"])))' >"$TREE_OUT/shell_files.txt"
+            python3 -c 'import json,os,sys; files=json.loads(os.environ["PYTEST_FILES_JSON"]); sys.stdout.write("\n".join(files) + ("\n" if files else ""))' >"$TREE_OUT/pytest_files.txt"
+            python3 -c 'import json,os,sys; files=json.loads(os.environ["SHELL_FILES_JSON"]); sys.stdout.write("\n".join(files) + ("\n" if files else ""))' >"$TREE_OUT/shell_files.txt"
             if [ -s "$TREE_OUT/pytest_files.txt" ]; then
               pytest_requested=true
               if [ -x scripts/gate-quality ]; then
@@ -104,7 +104,7 @@ jobs:
             elif [ -x scripts/gate-quality ]; then entry_present=true
             fi
             if [ -z "$step_insufficient" ] && [ -s "$TREE_OUT/shell_files.txt" ]; then
-              while IFS= read -r f; do
+              while IFS= read -r f || [ -n "$f" ]; do
                 [ -n "$f" ] || continue
                 set +e
                 timeout -s TERM 300 bash "$f"
