@@ -195,12 +195,11 @@ def test_compliant_rejected_projects_and_releases(tmp_path, monkeypatch, capsys)
     assert payload["findings"] == [_finding(OK_FINDING_ID)]  # findings stay verbatim
     rejected = payload["dispositions"][0]
     assert set(rejected) == {
-        "finding_id", "finding_key", "disposition", "head_sha", "approved_at", "reason",
+        "finding_id", "disposition", "head_sha", "approved_at", "reason",
         "counterevidence", "tracking_issue",
     }
     assert rejected == {
         "finding_id": OK_FINDING_ID,
-        "finding_key": AGG._GATE_ACTION.canonical_finding_key(_finding(OK_FINDING_ID)),
         "disposition": "rejected", "head_sha": rejected["head_sha"],
         "approved_at": "2026-11-25T09:00:00Z", "reason": "sol verifier retracted after re-check",
         "counterevidence": None, "tracking_issue": None,
@@ -270,6 +269,38 @@ def test_blank_reason_rejected_stays_dropped(tmp_path, monkeypatch, capsys):
     assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=1\n"
     assert [item["finding_id"] for item in payload["dispositions"]] == [OK_FINDING_ID]
     assert [item["id"] for item in payload["open_findings"]] == ["sol-carry-blank"]
+
+
+def test_write_previous_context_omits_finding_key_and_preserves_rejected_release(tmp_path):
+    finding = _finding(OK_FINDING_ID)
+    finding_key = AGG._GATE_ACTION.canonical_finding_key(finding)
+    disposition = {
+        "finding_id": OK_FINDING_ID,
+        "finding_key": finding_key,
+        "disposition": "rejected",
+        "head_sha": "h" * 40,
+        "approved_at": "2026-11-25T09:00:00Z",
+        "reason": "sol verifier retracted after re-check",
+        "counterevidence": None,
+        "tracking_issue": None,
+    }
+    previous = {"findings": [finding], "available": True}
+    path = tmp_path / "previous-findings.json"
+
+    AGG._CARRY.write_previous_context(
+        previous, [disposition], str(path),
+        rejected_release_keys={(OK_FINDING_ID, finding_key)},
+        canonical_finding_key=AGG._GATE_ACTION.canonical_finding_key,
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_keys = {
+        "finding_id", "disposition", "head_sha", "approved_at", "reason",
+        "counterevidence", "tracking_issue",
+    }
+    assert all(set(item) == expected_keys for item in payload["dispositions"])
+    assert "finding_key" in disposition  # serialization does not mutate the in-memory input
+    assert payload["open_findings"] == []  # rejected-release eligibility still uses the in-memory disposition
 
 
 def test_false_positive_and_deferred_behavior_unchanged(tmp_path, monkeypatch, capsys):
