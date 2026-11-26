@@ -78,6 +78,8 @@ from gate_dispositions import (
 )
 
 
+# Replay anchors (design §4.2): 187↔190 / 116↔118 / 37↔40. |Δline|<=4 covers
+# those pairs; |Δline|==5 must not match. Category is not part of neighbor identity.
 def disposition_receipt_artifact_name(receipt: DispositionReceipt) -> str:
     """Reconstruct the producer artifact name bound to one receipt payload.
 
