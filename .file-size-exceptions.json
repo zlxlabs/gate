@@ -1,5 +1,5 @@
 [
-    {"path": ".github/actions/gate-aggregator/aggregate.py", "ceiling": 4274, "reason": "存量基线 2026-11-25；锁现值不放大（gate-hub#2579 L5b 需触碰）；gate-hub#2677 继承驳回挂接 +89 行，主脑授权 2026-11-26（拆分见 gate#453）；+40 预留 gate-hub#2677 G2b 未处置 sol 条目携带挂接（主脑授权 2026-11-26）"},
+    {"path": ".github/actions/gate-aggregator/aggregate.py", "ceiling": 3103, "reason": "gate#453 卡 2 已拆纯判定模块；ceiling 精确锁定当前实际行数"},
     {"path": "tests/test_gate_v2_contract.py", "ceiling": 4067, "reason": "存量基线 2026-11-25；锁现值不放大（gate-hub#2579 L3 需触碰）"},
     {"path": "tests/test_gate_aggregator.py", "ceiling": 6065, "reason": "存量基线 2026-11-26；锁现值不放大（gate-hub#2677 跟随断言需触碰）"}
 ]

@@ -98,7 +98,6 @@ tests/test_gate_aggregator.py for the full decision matrix):
 from __future__ import annotations
 
 import argparse
-import contextvars
 import hashlib
 import importlib.util
 import io
@@ -113,9 +112,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 GATE_ROOT = Path(__file__).resolve().parents[3]
 if str(GATE_ROOT) not in sys.path:
@@ -124,21 +122,26 @@ if str(GATE_ROOT) not in sys.path:
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
-_CONVERGENCE_SPEC = importlib.util.spec_from_file_location(
-    "gate_convergence_from_aggregate",
-    Path(__file__).with_name("convergence.py"),
-)
-assert _CONVERGENCE_SPEC and _CONVERGENCE_SPEC.loader
-_CONVERGENCE = importlib.util.module_from_spec(_CONVERGENCE_SPEC)
-sys.modules[_CONVERGENCE_SPEC.name] = _CONVERGENCE
-_CONVERGENCE_SPEC.loader.exec_module(_CONVERGENCE)
-_GATE_ACTION_SPEC = importlib.util.spec_from_file_location(
-    "gate_action_from_aggregate",
-    Path(__file__).with_name("gate_action.py"),
-)
-_GATE_ACTION = importlib.util.module_from_spec(_GATE_ACTION_SPEC)
-sys.modules[_GATE_ACTION_SPEC.name] = _GATE_ACTION
-_GATE_ACTION_SPEC.loader.exec_module(_GATE_ACTION)
+_CONVERGENCE_NAME = "gate_convergence_from_aggregate"
+_CONVERGENCE = sys.modules.get(_CONVERGENCE_NAME)
+if _CONVERGENCE is None:
+    _CONVERGENCE_SPEC = importlib.util.spec_from_file_location(
+        _CONVERGENCE_NAME, Path(__file__).with_name("convergence.py")
+    )
+    assert _CONVERGENCE_SPEC and _CONVERGENCE_SPEC.loader
+    _CONVERGENCE = importlib.util.module_from_spec(_CONVERGENCE_SPEC)
+    sys.modules[_CONVERGENCE_NAME] = _CONVERGENCE
+    _CONVERGENCE_SPEC.loader.exec_module(_CONVERGENCE)
+_GATE_ACTION_NAME = "gate_action_from_aggregate"
+_GATE_ACTION = sys.modules.get(_GATE_ACTION_NAME)
+if _GATE_ACTION is None:
+    _GATE_ACTION_SPEC = importlib.util.spec_from_file_location(
+        _GATE_ACTION_NAME, Path(__file__).with_name("gate_action.py")
+    )
+    assert _GATE_ACTION_SPEC and _GATE_ACTION_SPEC.loader
+    _GATE_ACTION = importlib.util.module_from_spec(_GATE_ACTION_SPEC)
+    sys.modules[_GATE_ACTION_NAME] = _GATE_ACTION
+    _GATE_ACTION_SPEC.loader.exec_module(_GATE_ACTION)
 
 # gate#297: collector for NeighborEvidence (subprocess/git/silo I/O lives
 # there; this module and convergence.py stay out of that business).
@@ -169,684 +172,90 @@ assert _CARRY_BLOCKERS_SPEC and _CARRY_BLOCKERS_SPEC.loader
 _CARRY_BLOCKERS = importlib.util.module_from_spec(_CARRY_BLOCKERS_SPEC)
 _CARRY_BLOCKERS_SPEC.loader.exec_module(_CARRY_BLOCKERS)
 
+_MODELS_NAME = "gate_aggregate_models"
+_MODELS = sys.modules.get(_MODELS_NAME)
+if _MODELS is None:
+    _MODELS_SPEC = importlib.util.spec_from_file_location(
+        _MODELS_NAME, Path(__file__).with_name("aggregate_models.py")
+    )
+    assert _MODELS_SPEC and _MODELS_SPEC.loader
+    _MODELS = importlib.util.module_from_spec(_MODELS_SPEC)
+    sys.modules[_MODELS_NAME] = _MODELS
+    _MODELS_SPEC.loader.exec_module(_MODELS)
+_PROJECTION_NAME = "gate_disposition_projection"
+_PROJECTION = sys.modules.get(_PROJECTION_NAME)
+if _PROJECTION is None:
+    _PROJECTION_SPEC = importlib.util.spec_from_file_location(
+        _PROJECTION_NAME, Path(__file__).with_name("disposition_projection.py")
+    )
+    assert _PROJECTION_SPEC and _PROJECTION_SPEC.loader
+    _PROJECTION = importlib.util.module_from_spec(_PROJECTION_SPEC)
+    sys.modules[_PROJECTION_NAME] = _PROJECTION
+    _PROJECTION_SPEC.loader.exec_module(_PROJECTION)
+_FINDING_RELATIONS_NAME = "gate_finding_relations"
+_FINDING_RELATIONS = sys.modules.get(_FINDING_RELATIONS_NAME)
+if _FINDING_RELATIONS is None:
+    _FINDING_RELATIONS_SPEC = importlib.util.spec_from_file_location(
+        _FINDING_RELATIONS_NAME, Path(__file__).with_name("finding_relations.py")
+    )
+    assert _FINDING_RELATIONS_SPEC and _FINDING_RELATIONS_SPEC.loader
+    _FINDING_RELATIONS = importlib.util.module_from_spec(_FINDING_RELATIONS_SPEC)
+    sys.modules[_FINDING_RELATIONS_NAME] = _FINDING_RELATIONS
+    _FINDING_RELATIONS_SPEC.loader.exec_module(_FINDING_RELATIONS)
+_DECISION_NAME = "gate_aggregate_decision"
+_DECISION = sys.modules.get(_DECISION_NAME)
+if _DECISION is None:
+    _DECISION_SPEC = importlib.util.spec_from_file_location(
+        _DECISION_NAME, Path(__file__).with_name("decision.py")
+    )
+    assert _DECISION_SPEC and _DECISION_SPEC.loader
+    _DECISION = importlib.util.module_from_spec(_DECISION_SPEC)
+    sys.modules[_DECISION_NAME] = _DECISION
+    _DECISION_SPEC.loader.exec_module(_DECISION)
 
-# The audit schema's complete verdict domain, including states not_expected
-# and waived that this canary evaluator currently rejects at the policy layer.
-PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable", "not_expected", "waived")
-# Terminal history transports only actual review outcomes; skip/policy states
-# remain described by the terminal's existing result and skip_reason fields.
-TERMINAL_PRIMARY_VERDICT_DOMAIN = ("pass", "fail", "unavailable")
-IDENTITY_QUINTUPLE = ("repository_id", "head_sha", "run_id", "run_attempt", "pr")
-_IDENTITY_INT_FIELDS = ("repository_id", "run_id", "run_attempt", "pr")
-
-# The exact `needs.primary.result` / `needs.quality.result` values GitHub
-# Actions can produce for a job. Anything outside this set fails closed
-# immediately rather than being funneled into whichever branch it happens to
-# fall through to.
-PRIMARY_RESULT_DOMAIN = ("success", "failure", "cancelled", "skipped")
-QUALITY_RESULT_DOMAIN = PRIMARY_RESULT_DOMAIN
-# gate#199 根治：quality job 末尾记录步上报的业务检查证据值域。空字符串
-# 不是额外的值——它是“证据缺席”（job 在记录步之前死掉、或调用方工作流尚未
-# 升级），与 not_started/passed 同归 unavailable，绝不能默认 fail。
-# signal_terminated：Tests 步被信号打死（make Error 143/137 或 exit 128+N），
-# 仍 fail-closed 为 quality_infra，不放行。gate-hub#1696。
-CALLER_CHECKS_DOMAIN = ("not_started", "passed", "failed", "signal_terminated")
-# PR size preflight producer's structured result. `blocked` means a measured
-# budget overflow; `unavailable` means measurement failed and must be treated
-# as infrastructure failure. Empty/legacy job states are retained only for
-# callers whose evidence step never ran, and never imply a passing gate.
-PREFLIGHT_RESULT_DOMAIN = ("", "success", "blocked", "unavailable", "skipped", "cancelled")
-TERMINAL_CLASSIFICATION_DOMAIN = ("code_pass", "code_fail", "expected_skip", "review_unavailable", "ci_failure", "integration_error")
-TERMINAL_REASON_DOMAIN = ("primary_pass", "primary_findings", "disposition_resolved", "review_not_expected", "primary_unavailable", "primary_cancelled", "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip")
-GATE_RESULT_DOMAIN = ("pass", "fail", "skipped", "unavailable")
-PRIMARY_SKIP_REASON_DOMAIN = ("draft", "review_exempt", "fork", "hosted_runner")
-PANEL_DELIVERY_SCHEMA_VERSION = 1
-PANEL_DELIVERY_KIND = "gate_v2_status_panel_delivery"
-CONVERGENCE_ENVELOPE_SCHEMA_VERSION = 1
-CONVERGENCE_ENVELOPE_KIND = "gate_convergence_round"
-TERMINAL_HISTORY_CACHE_SCHEMA_VERSION = 1
-GITHUB_API_TIMEOUT_SECONDS = 15
-DEFAULT_PUBLISH_BUDGET_SECONDS = 120
-PUBLISH_BUDGET_ENV = "GATE_PUBLISH_BUDGET_SECONDS"
-DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS = 45
-HISTORY_RECONSTRUCTION_BUDGET_ENV = "GATE_HISTORY_RECONSTRUCTION_BUDGET_SECONDS"
-MAX_REPO_WIDE_HISTORY_PAGES = 5
-MAX_TARGETED_HISTORY_RUNS = 50
-# Wall-clock cap for one `_silo_cli` subprocess at call sites that sit outside
-# the HISTORY_RECONSTRUCTION deadline (previous-round latest ledger GET,
-# disposition receipts). Previous-round findings are a single GET; the cap
-# exists so a hung Silo connection cannot stall the aggregate job indefinitely.
-SILO_CLI_CALL_TIMEOUT_SECONDS = 120
-MAX_HISTORY_WARNING_CHARS = 500
-DISPOSITION_ARTIFACT_PREFIX = "gate-disposition-receipt-v3-"
-SILO_TERMINAL_TIER = "d30"
-SILO_DISPOSITION_TIER = "d30"
-PUBLISH_OPERATION_ORDER = (
-    "IDENTITY",
-    "COMMENT_LOOKUP",
-    "HISTORY_RECONSTRUCTION",
-    "COMMENT_PUBLISH",
-    "POST_VERIFY",
-    "SELF_HEAL",
+from gate_aggregate_models import (  # noqa: E402
+    ACTIONS_BOT_ID, ACTIONS_BOT_LOGIN, CALLER_CHECKS_DOMAIN,
+    CONVERGENCE_ENVELOPE_KIND, CONVERGENCE_ENVELOPE_SCHEMA_VERSION,
+    DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS, DEFAULT_PUBLISH_BUDGET_SECONDS,
+    DISPOSITION_ARTIFACT_PREFIX, FINDING_SUMMARY_MAX_FINDINGS,
+    FINDING_SUMMARY_MAX_TITLE_CHARS, FINDING_SUMMARY_UNAVAILABLE,
+    GATE_RESULT_DOMAIN, GITHUB_API_TIMEOUT_SECONDS,
+    HISTORY_RECONSTRUCTION_BUDGET_ENV, IDENTITY_QUINTUPLE,
+    MAX_HISTORY_WARNING_CHARS, MAX_REPO_WIDE_HISTORY_PAGES, MAX_TARGETED_HISTORY_RUNS,
+    PANEL_BUCKET_BY_GATE_RESULT, PANEL_DELIVERY_KIND, PANEL_DELIVERY_SCHEMA_VERSION,
+    PANEL_HISTORY_ROW_SCHEMA_VERSION, PANEL_MARKER, PREFLIGHT_RESULT_DOMAIN,
+    PRIMARY_BUDGET_EXHAUSTED_EXIT_CODE, PRIMARY_BUDGET_EXHAUSTED_REASON,
+    PRIMARY_FINDINGS_PANEL_MARKER, PRIMARY_RESULT_DOMAIN,
+    PRIMARY_SKIP_REASON_DOMAIN, PRIMARY_VERDICT_DOMAIN,
+    PUBLISH_BUDGET_ENV, PUBLISH_OPERATION_ORDER, QUALITY_RESULT_DOMAIN,
+    RUNNER_DOMAIN, SILO_CLI_CALL_TIMEOUT_SECONDS, SILO_DISPOSITION_TIER,
+    SILO_TERMINAL_TIER, SYNTHETIC_STATUS_ARTIFACT_MISSING,
+    SYNTHETIC_STATUS_TIMED_OUT, TERMINAL_CLASSIFICATION_DOMAIN,
+    TERMINAL_HISTORY_CACHE_SCHEMA_VERSION, TERMINAL_PRIMARY_VERDICT_DOMAIN,
+    TERMINAL_REASON_DOMAIN, _ACTIVE_PUBLISH_BUDGET, _COLON_RUN,
+    _FINDING_SUMMARY_COLUMNS, _IDENTITY_INT_FIELDS, BoolParseError, HistoryLoad,
+    Identity, Outcome, _PublishBudget, _PublishBudgetExhausted, as_bool,
+    _is_strict_int,
 )
-PANEL_MARKER = "<!-- gate-v2-status-panel:v1 -->"
-PANEL_HISTORY_ROW_SCHEMA_VERSION = 1
-ACTIONS_BOT_ID = 41898282
-ACTIONS_BOT_LOGIN = "github-actions[bot]"
-PANEL_BUCKET_BY_GATE_RESULT = {
-    "pass": "可合并",
-    "fail": "要修代码",
-    "skipped": "无需动作",
-    "unavailable": "修基础设施",
-}
-
-# Kept in sync with gate-hub's scripts/review/job_budget.py. The primary audit
-# is the cross-repository contract; importing gate-hub here would make this
-# action depend on a second checkout. Do not broaden this to a reason prefix:
-# an unavailable leg with another cause must keep the infrastructure guidance.
-PRIMARY_BUDGET_EXHAUSTED_EXIT_CODE = 22
-PRIMARY_BUDGET_EXHAUSTED_REASON = "评审总预算已耗尽，保留收尾空间"
-
-# The `runner` reusable-workflow input's only two legal values (see
-# gate-v2.yml's `inputs.runner`). A typo (e.g. "slef") must never be silently
-# treated as either value.
-RUNNER_DOMAIN = ("self", "hosted")
-
-# The two statuses gate-hub's contracts.build_synthetic_primary accepts
-# (SYNTHETIC_STATUSES) — this aggregator never invents a third one.
-SYNTHETIC_STATUS_TIMED_OUT = "job_timed_out"
-SYNTHETIC_STATUS_ARTIFACT_MISSING = "artifact_missing"
-
-# gate-hub#1294: a `fail` primary round used to publish nothing a downstream
-# reader could act on — the findings exist only inside the canonical audit,
-# which a caller repo cannot read (it has no silo credentials), so the only
-# readable evidence was a verdict line. `_render_findings_summary` republishes
-# four fields per finding (id, severity, file:line, title) into the job log and
-# the Step Summary. The caps below are anti-flood only: 50 rows is already past
-# a reviewable batch, and a title is a one-line label, never the finding body.
-FINDING_SUMMARY_MAX_FINDINGS = 50
-FINDING_SUMMARY_MAX_TITLE_CHARS = 200
-PRIMARY_FINDINGS_PANEL_MARKER = "PRIMARY-FINDINGS"
-FINDING_SUMMARY_UNAVAILABLE = f"{PRIMARY_FINDINGS_PANEL_MARKER}-SUMMARY-UNAVAILABLE"
-# Column order of the published table; the log line is a key=value rendering of
-# the same four fields, so the two surfaces can never drift apart.
-_FINDING_SUMMARY_COLUMNS = ("severity", "id", "location", "title")
-# Any run of two or more colons collapses to one, so a `::error::`-shaped title
-# cannot carry the workflow-command prefix even at a line start.
-_COLON_RUN = re.compile(r":{2,}")
-
-
-class BoolParseError(ValueError):
-    """Raised by `as_bool` for anything other than a GitHub Actions boolean
-    rendering ('true'/'false', case/whitespace normalized). GitHub Actions
-    always renders a boolean expression as exactly one of those two strings;
-    anything else means something upstream is already broken (a workflow YAML
-    edit, a manual invocation, a runtime bug) and must fail closed rather than
-    silently coerce to False — `"banana" == "true"` evaluating to False is
-    exactly the silent-coercion trap this class exists to prevent callers from
-    falling into.
-    """
-
-
-def as_bool(value: Any) -> bool:
-    """Strictly parse a GitHub Actions boolean-expression string.
-
-    Only 'true'/'false' (after `str().strip().lower()`) are accepted; any
-    other input raises `BoolParseError` instead of silently defaulting to
-    False. See `main()` for how the CLI turns that into a clean fail-closed
-    Outcome instead of an unhandled traceback.
-    """
-    normalized = str(value).strip().lower()
-    if normalized == "true":
-        return True
-    if normalized == "false":
-        return False
-    raise BoolParseError(f"expected 'true' or 'false' (GitHub Actions boolean rendering), got {value!r}")
-
-
-def _is_strict_int(value: Any) -> bool:
-    """True only for a genuine int. Python's `bool` is an `int` subclass, so
-    `isinstance(True, int)` is True — this rejects that trap explicitly: a
-    downloaded audit's `run_attempt: true` must be rejected, never silently
-    accepted as `1`."""
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-@dataclass(frozen=True)
-class Identity:
-    """The identity quintuple the plan requires the aggregator to cross-check
-    a downloaded primary audit against, before trusting its verdict. The
-    run_attempt member is the current attempt ceiling: an earlier source
-    attempt is valid, while a future source attempt is rejected."""
-
-    repository_id: int
-    head_sha: str
-    run_id: int
-    run_attempt: int
-    pr: int
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "repository_id": self.repository_id,
-            "head_sha": self.head_sha,
-            "run_id": self.run_id,
-            "run_attempt": self.run_attempt,
-            "pr": self.pr,
-        }
-
-
-@dataclass
-class Outcome:
-    ok: bool
-    notes: list[str] = field(default_factory=list)
-    problems: list[str] = field(default_factory=list)
-    synthetic_audit: Optional[dict[str, Any]] = None
-    classification: Optional[str] = None
-    reason_code: Optional[str] = None
-    gate_result: Optional[str] = None
-    skip_reason: Optional[str] = None
-    audit_available: bool = False
-    primary_verdict: Optional[str] = None
-    convergence: Optional[dict[str, int | bool | None]] = None
-    audit_source_attempt: Optional[int] = None
-    audit_artifact_name: Optional[str] = None
-    convergence_envelope: Optional[dict[str, Any]] = None
-    convergence_shadow: Optional[dict[str, Any]] = None
-    convergence_receipt: Optional[Any] = None
-    recorded_disposition_claims: list[str] = field(default_factory=list)
-    # Typed receipt audit is the only source for the terminal receipt record.
-    disposition_audit: Optional[Any] = None
-    finding_relation: Optional[dict[str, Any]] = None
-
-
-@dataclass
-class HistoryLoad:
-    """Best-effort history projection with per-record loss diagnostics."""
-
-    rows: list[dict[str, Any]] = field(default_factory=list)
-    skipped_records: list[dict[str, str]] = field(default_factory=list)
-    incomplete_reasons: list[str] = field(default_factory=list)
-    target_run_ids: Optional[tuple[int, ...]] = None
-
-
-class _PublishBudgetExhausted(Exception):
-    def __init__(self, operation: str):
-        self.operation = operation
-        super().__init__(f"publish budget exhausted during {operation}")
-
-
-@dataclass
-class _PublishBudget:
-    seconds: float
-    history_seconds: float = DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS
-    started_at: float = field(default_factory=time.monotonic)
-    completed_operations: list[str] = field(default_factory=list)
-    pending_operations: list[str] = field(default_factory=lambda: list(PUBLISH_OPERATION_ORDER))
-    current_operation: Optional[str] = None
-    operation_deadline: Optional[float] = field(default=None, init=False)
-
-    @classmethod
-    def from_environment(cls) -> "_PublishBudget":
-        raw = os.environ.get(PUBLISH_BUDGET_ENV)
-        seconds = DEFAULT_PUBLISH_BUDGET_SECONDS if raw is None else float(raw)
-        if seconds <= 0:
-            raise ValueError(f"{PUBLISH_BUDGET_ENV} must be greater than zero")
-        history_raw = os.environ.get(HISTORY_RECONSTRUCTION_BUDGET_ENV)
-        history_seconds = (
-            DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS
-            if history_raw is None else float(history_raw)
-        )
-        if history_seconds <= 0 or history_seconds > DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS:
-            raise ValueError(
-                f"{HISTORY_RECONSTRUCTION_BUDGET_ENV} must be between zero and "
-                f"{DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS} seconds"
-            )
-        return cls(seconds=seconds, history_seconds=history_seconds)
-
-    def remaining(self) -> float:
-        return self.seconds - (time.monotonic() - self.started_at)
-
-    def timeout(self) -> float:
-        remaining = self.remaining()
-        if self.current_operation == "HISTORY_RECONSTRUCTION" and self.operation_deadline is not None:
-            remaining = min(remaining, self.operation_deadline - time.monotonic())
-        if remaining <= 0:
-            raise _PublishBudgetExhausted(self.current_operation or "UNKNOWN")
-        return min(GITHUB_API_TIMEOUT_SECONDS, remaining)
-
-    def begin(self, operation: str) -> None:
-        self.current_operation = operation
-        self.operation_deadline = (
-            time.monotonic() + self.history_seconds
-            if operation == "HISTORY_RECONSTRUCTION" else None
-        )
-        self.timeout()
-
-    def complete(self, operation: str) -> None:
-        if operation not in self.completed_operations:
-            self.completed_operations.append(operation)
-        if operation in self.pending_operations:
-            self.pending_operations.remove(operation)
-        if operation == "HISTORY_RECONSTRUCTION":
-            self.operation_deadline = None
-
-    def add(self, operation: str) -> None:
-        if operation not in self.completed_operations and operation not in self.pending_operations:
-            self.pending_operations.append(operation)
-
-    def discard(self, operation: str) -> None:
-        if operation in self.pending_operations:
-            self.pending_operations.remove(operation)
-
-
-_ACTIVE_PUBLISH_BUDGET: contextvars.ContextVar[Optional[_PublishBudget]] = contextvars.ContextVar(
-    "active_publish_budget", default=None,
+from gate_disposition_projection import (  # noqa: E402
+    empty_disposition_receipt_audit, project_disposition_receipt_audit,
 )
-
-
-def empty_disposition_receipt_audit() -> dict[str, Any]:
-    """Default receipt-consumption block for a run without current receipts."""
-    return {
-        "recorded": [],
-        "resolved": [],
-        "consumed_count": 0,
-        "rejected_count": 0,
-        "rejected_reasons": {},
-        "fail_closed": False,
-        "remaining_p1_ids": [],
-    }
-
-
-def project_disposition_receipt_audit(audit: Any) -> dict[str, Any]:
-    """Project active evidence-bound receipts and rejected receipt reasons."""
-    if audit is None:
-        return empty_disposition_receipt_audit()
-    recorded_finding_ids = audit.recorded_finding_ids
-    if len(recorded_finding_ids) != len(audit.recorded_receipts):
-        raise ValueError("disposition audit has mismatched recorded finding ids")
-    recorded = []
-    resolved = []
-    for index, receipt in enumerate(audit.recorded_receipts):
-        target = recorded_finding_ids[index]
-        if receipt.disposition == "false-positive":
-            evidence = receipt.counterevidence or {}
-            evidence_pointer = _CONVERGENCE._bounded_disposition_text(evidence.get("pointer", ""))
-            command = _CONVERGENCE._bounded_disposition_text(evidence.get("command", ""))
-            output = _CONVERGENCE._bounded_disposition_text(evidence.get("output", ""))
-        else:
-            evidence_pointer = _CONVERGENCE._bounded_disposition_text(receipt.tracking_issue or "")
-            command = output = ""
-        item = {
-            "finding_id": target,
-            "receipt": _CONVERGENCE.disposition_receipt_artifact_name(receipt),
-            "disposition_claim": receipt.disposition,
-            "triggering_actor": _CONVERGENCE._bounded_disposition_text(receipt.approver),
-            "triggering_actor_id": receipt.approver_id,
-            "recorded_at": receipt.approved_at,
-            "reason": _CONVERGENCE._bounded_disposition_text(receipt.reason),
-            "evidence_pointer": evidence_pointer,
-        }
-        if command:
-            item["counterevidence_command"] = command
-        if output:
-            item["counterevidence_output"] = output
-        if receipt.finding_key:
-            item["finding_key"] = receipt.finding_key
-        recorded.append(item)
-        resolved_item = {
-            "finding_id": target,
-            "receipt": item["receipt"],
-            "approver": _CONVERGENCE._bounded_disposition_text(receipt.approver),
-            "approver_id": receipt.approver_id,
-            "approved_at": receipt.approved_at,
-            "reason": item["reason"],
-            "disposition": receipt.disposition,
-            "evidence_pointer": evidence_pointer,
-            **({"counterevidence_command": command} if command else {}),
-            **({"counterevidence_output": output} if output else {}),
-            **({"finding_key": receipt.finding_key} if receipt.finding_key else {}),
-        }
-        inherited_status = next((
-            status for status in getattr(audit, "statuses", ())
-            if status.receipt is receipt and status.matched_by == "inherited_rejected"
-        ), None)
-        if inherited_status is not None:
-            resolved_item.update({
-                "matched_by": "inherited_rejected",
-                "receipt_head_sha": receipt.head_sha,
-                "receipt_finding_id": receipt.finding_id,
-            })
-        resolved.append(resolved_item)
-    rejected_reasons: dict[str, int] = {}
-    for _receipt, reason in audit.rejected_receipts:
-        rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
-    return {
-        "recorded": recorded,
-        "resolved": resolved,
-        "consumed_count": len(resolved),
-        "rejected_count": len(audit.rejected_receipts),
-        "rejected_reasons": dict(sorted(rejected_reasons.items())),
-        "fail_closed": False,
-        "remaining_p1_ids": list(audit.remaining_p1_ids),
-    }
-
-
-RELATION_VALUES = frozenset({"new", "repeat", "conflict"})
-RELATION_DEGRADED = "GATE-FINDING-RELATION-DEGRADED"
-RELATION_UNKNOWN = "GATE-FINDING-RELATION-UNKNOWN"
-PREVIOUS_FINDING_LIMIT = 30
-FINDING_TEXT_MAX = 240
-_P1_RELATION_SEVERITIES = frozenset({"major", "blocker"})
-_LEDGER_LATEST_PREFIX = "codex-review-ledger-latest-v1-"
-_LEDGER_LATEST_OBJECT = "ledger.jsonl"
-_LATEST_LEDGER_DEGRADE = frozenset({
-    "silo-ledger-latest-absent",
-    "silo-ledger-latest-not-prior",
-    "silo-ledger-latest-unreadable",
-})
-
-
-class FindingRelationError(ValueError):
-    pass
-
-
-def _degrade_previous_round(detail: str) -> dict[str, Any]:
-    print(f"{RELATION_DEGRADED}: source=previous-ledger detail={detail}")
-    return {"available": False, "detail": detail, "head_sha": None, "findings": []}
-
-
-def _norm_text(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return " ".join(value.split()).casefold()
-
-
-def _clip_text(value: Any) -> str:
-    text = value if isinstance(value, str) else ""
-    if len(text) <= FINDING_TEXT_MAX:
-        return text
-    return text[: FINDING_TEXT_MAX - 1] + "…"
-
-
-def _require_relation(value: Any) -> str:
-    if value not in RELATION_VALUES:
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: {value!r}")
-    return str(value)
-
-
-def project_finding(finding: dict[str, Any]) -> dict[str, Any]:
-    line = finding.get("line")
-    return {
-        "id": finding.get("id") if isinstance(finding.get("id"), str) else "",
-        "file": finding.get("file") if isinstance(finding.get("file"), str) else "",
-        "line": line if type(line) is int else None,
-        "severity": finding.get("severity") if isinstance(finding.get("severity"), str) else "",
-        "category": finding.get("category") if isinstance(finding.get("category"), str) else "",
-        "issue": _clip_text(finding.get("issue")),
-        "acceptance": _clip_text(finding.get("acceptance")),
-    }
-
-
-def _is_location_conflict(current: dict[str, Any], previous: dict[str, Any]) -> bool:
-    if current["id"] and current["id"] == previous.get("id"):
-        return False
-    if not current["file"] or current["file"] != previous.get("file"):
-        return False
-    if type(current["line"]) is not int or current["line"] != previous.get("line"):
-        return False
-    if current["severity"] not in _P1_RELATION_SEVERITIES or previous.get("severity") not in _P1_RELATION_SEVERITIES:
-        return False
-    issue_current, issue_previous = _norm_text(current.get("issue")), _norm_text(previous.get("issue"))
-    acceptance_current = _norm_text(current.get("acceptance"))
-    acceptance_previous = _norm_text(previous.get("acceptance"))
-    if not issue_current or not issue_previous or not acceptance_current or not acceptance_previous:
-        return False
-    return issue_current != issue_previous and acceptance_current != acceptance_previous
-
-
-def relate_findings(current: list[Any], previous: list[Any]) -> list[dict[str, Any]]:
-    by_id: dict[str, dict[str, Any]] = {}
-    for item in previous:
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]:
-            by_id.setdefault(item["id"], item)
-    preset = [isinstance(item, dict) and "relation_to_previous" in item for item in current if isinstance(item, dict)]
-    if any(preset) and not all(preset):
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: partial relation_to_previous")
-    labeled: list[dict[str, Any]] = []
-    for finding in current:
-        if not isinstance(finding, dict):
-            continue
-        projected = project_finding(finding)
-        if "relation_to_previous" in finding:
-            relation = _require_relation(finding.get("relation_to_previous"))
-            pointer = finding.get("previous_finding_id")
-            if relation != "new" and (not isinstance(pointer, str) or not pointer):
-                raise FindingRelationError(f"{RELATION_UNKNOWN}: {relation} missing previous_finding_id")
-            if relation == "new" and pointer not in (None, ""):
-                raise FindingRelationError(f"{RELATION_UNKNOWN}: new must not carry previous_finding_id")
-            projected["relation_to_previous"] = relation
-            if relation != "new":
-                projected["previous_finding_id"] = pointer
-            labeled.append(projected)
-            continue
-        if projected["id"] and projected["id"] in by_id:
-            projected["relation_to_previous"] = "repeat"
-            projected["previous_finding_id"] = projected["id"]
-            labeled.append(projected)
-            continue
-        sol_key_matches = [
-            item for item in previous
-            if isinstance(item, dict)
-            and item.get("origin") == "sol_verify"
-            and finding.get("origin") == "sol_verify"
-            and _GATE_ACTION.canonical_finding_key(item) == _GATE_ACTION.canonical_finding_key(finding)
-        ]
-        if len(sol_key_matches) == 1 and isinstance(sol_key_matches[0].get("id"), str) and sol_key_matches[0]["id"]:
-            projected["relation_to_previous"] = "repeat"
-            projected["previous_finding_id"] = sol_key_matches[0]["id"]
-            labeled.append(projected)
-            continue
-        matches = [item for item in previous if isinstance(item, dict) and _is_location_conflict(projected, project_finding(item))]
-        pointer = matches[0].get("id") if len(matches) == 1 else ""
-        if isinstance(pointer, str) and pointer:
-            projected["relation_to_previous"] = "conflict"
-            projected["previous_finding_id"] = pointer
-        else:
-            projected["relation_to_previous"] = "new"
-        labeled.append(projected)
-    return labeled
-
-
-def build_finding_relation(findings: list[Any], previous_round: dict[str, Any]) -> dict[str, Any]:
-    previous: list[Any] = []
-    open_findings: list[dict[str, Any]] = []
-    if previous_round.get("available") is True:
-        raw = previous_round.get("findings")
-        if not isinstance(raw, list):
-            raise FindingRelationError(f"{RELATION_UNKNOWN}: previous findings are not a list")
-        previous = raw
-        positions: dict[str, int] = {}
-        for finding in previous:
-            if not isinstance(finding, dict):
-                continue
-            projected = dict(finding)
-            finding_id = projected.get("id")
-            if isinstance(finding_id, str) and finding_id:
-                if finding_id in positions:
-                    open_findings[positions[finding_id]].update(projected)
-                    continue
-                positions[finding_id] = len(open_findings)
-            open_findings.append(projected)
-    else:
-        positions = {}
-    for finding in findings:
-        if not isinstance(finding, dict):
-            continue
-        projected = dict(finding)
-        finding_id = projected.get("id")
-        if isinstance(finding_id, str) and finding_id in positions:
-            open_findings[positions[finding_id]].update(projected)
-            continue
-        if isinstance(finding_id, str) and finding_id:
-            positions[finding_id] = len(open_findings)
-        open_findings.append(projected)
-    items = relate_findings(findings, previous)
-    counts = {name: sum(item["relation_to_previous"] == name for item in items) for name in ("new", "repeat", "conflict")}
-    return {
-        "schema_version": 1,
-        "counts": counts,
-        "review_terminal": "manual_required" if counts["conflict"] else "unchanged",
-        "items": items,
-        "open_findings": open_findings,
-    }
-
-
-def validate_finding_relation_block(block: Any) -> dict[str, Any]:
-    if not isinstance(block, dict) or block.get("schema_version") != 1:
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: block schema")
-    counts = block.get("counts")
-    if not isinstance(counts, dict) or set(counts) != set(RELATION_VALUES):
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: counts")
-    for name in RELATION_VALUES:
-        if not _is_strict_int(counts[name]) or counts[name] < 0:
-            raise FindingRelationError(f"{RELATION_UNKNOWN}: count {name}")
-    items = block.get("items")
-    if not isinstance(items, list) or sum(counts[name] for name in RELATION_VALUES) != len(items):
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: counts do not match items")
-    for item in items:
-        if not isinstance(item, dict):
-            raise FindingRelationError(f"{RELATION_UNKNOWN}: item")
-        relation = _require_relation(item.get("relation_to_previous"))
-        pointer = item.get("previous_finding_id")
-        if relation != "new" and (not isinstance(pointer, str) or not pointer):
-            raise FindingRelationError(f"{RELATION_UNKNOWN}: {relation} missing previous_finding_id")
-    if "open_findings" in block and (
-        not isinstance(block["open_findings"], list)
-        or any(not isinstance(item, dict) for item in block["open_findings"])
-    ):
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: open_findings")
-    history_status = block.get("history_status")
-    if history_status is not None and history_status not in {"available", "unknown"}:
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: history_status")
-    terminal = block.get("review_terminal")
-    if terminal not in {"unchanged", "manual_required"}:
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: review_terminal {terminal!r}")
-    if (counts["conflict"] > 0) != (terminal == "manual_required"):
-        raise FindingRelationError(f"{RELATION_UNKNOWN}: review_terminal does not match conflict count")
-    return block
-
-
-def apply_finding_relation(outcome: Outcome, findings: list[Any], previous_round: dict[str, Any]) -> None:
-    block = validate_finding_relation_block(build_finding_relation(findings, previous_round))
-    outcome.finding_relation = block
-    if len(findings) == len(block["items"]):
-        for finding, item in zip(findings, block["items"]):
-            if not isinstance(finding, dict):
-                continue
-            finding["relation_to_previous"] = item["relation_to_previous"]
-            finding.pop("previous_finding_id", None)
-            if item["relation_to_previous"] != "new":
-                finding["previous_finding_id"] = item["previous_finding_id"]
-    if block["counts"]["conflict"] and outcome.gate_result == "pass":
-        outcome.ok = False
-        outcome.gate_result = "fail"
-        outcome.classification = "code_fail"
-        outcome.reason_code = "primary_findings"
-        outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
-
-
-def _consume_explicit_withdrawals(
-    relation: dict[str, Any], previous_round: dict[str, Any], withdrawals: Any,
-) -> dict[str, Any]:
-    """Close prior open findings only for valid, reasoned audit withdrawals."""
-    if withdrawals is None or withdrawals == []:
-        return relation
-    if not isinstance(withdrawals, list):
-        print("GATE-WITHDRAWAL-IGNORED: invalid explicit withdrawal record")
-        return relation
-    valid_ids: set[str] = set()
-    for item in withdrawals:
-        if (
-            not isinstance(item, dict)
-            or set(item) != {"finding_id", "reason"}
-            or not isinstance(item.get("finding_id"), str)
-            or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", item["finding_id"])
-            or not isinstance(item.get("reason"), str)
-            or not item["reason"].strip()
-        ):
-            print("GATE-WITHDRAWAL-IGNORED: invalid explicit withdrawal record")
-            return relation
-        valid_ids.add(item["finding_id"])
-    if previous_round.get("available") is not True:
-        return relation
-    previous_findings = previous_round.get("findings")
-    if not isinstance(previous_findings, list):
-        return relation
-    prior_ids = {
-        item["id"] for item in previous_findings
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
-    reported_prior_ids = {
-        pointer
-        for item in relation.get("items", [])
-        if isinstance(item, dict)
-        for pointer in (item.get("id"), item.get("previous_finding_id"))
-        if isinstance(pointer, str)
-    }
-    closable_ids = (valid_ids & prior_ids) - reported_prior_ids
-    open_findings = relation.get("open_findings")
-    if not closable_ids or not isinstance(open_findings, list):
-        return relation
-    return {
-        **relation,
-        "open_findings": [
-            item for item in open_findings
-            if not isinstance(item, dict) or item.get("id") not in closable_ids
-        ],
-    }
-
-
-def _close_consumed_false_positive_carry(
-    relation: dict[str, Any], findings: list[Any], disposition_audit: Any,
-) -> dict[str, Any]:
-    """Close only current open carry entries consumed by a valid refuted receipt."""
-    open_findings = relation.get("open_findings")
-    if not isinstance(open_findings, list):
-        return relation
-    if not isinstance(disposition_audit, _CONVERGENCE.DispositionAudit):
-        return relation
-    recorded_receipts = disposition_audit.recorded_receipts
-    recorded_finding_ids = disposition_audit.recorded_finding_ids
-    if len(recorded_receipts) != len(recorded_finding_ids):
-        return relation
-
-    current_keys_by_id: dict[str, list[str]] = {}
-    for finding in findings:
-        if not isinstance(finding, dict):
-            continue
-        finding_id = finding.get("id")
-        if not isinstance(finding_id, str) or not finding_id:
-            continue
-        if finding.get("severity") not in _CONVERGENCE.P1_SEVERITIES:
-            continue
-        current_keys_by_id.setdefault(finding_id, []).append(_CONVERGENCE.canonical_finding_key(finding))
-
-    closed: set[tuple[str, str]] = set()
-    for receipt, finding_id in zip(recorded_receipts, recorded_finding_ids):
-        if receipt.disposition != "false-positive" or _CONVERGENCE._counterevidence_reason(receipt):
-            continue
-        current_keys = current_keys_by_id.get(finding_id, [])
-        if len(current_keys) == 1:
-            closed.add((finding_id, current_keys[0]))
-    if not closed:
-        return relation
-    return {
-        **relation,
-        "open_findings": [finding for finding in open_findings if (
-            not isinstance(finding, dict)
-            or (finding.get("id"), _CONVERGENCE.canonical_finding_key(finding)) not in closed
-        )],
-    }
+from gate_finding_relations import (  # noqa: E402
+    FINDING_TEXT_MAX, PREVIOUS_FINDING_LIMIT, RELATION_DEGRADED,
+    RELATION_UNKNOWN, RELATION_VALUES, FindingRelationError,
+    _LATEST_LEDGER_DEGRADE, _LEDGER_LATEST_OBJECT, _LEDGER_LATEST_PREFIX,
+    _P1_RELATION_SEVERITIES, _close_consumed_false_positive_carry,
+    _clip_text, _consume_explicit_withdrawals, _degrade_previous_round,
+    _is_location_conflict, _norm_text, _require_relation, apply_finding_relation,
+    build_finding_relation, project_finding, relate_findings,
+    validate_finding_relation_block,
+)
+from gate_aggregate_decision import (  # noqa: E402
+    _CONVERGENCE_SCOPE_FIELDS, _canonical_p1_findings,
+    _convergence_scope_from_audit, build_convergence_envelope,
+    build_synthetic_audit, build_terminal_envelope, evaluate,
+    validate_audit_identity,
+)
 
 
 def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
@@ -1320,581 +729,6 @@ def _render_findings_summary_cli(argv: list[str]) -> int:
         # invocation with `|| echo ... reason=render-invocation-failed`.
         print(f"{FINDING_SUMMARY_UNAVAILABLE} reason=render-failed {type(exc).__name__}")
     return 0
-
-
-def build_terminal_envelope(
-    *, repository: str, identity: Identity, quality_result: str, primary_result: str, review_expected: bool,
-    is_draft: bool, runner: str, outcome: Outcome,
-) -> dict[str, Any]:
-    """Build the versioned machine-readable gate terminal envelope."""
-    if outcome.classification not in TERMINAL_CLASSIFICATION_DOMAIN or outcome.reason_code not in TERMINAL_REASON_DOMAIN or outcome.gate_result not in GATE_RESULT_DOMAIN:
-        raise ValueError("terminal field is outside the finite domain")
-    if outcome.skip_reason not in (None,) + PRIMARY_SKIP_REASON_DOMAIN:
-        raise ValueError("primary skip reason is outside the finite domain")
-    if outcome.primary_verdict is not None and outcome.primary_verdict not in TERMINAL_PRIMARY_VERDICT_DOMAIN:
-        raise ValueError("terminal primary_verdict is outside the finite domain")
-    envelope = {
-        "schema_version": 1, "kind": "gate_terminal", "repository": repository,
-        "repository_id": identity.repository_id, "pr_number": identity.pr, "run_id": identity.run_id,
-        "run_attempt": identity.run_attempt, "head_sha": identity.head_sha,
-        "quality_result": quality_result,
-        "primary_result": primary_result,
-        "skip_reason": outcome.skip_reason,
-        "review_expected": review_expected,
-        "is_draft": is_draft,
-        "runner": runner,
-        "gate_result": outcome.gate_result,
-        "classification": outcome.classification,
-        "reason_code": outcome.reason_code,
-        "audit": {"available": outcome.audit_available, "source_attempt": outcome.audit_source_attempt if outcome.audit_available else None, "artifact_name": outcome.audit_artifact_name if outcome.audit_available else None},
-        "disposition_receipt_consumption": project_disposition_receipt_audit(
-            outcome.disposition_audit,
-        ),
-    }
-    if outcome.primary_verdict is not None:
-        envelope["primary_verdict"] = outcome.primary_verdict
-    if outcome.convergence is not None:
-        envelope["convergence"] = dict(outcome.convergence)
-    if outcome.recorded_disposition_claims:
-        envelope["recorded_disposition_claims"] = list(outcome.recorded_disposition_claims)
-    if outcome.convergence_shadow is not None:
-        envelope["convergence_shadow"] = dict(outcome.convergence_shadow)
-    if outcome.finding_relation is not None:
-        envelope["finding_relation"] = outcome.finding_relation
-    return envelope
-
-
-_CONVERGENCE_SCOPE_FIELDS = (
-    "base_sha", "diff_digest", "policy_version", "policy_digest",
-    "caller_sha", "reusable_workflow_sha",
-)
-
-
-_canonical_p1_findings = _GATE_ACTION.p1_findings
-
-def _convergence_scope_from_audit(
-    audit: Any, identity: Identity,
-) -> tuple[Optional[Any], tuple[str, ...]]:
-    """Project the complete immutable Scope carried by a canonical audit."""
-    if not isinstance(audit, dict):
-        return None, ()
-    missing_fields = tuple(sorted(field for field in _CONVERGENCE_SCOPE_FIELDS if field not in audit))
-    if missing_fields:
-        return None, missing_fields
-    return _CONVERGENCE.Scope(
-        repository_id=identity.repository_id,
-        pr_number=identity.pr,
-        base_sha=audit["base_sha"],
-        head_sha=identity.head_sha,
-        diff_digest=audit["diff_digest"],
-        policy_version=audit["policy_version"],
-        policy_digest=audit["policy_digest"],
-        tier=audit.get("tier") if audit.get("tier") in _CONVERGENCE.SUPPORTED_TIERS else "internal",
-        caller_sha=audit["caller_sha"],
-        reusable_workflow_sha=audit["reusable_workflow_sha"],
-    ), ()
-
-
-def build_convergence_envelope(
-    *, scope: Any, decision: Any, audit_digest: str,
-    source_attempt: Optional[int], artifact_name: Optional[str],
-) -> dict[str, Any]:
-    """Build the additive, explicitly versioned one-round convergence envelope."""
-    if not isinstance(scope, _CONVERGENCE.Scope):
-        raise ValueError("convergence envelope requires a convergence Scope")
-    if not isinstance(decision, _CONVERGENCE.RoundDecision):
-        raise ValueError("convergence envelope requires a RoundDecision")
-    if not isinstance(audit_digest, str) or len(audit_digest) != 64:
-        raise ValueError("convergence envelope requires a 64-character SHA-256 digest")
-    envelope = {
-        "schema_version": CONVERGENCE_ENVELOPE_SCHEMA_VERSION,
-        "kind": CONVERGENCE_ENVELOPE_KIND,
-        "scope": scope.as_dict(),
-        "epoch": decision.state.epoch,
-        "audit_digest": audit_digest,
-        "source_attempt": source_attempt,
-        "artifact_name": artifact_name,
-        "decision": decision.decision,
-        "state": decision.state.as_dict(),
-    }
-    return envelope
-
-
-def validate_audit_identity(record: Any, identity: Identity) -> list[str]:
-    """Independent, minimal-but-strict structural check — NOT a
-    re-implementation of gate-hub's validate_primary_record (that full schema
-    validation already ran once, inside review-primary, before this record
-    was ever written). This aggregator only needs to confirm what it must
-    itself trust before basing a merge decision on the downloaded file: it
-    parses as an object, it is a primary_review record at schema_version 1
-    (this aggregator is the only writer of synthetic_primary records — a
-    downloaded synthetic_primary would mean something upstream is badly
-    confused), the verdict is a known value, the identity quintuple matches
-    the current run/PR/head with EXACT types (rejecting e.g. a bool where an
-    int is required; an earlier source run_attempt is valid but a future one
-    is rejected), and — for verdicts that name a reviewer — that the
-    reviewer field is actually populated.
-    """
-    if not isinstance(record, dict):
-        return [f"primary audit is not a JSON object (top-level type: {type(record).__name__})"]
-    errors: list[str] = []
-
-    if record.get("kind") != "primary_review":
-        errors.append(f"unexpected audit kind {record.get('kind')!r} (expected 'primary_review')")
-
-    schema_version = record.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2}:
-        errors.append(f"schema_version must be exactly int 1 or 2, got {schema_version!r}")
-
-    verdict = record.get("verdict")
-    if verdict not in PRIMARY_VERDICT_DOMAIN:
-        errors.append(f"verdict {verdict!r} is not in the accepted domain {PRIMARY_VERDICT_DOMAIN!r}")
-
-    expected = identity.as_dict()
-    for key in IDENTITY_QUINTUPLE:
-        value = record.get(key)
-        if key in _IDENTITY_INT_FIELDS:
-            if not _is_strict_int(value):
-                errors.append(
-                    f"{key} must be a genuine int (not bool/str/other), got {value!r} ({type(value).__name__})"
-                )
-                continue
-        else:  # head_sha
-            if not (isinstance(value, str) and value):
-                errors.append(f"{key} must be a non-empty string, got {value!r} ({type(value).__name__})")
-                continue
-        if key == "run_attempt":
-            if value > expected[key]:
-                errors.append(
-                    f"identity mismatch on 'run_attempt': audit={value!r} "
-                    f"exceeds current run_attempt={expected[key]!r}"
-                )
-            continue
-        if value != expected[key]:
-            errors.append(f"identity mismatch on {key!r}: audit={value!r} expected={expected[key]!r}")
-
-    if isinstance(verdict, str) and verdict in ("pass", "fail", "unavailable"):
-        reviewer = record.get("reviewer")
-        if not isinstance(reviewer, str) or not reviewer:
-            errors.append(f"reviewer must be a non-empty string when verdict is {verdict!r}, got {reviewer!r}")
-
-    return errors
-
-
-def build_synthetic_audit(*, identity: Identity, status: str, reason: str) -> dict[str, Any]:
-    """Best-effort synthetic audit trail shaped like gate-hub's
-    contracts.build_synthetic_primary (kind/schema_version/status/reason/
-    verdict/attempts/shadow_mode/expected_shadows + the identity quintuple
-    this aggregator actually knows). Fields build_synthetic_primary also
-    carries but this workflow-side aggregator has no way to derive
-    (base_sha, diff_digest, policy_version, policy_digest, registry_commit,
-    caller_sha, reusable_workflow_sha, job_id, reviewer) are deliberately
-    OMITTED rather than fabricated — per the plan's "Caller / reusable
-    workflow boundary", policy resolution belongs to gate-hub, not this
-    aggregator. This record is a workflow-side Step Summary audit trail, not
-    a drop-in replacement for gate-hub's canonical schema or ledger input.
-    """
-    if status not in (SYNTHETIC_STATUS_TIMED_OUT, SYNTHETIC_STATUS_ARTIFACT_MISSING):
-        raise ValueError(f"invalid synthetic status: {status!r}")
-    payload = identity.as_dict()
-    payload.update(
-        {
-            "kind": "synthetic_primary",
-            "schema_version": 1,
-            "status": status,
-            "reason": reason,
-            "verdict": None,
-            "attempts": [],
-            "shadow_mode": "detached",
-            "expected_shadows": [],
-        }
-    )
-    return payload
-
-
-def evaluate(
-    *,
-    quality_result: str,
-    primary_result: str,
-    runner: str,
-    is_draft: bool,
-    review_expected: bool,
-    audit: Any,
-    audit_error: Optional[str],
-    identity: Identity,
-    pr_author: Any,
-    is_fork: bool = False,
-    classify_review_expected: str = "",
-    audit_source_attempt: Optional[int] = None,
-    audit_artifact_name: Optional[str] = None,
-    scope: Optional[Any] = None,
-    audit_digest: Optional[str] = None,
-    legacy_raw_audit_digest: Optional[str] = None,
-    convergence_state: Optional[Any] = None,
-    waiver_receipts: Sequence[Any] = (),
-    caller_checks: str = "",
-    caller_signal: str = "",
-    preflight_result: str = "",
-    repository: str | None = None,
-    prior_eligible_run_ids: Sequence[int] = (),
-    convergence_history_status: str = "history_unavailable",
-    neighbor_evidence: Optional[dict[str, Any]] = None,
-    inherited_rejection_matches: Optional[dict[tuple[str, str, str], str]] = None,
-) -> Outcome:
-    """The pure decision core — no I/O, no GitHub API, fully unit-testable.
-
-    `audit`/`audit_error` are pre-fetched by the thin CLI wrapper (`main`):
-    `audit` is either the parsed JSON value found on disk (which may be any
-    JSON type, not necessarily an object — see `validate_audit_identity`), or
-    None; when None, `audit_error` explains why (download failed, no file,
-    bad JSON, ...). Draft skip decisions use only the event payload: this run
-    represents checks from the draft stage, while a non-draft run with no
-    trusted primary result still fails closed. See tests/test_gate_aggregator.py
-    for the judgement matrix this function must satisfy.
-    """
-    notes: list[str] = []
-    problems: list[str] = []
-    synthetic: Optional[dict[str, Any]] = None
-    if not isinstance(pr_author, str) or not pr_author:
-        return Outcome(ok=False, problems=["PR author missing or is not a non-empty string — fail-closed"], classification="review_unavailable", reason_code="primary_unavailable", gate_result="unavailable")
-    if pr_author == "dependabot[bot]" and not (is_draft is True and primary_result == "skipped"):
-        return Outcome(ok=False, problems=["Dependabot PR author has no trusted primary review — fail-closed"], classification="review_unavailable", reason_code="primary_unavailable", gate_result="unavailable")
-    invalid_inputs = []
-    if runner not in RUNNER_DOMAIN:
-        invalid_inputs.append(f"runner input {runner!r} is not a recognized value (expected one of {RUNNER_DOMAIN!r}) — fail-closed")
-    if quality_result not in QUALITY_RESULT_DOMAIN:
-        invalid_inputs.append(f"quality job result {quality_result!r} is not a recognized value — fail-closed")
-    if primary_result not in PRIMARY_RESULT_DOMAIN:
-        invalid_inputs.append(f"primary job result {primary_result!r} is not a recognized value (expected one of {PRIMARY_RESULT_DOMAIN!r}) — fail-closed")
-    if type(is_draft) is not bool or type(review_expected) is not bool:
-        invalid_inputs.append("draft/review_expected must be genuine booleans — fail-closed")
-    if type(is_fork) is not bool:
-        invalid_inputs.append("is_fork must be a genuine boolean — fail-closed")
-    if not isinstance(classify_review_expected, str):
-        invalid_inputs.append("classify_review_expected must be a string — fail-closed")
-    caller_checks = (caller_checks or "").strip()
-    if caller_checks not in ("",) + CALLER_CHECKS_DOMAIN:
-        invalid_inputs.append(f"caller_checks input {caller_checks!r} is not a recognized value (expected one of {CALLER_CHECKS_DOMAIN!r} or empty when the evidence step never ran) — fail-closed")
-    preflight_result = (preflight_result or "").strip()
-    if preflight_result not in PREFLIGHT_RESULT_DOMAIN:
-        invalid_inputs.append(f"preflight_result input {preflight_result!r} is not a recognized value — fail-closed")
-    if invalid_inputs:
-        return Outcome(ok=False, problems=invalid_inputs)
-
-    # gate#105 方案 A: the workflow skips quality by design when primary
-    # already failed (quality: needs [primary], if != 'failure'). That skip is
-    # the short-circuit working as intended, NOT a quality problem — it must
-    # not claim the quality_skipped reason; primary's own terminal state
-    # decides the classification. Every other skipped combination (primary
-    # not failed) keeps the quality_skipped semantics.
-    quality_short_circuited = quality_result == "skipped" and primary_result == "failure"
-    quality_reason = None if quality_result == "success" or quality_short_circuited else {"failure": "quality_failure", "cancelled": "quality_cancelled", "skipped": "quality_skipped"}[quality_result]
-    primary_classification = primary_reason = None
-    audit_available = False
-    primary_verdict: Optional[str] = None
-    convergence_eligible = False
-    audit_source = artifact_name = None
-    skip_reason = None
-
-    if quality_result == "success":
-        notes.append("quality: success")
-    elif quality_short_circuited:
-        problems.append("quality job was skipped because primary already failed (short-circuit; the gate result is decided by primary)")
-    else:
-        problems.append(f"quality job result is {quality_result!r} (required: success)")
-
-    if primary_result == "skipped":
-        if is_draft:
-            skip_reason = "draft"
-            notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
-            notes.append("draft event check records quality for the draft stage; primary review is not expected")
-            primary_classification, primary_reason = "expected_skip", "review_not_expected"
-        elif is_fork:
-            skip_reason = "fork"
-            notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
-            primary_classification, primary_reason = "expected_skip", "review_not_expected"
-        elif runner != "self":
-            skip_reason = "hosted_runner"
-            notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
-            primary_classification, primary_reason = "expected_skip", "review_not_expected"
-        elif classify_review_expected == "false":
-            skip_reason = "review_exempt"
-            notes.append(f"primary: skipped and accepted (draft={is_draft}, review_expected={review_expected})")
-            primary_classification, primary_reason = "expected_skip", "review_not_expected"
-        else:
-            problems.append(
-                "primary job was skipped but no skip reason could be derived from draft, fork, runner, "
-                "or classify output — an unexplained skip is never accepted as a passing primary review"
-            )
-            primary_classification, primary_reason = "integration_error", "unexpected_primary_skip"
-    elif primary_result == "cancelled":
-        synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_TIMED_OUT, reason="primary job concluded 'cancelled' before a canonical audit could be finalized")
-        problems.append("primary job was cancelled before completion — fail-closed, synthetic audit generated")
-        primary_classification, primary_reason = "review_unavailable", "primary_cancelled"
-    elif audit is None:
-        synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_ARTIFACT_MISSING, reason=audit_error or "primary audit artifact was not found")
-        problems.append(f"primary audit artifact missing ({audit_error or 'not found'}) — fail-closed")
-        primary_classification, primary_reason = "integration_error", "audit_missing"
-    else:
-        errors = validate_audit_identity(audit, identity)
-        if errors:
-            synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_ARTIFACT_MISSING, reason="downloaded primary audit failed validation: " + "; ".join(errors))
-            problems.append("primary audit failed validation: " + "; ".join(errors))
-            primary_classification, primary_reason = "integration_error", "audit_invalid"
-        else:
-            verdict = audit["verdict"]
-            audit_source = audit["run_attempt"]
-            if audit_source_attempt != audit_source or not (isinstance(audit_artifact_name, str) and audit_artifact_name):
-                synthetic = build_synthetic_audit(identity=identity, status=SYNTHETIC_STATUS_ARTIFACT_MISSING, reason=("downloaded primary audit source attempt does not match the selected artifact output: " f"audit={audit_source!r} selected={audit_source_attempt!r}"))
-                problems.append(
-                    "primary audit source run_attempt mismatch: "
-                    f"audit={audit_source!r} selected={audit_source_attempt!r}"
-                )
-                audit_source = None
-                primary_classification, primary_reason = "integration_error", "audit_source_mismatch"
-            else:
-                audit_available = verdict in ("pass", "fail", "unavailable")
-                convergence_eligible = audit_available
-                artifact_name = audit_artifact_name if isinstance(audit_artifact_name, str) and audit_artifact_name else None
-                notes.append(f"primary audit source run_attempt={audit_source} (current run_attempt={identity.run_attempt})")
-                if verdict == "pass":
-                    if primary_result != "success":
-                        audit_available = False
-                        convergence_eligible = False
-                        audit_source = artifact_name = None
-                        problems.append(
-                            f"primary audit verdict is 'pass' but the job result is {primary_result!r} — inconsistent, fail-closed"
-                        )
-                        primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
-                    else:
-                        notes.append("primary: pass")
-                        primary_classification, primary_reason = "code_pass", "primary_pass"
-                elif verdict == "fail":
-                    problems.append("primary review verdict is 'fail'")
-                    primary_classification, primary_reason = "code_fail", "primary_findings"
-                elif verdict == "unavailable":
-                    problems.append("primary review verdict is 'unavailable'")
-                    primary_classification, primary_reason = "review_unavailable", "primary_unavailable"
-                else:
-                    audit_available = False
-                    convergence_eligible = False
-                    audit_source = artifact_name = None
-                    problems.append(
-                        f"primary audit verdict {verdict!r} is not accepted: canary-stage primary never legitimately writes "
-                        "not_expected/waived; companion-field validation is not wired yet"
-                    )
-                    primary_classification, primary_reason = "integration_error", "audit_invalid"
-                if primary_result == "success" and verdict in ("fail", "unavailable"):
-                    audit_available = False
-                    convergence_eligible = False
-                    audit_source = artifact_name = None
-                    primary_classification, primary_reason = "integration_error", "job_audit_mismatch"
-                if audit_available:
-                    primary_verdict = verdict
-
-    # gate#199: a primary that was expected but produced no conclusion
-    # (cancelled job, missing/invalid audit) means there is no reviewer
-    # verdict to trust — the gate cannot attribute the run to a code
-    # problem, so the primary leg outranks the quality leg. An expected
-    # skip (draft/fork/hosted) is a verdict in itself and stays below
-    # quality: a genuinely red quality run on a draft is still a code
-    # problem. code_pass/code_fail keep the old quality-first order (the
-    # primary=success + quality=infra-failure residual is left for the
-    # follow-up card, not flipped here).
-    if primary_classification in ("integration_error", "review_unavailable"):
-        classification, reason_code = primary_classification, primary_reason
-    elif quality_reason is not None:
-        if quality_reason == "quality_failure":
-            # gate#199 根治：quality=failure 是 job 级标量，混同了门禁控制面
-            # 步骤失败与业务检查真失败。只有结构化证据明确表明预算
-            # blocked，才把 preflight 红归因于代码改动；测量 unavailable
-            # 必须优先留在基础设施桶，即使其他业务步骤也失败；不能
-            # 冒充超预算，也不能放行。
-            if preflight_result == "blocked":
-                problems.append("PR size preflight blocked (PR exceeds the single-review budget) — split the PR and retry")
-                classification, reason_code = "ci_failure", "quality_failure"
-            elif preflight_result == "unavailable":
-                problems.append(
-                    "PR size preflight was unavailable (git measurement failed) — "
-                    "treated as an infrastructure problem, not a size decision"
-                )
-                classification, reason_code = "review_unavailable", "quality_infra"
-            elif caller_checks == "signal_terminated":
-                sig = (caller_signal or "").strip() or "unknown"
-                problems.append(
-                    f"quality tests were terminated by signal {sig} — "
-                    "infrastructure (host memory/eviction), not a code problem"
-                )
-                classification, reason_code = "review_unavailable", "quality_infra"
-            elif caller_checks == "failed":
-                problems.append("quality business checks reported failure (caller_checks=failed) — a code problem")
-                classification, reason_code = "ci_failure", "quality_failure"
-            else:
-                evidence = caller_checks if caller_checks else "missing (the evidence record step never ran)"
-                problems.append(
-                    f"quality job failed but the business checks show no failure (caller_checks={evidence}) — "
-                    "treated as an infrastructure problem, not a code problem"
-                )
-                classification, reason_code = "review_unavailable", "quality_infra"
-        else:
-            classification, reason_code = "ci_failure", quality_reason
-    else:
-        classification, reason_code = primary_classification, primary_reason
-    # A structured unavailable result is a measurement failure, not a size
-    # verdict. Keep the gate closed even if a malformed caller reports a
-    # successful quality job; a skipped quality job remains the primary
-    # short-circuit path and is judged by its primary result above.
-    if (
-        preflight_result == "unavailable"
-        and quality_result in ("success", "failure")
-        and primary_classification not in ("code_fail", "integration_error")
-        and (classification, reason_code) != ("review_unavailable", "quality_infra")
-    ):
-        problems.append(
-            "PR size preflight was unavailable (git measurement failed) — "
-            "treated as an infrastructure problem, not a size decision"
-        )
-        classification, reason_code = "review_unavailable", "quality_infra"
-    elif (
-        preflight_result == "blocked"
-        and quality_result == "success"
-        and primary_classification not in ("code_fail", "integration_error")
-    ):
-        problems.append(
-            "PR size preflight reported a budget block despite a successful quality job — "
-            "fail-closed as a quality failure"
-        )
-        classification, reason_code = "ci_failure", "quality_failure"
-    elif (
-        preflight_result in ("", "skipped", "cancelled")
-        and quality_result == "success"
-        and primary_classification == "code_pass"
-    ):
-        problems.append(
-            "PR size preflight evidence was missing or non-terminal — "
-            "treated as an infrastructure problem, not a size decision"
-        )
-        classification, reason_code = "review_unavailable", "quality_infra"
-    gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[classification]
-    outcome = Outcome(
-        ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,
-        classification=classification, reason_code=reason_code, gate_result=gate_result,
-        skip_reason=skip_reason,
-        audit_available=audit_available, primary_verdict=primary_verdict,
-        audit_source_attempt=audit_source, audit_artifact_name=artifact_name,
-    )
-    # This is deliberately the only convergence hand-off in the single-round
-    # evaluator.  It runs only after the existing audit identity/job verdict
-    # checks have succeeded; the old Outcome fields remain single-round facts.
-    if scope is not None and convergence_eligible and audit_digest is not None and isinstance(audit, dict):
-        p1_findings = () if audit.get("verdict") == "unavailable" and audit.get("result") is None else _canonical_p1_findings(audit)
-        if p1_findings is None:
-            outcome.primary_verdict = None
-            outcome.ok = False
-            outcome.classification = "integration_error"
-            outcome.reason_code = "audit_invalid"
-            outcome.gate_result = "unavailable"
-            outcome.problems.append("canonical finding severity is missing, unknown, or malformed — fail-closed")
-            return outcome
-        p1_ids = tuple(item[0] for item in p1_findings)
-        primary = _CONVERGENCE.CanonicalPrimary(
-            schema_version=1,
-            repository_id=identity.repository_id,
-            pr_number=identity.pr,
-            head_sha=identity.head_sha,
-            run_id=identity.run_id,
-            run_attempt=identity.run_attempt,
-            verdict=audit["verdict"],
-            p1_ids=p1_ids,
-            p1_findings=p1_findings,
-        )
-        # Blocking-matrix-v1 audits widen the receipt-coverable set to every
-        # finding whose gate_action is block/must_respond (including a saas
-        # minor). The round-convergence primary above stays P1-only; only the
-        # disposition projection below uses the widened set.
-        projection = _GATE_ACTION.disposition_projection(audit, primary)
-        disposition_ids, disposition_primary, gate_actions, invalid_note = (
-            projection if projection is not None else (p1_ids, primary, None, None)
-        )
-        if invalid_note:
-            outcome.notes.append(invalid_note)
-        processing_key = _CONVERGENCE.ProcessingKey(
-            identity.repository_id, identity.pr, identity.run_id, identity.run_attempt,
-        )
-        disposition_audit = _CONVERGENCE.record_dispositions(
-            disposition_ids,
-            waiver_receipts,
-            scope=scope,
-            primary=disposition_primary,
-            audit_digest=audit_digest,
-            legacy_raw_audit_digest=legacy_raw_audit_digest,
-            repository=repository,
-            neighbor_evidence=neighbor_evidence,
-            gate_actions=gate_actions,
-            inherited_rejection_matches=inherited_rejection_matches,
-        )
-        outcome.disposition_audit = disposition_audit
-        state = convergence_state or _CONVERGENCE.initial_state(scope)
-        round_decision = _CONVERGENCE.evaluate_round(
-            state=state,
-            scope=scope,
-            primary=primary,
-            audit_digest=audit_digest,
-            waiver_receipts=waiver_receipts,
-            disposition_audit=disposition_audit,
-            processing_key=processing_key,
-            repository=repository, coverage_result=audit.get("result"),
-        )
-        outcome.convergence_envelope = build_convergence_envelope(
-            scope=scope,
-            decision=round_decision,
-            audit_digest=audit_digest,
-            source_attempt=audit_source,
-            artifact_name=artifact_name,
-        )
-        if round_decision.accepted and not round_decision.no_op and round_decision.event_id:
-            outcome.convergence_receipt = _CONVERGENCE.receipt_for_round(
-                scope=scope,
-                primary=primary,
-                audit_digest=audit_digest,
-                decision=round_decision,
-                source_attempt=audit_source,
-                artifact_name=artifact_name,
-            )
-        recorded_claim_lines = list(_CONVERGENCE.recorded_disposition_lines(disposition_audit))
-        if recorded_claim_lines:
-            outcome.recorded_disposition_claims = recorded_claim_lines
-        if (
-            outcome.classification == "code_fail"
-            and outcome.reason_code == "primary_findings"
-            and audit["verdict"] == "fail"
-            and disposition_audit.recorded_receipts
-            and not disposition_audit.remaining_p1_ids
-        ):
-            outcome.ok = True
-            outcome.classification = "code_pass"
-            outcome.reason_code = "disposition_resolved"
-            outcome.gate_result = "pass"
-            outcome.problems = [problem for problem in outcome.problems if problem != "primary review verdict is 'fail'"]
-            outcome.notes.append("all current P1 findings are covered by active evidence-bound gate-disposition receipts")
-    if scope is not None:
-        eligible_this_round = (
-            audit_available
-            and audit_source is not None
-            and isinstance(audit, dict)
-            and audit.get("verdict") in ("pass", "fail")
-        )
-        outcome.convergence_shadow = {
-            **_CONVERGENCE.pr_round_budget(
-                prior_run_ids=prior_eligible_run_ids,
-                current_run_id=identity.run_id,
-                current_eligible=eligible_this_round,
-                tier=scope.tier,
-                history_status=convergence_history_status,
-            ),
-            "eligible_this_round": eligible_this_round,
-        }
-    return outcome
 
 
 def _read_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str], Optional[bytes]]:
