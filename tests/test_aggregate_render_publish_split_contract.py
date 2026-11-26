@@ -260,10 +260,19 @@ row = {"run_id": 701, "run_attempt": 1, "gate_result": "fail", "classification":
        "reason_code": "primary_findings", "head_sha": "a" * 40, "repository": "owner/repo"}
 panel_aggregate = agg.render_status_panel([row]).encode("utf-8")
 panel_rendering = rendering.render_status_panel([row]).encode("utf-8")
+identity = agg.Identity(repository_id=123, head_sha="a" * 40, run_id=701, run_attempt=1, pr=42)
+receipt = agg._build_panel_delivery(body="panel", repository="owner/repo", pr_number=42,
+                                    identity=identity, delivery="created", reason_code="posted")
+aggregate_receipt_path = Path(tempfile.mkdtemp()) / "aggregate.json"
+panel_receipt_path = Path(tempfile.mkdtemp()) / "panel.json"
+agg._write_panel_delivery(str(aggregate_receipt_path), receipt)
+agg._PANEL_PUBLISH._write_panel_delivery(str(panel_receipt_path), receipt)
 print(json.dumps({"summary": base64.b64encode(summary).decode(),
                   "expected": base64.b64encode(expected).decode(),
                   "panel_aggregate": base64.b64encode(panel_aggregate).decode(),
-                  "panel_rendering": base64.b64encode(panel_rendering).decode()}))
+                  "panel_rendering": base64.b64encode(panel_rendering).decode(),
+                  "receipt_aggregate": base64.b64encode(aggregate_receipt_path.read_bytes()).decode(),
+                  "receipt_panel": base64.b64encode(panel_receipt_path.read_bytes()).decode()}))
 '''
     completed = subprocess.run(
         [sys.executable, "-c", script, str(isolated)],
@@ -277,6 +286,7 @@ print(json.dumps({"summary": base64.b64encode(summary).decode(),
     panel_bytes = base64.b64decode(payload["panel_aggregate"])
     assert summary_bytes == expected_summary_bytes
     assert panel_bytes == base64.b64decode(payload["panel_rendering"])
+    assert base64.b64decode(payload["receipt_aggregate"]) == base64.b64decode(payload["receipt_panel"])
 
 
 def test_aggregate_canonical_loader_names_every_split_module():
