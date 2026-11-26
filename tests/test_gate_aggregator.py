@@ -5388,7 +5388,7 @@ def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp
     assert all(disposition["counterevidence"][field] for field in ("command", "output", "result", "pointer"))
     assert disposition["head_sha"] == ledger["head_sha"]
     assert set(disposition) == {
-        "finding_id", "disposition", "head_sha", "approved_at", "reason", "counterevidence", "tracking_issue",
+        "finding_id", "finding_key", "disposition", "head_sha", "approved_at", "reason", "counterevidence", "tracking_issue",
     }
     assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=0" in out
 

@@ -685,3 +685,76 @@ def collect_neighbor_evidence(
     )
     collector.set_current_digests(audit_digest, legacy_raw_audit_digest)
     return collector.collect(receipts)
+
+
+def collect_file_blob_oids(
+    *, repository: str, current_head_sha: str,
+    head_paths: Sequence[tuple[str, str]], token: str,
+) -> dict[tuple[str, str], str]:
+    """Shallow-fetch requested commits and return only verified file blob OIDs.
+
+    This is the rejected-receipt evidence path: it does not inspect diffs,
+    nearby lines, or rerun commands. Missing commits/files produce no entry so
+    the caller fails closed rather than treating absent evidence as equality.
+    """
+    collector = _Collector(
+        repository=repository,
+        repository_id=0,
+        pr_number=0,
+        current_head_sha=current_head_sha,
+        terminal_history_rows=(),
+        token=token,
+    )
+    requested = set(head_paths)
+    if not requested:
+        return {}
+    setup_reason = collector._init_caller_repo()
+    if setup_reason is not None:
+        print(f"GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason={setup_reason}")
+        return {}
+    caller_dir = collector._caller_dir
+    assert caller_dir is not None
+    result: dict[tuple[str, str], str] = {}
+    try:
+        for sha in sorted({current_head_sha, *(head for head, _path in requested)}):
+            if sha in collector._fetched_heads:
+                continue
+            fetch_reason = collector._fetch_commit_into(caller_dir, sha)
+            if fetch_reason is not None:
+                print(f"GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason={fetch_reason}")
+        for sha, path in sorted(requested):
+            if sha not in collector._fetched_heads:
+                continue
+            try:
+                proc = _run_git(
+                    ["git", "-C", str(caller_dir), "rev-parse", "--verify", f"{sha}:{path}"],
+                    timeout_s=_GIT_SETUP_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=blob_lookup_timeout")
+                continue
+            except OSError:
+                print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=blob_lookup_failed")
+                continue
+            oid = proc.stdout.decode("ascii", errors="ignore").strip()
+            if proc.returncode != 0 or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid):
+                print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=blob_missing")
+                continue
+            try:
+                object_type = _run_git(
+                    ["git", "-C", str(caller_dir), "cat-file", "-t", oid],
+                    timeout_s=_GIT_SETUP_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=blob_lookup_timeout")
+                continue
+            except OSError:
+                print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=blob_lookup_failed")
+                continue
+            if object_type.returncode == 0 and object_type.stdout.strip() == b"blob":
+                result[(sha, path)] = oid
+            else:
+                print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=blob_missing")
+    finally:
+        shutil.rmtree(caller_dir, ignore_errors=True)
+    return result

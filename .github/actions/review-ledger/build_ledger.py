@@ -497,6 +497,23 @@ def validate_disposition_receipt_audit(block: Any) -> dict[str, Any]:
             if not isinstance(item["finding_key"], str) or not item["finding_key"]:
                 raise ValueError("disposition_receipt_consumption.resolved item has an invalid finding_key")
             projected_item["finding_key"] = item["finding_key"]
+        inherited_fields = ("receipt_head_sha", "receipt_finding_id")
+        if "matched_by" in item:
+            if item["matched_by"] != "inherited_rejected":
+                raise ValueError("disposition_receipt_consumption.resolved item has invalid matched_by")
+            if any(key not in item for key in inherited_fields):
+                raise ValueError("disposition_receipt_consumption.resolved inherited item is incomplete")
+            if not isinstance(item["receipt_head_sha"], str) or not _SHA40_RE.fullmatch(item["receipt_head_sha"]):
+                raise ValueError("disposition_receipt_consumption.resolved item has invalid receipt_head_sha")
+            if not isinstance(item["receipt_finding_id"], str) or not item["receipt_finding_id"]:
+                raise ValueError("disposition_receipt_consumption.resolved item has invalid receipt_finding_id")
+            projected_item.update({
+                "matched_by": "inherited_rejected",
+                "receipt_head_sha": item["receipt_head_sha"],
+                "receipt_finding_id": item["receipt_finding_id"],
+            })
+        elif any(key in item for key in inherited_fields):
+            raise ValueError("disposition_receipt_consumption.resolved inherited fields require matched_by")
         for key in display_fields:
             if key not in item:
                 continue
