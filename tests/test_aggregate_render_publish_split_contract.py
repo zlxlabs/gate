@@ -255,7 +255,7 @@ expected = agg.scrub_for_publish(
 ).encode("utf-8")
 verdict = {"v": 1, "gate_result": "pass", "classification": "integration_error",
            "reason_code": "audit_invalid", "primary": "executed", "skip_reason": None, "draft": False}
-expected += "AGENT-GATE-VERDICT-V1 " + json.dumps(verdict, sort_keys=True, separators=(",", ":")) + "\n"
+expected += ("AGENT-GATE-VERDICT-V1 " + json.dumps(verdict, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 row = {"run_id": 701, "run_attempt": 1, "gate_result": "fail", "classification": "code_fail",
        "reason_code": "primary_findings", "head_sha": "a" * 40, "repository": "owner/repo"}
 panel_aggregate = agg.render_status_panel([row]).encode("utf-8")
