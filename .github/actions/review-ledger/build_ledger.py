@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any
 
 GATE_ROOT = Path(__file__).resolve().parents[3]
-sys.path[:0] = [str(GATE_ROOT), str(Path(__file__).resolve().parent)]
+sys.path[:0] = [str(GATE_ROOT)]
 
-from provenance_fields import project_provenance_fields
+from scripts.review_provenance import project_provenance_fields
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
