@@ -109,6 +109,18 @@ def test_duplicate_shell_manifest_is_insufficient(tmp_path):
     assert doc["insufficient_code"] == "artifact_missing"
 
 
+def test_timeout_takes_priority_over_unexecuted_shell_manifest(tmp_path):
+    c, t = tmp_path / "c", tmp_path / "t"
+    _tree(c, role="contrast", sha=C_SHA, tree=C_TREE, step="timeout")
+    _tree(t, role="tip", sha=T_SHA, tree=T_TREE)
+
+    doc = _synth(c, t, shell_files=["tests/test_shell.sh"])
+
+    jsonschema.validate(doc, SCHEMA)
+    assert doc["evidence_status"] == "insufficient"
+    assert doc["insufficient_code"] == "timeout"
+
+
 def test_matching_shell_manifest_is_complete(tmp_path):
     c, t = tmp_path / "c", tmp_path / "t"
     _tree(c, role="contrast", sha=C_SHA, tree=C_TREE)
