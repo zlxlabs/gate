@@ -17,7 +17,6 @@ from typing import Any
 GATE_ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(GATE_ROOT)]
 
-from scripts.review_provenance import project_provenance_fields
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
@@ -748,8 +747,8 @@ def build_live_review_record(
 
     def project(source: dict[str, Any], field: str, unknown_key: str, reason: str) -> Any:
         value = source.get(field)
-        if value is None:
-            unknown[unknown_key] = reason
+        if value is None: unknown[unknown_key] = reason
+        elif field in ("prompt_digest", "model_used") and (not isinstance(value, str) or not value): raise ValueError(f"primary audit {field} must be a non-empty string")
         return value
 
     result = review.get("result")
@@ -844,7 +843,8 @@ def build_live_review_record(
     reviewer_id = review.get("reviewer")
     if reviewer_id is None:
         unknown["reviewer_id"] = "live ledger has no reviewer identifier"
-    provenance_fields = project_provenance_fields(primary, unknown)
+    provenance_fields = {field: project(primary, field, field, "live ledger producer has no exact value for this field")
+                         for field in ("prompt_digest", "model_used")}
     unknown.update({field: "live ledger producer has no exact value for this field" for field in ("round_index", "profile")})
     registry_commit = primary.get("registry_commit")
     if registry_commit is None:
