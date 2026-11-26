@@ -227,7 +227,8 @@ def test_unusable_payloads_are_not_false(tmp_path, name, payload_text, extra_arg
         extra_args=extra_args,
         input_text=payload_text,
     )
-    # Failure must not skip review: never write false. Exit may be non-zero.
+    # Invalid input must fail, and must never lead to a false exemption.
+    assert proc.returncode != 0, name
     combined = written + proc.stdout
     assert "review_expected=false" not in combined, name
     if "review_expected=" in combined:
