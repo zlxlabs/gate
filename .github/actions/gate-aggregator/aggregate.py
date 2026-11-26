@@ -250,6 +250,39 @@ from gate_finding_relations import (  # noqa: E402
     build_finding_relation, project_finding, relate_findings,
     validate_finding_relation_block,
 )
+_GATE_IO_NAME = "gate_aggregate_io"
+_GATE_IO = sys.modules.get(_GATE_IO_NAME)
+if _GATE_IO is None:
+    _GATE_IO_SPEC = importlib.util.spec_from_file_location(
+        _GATE_IO_NAME, Path(__file__).with_name("gate_io.py")
+    )
+    assert _GATE_IO_SPEC and _GATE_IO_SPEC.loader
+    _GATE_IO = importlib.util.module_from_spec(_GATE_IO_SPEC)
+    sys.modules[_GATE_IO_NAME] = _GATE_IO
+    _GATE_IO_SPEC.loader.exec_module(_GATE_IO)
+
+_TERMINAL_HISTORY_NAME = "gate_terminal_history"
+_TERMINAL_HISTORY = sys.modules.get(_TERMINAL_HISTORY_NAME)
+if _TERMINAL_HISTORY is None:
+    _TERMINAL_HISTORY_SPEC = importlib.util.spec_from_file_location(
+        _TERMINAL_HISTORY_NAME, Path(__file__).with_name("terminal_history.py")
+    )
+    assert _TERMINAL_HISTORY_SPEC and _TERMINAL_HISTORY_SPEC.loader
+    _TERMINAL_HISTORY = importlib.util.module_from_spec(_TERMINAL_HISTORY_SPEC)
+    sys.modules[_TERMINAL_HISTORY_NAME] = _TERMINAL_HISTORY
+    _TERMINAL_HISTORY_SPEC.loader.exec_module(_TERMINAL_HISTORY)
+
+_PREVIOUS_CONTEXT_NAME = "gate_previous_context"
+_PREVIOUS_CONTEXT = sys.modules.get(_PREVIOUS_CONTEXT_NAME)
+if _PREVIOUS_CONTEXT is None:
+    _PREVIOUS_CONTEXT_SPEC = importlib.util.spec_from_file_location(
+        _PREVIOUS_CONTEXT_NAME, Path(__file__).with_name("previous_context.py")
+    )
+    assert _PREVIOUS_CONTEXT_SPEC and _PREVIOUS_CONTEXT_SPEC.loader
+    _PREVIOUS_CONTEXT = importlib.util.module_from_spec(_PREVIOUS_CONTEXT_SPEC)
+    sys.modules[_PREVIOUS_CONTEXT_NAME] = _PREVIOUS_CONTEXT
+    _PREVIOUS_CONTEXT_SPEC.loader.exec_module(_PREVIOUS_CONTEXT)
+
 from gate_aggregate_decision import (  # noqa: E402
     _CONVERGENCE_SCOPE_FIELDS, _canonical_p1_findings,
     _convergence_scope_from_audit, build_convergence_envelope,
@@ -258,286 +291,121 @@ from gate_aggregate_decision import (  # noqa: E402
 )
 
 
-def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
-    return (
-        f"{SILO_TERMINAL_TIER}/{repository_id}/"
-        f"{_LEDGER_LATEST_PREFIX}{repository_id}-pr{pr_number}/"
-        f"{_LEDGER_LATEST_OBJECT}"
+
+from types import SimpleNamespace
+
+def _gate_io_ports() -> SimpleNamespace:
+    return SimpleNamespace(
+        _download_terminal_zip=_download_terminal_zip,
+        _github_json=_github_json,
+        _github_identity=_github_identity,
+        _fetch_panel_comments=_fetch_panel_comments,
+        _post_issue_comment=_post_issue_comment,
+        _patch_issue_comment=_patch_issue_comment,
+        _delete_issue_comment=_delete_issue_comment,
+        _read_audit_file=_read_audit_file,
+        _write_convergence_receipt=_write_convergence_receipt,
+        _read_disposition_zip=_read_disposition_zip,
+        _fetch_github_disposition_receipts=_fetch_github_disposition_receipts,
+        _silo_configured=_silo_configured,
+        _silo_cli=_silo_cli,
+        _silo_objects_under=_silo_objects_under,
+        _fetch_silo_disposition_receipts=_fetch_silo_disposition_receipts,
+        _receipt_merge_key=_receipt_merge_key,
+        _merge_disposition_receipts=_merge_disposition_receipts,
+        _fetch_disposition_receipts=_fetch_disposition_receipts,
+        _NoRedirectHandler=_NoRedirectHandler,
+        _github_request=_github_request,
     )
+
+def _terminal_history_ports() -> SimpleNamespace:
+    return SimpleNamespace(
+        _terminal_row=_terminal_row,
+        _compute_pr_primary_convergence=_compute_pr_primary_convergence,
+        _read_terminal_zip=_read_terminal_zip,
+        _consume_terminal_artifact=_consume_terminal_artifact,
+        _fetch_github_terminal_history=_fetch_github_terminal_history,
+        _terminal_artifact_run_id=_terminal_artifact_run_id,
+        _silo_artifact_name=_silo_artifact_name,
+        _consume_silo_terminal_json=_consume_silo_terminal_json,
+        _fetch_silo_terminal_history=_fetch_silo_terminal_history,
+        _pr_target_run_ids=_pr_target_run_ids,
+        _load_pr_convergence_history=_load_pr_convergence_history,
+        _terminal_history_cache_path=_terminal_history_cache_path,
+        _write_terminal_history_cache=_write_terminal_history_cache,
+        _read_terminal_history_cache=_read_terminal_history_cache,
+        _merge_history_loads=_merge_history_loads,
+        _fetch_terminal_history=_fetch_terminal_history,
+        _download_terminal_zip=_download_terminal_zip,
+        _github_json=_github_json,
+        _github_identity=_github_identity,
+        _fetch_panel_comments=_fetch_panel_comments,
+        _post_issue_comment=_post_issue_comment,
+        _patch_issue_comment=_patch_issue_comment,
+        _delete_issue_comment=_delete_issue_comment,
+        _read_audit_file=_read_audit_file,
+        _write_convergence_receipt=_write_convergence_receipt,
+        _read_disposition_zip=_read_disposition_zip,
+        _fetch_github_disposition_receipts=_fetch_github_disposition_receipts,
+        _silo_configured=_silo_configured,
+        _silo_cli=_silo_cli,
+        _silo_objects_under=_silo_objects_under,
+        _fetch_silo_disposition_receipts=_fetch_silo_disposition_receipts,
+        _receipt_merge_key=_receipt_merge_key,
+        _merge_disposition_receipts=_merge_disposition_receipts,
+        _fetch_disposition_receipts=_fetch_disposition_receipts,
+        _FINDING_RELATIONS=_FINDING_RELATIONS,
+    )
+
+def _previous_context_ports() -> SimpleNamespace:
+    return SimpleNamespace(
+        _ledger_latest_key=_ledger_latest_key,
+        _previous_findings_from_silo=_previous_findings_from_silo,
+        load_previous_round_findings=load_previous_round_findings,
+        _project_previous_dispositions=_project_previous_dispositions,
+        _render_previous_context_cli=_render_previous_context_cli,
+        _annotate_primary_audit_cli=_annotate_primary_audit_cli,
+        _silo_configured=_silo_configured,
+        _silo_cli=_silo_cli,
+        _fetch_silo_disposition_receipts=_fetch_silo_disposition_receipts,
+        _GATE_ACTION=_GATE_ACTION,
+        _INHERITED_REJECTION=_INHERITED_REJECTION,
+        _CARRY=_CARRY,
+        _NEIGHBOR_EVIDENCE=_NEIGHBOR_EVIDENCE,
+        _CARRY_BLOCKERS=_CARRY_BLOCKERS,
+        _FINDING_RELATIONS=_FINDING_RELATIONS,
+        validate_audit_identity=validate_audit_identity,
+    )
+
+
+def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
+    return _PREVIOUS_CONTEXT._ledger_latest_key(repository_id=repository_id, pr_number=pr_number, _ports=_previous_context_ports())
 
 
 def _previous_findings_from_silo(
     *, repository_id: int, pr_number: int, run_id: int, run_attempt: int,
 ) -> tuple[Optional[str], list[Any]]:
-    """Return carried open facts (legacy latest findings when absent); a missing head stays unknown."""
-    import tempfile
-
-    key = _ledger_latest_key(repository_id, pr_number)
-    with tempfile.TemporaryDirectory(prefix="silo-ledger-latest-") as dest:
-        target = Path(dest) / _LEDGER_LATEST_OBJECT
-        proc = _silo_cli(["get", "--key", key, "--dest", str(target)], SILO_CLI_CALL_TIMEOUT_SECONDS)
-        if proc.returncode == 2: raise RuntimeError("silo-ledger-latest-absent")
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or proc.stdout or f"silo get failed: {key}").strip())
-        raw = target.read_text(encoding="utf-8")
-    try:
-        entry = json.loads(raw.splitlines()[0])
-    except (IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError("silo-ledger-latest-unreadable") from exc
-    if not isinstance(entry, dict) or entry.get("pr_number") != pr_number:
-        raise RuntimeError("silo-ledger-latest-unreadable")
-    try:
-        parsed = (int(entry["run_id"]), int(entry["run_attempt"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("silo-ledger-latest-unreadable") from exc
-    if parsed >= (run_id, run_attempt): raise RuntimeError("silo-ledger-latest-not-prior")
-    review = entry.get("review") if isinstance(entry.get("review"), dict) else {}
-    result = review.get("result") if isinstance(review.get("result"), dict) else {}
-    findings = result.get("findings") if isinstance(result.get("findings"), list) else []
-    finding_relation = entry.get("finding_relation")
-    if finding_relation is not None and not isinstance(finding_relation, dict):
-        raise RuntimeError("silo-ledger-latest-unreadable")
-    if isinstance(finding_relation, dict) and "open_findings" in finding_relation:
-        carried = finding_relation["open_findings"]
-        if not isinstance(carried, list) or any(not isinstance(item, dict) for item in carried):
-            raise RuntimeError("silo-ledger-latest-unreadable")
-    else:
-        carried = findings
-    head_sha = entry.get("head_sha")
-    return head_sha if isinstance(head_sha, str) and head_sha else None, [
-        item for item in carried if isinstance(item, dict)
-    ]
+    return _PREVIOUS_CONTEXT._previous_findings_from_silo(repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt, _ports=_previous_context_ports())
 
 
 def load_previous_round_findings(
     *, path: Optional[str], repository_id: int, pr_number: int, run_id: int, run_attempt: int,
 ) -> dict[str, Any]:
-    if path:
-        file = Path(path)
-        if not file.is_file() or file.stat().st_size == 0:
-            return _degrade_previous_round("previous-findings-file-missing")
-        try:
-            payload = json.loads(file.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return _degrade_previous_round("previous-findings-file-invalid")
-        if isinstance(payload, dict) and payload.get("available") is False:
-            detail = payload.get("detail")
-            return _degrade_previous_round(detail if isinstance(detail, str) and detail else "previous-findings-unavailable")
-        if isinstance(payload, dict) and payload.get("available") is True and isinstance(payload.get("findings"), list):
-            open_findings = payload.get("open_findings", payload["findings"])
-            if not isinstance(open_findings, list) or any(not isinstance(item, dict) for item in open_findings):
-                return _degrade_previous_round("previous-findings-file-invalid")
-            head_sha = payload.get("head_sha")
-            return {
-                "available": True,
-                "detail": "",
-                "head_sha": head_sha if isinstance(head_sha, str) and head_sha else None,
-                "findings": payload["findings"],
-                "open_findings": open_findings,
-            }
-        return _degrade_previous_round("previous-findings-file-invalid")
-    if not _silo_configured(): return _degrade_previous_round("silo-not-configured")
-    try:
-        head_sha, findings = _previous_findings_from_silo(
-            repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt,
-        )
-    except Exception as exc:
-        detail = str(exc)
-        if detail in _LATEST_LEDGER_DEGRADE: return _degrade_previous_round(detail)
-        return _degrade_previous_round(f"silo-ledger-unreadable:{type(exc).__name__}")
-    return {"available": True, "detail": "", "head_sha": head_sha, "findings": findings}
+    return _PREVIOUS_CONTEXT.load_previous_round_findings(path=path, repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt, _ports=_previous_context_ports())
 
 
 def _project_previous_dispositions(
     *, repository_id: int, pr_number: int,
 ) -> list[dict[str, Any]]:
-    projected: list[tuple[str, dict[str, Any]]] = []
-    dropped = 0
-    for receipt in _fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number):
-        counterevidence = None
-        tracking_issue = None
-        if receipt.disposition == "false-positive":
-            if _CONVERGENCE._counterevidence_reason(receipt) is not None:
-                dropped += 1
-                continue
-            evidence = receipt.counterevidence
-            counterevidence = {
-                field: _clip_text(evidence[field])
-                for field in ("command", "output", "result", "pointer")
-            }
-            if evidence.get("match_expectation") == "absent":
-                counterevidence["match_expectation"] = "absent"
-        elif receipt.disposition == "deferred":
-            if not isinstance(receipt.tracking_issue, str) or not receipt.tracking_issue.strip():
-                dropped += 1
-                continue
-            tracking_issue = _clip_text(receipt.tracking_issue)
-        elif receipt.disposition == "rejected":
-            # gate-hub#2644: rejected projects evidence-free; blank reason stays dropped.
-            if not receipt.reason.strip():
-                dropped += 1
-                continue
-        else:
-            dropped += 1
-            continue
-
-        approved_at = receipt.approved_at if isinstance(receipt.approved_at, str) else ""
-        projected.append((approved_at, {
-            "finding_id": _clip_text(receipt.finding_id),
-            "finding_key": receipt.finding_key,
-            "disposition": _clip_text(receipt.disposition),
-            "head_sha": receipt.head_sha,
-            "approved_at": _clip_text(approved_at),
-            "reason": _clip_text(receipt.reason),
-            "counterevidence": counterevidence,
-            "tracking_issue": tracking_issue,
-        }))
-
-    projected.sort(key=lambda item: item[0], reverse=True)
-    if len(projected) > PREVIOUS_FINDING_LIMIT:
-        dropped += len(projected) - PREVIOUS_FINDING_LIMIT
-        projected = projected[:PREVIOUS_FINDING_LIMIT]
-    result = [item for _approved_at, item in projected]
-    print(f"GATE-PREVIOUS-DISPOSITIONS: kept={len(result)} dropped={dropped}")
-    return result
+    return _PREVIOUS_CONTEXT._project_previous_dispositions(repository_id=repository_id, pr_number=pr_number, _ports=_previous_context_ports())
 
 
 def _render_previous_context_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser()
-    for name in ("--repository-id", "--pr-number", "--run-id", "--run-attempt"):
-        parser.add_argument(name, required=True, type=int)
-    parser.add_argument("--previous-json", required=True)
-    args = parser.parse_args(argv)
-    previous = load_previous_round_findings(
-        path=None, repository_id=args.repository_id, pr_number=args.pr_number,
-        run_id=args.run_id, run_attempt=args.run_attempt,
-    )
-    dispositions = _project_previous_dispositions(
-        repository_id=args.repository_id, pr_number=args.pr_number,
-    ) if previous["available"] else []
-    rejected_release_keys: set[tuple[str, str]] = set()
-    target_head_sha = previous.get("head_sha")
-    candidates = _INHERITED_REJECTION.disposition_blob_candidates(
-        findings=previous.get("findings", []), dispositions=dispositions,
-        target_head_sha=target_head_sha or "",
-        canonical_finding_key=_GATE_ACTION.canonical_finding_key,
-        is_rejected_eligible=_CARRY._rejected_releases,
-    ) if previous["available"] else []
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
-    repository = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("REPOSITORY", "")
-    if candidates and token and repository and target_head_sha:
-        blob_oids = _NEIGHBOR_EVIDENCE.collect_file_blob_oids(
-            repository=repository,
-            current_head_sha=target_head_sha,
-            head_paths=sorted(_INHERITED_REJECTION.blob_fetch_requests(candidates)),
-            token=token,
-        )
-        rejected_release_keys = _INHERITED_REJECTION.matching_finding_keys(
-            candidates, blob_oids,
-        )
-    elif candidates:
-        print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=environment_missing")
-    _CARRY.write_previous_context(
-        previous, dispositions, args.previous_json,
-        rejected_release_keys=rejected_release_keys,
-        canonical_finding_key=_GATE_ACTION.canonical_finding_key,
-    )
-    return 0
+    return _PREVIOUS_CONTEXT._render_previous_context_cli(argv=argv, _ports=_previous_context_ports())
 
 
 def _annotate_primary_audit_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--audit-path", required=True)
-    parser.add_argument("--previous-findings-path", required=True)
-    args = parser.parse_args(argv)
-    audit_path = Path(args.audit_path)
-    if not audit_path.is_file(): return 0
-    previous = load_previous_round_findings(
-        path=args.previous_findings_path, repository_id=0, pr_number=0, run_id=0, run_attempt=0,
-    )
-    audit = json.loads(audit_path.read_text(encoding="utf-8"))
-    result = audit.get("result") if isinstance(audit, dict) else None
-    findings = result.get("findings") if isinstance(result, dict) else None
-    if isinstance(findings, list):
-        relation_previous = {
-            **previous,
-            "findings": previous.get("open_findings", previous.get("findings", [])),
-        }
-        annotation = Outcome(ok=True)
-        apply_finding_relation(annotation, findings, relation_previous)
-        relation = annotation.finding_relation
-        assert relation is not None
-        relation = _consume_explicit_withdrawals(
-            relation, relation_previous,
-            result.get("withdrawals") if isinstance(result, dict) else None,
-        )
-        if (
-            previous.get("available") is True
-            and audit.get("verdict") in {"pass", "fail"}
-            and result.get("verdict") == audit.get("verdict")
-            and all(isinstance(item, dict) for item in findings)
-        ):
-            try:
-                identity = Identity(
-                    repository_id=int(os.environ["REPOSITORY_ID"]), head_sha=os.environ["HEAD_SHA"],
-                    run_id=int(os.environ["RUN_ID"]), run_attempt=int(os.environ["RUN_ATTEMPT"]),
-                    pr=int(os.environ["PR_NUMBER"]),
-                )
-            except (KeyError, ValueError):
-                print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=current_identity_missing")
-            else:
-                if validate_audit_identity(audit, identity):
-                    print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=current_audit_invalid")
-                else:
-                    anchor_updates = _NEIGHBOR_EVIDENCE.collect_anchor_updates(
-                        findings=relation_previous["findings"], repository=os.environ.get("GITHUB_REPOSITORY", ""),
-                        previous_head_sha=previous.get("head_sha") or "",
-                        current_head_sha=identity.head_sha,
-                        token=os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", ""),
-                    )
-                    reported = {
-                        pointer for item in relation.get("items", []) if isinstance(item, dict)
-                        for pointer in (item.get("id"), item.get("previous_finding_id"))
-                        if isinstance(pointer, str)
-                    }
-                    if anchor_updates is not None:
-                        open_findings = []
-                        for item in relation.get("open_findings", []):
-                            finding_id = item.get("id") if isinstance(item, dict) else None
-                            if finding_id not in reported and finding_id in anchor_updates:
-                                current_line = anchor_updates[finding_id]
-                                if current_line is None:
-                                    continue
-                                item["line"] = current_line
-                            open_findings.append(item)
-                        relation["open_findings"] = open_findings
-                    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
-                    repository = os.environ.get("GITHUB_REPOSITORY", "")
-                    carry_candidates = _CARRY_BLOCKERS.candidates(
-                        open_findings=relation.get("open_findings", []), current_findings=findings,
-                        source_head_sha=previous.get("head_sha"), current_head_sha=identity.head_sha,
-                        canonical_finding_key=_GATE_ACTION.canonical_finding_key,
-                    )
-                    blob_oids = _NEIGHBOR_EVIDENCE.collect_file_blob_oids(
-                        repository=repository, current_head_sha=identity.head_sha,
-                        head_paths=sorted(_CARRY_BLOCKERS.blob_fetch_requests(carry_candidates)), token=token,
-                    ) if carry_candidates and token and repository else {}
-                    if carry_candidates and not (token and repository):
-                        print("GATE-CARRY-BLOCKER-EVIDENCE-UNAVAILABLE reason=environment_missing")
-                    carried = _CARRY_BLOCKERS.audit_additions(
-                        carry_candidates, _CARRY_BLOCKERS.blockers(carry_candidates, blob_oids),
-                    )
-                    if carried:
-                        findings.extend(finding for finding, _ in carried)
-                        relation["carried_findings"] = [metadata for _, metadata in carried]
-                        audit["verdict"] = result["verdict"] = "fail"
-                        for metadata in relation["carried_findings"]:
-                            print(f"GATE-CARRIED-FINDING id={metadata['id']} reason={metadata['evidence_reason']}")
-        relation["history_status"] = "available" if previous["available"] else "unknown"
-        relation["previous_head_sha"] = previous.get("head_sha")
-        audit["finding_relation"] = relation
-        audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return 0
+    return _PREVIOUS_CONTEXT._annotate_primary_audit_cli(argv=argv, _ports=_previous_context_ports())
 
 
 class _FindingsSummaryUnavailable(Exception):
@@ -732,33 +600,11 @@ def _render_findings_summary_cli(argv: list[str]) -> int:
 
 
 def _read_audit_file(audit_dir: Optional[Path]) -> tuple[Any, Optional[str], Optional[bytes]]:
-    """Read the sole downloaded audit and retain the exact producer bytes."""
-    if audit_dir is None or not audit_dir.is_dir():
-        return None, "audit directory not present (download step likely found no artifact)", None
-    candidates = sorted(p for p in audit_dir.iterdir() if p.suffix == ".json")
-    if not candidates:
-        return None, f"no *.json file found under {audit_dir}", None
-    if len(candidates) > 1:
-        names = ", ".join(p.name for p in candidates)
-        return None, f"expected exactly one audit file under {audit_dir}, found {len(candidates)}: {names}", None
-    try:
-        raw = candidates[0].read_bytes()
-        return json.loads(raw.decode("utf-8")), None, raw
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return None, f"could not parse {candidates[0].name}: {exc}", None
+    return _GATE_IO._read_audit_file(audit_dir=audit_dir, _ports=_gate_io_ports())
 
 
 def _write_convergence_receipt(path: str, receipt: Any) -> None:
-    """Write one canonical receipt payload before any terminal publication."""
-    _CONVERGENCE.validate_receipt(receipt, receipt.scope)
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        receipt.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    temporary_path = target.with_name(f".{target.name}.tmp")
-    temporary_path.write_bytes(payload)
-    temporary_path.replace(target)
+    return _GATE_IO._write_convergence_receipt(path=path, receipt=receipt, _ports=_gate_io_ports())
 
 
 # Human-readable, per-reason_code explanations rendered into the Step Summary
@@ -1174,460 +1020,73 @@ def _github_request(*, token: str, url: str, method: str = "GET", payload: Optio
 
 
 def _download_terminal_zip(*, token: str, url: str) -> bytes:
-    """Download one terminal zip while keeping GitHub auth off signed blobs."""
-    opener = urllib.request.build_opener(_NoRedirectHandler())
-    budget = _ACTIVE_PUBLISH_BUDGET.get()
-    api_headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "gate-aggregator",
-    }
-
-    def open_once(request: urllib.request.Request) -> bytes:
-        timeout = budget.timeout() if budget is not None else GITHUB_API_TIMEOUT_SECONDS
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                raw = response.read()
-        except (socket.timeout, TimeoutError) as exc:
-            if budget is not None:
-                try:
-                    budget.timeout()
-                except _PublishBudgetExhausted as budget_exc:
-                    raise budget_exc from exc
-            raise
-        if budget is not None:
-            budget.timeout()
-        return raw
-
-    request = urllib.request.Request(url, headers=api_headers, method="GET")
-    try:
-        return open_once(request)
-    except urllib.error.HTTPError as exc:
-        if exc.code != 302:
-            raise
-        location = exc.headers.get("Location") if exc.headers is not None else None
-        if not isinstance(location, str) or not location:
-            raise ValueError("artifact zip redirect did not include a Location header")
-        if urllib.parse.urlsplit(location).hostname is None:
-            raise ValueError("artifact zip redirect Location is not an absolute URL")
-        redirect_headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "gate-aggregator",
-        }
-        if urllib.parse.urlsplit(location).hostname.lower() == "api.github.com":
-            redirect_headers.update(api_headers)
-        return open_once(urllib.request.Request(location, headers=redirect_headers, method="GET"))
+    return _GATE_IO._download_terminal_zip(token=token, url=url, _ports=_gate_io_ports())
 
 
 def _github_json(*, token: str, url: str) -> Any:
-    raw = _github_request(token=token, url=url)
-    return json.loads(raw) if raw else None
+    return _GATE_IO._github_json(token=token, url=url, _ports=_gate_io_ports())
 
 
 def _github_identity(token: str) -> dict[str, Any]:
-    try:
-        payload = _github_json(token=token, url="https://api.github.com/user")
-    except urllib.error.HTTPError as exc:
-        if exc.code not in (403, 404):
-            raise
-        return {"id": ACTIONS_BOT_ID, "login": ACTIONS_BOT_LOGIN, "identity_source": "actions_bot_fallback"}
-    if not isinstance(payload, dict) or not _is_strict_int(payload.get("id")) or not isinstance(payload.get("login"), str) or not payload["login"]:
-        raise ValueError("GitHub identity response is missing a strict numeric id or login")
-    return {"id": payload["id"], "login": payload["login"], "identity_source": "user_api"}
+    return _GATE_IO._github_identity(token=token, _ports=_gate_io_ports())
 
 
 def _fetch_panel_comments(*, token: str, repository: str, pr_number: int) -> list[dict[str, Any]]:
-    comments: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        payload = _github_json(
-            token=token,
-            url=f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments?per_page=100&page={page}",
-        )
-        if not isinstance(payload, list) or any(not isinstance(comment, dict) for comment in payload):
-            raise ValueError("PR comments response has an invalid shape")
-        comments.extend(payload)
-        if len(payload) < 100:
-            return comments
-        page += 1
+    return _GATE_IO._fetch_panel_comments(token=token, repository=repository, pr_number=pr_number, _ports=_gate_io_ports())
 
 
 def _post_issue_comment(*, repository: str, pr_number: int, body: str, token: str) -> None:
-    _github_request(
-        token=token,
-        url=f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments",
-        method="POST",
-        payload={"body": body},
-    )
+    return _GATE_IO._post_issue_comment(repository=repository, pr_number=pr_number, body=body, token=token, _ports=_gate_io_ports())
 
 
 def _patch_issue_comment(*, repository: str, comment_id: int, body: str, token: str) -> None:
-    _github_request(
-        token=token,
-        url=f"https://api.github.com/repos/{repository}/issues/comments/{comment_id}",
-        method="PATCH",
-        payload={"body": body},
-    )
+    return _GATE_IO._patch_issue_comment(repository=repository, comment_id=comment_id, body=body, token=token, _ports=_gate_io_ports())
 
 
 def _delete_issue_comment(*, repository: str, comment_id: int, token: str) -> None:
-    _github_request(
-        token=token,
-        url=f"https://api.github.com/repos/{repository}/issues/comments/{comment_id}",
-        method="DELETE",
-    )
+    return _GATE_IO._delete_issue_comment(repository=repository, comment_id=comment_id, token=token, _ports=_gate_io_ports())
 
 
 def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number: int) -> dict[str, Any]:
-    if not isinstance(record, dict):
-        raise ValueError("gate terminal artifact is not a JSON object")
-    if type(record.get("schema_version")) is not int or record.get("schema_version") != 1 or record.get("kind") != "gate_terminal":
-        raise ValueError("gate terminal artifact has an unsupported schema")
-    if record.get("repository") != repository or record.get("repository_id") != repository_id or record.get("pr_number") != pr_number:
-        raise ValueError("gate terminal artifact identity does not match this PR")
-    for field_name in ("run_id", "run_attempt"):
-        if not _is_strict_int(record.get(field_name)) or record[field_name] <= 0:
-            raise ValueError(f"gate terminal {field_name} must be a positive integer")
-    if not isinstance(record.get("head_sha"), str) or not record["head_sha"]:
-        raise ValueError("gate terminal head_sha must be a non-empty string")
-    if record.get("gate_result") not in GATE_RESULT_DOMAIN:
-        raise ValueError("gate terminal gate_result is outside the finite domain")
-    primary_verdict = record.get("primary_verdict")
-    if primary_verdict is not None and primary_verdict not in TERMINAL_PRIMARY_VERDICT_DOMAIN:
-        raise ValueError("gate terminal primary_verdict is outside the finite domain")
-    if record.get("classification") not in TERMINAL_CLASSIFICATION_DOMAIN or record.get("reason_code") not in TERMINAL_REASON_DOMAIN:
-        raise ValueError("gate terminal classification/reason_code is outside the finite domain")
-    audit = record.get("audit")
-    known_primary_skip = (
-        record.get("primary_result") == "skipped"
-        and record.get("skip_reason") in PRIMARY_SKIP_REASON_DOMAIN
-        and not (isinstance(audit, dict) and audit.get("available") is True)
-    )
-    shadow = record.get("convergence_shadow")
-    eligible_primary_round = (
-        isinstance(audit, dict)
-        and audit.get("available") is True
-        and record.get("primary_result") in ("success", "failure")
-        and record["gate_result"] in ("pass", "fail")
-    )
-    if shadow is not None:
-        if not isinstance(shadow, dict):
-            raise ValueError("gate terminal convergence_shadow is not an object")
-        if type(shadow.get("eligible_this_round")) is not bool:
-            raise ValueError("gate terminal convergence eligibility is invalid")
-        eligible_primary_round = shadow["eligible_this_round"]
-    row = {
-        "schema_version": PANEL_HISTORY_ROW_SCHEMA_VERSION,
-        "repository": repository,
-        "run_id": record["run_id"],
-        "run_attempt": record["run_attempt"],
-        "head_sha": record["head_sha"],
-        "gate_result": record["gate_result"],
-        "primary_verdict": primary_verdict,
-        "_known_primary_skip": known_primary_skip,
-        "classification": record["classification"],
-        "reason_code": record["reason_code"],
-        "_eligible_primary_round": eligible_primary_round,
-    }
-    if shadow is not None:
-        history_status = shadow.get("history_status")
-        decision = shadow.get("terminal_decision")
-        if history_status not in ("available", "history_unavailable"):
-            raise ValueError("gate terminal convergence history_status is invalid")
-        if decision not in ("collecting", "arbitration_required", "history_unavailable"):
-            raise ValueError("gate terminal convergence terminal_decision is invalid")
-        if type(shadow.get("limit")) is not int or shadow["limit"] <= 0:
-            raise ValueError("gate terminal convergence limit is invalid")
-        projected_shadow = {
-            "history_status": history_status,
-            "terminal_decision": decision,
-            "limit": shadow["limit"],
-            "eligible_this_round": shadow["eligible_this_round"],
-        }
-        rounds = shadow.get("eligible_rounds")
-        if history_status == "available":
-            if type(rounds) is not int or rounds < 0:
-                raise ValueError("gate terminal convergence eligible_rounds is invalid")
-            projected_shadow["eligible_rounds"] = rounds
-        elif "eligible_rounds" in shadow:
-            raise ValueError("unavailable convergence history must not publish an eligible count")
-        row["convergence_shadow"] = projected_shadow
-    recorded_claims = record.get("recorded_disposition_claims")
-    if isinstance(recorded_claims, list) and all(isinstance(item, str) for item in recorded_claims) and recorded_claims:
-        row["recorded_disposition_claims"] = list(recorded_claims)
-    resolved = record.get("resolved_findings")
-    if isinstance(resolved, list) and all(isinstance(item, str) for item in resolved) and resolved:
-        row["resolved_findings"] = [item for item in resolved if "resolved by receipt" not in item]
-    if "finding_relation" in record:
-        try:
-            row["finding_relation"] = validate_finding_relation_block(record.get("finding_relation"))
-        except FindingRelationError as exc:
-            raise ValueError(str(exc)) from exc
-    return row
+    return _TERMINAL_HISTORY._terminal_row(record=record, repository=repository, repository_id=repository_id, pr_number=pr_number, _ports=_terminal_history_ports())
 
 
 def _compute_pr_primary_convergence(
     history: HistoryLoad, *, identity: Identity, primary_result: str, outcome: Outcome,
 ) -> tuple[Optional[int], Optional[bool]]:
-    """Count distinct primary failures across all heads in one PR.
-
-    A known no-review skip contributes zero. The current verdict comes only
-    from the validated audit in `Outcome`, even while its run is in progress.
-    `run_id` deduplicates runs; `head_sha` identifies a row but does not partition
-    PR-wide convergence history.
-    """
-    target_run_ids = history.target_run_ids
-    target_ids = set(target_run_ids or ())
-    complete = target_run_ids is not None and not history.incomplete_reasons
-    rows_by_run: dict[int, list[dict[str, Any]]] = {}
-    observed_run_ids: set[int] = set()
-    for row in history.rows:
-        run_id = row.get("run_id")
-        if not _is_strict_int(run_id) or (
-            target_run_ids is not None and run_id not in target_ids and run_id != identity.run_id
-        ):
-            complete = False
-            continue
-        observed_run_ids.add(run_id)
-        if row.get("head_sha") != identity.head_sha and run_id == identity.run_id:
-            complete = False
-        rows_by_run.setdefault(run_id, []).append(row)
-    if target_run_ids is not None:
-        for run_id in target_ids:
-            if run_id != identity.run_id and run_id not in observed_run_ids:
-                complete = False
-    rows_by_run.setdefault(identity.run_id, []).append({
-        "run_attempt": identity.run_attempt,
-        "primary_verdict": outcome.primary_verdict,
-        "_known_primary_skip": (
-            primary_result == "skipped"
-            and outcome.skip_reason in PRIMARY_SKIP_REASON_DOMAIN
-            and not outcome.audit_available
-        ),
-        "primary_result": primary_result,
-        "audit_available": outcome.audit_available,
-    })
-    failed_run_ids: set[int] = set()
-    for run_id, attempts in rows_by_run.items():
-        actual_attempts = []
-        for attempt in attempts:
-            verdict = attempt.get("primary_verdict")
-            if verdict in ("pass", "fail"):
-                actual_attempts.append(attempt)
-            elif verdict in ("unavailable", "not_expected", "waived") or attempt.get("_known_primary_skip") is True:
-                continue
-            else:
-                complete = False
-        if actual_attempts and max(actual_attempts, key=lambda row: row["run_attempt"])["primary_verdict"] == "fail":
-            failed_run_ids.add(run_id)
-    fail_count = len(failed_run_ids) if complete else None
-    if outcome.primary_verdict == "pass" or (
-        primary_result == "skipped" and outcome.skip_reason in PRIMARY_SKIP_REASON_DOMAIN
-    ):
-        reconsider: Optional[bool] = False
-    elif outcome.primary_verdict == "fail":
-        reconsider = True if len(failed_run_ids) >= 3 else (False if complete else None)
-    else:
-        reconsider = None
-    return fail_count, reconsider
+    return _TERMINAL_HISTORY._compute_pr_primary_convergence(history=history, identity=identity, primary_result=primary_result, outcome=outcome, _ports=_terminal_history_ports())
 
 
 def _read_terminal_zip(raw: bytes) -> dict[str, Any]:
-    with zipfile.ZipFile(io.BytesIO(raw)) as bundle:
-        candidates = [name for name in bundle.namelist() if Path(name).name == "gate-terminal.json"]
-        if len(candidates) != 1:
-            raise ValueError(f"terminal artifact must contain exactly one gate-terminal.json, found {len(candidates)}")
-        return json.loads(bundle.read(candidates[0]))
+    return _TERMINAL_HISTORY._read_terminal_zip(raw=raw, _ports=_terminal_history_ports())
 
 
 def _consume_terminal_artifact(
     result: HistoryLoad, *, artifact: dict[str, Any], token: str, repository: str,
     repository_id: int, pr_number: int,
 ) -> bool:
-    name = artifact["name"]
-    if artifact.get("expired") is True:
-        result.skipped_records.append({"name": name, "reason": "expired_artifact"})
-        result.incomplete_reasons.append(f"expired artifact {name}")
-        return True
-    archive_url = artifact.get("archive_download_url")
-    if not isinstance(archive_url, str) or not archive_url:
-        result.skipped_records.append({"name": name, "reason": "missing_archive_url"})
-        result.incomplete_reasons.append(f"artifact {name} has no archive URL")
-        return True
-    try:
-        record = _read_terminal_zip(_download_terminal_zip(token=token, url=archive_url))
-        result.rows.append(_terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number))
-    except _PublishBudgetExhausted:
-        result.incomplete_reasons.append(f"history budget exhausted while downloading {name}")
-        return False
-    except ValueError as exc:
-        reason = f"{type(exc).__name__}: {exc}"
-        result.skipped_records.append({"name": name, "reason": reason})
-        if "identity does not match" not in str(exc):
-            result.incomplete_reasons.append(f"artifact {name}: {reason}")
-    except Exception as exc:
-        reason = f"{type(exc).__name__}: {exc}"
-        result.skipped_records.append({"name": name, "reason": reason})
-        result.incomplete_reasons.append(f"artifact {name}: {reason}")
-    return True
+    return _TERMINAL_HISTORY._consume_terminal_artifact(result=result, artifact=artifact, token=token, repository=repository, repository_id=repository_id, pr_number=pr_number, _ports=_terminal_history_ports())
 
 
 def _fetch_github_terminal_history(
     *, token: str, repository: str, repository_id: int, pr_number: int,
     target_run_ids: Optional[list[int]] = None,
 ) -> HistoryLoad:
-    prefix = f"gate-terminal-v1-{repository_id}-"
-    result = HistoryLoad()
-
-    if target_run_ids is not None:
-        unique_run_ids = list(dict.fromkeys(target_run_ids))
-        if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
-            result.incomplete_reasons.append(
-                f"bounded_scan: targeted history run limit {MAX_TARGETED_HISTORY_RUNS} reached"
-            )
-            unique_run_ids = unique_run_ids[:MAX_TARGETED_HISTORY_RUNS]
-        for run_id in unique_run_ids:
-            try:
-                payload = _github_json(
-                    token=token,
-                    url=f"https://api.github.com/repos/{repository}/actions/runs/{run_id}/artifacts",
-                )
-            except _PublishBudgetExhausted:
-                result.incomplete_reasons.append("history budget exhausted during targeted scan")
-                break
-            if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
-                raise ValueError("Actions run artifacts response has an invalid shape")
-            artifacts = [
-                artifact for artifact in payload["artifacts"]
-                if isinstance(artifact, dict)
-                and isinstance(artifact.get("name"), str)
-                and artifact["name"].startswith(prefix)
-            ]
-            if not artifacts:
-                result.incomplete_reasons.append(f"no terminal artifact matched run {run_id}")
-            for artifact in artifacts:
-                if not _consume_terminal_artifact(
-                    result, artifact=artifact, token=token, repository=repository,
-                    repository_id=repository_id, pr_number=pr_number,
-                ):
-                    return result
-        if not unique_run_ids:
-            result.incomplete_reasons.append("no cached panel run ids were available for targeted history")
-        return result
-
-    artifacts: list[dict[str, Any]] = []
-    page = 1
-    while page <= MAX_REPO_WIDE_HISTORY_PAGES:
-        try:
-            payload = _github_json(
-                token=token,
-                url=f"https://api.github.com/repos/{repository}/actions/artifacts?per_page=100&page={page}",
-            )
-        except _PublishBudgetExhausted:
-            result.incomplete_reasons.append("history budget exhausted during bounded_scan")
-            break
-        if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
-            raise ValueError("Actions artifacts response has an invalid shape")
-        page_artifacts = payload["artifacts"]
-        artifacts.extend(
-            artifact for artifact in page_artifacts
-            if isinstance(artifact, dict)
-            and isinstance(artifact.get("name"), str)
-            and artifact["name"].startswith(prefix)
-        )
-        if len(page_artifacts) < 100:
-            break
-        if page == MAX_REPO_WIDE_HISTORY_PAGES:
-            result.incomplete_reasons.append(
-                f"bounded_scan: repo-wide artifact page limit {MAX_REPO_WIDE_HISTORY_PAGES} reached"
-            )
-            break
-        page += 1
-    if not artifacts:
-        if not result.incomplete_reasons:
-            result.incomplete_reasons.append(f"no terminal artifact matched {prefix}")
-    for artifact in artifacts:
-        if not _consume_terminal_artifact(
-            result, artifact=artifact, token=token, repository=repository,
-            repository_id=repository_id, pr_number=pr_number,
-        ):
-            break
-    return result
+    return _TERMINAL_HISTORY._fetch_github_terminal_history(token=token, repository=repository, repository_id=repository_id, pr_number=pr_number, target_run_ids=target_run_ids, _ports=_terminal_history_ports())
 
 
 def _read_disposition_zip(raw: bytes) -> dict[str, Any]:
-    with zipfile.ZipFile(io.BytesIO(raw)) as bundle:
-        names = [name for name in bundle.namelist() if not name.endswith("/")]
-        if len(names) != 1:
-            raise ValueError(
-                f"disposition artifact must contain exactly one file, found {len(names)}"
-            )
-        payload = json.loads(bundle.read(names[0]))
-    if not isinstance(payload, dict):
-        raise ValueError("disposition receipt payload must be a JSON object")
-    return payload
+    return _GATE_IO._read_disposition_zip(raw=raw, _ports=_gate_io_ports())
 
 
 def _fetch_github_disposition_receipts(
     *, token: str, repository: str, repository_id: int, pr_number: int,
 ) -> tuple[Any, ...]:
-    """Bounded same-repo GitHub artifact scan; errors fail-open to an empty tuple."""
-
-    artifacts: list[dict[str, Any]] = []
-    page = 1
-    try:
-        while page <= MAX_REPO_WIDE_HISTORY_PAGES:
-            payload = _github_json(
-                token=token,
-                url=(
-                    f"https://api.github.com/repos/{repository}/actions/artifacts"
-                    f"?per_page=100&page={page}"
-                ),
-            )
-            if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
-                print("::warning::Disposition receipt scan returned an invalid artifact list; claims were not recorded.")
-                return ()
-            page_artifacts = payload["artifacts"]
-            artifacts.extend(
-                artifact for artifact in page_artifacts
-                if isinstance(artifact, dict)
-                and isinstance(artifact.get("name"), str)
-                and artifact["name"].startswith(DISPOSITION_ARTIFACT_PREFIX)
-                and artifact.get("expired") is not True
-            )
-            if len(page_artifacts) < 100:
-                break
-            page += 1
-    except Exception as exc:
-        print(f"::warning::Disposition receipt scan failed; claims were not recorded ({type(exc).__name__}).")
-        return ()
-
-    receipts: list[Any] = []
-    artifact_warning_reported = False
-    for artifact in artifacts:
-        archive_url = artifact.get("archive_download_url")
-        if not isinstance(archive_url, str) or not archive_url:
-            if not artifact_warning_reported:
-                print("::warning::Disposition receipt artifact has no archive URL; claims were not recorded.")
-                artifact_warning_reported = True
-            continue
-        try:
-            payload = _read_disposition_zip(_download_terminal_zip(token=token, url=archive_url))
-            receipt = _CONVERGENCE.parse_disposition_receipt(payload)
-        except Exception as exc:
-            if not artifact_warning_reported:
-                print(f"::warning::Disposition receipt artifact could not be recorded ({type(exc).__name__}).")
-                artifact_warning_reported = True
-            continue
-        if receipt.pr_number != pr_number or receipt.repository_id != str(repository_id):
-            continue
-        receipts.append(receipt)
-    return tuple(receipts)
+    return _GATE_IO._fetch_github_disposition_receipts(token=token, repository=repository, repository_id=repository_id, pr_number=pr_number, _ports=_gate_io_ports())
 
 
 def _silo_configured() -> bool:
-    return bool((os.environ.get("SILO_ENDPOINT") or "").strip())
+    return _GATE_IO._silo_configured(_ports=_gate_io_ports())
 
 
 def _silo_cli(argv: list[str], timeout_s: float = SILO_CLI_CALL_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
@@ -1637,350 +1096,59 @@ def _silo_cli(argv: list[str], timeout_s: float = SILO_CLI_CALL_TIMEOUT_SECONDS)
     # 任何包管理器入口。仓内调用点必须显式传 timeout_s（deadline 剩余或
     # SILO_CLI_CALL_TIMEOUT_SECONDS）；默认值只服务于仓外无超时语义的探针
     # （tests/test_no_runtime_install.py），且本身就是有界的。
-    store_path = os.environ.get("SILO_STORE") or str(GATE_ROOT / "scripts" / "silo_store.py")
-    return subprocess.run(
-        [sys.executable, store_path, *argv],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_s,
-    )
+    return _GATE_IO._silo_cli(argv=argv, timeout_s=timeout_s, _ports=_gate_io_ports())
 
 
 def _silo_objects_under(prefix: str, timeout_s: float) -> list[tuple[str, bytes]]:
-    """Return (key, body) pairs under a Silo prefix. Raises on listing/get failure."""
-    import tempfile
-
-    with tempfile.TemporaryDirectory(prefix="silo-scan-") as dest:
-        proc = _silo_cli(["list", "--prefix", prefix, "--dest", dest], timeout_s)
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or proc.stdout or "silo list failed").strip())
-        keys = [line for line in proc.stdout.splitlines() if line.strip()]
-        objects = []
-        for key in keys:
-            parts = key.split("/", 3)
-            if len(parts) != 4:
-                raise ValueError(f"silo key is not tier/repo_id/artifact_name/path: {key}")
-            path = Path(dest) / parts[2] / parts[3]
-            objects.append((key, path.read_bytes()))
-        return objects
+    return _GATE_IO._silo_objects_under(prefix=prefix, timeout_s=timeout_s, _ports=_gate_io_ports())
 
 
 def _terminal_artifact_run_id(name: str, repository_id: int) -> Optional[int]:
-    prefix = f"gate-terminal-v1-{repository_id}-"
-    if not name.startswith(prefix):
-        return None
-    parts = name[len(prefix) :].rsplit("-", 2)
-    if len(parts) != 3:
-        return None
-    sha, run_id_s, attempt_s = parts
-    if len(sha) != 40 or not run_id_s.isdigit() or not attempt_s.isdigit():
-        return None
-    return int(run_id_s)
+    return _TERMINAL_HISTORY._terminal_artifact_run_id(name=name, repository_id=repository_id, _ports=_terminal_history_ports())
 
 
 def _silo_artifact_name(key: str) -> str:
-    parts = key.split("/")
-    if len(parts) >= 3 and parts[2]:
-        return parts[2]
-    return key
+    return _TERMINAL_HISTORY._silo_artifact_name(key=key, _ports=_terminal_history_ports())
 
 
 def _consume_silo_terminal_json(
     result: HistoryLoad, *, name: str, raw: bytes, repository: str,
     repository_id: int, pr_number: int,
 ) -> None:
-    try:
-        record = json.loads(raw)
-        result.rows.append(
-            _terminal_row(record, repository=repository, repository_id=repository_id, pr_number=pr_number)
-        )
-    except ValueError as exc:
-        reason = f"{type(exc).__name__}: {exc}"
-        result.skipped_records.append({"name": name, "reason": reason})
-        if "identity does not match" not in str(exc):
-            result.incomplete_reasons.append(f"silo object {name}: {reason}")
-    except Exception as exc:
-        reason = f"{type(exc).__name__}: {exc}"
-        result.skipped_records.append({"name": name, "reason": reason})
-        result.incomplete_reasons.append(f"silo object {name}: {reason}")
+    return _TERMINAL_HISTORY._consume_silo_terminal_json(result=result, name=name, raw=raw, repository=repository, repository_id=repository_id, pr_number=pr_number, _ports=_terminal_history_ports())
 
 
 def _fetch_silo_terminal_history(
     *, repository: str, repository_id: int, pr_number: int,
     target_run_ids: Optional[list[int]] = None,
 ) -> HistoryLoad:
-    """Fetch this PR's terminal records from the d30 Silo tier.
-
-    Two hard bounds apply: only objects whose artifact name decodes to a
-    targeted run id are ever downloaded (the artifact name does not carry the
-    PR number, so the run-id filter is what keeps a busy repo from pulling
-    every other PR's records), and each `_silo_cli` call runs against the
-    active HISTORY_RECONSTRUCTION deadline — or SILO_CLI_CALL_TIMEOUT_SECONDS
-    when no budget is active — so a slow Silo can never stall the job.
-    """
-    import tempfile
-
-    prefix = f"{SILO_TERMINAL_TIER}/{repository_id}/gate-terminal-v1-{repository_id}-"
-    result = HistoryLoad()
-    budget = _ACTIVE_PUBLISH_BUDGET.get()
-    deadline = (
-        budget.operation_deadline
-        if budget is not None and budget.current_operation == "HISTORY_RECONSTRUCTION"
-        else None
-    )
-
-    def silo_timeout() -> float:
-        if deadline is None:
-            return SILO_CLI_CALL_TIMEOUT_SECONDS
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _PublishBudgetExhausted("HISTORY_RECONSTRUCTION")
-        return remaining
-
-    allowed: Optional[set[int]] = None
-    if target_run_ids is not None:
-        unique_run_ids = list(dict.fromkeys(target_run_ids))
-        if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
-            unique_run_ids = unique_run_ids[:MAX_TARGETED_HISTORY_RUNS]
-        allowed = set(unique_run_ids)
-    with tempfile.TemporaryDirectory(prefix="silo-terminal-") as dest:
-        proc = _silo_cli(["list", "--prefix", prefix], silo_timeout())
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or proc.stdout or "silo list failed").strip())
-        keys = [line for line in proc.stdout.splitlines() if line.strip()]
-        for key in keys:
-            if allowed is not None:
-                run_id = _terminal_artifact_run_id(_silo_artifact_name(key), repository_id)
-                if run_id is None or run_id not in allowed:
-                    continue
-            parts = key.split("/", 3)
-            if len(parts) != 4:
-                raise ValueError(f"silo key is not tier/repo_id/artifact_name/path: {key}")
-            target = Path(dest) / parts[2]
-            try:
-                proc = _silo_cli(["get", "--key", key, "--dest", str(target)], silo_timeout())
-            except subprocess.TimeoutExpired as exc:
-                if deadline is not None:
-                    raise _PublishBudgetExhausted("HISTORY_RECONSTRUCTION") from exc
-                raise
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    (proc.stderr or proc.stdout or f"silo get failed: {key}").strip()
-                )
-            _consume_silo_terminal_json(
-                result, name=_silo_artifact_name(key), raw=target.read_bytes(),
-                repository=repository, repository_id=repository_id, pr_number=pr_number,
-            )
-            target.unlink(missing_ok=True)
-    return result
+    return _TERMINAL_HISTORY._fetch_silo_terminal_history(repository=repository, repository_id=repository_id, pr_number=pr_number, target_run_ids=target_run_ids, _ports=_terminal_history_ports())
 
 
 def _pr_target_run_ids(*, token: str, repository: str, pr_number: int) -> Optional[list[int]]:
-    """Cheaply enumerate this PR's prior Actions runs so history reads can be
-    PR-targeted instead of repo-wide: the PR's head branch narrows the run
-    list, and the silo/GitHub artifact filters drop everything that is not a
-    gate terminal record. One page (newest first) is enough because
-    MAX_TARGETED_HISTORY_RUNS already caps the consumed set at 50.
-
-    Returns None instead of a partial list whenever the run list is known to
-    be incomplete — the API reports more runs than this page holds
-    (total_count, or a full page when total_count is absent), or the list
-    exceeds MAX_TARGETED_HISTORY_RUNS. INV-A4: a history that cannot be fully
-    listed must degrade to history_unavailable, never to a smaller count.
-    `event=pull_request` matches the only trigger the Required Gate caller
-    template declares (terminal records exist for pull_request runs only) and
-    keeps unrelated branch runs from triggering the truncation path.
-    """
-    pull = _github_json(token=token, url=f"https://api.github.com/repos/{repository}/pulls/{pr_number}")
-    if not isinstance(pull, dict) or not isinstance(pull.get("head"), dict):
-        raise ValueError("PR response has an invalid shape")
-    head_ref = pull["head"].get("ref")
-    if not isinstance(head_ref, str) or not head_ref:
-        raise ValueError("PR head branch is missing")
-    payload = _github_json(
-        token=token,
-        url=(
-            f"https://api.github.com/repos/{repository}/actions/runs"
-            f"?event=pull_request&branch={urllib.parse.quote(head_ref, safe='')}&per_page=100"
-        ),
-    )
-    if not isinstance(payload, dict) or not isinstance(payload.get("workflow_runs"), list):
-        raise ValueError("Actions runs response has an invalid shape")
-    workflow_runs = payload["workflow_runs"]
-    total_count = payload.get("total_count")
-    if isinstance(total_count, int) and total_count > len(workflow_runs):
-        return None
-    if not isinstance(total_count, int) and len(workflow_runs) >= 100:
-        return None
-    run_ids = [
-        run["id"] for run in workflow_runs
-        if isinstance(run, dict) and _is_strict_int(run.get("id")) and run["id"] > 0
-    ]
-    unique_run_ids = list(dict.fromkeys(run_ids))
-    if len(unique_run_ids) > MAX_TARGETED_HISTORY_RUNS:
-        return None
-    return unique_run_ids
+    return _TERMINAL_HISTORY._pr_target_run_ids(token=token, repository=repository, pr_number=pr_number, _ports=_terminal_history_ports())
 
 
 def _load_pr_convergence_history(
     *, repository: str, repository_id: int, pr_number: int,
 ) -> tuple[str, tuple[int, ...], HistoryLoad]:
-    """Load d30 terminal history once for both shadow count and panel cache.
-
-    The whole load — Silo reads plus the GitHub fallback — runs under one
-    HISTORY_RECONSTRUCTION deadline from `_PublishBudget` (45s by default, the
-    same knob the panel flow uses). gate#287 was reverted (gate#290) because an
-    unbounded Silo read plus a repo-wide GitHub scan pushed the aggregate job
-    past its `timeout-minutes`; the deadline turns any such stall into a fast
-    `history_unavailable` with a greppable reason instead.
-    """
-    history = HistoryLoad()
-    if not _silo_configured():
-        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured")
-        history.incomplete_reasons.append("Silo terminal history unavailable: not configured")
-        return "history_unavailable", (), history
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
-    if not token:
-        # Without a token the load cannot be PR-targeted; an untargeted read
-        # would download every terminal record on the repo (gate#290's revert
-        # reason), so it fails fast instead.
-        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_token_missing")
-        history.incomplete_reasons.append("history loader needs GITHUB_TOKEN to target this PR's runs")
-        return "history_unavailable", (), history
-    try:
-        budget = _PublishBudget.from_environment()
-    except ValueError as exc:
-        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=invalid_history_budget")
-        history.incomplete_reasons.append(f"invalid history budget configuration: {exc}")
-        return "history_unavailable", (), history
-    budget_context = _ACTIVE_PUBLISH_BUDGET.set(budget)
-    try:
-        budget.begin("HISTORY_RECONSTRUCTION")
-        try:
-            target_run_ids = _pr_target_run_ids(
-                token=token, repository=repository, pr_number=pr_number,
-            )
-        except _PublishBudgetExhausted:
-            raise
-        except Exception as exc:
-            print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
-            history.incomplete_reasons.append(f"GitHub run targeting unavailable: {type(exc).__name__}")
-            return "history_unavailable", (), history
-        if target_run_ids is None:
-            # INV-A4: a truncated run list must never shrink to a partial count.
-            print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_truncated")
-            history.incomplete_reasons.append(
-                "history truncated: this PR's branch has more pull_request runs than one page or the targeted cap"
-            )
-            return "history_unavailable", (), history
-        history.target_run_ids = tuple(target_run_ids)
-        try:
-            history = _fetch_silo_terminal_history(
-                repository=repository, repository_id=repository_id, pr_number=pr_number,
-                target_run_ids=target_run_ids,
-            )
-            history.target_run_ids = tuple(target_run_ids)
-        except _PublishBudgetExhausted:
-            raise
-        except Exception as exc:
-            print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
-            history.incomplete_reasons.append(f"Silo terminal history unavailable: {type(exc).__name__}")
-            return "history_unavailable", (), history
-        if history.incomplete_reasons:
-            print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history")
-            return "history_unavailable", (), history
-        if not history.rows and target_run_ids:
-            try:
-                github_history = _fetch_github_terminal_history(
-                    token=token,
-                    repository=repository,
-                    repository_id=repository_id,
-                    pr_number=pr_number,
-                    target_run_ids=target_run_ids,
-                )
-            except _PublishBudgetExhausted:
-                raise
-            except Exception as exc:
-                print(f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(exc).__name__}")
-                history.incomplete_reasons.append(f"GitHub terminal history unavailable: {type(exc).__name__}")
-                return "history_unavailable", (), history
-            if github_history.rows:
-                print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_empty_but_github_has_terminal_history")
-                history.incomplete_reasons.append("Silo empty but GitHub has terminal history")
-                return "history_unavailable", (), history
-            budget_exhausted = [
-                reason for reason in github_history.incomplete_reasons
-                if "history budget exhausted" in reason
-            ]
-            unexpected_reasons = [
-                reason for reason in github_history.incomplete_reasons
-                if not reason.startswith("no terminal artifact matched run ")
-                and "history budget exhausted" not in reason
-            ]
-            if budget_exhausted:
-                raise _PublishBudgetExhausted("HISTORY_RECONSTRUCTION")
-            if unexpected_reasons:
-                print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_history_incomplete")
-                history.incomplete_reasons.append("GitHub terminal history incomplete")
-                return "history_unavailable", (), history
-    except _PublishBudgetExhausted:
-        print("GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_budget_exhausted")
-        history.incomplete_reasons.append("history budget exhausted")
-        return "history_unavailable", (), history
-    finally:
-        _ACTIVE_PUBLISH_BUDGET.reset(budget_context)
-    return "available", tuple(
-        row["run_id"] for row in history.rows
-        if row.get("_eligible_primary_round") is True
-    ), history
+    return _TERMINAL_HISTORY._load_pr_convergence_history(repository=repository, repository_id=repository_id, pr_number=pr_number, _ports=_terminal_history_ports())
 
 
 def _terminal_history_cache_path(terminal_path: str | Path) -> Path:
-    target = Path(terminal_path)
-    return target.with_name(target.name + ".history.json")
+    return _TERMINAL_HISTORY._terminal_history_cache_path(terminal_path=terminal_path, _ports=_terminal_history_ports())
 
 
 def _write_terminal_history_cache(terminal_path: str | Path, history: HistoryLoad) -> None:
-    payload = {
-        "schema_version": TERMINAL_HISTORY_CACHE_SCHEMA_VERSION,
-        "rows": history.rows,
-        "skipped_records": history.skipped_records,
-        "incomplete_reasons": history.incomplete_reasons,
-    }
-    target = _terminal_history_cache_path(terminal_path)
-    temporary_path = target.with_name(f".{target.name}.tmp")
-    temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary_path.replace(target)
+    return _TERMINAL_HISTORY._write_terminal_history_cache(terminal_path=terminal_path, history=history, _ports=_terminal_history_ports())
 
 
 def _read_terminal_history_cache(path: str | Path) -> HistoryLoad:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] != TERMINAL_HISTORY_CACHE_SCHEMA_VERSION:
-        raise ValueError("terminal history cache has an unsupported schema")
-    rows = payload.get("rows")
-    skipped_records = payload.get("skipped_records")
-    incomplete_reasons = payload.get("incomplete_reasons")
-    if (
-        not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
-        or not isinstance(skipped_records, list) or any(not isinstance(row, dict) for row in skipped_records)
-        or not isinstance(incomplete_reasons, list) or any(not isinstance(reason, str) for reason in incomplete_reasons)
-    ):
-        raise ValueError("terminal history cache has an invalid payload")
-    return HistoryLoad(rows=rows, skipped_records=skipped_records, incomplete_reasons=incomplete_reasons)
+    return _TERMINAL_HISTORY._read_terminal_history_cache(path=path, _ports=_terminal_history_ports())
 
 
 def _merge_history_loads(github: HistoryLoad, silo: HistoryLoad) -> HistoryLoad:
-    by_identity: dict[tuple[int, int], dict[str, Any]] = {}
-    for row in github.rows:
-        by_identity[(row["run_id"], row["run_attempt"])] = row
-    for row in silo.rows:
-        by_identity[(row["run_id"], row["run_attempt"])] = row
-    return HistoryLoad(
-        rows=list(by_identity.values()),
-        skipped_records=[*github.skipped_records, *silo.skipped_records],
-        incomplete_reasons=[*github.incomplete_reasons, *silo.incomplete_reasons],
-    )
+    return _TERMINAL_HISTORY._merge_history_loads(github=github, silo=silo, _ports=_terminal_history_ports())
 
 
 def _fetch_terminal_history(
@@ -1988,103 +1156,25 @@ def _fetch_terminal_history(
     target_run_ids: Optional[list[int]] = None,
     silo_history: Optional[HistoryLoad] = None,
 ) -> HistoryLoad:
-    github = HistoryLoad()
-    try:
-        github = _fetch_github_terminal_history(
-            token=token, repository=repository, repository_id=repository_id,
-            pr_number=pr_number, target_run_ids=target_run_ids,
-        )
-    except _PublishBudgetExhausted:
-        raise
-    except Exception as exc:
-        github = HistoryLoad(
-            incomplete_reasons=[f"GitHub terminal history unavailable: {type(exc).__name__}"],
-        )
-    silo = silo_history if silo_history is not None else HistoryLoad()
-    if silo_history is None and _silo_configured():
-        try:
-            silo = _fetch_silo_terminal_history(
-                repository=repository, repository_id=repository_id,
-                pr_number=pr_number, target_run_ids=target_run_ids,
-            )
-        except _PublishBudgetExhausted:
-            raise
-        except Exception as exc:
-            print(f"::warning::Silo terminal history unavailable: {type(exc).__name__}")
-            silo = HistoryLoad(
-                incomplete_reasons=[f"Silo terminal history unavailable: {type(exc).__name__}"],
-            )
-    merged = _merge_history_loads(github, silo)
-    present_runs = {row["run_id"] for row in merged.rows}
-    filtered: list[str] = []
-    for reason in merged.incomplete_reasons:
-        if reason.startswith("no terminal artifact matched run "):
-            run_token = reason.rsplit(" ", 1)[-1]
-            if run_token.isdigit() and int(run_token) in present_runs:
-                continue
-        if reason.startswith("no terminal artifact matched gate-terminal-v1-") and merged.rows:
-            continue
-        filtered.append(reason)
-    merged.incomplete_reasons = filtered
-    return merged
+    return _TERMINAL_HISTORY._fetch_terminal_history(token=token, repository=repository, repository_id=repository_id, pr_number=pr_number, target_run_ids=target_run_ids, silo_history=silo_history, _ports=_terminal_history_ports())
 
 
 def _fetch_silo_disposition_receipts(*, repository_id: int, pr_number: int) -> tuple[Any, ...]:
-    prefix = f"{SILO_DISPOSITION_TIER}/{repository_id}/{DISPOSITION_ARTIFACT_PREFIX}"
-    try:
-        objects = _silo_objects_under(prefix, SILO_CLI_CALL_TIMEOUT_SECONDS)
-    except Exception as exc:
-        print(
-            f"::warning::Silo disposition receipt scan failed; "
-            f"claims from Silo were not recorded ({type(exc).__name__})."
-        )
-        return ()
-    receipts: list[Any] = []
-    artifact_warning_reported = False
-    for key, raw in objects:
-        try:
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise ValueError("disposition receipt payload must be a JSON object")
-            receipt = _CONVERGENCE.parse_disposition_receipt(payload)
-        except Exception as exc:
-            if not artifact_warning_reported:
-                print(
-                    f"::warning::Silo disposition receipt object could not be recorded ({type(exc).__name__})."
-                )
-                artifact_warning_reported = True
-            continue
-        if receipt.pr_number != pr_number or receipt.repository_id != str(repository_id):
-            continue
-        receipts.append(receipt)
-    return tuple(receipts)
+    return _GATE_IO._fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number, _ports=_gate_io_ports())
 
 
 def _receipt_merge_key(receipt: Any) -> str:
-    return _CONVERGENCE.disposition_receipt_artifact_name(receipt)
+    return _GATE_IO._receipt_merge_key(receipt=receipt, _ports=_gate_io_ports())
 
 
 def _merge_disposition_receipts(github: tuple[Any, ...], silo: tuple[Any, ...]) -> tuple[Any, ...]:
-    by_name: dict[str, Any] = {}
-    for receipt in github:
-        by_name[_receipt_merge_key(receipt)] = receipt
-    for receipt in silo:
-        by_name[_receipt_merge_key(receipt)] = receipt
-    return tuple(by_name.values())
+    return _GATE_IO._merge_disposition_receipts(github=github, silo=silo, _ports=_gate_io_ports())
 
 
 def _fetch_disposition_receipts(
     *, token: str, repository: str, repository_id: int, pr_number: int,
 ) -> tuple[Any, ...]:
-    """Dual-read GitHub ∪ Silo; errors fail-open per source and merge the rest."""
-
-    github = _fetch_github_disposition_receipts(
-        token=token, repository=repository, repository_id=repository_id, pr_number=pr_number,
-    )
-    silo: tuple[Any, ...] = ()
-    if _silo_configured():
-        silo = _fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number)
-    return _merge_disposition_receipts(github, silo)
+    return _GATE_IO._fetch_disposition_receipts(token=token, repository=repository, repository_id=repository_id, pr_number=pr_number, _ports=_gate_io_ports())
 
 
 def _merge_panel_rows(current: dict[str, Any], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
