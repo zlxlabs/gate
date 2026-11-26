@@ -45,6 +45,9 @@ ENTRY_FILES = {
     # previous findings）。本卡主修对象。
     ".github/actions/gate-aggregator/aggregate.py": "gate 槽聚合器",
     ".github/actions/gate-aggregator/convergence.py": "被聚合器载入的同目录模块",
+    ".github/actions/gate-aggregator/convergence_contract.py": "被收敛与处置模块共享的不可变合同和规范化模块",
+    ".github/actions/gate-aggregator/disposition_receipts.py": "被处置裁决模块加载的回执句法模块",
+    ".github/actions/gate-aggregator/dispositions.py": "收敛状态机调用的处置裁决与消费模块",
     ".github/actions/gate-aggregator/gate_action.py": "gate_action 判定与覆盖规则模块（聚合器/convergence/签发器共享，file-size ratchet 拆分，dlg-20261120-180704-d7a06b seq=3）",
     ".github/actions/gate-aggregator/followup_round.py": "primary 槽 follow-up 决策 CLI（gate-v2 注入步骤 python3 直执行，仅标准库+spec 加载仓内聚合器，dlg-20261121-105548-30ad72）",
     ".github/actions/gate-aggregator/carry_findings.py": "被聚合器 spec 加载的 previous-context open_findings 投影模块（非独立入口，仅标准库，dlg-20261121-113103-7af1cd）",

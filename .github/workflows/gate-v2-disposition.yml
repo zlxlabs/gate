@@ -562,6 +562,9 @@ jobs:
           GATE_CHECKOUT_SPARSE: |
             .github/actions/gate-disposition/issue_receipt.py
             .github/actions/gate-aggregator/convergence.py
+            .github/actions/gate-aggregator/convergence_contract.py
+            .github/actions/gate-aggregator/disposition_receipts.py
+            .github/actions/gate-aggregator/dispositions.py
             .github/actions/gate-aggregator/gate_action.py
             .github/actions/gate-aggregator/counterevidence_argv.py
             .github/actions/gate-aggregator/behavior_counterevidence.py
