@@ -279,7 +279,7 @@ def test_shadow_classify_job_matches_required_gate_classifier():
     for runs_on in (shadow_job["runs-on"], required_job["runs-on"]):
         assert FORK_GUARD in runs_on
         assert "ubuntu-latest" in runs_on
-    assert shadow_job["outputs"] == required_job["outputs"]
+    assert shadow_job["outputs"] == {"review_expected": required_job["outputs"]["review_expected"]} and required_job["outputs"].keys() - shadow_job["outputs"].keys() == {"quality_reusable", "reuse_source_run_id", "reuse_caller_checks", "reuse_preflight_result", "reuse_reason"}
     shadow_classify = next(s for s in shadow_job["steps"] if s.get("id") == "classify")
     required_classify = next(s for s in required_job["steps"] if s.get("id") == "classify")
     assert shadow_classify["run"] == required_classify["run"]

@@ -593,7 +593,6 @@ def test_disposition_workflow_call_declares_optional_silo_secret_pair():
     assert "secrets" not in trigger["workflow_dispatch"]
 
 
-
 def test_production_v2_official_actions_are_exactly_sha_pinned():
     raw, _ = _load_workflow()
     actual = {}
@@ -619,7 +618,8 @@ def test_gate_v2_has_no_github_artifact_actions():
     assert uploads == [
         ("quality", "upload-quality-junit", "${{ runner.temp }}/gate-quality/junit/"),
         ("quality", "upload-quality-junit-legacy", "${{ runner.temp }}/gate-tested-evidence-junit/"),
-    ], "GitHub artifact upload is only the quality-job junit retention path"
+        ("quality", "upload-quality-reuse-receipt", "${{ runner.temp }}/gate-quality-reuse/quality-reuse-receipt.json"),
+    ], "GitHub artifact uploads are quality junit retention and quality reuse receipt paths"
     assert raw.get("env", {}).get("SILO_ENDPOINT") == "https://zlx-vm-work-i5-infra.taile9071.ts.net:9000"
     assert raw.get("env", {}).get("SILO_BUCKET") == "ci-artifacts"
     hold = REPO_ROOT / ".github" / "v2-tag-sync.hold"
@@ -1344,7 +1344,7 @@ def test_aggregator_check_name_separates_draft_events():
     assert "gate" in raw["jobs"]
     gate = raw["jobs"]["gate"]
     assert gate.get("name") == GATE_AGGREGATOR_NAME_EXPRESSION
-    assert gate["if"] == "always()"
+    assert gate["if"] == "${{ always() && (github.event_name != 'pull_request' || github.event.action != 'converted_to_draft') }}"
     assert gate["needs"] == ["quality", "primary", "classify_pr_paths"]
     assert raw["jobs"]["ledger"]["needs"] == ["quality", "primary", "gate", "classify_pr_paths"]
 
@@ -1443,9 +1443,6 @@ def test_quality_and_primary_have_independent_cancel_true_pr_locks():
 
 
 # ── quality runs independently of primary (gate#129, owner 2026-09-07) ───────
-# Both expensive jobs start without waiting for the other. A primary failure
-# still fails the required gate through the aggregator, but no longer skips
-# quality; this keeps successful runs on the parallel critical path.
 
 
 @pytest.mark.parametrize("primary_result", ["success", "failure", "cancelled", "skipped"])
@@ -1454,7 +1451,8 @@ def test_quality_runs_for_each_primary_result_without_dependency(primary_result)
     quality = raw["jobs"]["quality"]
     assert primary_result in {"success", "failure", "cancelled", "skipped"}
     assert "primary" not in quality.get("needs", [])
-    assert "if" not in quality
+    assert quality["needs"] == ["classify_pr_paths"]
+    assert quality["if"] == "${{ !cancelled() && !(github.event_name == 'pull_request' && github.event.action == 'converted_to_draft') && !(github.event_name == 'pull_request' && github.event.action == 'ready_for_review' && needs.classify_pr_paths.outputs.quality_reusable == 'true') }}"
 
 
 def test_non_writer_non_expensive_jobs_have_no_concurrency():
@@ -1584,7 +1582,7 @@ def test_gate_aggregate_writes_receipt_output_and_transparently_exits_with_aggre
 def test_gate_job_id_is_literally_gate_and_runs_always():
     raw, _ = _load_workflow()
     gate_job = raw["jobs"]["gate"]
-    assert str(gate_job.get("if", "")) == "always()"
+    assert str(gate_job.get("if", "")) == "${{ always() && (github.event_name != 'pull_request' || github.event.action != 'converted_to_draft') }}"
     needs = gate_job.get("needs")
     assert set(needs if isinstance(needs, list) else [needs]) == {
         "quality", "primary", "classify_pr_paths",
@@ -2621,7 +2619,7 @@ def test_ledger_resolver_step_env_and_download_guard_literals():
     raw, _ = _load_workflow()
     ledger_steps = raw["jobs"]["ledger"]["steps"]
     resolve = next(s for s in ledger_steps if s.get("name") == "Resolve v2 ledger artifacts")
-    assert resolve["env"]["QUALITY_RESULT"] == "${{ needs.quality.result }}"
+    assert resolve["env"]["QUALITY_RESULT"] == "${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && 'success' || needs.quality.result }}"
     assert resolve["env"]["PRIMARY_RESULT"] == PRIMARY_RESULT_EXPR
     assert resolve["env"]["PRIMARY_RESULT_RAW"] == PRIMARY_RESULT_RAW_EXPR
     download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
@@ -3165,7 +3163,7 @@ def test_quality_preflight_checks_out_the_reusable_workflow_source():
     assert_workflow_sha_checkout(
         checkout,
         path="_gate-action-src",
-        sparse=[".github/actions", "scripts/gate_source.py", "scripts/scrub_outbound.py", "scripts/install_result_telemetry.py"],
+        sparse=[".github/actions", "scripts/gate_source.py", "scripts/scrub_outbound.py", "scripts/install_result_telemetry.py", "scripts/quality_reuse.py"],
     )
     names = [step.get("name") for step in steps]
     assert names.index(checkout["name"]) < names.index("PR size preflight")
@@ -3268,7 +3266,7 @@ def test_quality_action_sparse_checkout_excludes_tests_tree():
     assert ".github/actions" in sparse_paths
     assert "scripts/scrub_outbound.py" in sparse_paths
     assert not any(
-        path == "scripts" or path.startswith("scripts/") and path not in SHARED_ACTION_MODULES
+        path == "scripts" or path.startswith("scripts/") and path not in SHARED_ACTION_MODULES and path != "scripts/quality_reuse.py"
         for path in sparse_paths
     )
     assert not any(path == "tests" or path.startswith("tests/") for path in sparse_paths)
@@ -3768,8 +3766,8 @@ def test_gate_forwards_caller_checks_at_both_call_sites():
     ]
     assert len(consumers) == 2, "aggregate + publish-only call sites must both forward the evidence"
     for step in consumers:
-        assert step["env"]["QUALITY_CALLER_CHECKS"] == "${{ needs.quality.outputs.caller_checks }}"
-        assert step["env"]["QUALITY_PREFLIGHT_RESULT"] == "${{ needs.quality.outputs.preflight_result }}"
+        assert step["env"]["QUALITY_CALLER_CHECKS"] == "${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_caller_checks || needs.quality.outputs.caller_checks }}"
+        assert step["env"]["QUALITY_PREFLIGHT_RESULT"] == "${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_preflight_result || needs.quality.outputs.preflight_result }}"
         assert '--caller-checks "$QUALITY_CALLER_CHECKS"' in step["run"]
         assert '--preflight-result "$QUALITY_PREFLIGHT_RESULT"' in step["run"]
 
