@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any
 
 GATE_ROOT = Path(__file__).resolve().parents[3]
-if str(GATE_ROOT) not in sys.path:
-    sys.path.insert(0, str(GATE_ROOT))
+sys.path[:0] = [str(GATE_ROOT), str(Path(__file__).resolve().parent)]
 
+from provenance_fields import project_provenance_fields
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
 
@@ -31,7 +31,7 @@ PRIMARY_IDENTITY_FIELDS = (
     "policy_version", "policy_digest", "registry_commit", "caller_sha",
     "reusable_workflow_sha", "run_id", "run_attempt", "job_id", "reviewer",
     "merge_base_sha", "candidate_commit_sha", "candidate_tree_sha", "run_mode",
-    "spec_source", "pr_body_digest", "tier",
+    "spec_source", "pr_body_digest", "tier", "prompt_digest", "model_used",
 )
 PRIMARY_REQUIRED_IDENTITY_FIELDS = (
     "repository_id", "repository", "pr", "base_sha", "head_sha", "diff_digest",
@@ -844,8 +844,8 @@ def build_live_review_record(
     reviewer_id = review.get("reviewer")
     if reviewer_id is None:
         unknown["reviewer_id"] = "live ledger has no reviewer identifier"
-    for field in ("round_index", "prompt_digest", "model_used", "profile"):
-        unknown[field] = "live ledger producer has no exact value for this field"
+    provenance_fields = project_provenance_fields(primary, unknown)
+    unknown.update({field: "live ledger producer has no exact value for this field" for field in ("round_index", "profile")})
     registry_commit = primary.get("registry_commit")
     if registry_commit is None:
         gate_hub_commit = None
@@ -867,8 +867,8 @@ def build_live_review_record(
         "schema_version": "review-record/v1", "source": "ci", "repo": entry["repository"],
         "pr": entry["pr_number"], "base_sha": base_sha, "merge_base_sha": merge_base_sha,
         "head_sha": entry["head_sha"], "run_id": entry["run_id"], "attempt": entry["run_attempt"],
-        "round_index": None, "gate_hub_commit": gate_hub_commit, "prompt_digest": None,
-        "model_used": None, "profile": None, "reviewer_id": reviewer_id,
+        "round_index": None, "gate_hub_commit": gate_hub_commit, "prompt_digest": provenance_fields["prompt_digest"],
+        "model_used": provenance_fields["model_used"], "profile": None, "reviewer_id": reviewer_id,
         "verdict": review.get("verdict"), "findings": findings,
         "finding_dispositions": finding_dispositions, "convergence": convergence_fields,
         "risk": risk, "skip": {"reason": skip_reason}, "recorded_at": entry["recorded_at"],
