@@ -104,7 +104,13 @@ def write_previous_context(
     annotator and gate-hub's first-round path); ``open_findings`` is purely
     additive.
     """
-    payload = {**previous, "dispositions": dispositions}
+    payload = {
+        **previous,
+        "dispositions": [
+            {key: value for key, value in disposition.items() if key != "finding_key"}
+            for disposition in dispositions
+        ],
+    }
     findings = payload.get("findings")
     if not isinstance(findings, list):
         findings = []
