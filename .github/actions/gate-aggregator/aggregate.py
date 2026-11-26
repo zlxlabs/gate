@@ -163,6 +163,11 @@ assert _INHERITED_REJECTION_SPEC and _INHERITED_REJECTION_SPEC.loader
 _INHERITED_REJECTION = importlib.util.module_from_spec(_INHERITED_REJECTION_SPEC)
 sys.modules[_INHERITED_REJECTION_SPEC.name] = _INHERITED_REJECTION
 _INHERITED_REJECTION_SPEC.loader.exec_module(_INHERITED_REJECTION)
+_CARRY_BLOCKERS_SPEC = importlib.util.spec_from_file_location(
+    "gate_carry_blockers_from_aggregate", Path(__file__).with_name("carry_blockers.py"))
+assert _CARRY_BLOCKERS_SPEC and _CARRY_BLOCKERS_SPEC.loader
+_CARRY_BLOCKERS = importlib.util.module_from_spec(_CARRY_BLOCKERS_SPEC)
+_CARRY_BLOCKERS_SPEC.loader.exec_module(_CARRY_BLOCKERS)
 
 
 # The audit schema's complete verdict domain, including states not_expected
@@ -352,6 +357,7 @@ class Outcome:
     # Typed receipt audit is the only source for the terminal receipt record.
     disposition_audit: Optional[Any] = None
     finding_relation: Optional[dict[str, Any]] = None
+    carry_blockers: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -1098,6 +1104,7 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
                             open_findings.append(item)
                         relation["open_findings"] = open_findings
         relation["history_status"] = "available" if previous["available"] else "unknown"
+        relation["previous_head_sha"] = previous.get("head_sha")
         audit["finding_relation"] = relation
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
@@ -1322,6 +1329,7 @@ def build_terminal_envelope(
         "disposition_receipt_consumption": project_disposition_receipt_audit(
             outcome.disposition_audit,
         ),
+        **({"carry_blockers": outcome.carry_blockers} if outcome.carry_blockers else {}),
     }
     if outcome.primary_verdict is not None:
         envelope["primary_verdict"] = outcome.primary_verdict
@@ -2235,6 +2243,13 @@ def render_status_panel(
                 f"- `{item.get('id')}` 与上一轮 `{item.get('previous_finding_id')}` "
                 f"在 `{item.get('file')}:{item.get('line')}` 冲突"
             )
+    carry_blockers = current.get("carry_blockers") or []
+    if carry_blockers:
+        lines.extend(["", "#### 上一轮未处置的 sol 问题（文件未变，继续拦截）", ""])
+        for item in carry_blockers:
+            title = _summary_cell(item.get("title"))
+            lines.append(f"- `{item.get('id')}` — `{item.get('file')}:{item.get('line')}` — {title}（{item.get('evidence_reason')}）")
+        lines.append("出口：改代码，或对上一轮 audit 的该条签发 rejected 后在当前 head 重跑 gate。")
     lines.extend([
         "",
         "#### Gate 历史（v1；来源为持久化 `gate_terminal` 制品）",
@@ -2496,6 +2511,10 @@ def _terminal_row(record: Any, *, repository: str, repository_id: int, pr_number
             row["finding_relation"] = validate_finding_relation_block(record.get("finding_relation"))
         except FindingRelationError as exc:
             raise ValueError(str(exc)) from exc
+    if "carry_blockers" in record:
+        if not isinstance(record["carry_blockers"], list) or any(not isinstance(item, dict) for item in record["carry_blockers"]):
+            raise ValueError("gate terminal carry_blockers is invalid")
+        row["carry_blockers"] = record["carry_blockers"]
     return row
 
 
@@ -4205,6 +4224,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                 False, "fail", "code_fail", "primary_findings",
             )
             outcome.problems.append("cross-round finding conflict requires manual review (manual_required)")
+        source_head_sha = relation.pop("previous_head_sha", None)
+        carry_candidates = _CARRY_BLOCKERS.candidates(
+            open_findings=relation.get("open_findings", []), current_findings=findings,
+            source_head_sha=source_head_sha, current_head_sha=identity.head_sha,
+            canonical_finding_key=_GATE_ACTION.canonical_finding_key,
+            inherited_keys=_CARRY_BLOCKERS.inherited_rejection_keys(outcome.disposition_audit),
+        )
+        carry_blob_oids = _NEIGHBOR_EVIDENCE.collect_file_blob_oids(
+            repository=args.repository, current_head_sha=identity.head_sha,
+            head_paths=sorted(_CARRY_BLOCKERS.blob_fetch_requests(carry_candidates)), token=token,
+        ) if carry_candidates and token else {}
+        if carry_candidates and not token:
+            print("GATE-CARRY-BLOCKER-EVIDENCE-UNAVAILABLE reason=environment_missing")
+        outcome.carry_blockers = _CARRY_BLOCKERS.blockers(carry_candidates, carry_blob_oids)
+        for blocker in outcome.carry_blockers:
+            print(f"GATE-CARRY-BLOCKER id={blocker['id']} reason={blocker['evidence_reason']}")
+        if outcome.carry_blockers and outcome.gate_result == "pass":
+            outcome.ok, outcome.gate_result, outcome.classification, outcome.reason_code = (
+                False, "fail", "code_fail", "primary_findings",
+            )
+            outcome.problems.append("unreleased sol must_respond finding remains a carry blocker")
     fail_count, reconsider = _compute_pr_primary_convergence(
         silo_terminal_history if silo_terminal_history is not None else HistoryLoad(),
         identity=identity, primary_result=args.primary_result, outcome=outcome,

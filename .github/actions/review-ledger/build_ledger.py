@@ -71,6 +71,7 @@ LEDGER_ENTRY_REQUIRED_FIELDS = (
 )
 LEDGER_ENTRY_OPTIONAL_FIELDS = (
     "disposition_receipt_consumption", "terminal_source_attempt", "finding_relation", "risk",
+    "carry_blockers",
 )
 _RELATION_VALUES = frozenset({"new", "repeat", "conflict"})
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -711,6 +712,23 @@ def build_entry(
             entry["terminal_source_attempt"] = source_attempt
         if "finding_relation" in terminal_envelope:
             entry["finding_relation"] = _validate_finding_relation(terminal_envelope["finding_relation"])
+        if "carry_blockers" in terminal_envelope:
+            blockers = terminal_envelope["carry_blockers"]
+            if not isinstance(blockers, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str) or not item["id"]
+                or not isinstance(item.get("finding_key"), str) or not item["finding_key"]
+                or (item.get("source_head_sha") is not None and (
+                    not isinstance(item["source_head_sha"], str)
+                    or not _SHA40_RE.fullmatch(item["source_head_sha"])
+                ))
+                for item in blockers
+            ):
+                raise ValueError("gate terminal carry_blockers are invalid")
+            entry["carry_blockers"] = [
+                {key: item.get(key) for key in ("id", "finding_key", "source_head_sha")}
+                for item in blockers
+            ]
     return entry
 
 
