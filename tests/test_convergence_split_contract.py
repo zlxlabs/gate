@@ -152,7 +152,7 @@ receipt = convergence.DispositionReceipt(
 )
 parsed = convergence.parse_disposition_receipt(receipt.as_dict())
 contract = sys.modules["gate_convergence_contract"]
-assert parsed is contract.DispositionReceipt
+assert isinstance(parsed, contract.DispositionReceipt)
 assert second.DispositionReceipt is contract.DispositionReceipt
 print(json.dumps({"receipt": parsed.as_dict(), "single_class_identity": True}))
 '''
