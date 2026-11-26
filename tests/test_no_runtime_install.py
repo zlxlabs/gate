@@ -47,6 +47,8 @@ ENTRY_FILES = {
     ".github/actions/gate-aggregator/gate_io.py": "聚合器 GitHub/Silo I/O 与审计/处置回执模块",
     ".github/actions/gate-aggregator/terminal_history.py": "聚合器终端历史重建与缓存模块",
     ".github/actions/gate-aggregator/previous_context.py": "聚合器上轮 findings/ledger 与处置上下文模块",
+    ".github/actions/gate-aggregator/rendering.py": "聚合器 findings 与状态面板纯渲染模块",
+    ".github/actions/gate-aggregator/panel_publish.py": "聚合器状态面板发布模块",
     ".github/actions/gate-aggregator/aggregate_models.py": "聚合器共享领域值域与契约常量模块",
     ".github/actions/gate-aggregator/disposition_projection.py": "纯处置回执审计投影模块",
     ".github/actions/gate-aggregator/finding_relations.py": "纯跨轮 finding 关系判定模块",
@@ -138,6 +140,7 @@ IMPORT_ALLOWLIST_EXTRA = frozenset({
     "gate_disposition_projection",
     "gate_finding_relations",
     "gate_aggregate_decision",
+    "gate_aggregate_rendering",
 })
 
 
