@@ -71,8 +71,28 @@ def candidates(
             "line": finding.get("line"),
             "title": finding.get("title") or finding.get("issue") or "",
             "_safe_path": safe_path,
+            "_finding": dict(finding),
         })
     return selected
+
+
+def audit_additions(
+    items: Iterable[dict[str, Any]], decisions: Iterable[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Pair original finding payloads with audit-side carry provenance."""
+    by_key = {(item["id"], item["finding_key"]): item for item in items}
+    additions = []
+    for decision in decisions:
+        item = by_key[(decision["id"], decision["finding_key"])]
+        additions.append((
+            dict(item["_finding"]),
+            {
+                "id": item["id"],
+                "carried_from_head_sha": item["source_head_sha"],
+                "evidence_reason": decision["evidence_reason"],
+            },
+        ))
+    return additions
 
 
 def blob_fetch_requests(items: Iterable[dict[str, Any]]) -> set[tuple[str, str]]:
