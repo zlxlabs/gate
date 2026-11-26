@@ -44,12 +44,23 @@ def _tree(dir_: Path, *, role: str, sha: str, tree: str, junit: Path | None = No
         shutil.copy(junit, dir_ / "junit.xml")
 
 
-def _synth(contrast: Path, tip: Path):
+def _synth(contrast: Path, tip: Path, *, shell_files: list[str] | None = None):
     return synthesize(
         dispatch_id="dlg-test", run_id=1, run_attempt=1,
         contrast_sha=C_SHA, tip_sha=T_SHA, contrast_tree=C_TREE, tip_tree=T_TREE,
-        pytest_files=["mod.py"], shell_files=[],
+        pytest_files=["mod.py"], shell_files=shell_files or [],
         contrast=load_tree_dir(contrast), tip=load_tree_dir(tip),
+    )
+
+
+def _shell_case(case_id: str) -> dict[str, str | None]:
+    return {"id": case_id, "status": "pass", "fail_kind": None, "channel": "shell"}
+
+
+def _write_shell_cases(tree: Path, case_ids: list[str]) -> None:
+    (tree / "shell.jsonl").write_text(
+        "".join(json.dumps(_shell_case(case_id)) + "\n" for case_id in case_ids),
+        encoding="utf-8",
     )
 
 
@@ -62,6 +73,66 @@ def test_zero_cases_even_when_step_exits_zero(tmp_path):
     jsonschema.validate(doc, SCHEMA)
     assert doc["evidence_status"] == "insufficient"
     assert doc["insufficient_code"] == "zero_cases"
+
+
+@pytest.mark.parametrize("role", ["contrast", "tip"])
+@pytest.mark.parametrize(
+    "actual_ids",
+    [[], ["tests/test_shell.sh", "tests/test_shell.sh"], ["tests/test_shell.sh", "tests/extra.sh"]],
+    ids=["missing", "duplicate", "undeclared-extra"],
+)
+def test_shell_manifest_mismatch_is_insufficient(tmp_path, role, actual_ids):
+    c, t = tmp_path / "c", tmp_path / "t"
+    _tree(c, role="contrast", sha=C_SHA, tree=C_TREE)
+    _tree(t, role="tip", sha=T_SHA, tree=T_TREE)
+    _write_shell_cases(c if role == "contrast" else t, actual_ids)
+    _write_shell_cases(t if role == "contrast" else c, ["tests/test_shell.sh"])
+
+    doc = _synth(c, t, shell_files=["tests/test_shell.sh"])
+
+    jsonschema.validate(doc, SCHEMA)
+    assert doc["evidence_status"] == "insufficient"
+    assert doc["insufficient_code"] == "artifact_missing"
+
+
+def test_duplicate_shell_manifest_is_insufficient(tmp_path):
+    c, t = tmp_path / "c", tmp_path / "t"
+    _tree(c, role="contrast", sha=C_SHA, tree=C_TREE)
+    _tree(t, role="tip", sha=T_SHA, tree=T_TREE)
+    for tree in (c, t):
+        _write_shell_cases(tree, ["tests/test_shell.sh"])
+
+    doc = _synth(c, t, shell_files=["tests/test_shell.sh", "tests/test_shell.sh"])
+
+    jsonschema.validate(doc, SCHEMA)
+    assert doc["evidence_status"] == "insufficient"
+    assert doc["insufficient_code"] == "artifact_missing"
+
+
+def test_timeout_takes_priority_over_unexecuted_shell_manifest(tmp_path):
+    c, t = tmp_path / "c", tmp_path / "t"
+    _tree(c, role="contrast", sha=C_SHA, tree=C_TREE, step="timeout")
+    _tree(t, role="tip", sha=T_SHA, tree=T_TREE)
+
+    doc = _synth(c, t, shell_files=["tests/test_shell.sh"])
+
+    jsonschema.validate(doc, SCHEMA)
+    assert doc["evidence_status"] == "insufficient"
+    assert doc["insufficient_code"] == "timeout"
+
+
+def test_matching_shell_manifest_is_complete(tmp_path):
+    c, t = tmp_path / "c", tmp_path / "t"
+    _tree(c, role="contrast", sha=C_SHA, tree=C_TREE)
+    _tree(t, role="tip", sha=T_SHA, tree=T_TREE)
+    for tree in (c, t):
+        _write_shell_cases(tree, ["tests/test_shell.sh"])
+
+    doc = _synth(c, t, shell_files=["tests/test_shell.sh"])
+
+    jsonschema.validate(doc, SCHEMA)
+    assert doc["evidence_status"] == "complete"
+    assert "insufficient_code" not in doc
 
 
 def test_all_skipped(tmp_path):

@@ -127,11 +127,19 @@ def _codes_for(snap: TreeSnapshot, expected_sha: str, expected_tree: str) -> lis
     return codes
 
 
-def decide_evidence(contrast: TreeSnapshot, tip: TreeSnapshot, c_sha: str, t_sha: str, c_tree: str, t_tree: str) -> tuple[str, str | None]:
+def decide_evidence(contrast: TreeSnapshot, tip: TreeSnapshot, c_sha: str, t_sha: str, c_tree: str, t_tree: str, shell_files: list[str]) -> tuple[str, str | None]:
     found = set(_codes_for(contrast, c_sha, c_tree) + _codes_for(tip, t_sha, t_tree))
     for code in PRIORITY:
         if code in found and code not in {"zero_cases", "all_skipped"}:
             return "insufficient", code
+    declared = set(shell_files)
+    shell_manifest_complete = len(declared) == len(shell_files)
+    for snap in (contrast, tip):
+        shell_ids = [case["id"] for case in snap.cases if case.get("channel") == "shell"]
+        if len(shell_ids) != len(declared) or set(shell_ids) != declared:
+            shell_manifest_complete = False
+    if not shell_manifest_complete:
+        return "insufficient", "artifact_missing"
     cases = contrast.cases + tip.cases
     if not cases:
         return "insufficient", "zero_cases"
@@ -141,7 +149,7 @@ def decide_evidence(contrast: TreeSnapshot, tip: TreeSnapshot, c_sha: str, t_sha
 
 
 def synthesize(*, dispatch_id: str, run_id: int, run_attempt: int, contrast_sha: str, tip_sha: str, contrast_tree: str, tip_tree: str, pytest_files: list[str], shell_files: list[str], contrast: TreeSnapshot, tip: TreeSnapshot) -> dict[str, Any]:
-    status, code = decide_evidence(contrast, tip, contrast_sha, tip_sha, contrast_tree, tip_tree)
+    status, code = decide_evidence(contrast, tip, contrast_sha, tip_sha, contrast_tree, tip_tree, shell_files)
     doc: dict[str, Any] = {
         "schema": SCHEMA_ID,
         "dispatch_id": dispatch_id,
