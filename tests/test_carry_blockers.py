@@ -105,7 +105,10 @@ def _audit(*, target: str, source: str, prior: dict, current_findings: list[dict
     }
 
 
-def _run_gate(tmp_path, monkeypatch, repo, source, target, *, current_findings=None, missing_blobs=False):
+def _run_gate(
+    tmp_path, monkeypatch, repo, source, target, *, current_findings=None,
+    missing_blobs=False, quality_result="success",
+):
     audit_dir = tmp_path / "audit"
     audit_dir.mkdir()
     prior = _finding()
@@ -129,7 +132,8 @@ def _run_gate(tmp_path, monkeypatch, repo, source, target, *, current_findings=N
     monkeypatch.setenv("GITHUB_TOKEN", "fixture-token")
     monkeypatch.setattr(AGG._NEIGHBOR_EVIDENCE, "collect_file_blob_oids", collect_blobs)
     args = [
-        "--quality-result", "success", "--caller-checks", "passed",
+        "--quality-result", quality_result,
+        "--caller-checks", "failed" if quality_result == "failure" else "passed",
         "--preflight-result", "success", "--primary-result", "success",
         "--runner", "self", "--is-draft", "false", "--is-fork", "false",
         "--pr-author-json", '"owner"', "--review-expected", "true",
@@ -198,6 +202,19 @@ def test_unreleased_sol_finding_with_same_blob_fails_and_cross_process_ledger_ke
         "source_head_sha": source,
     }]
     assert json.loads(proc.stdout)["carry_blockers"] == ledger["carry_blockers"]
+
+
+def test_carry_blocker_preserves_an_existing_failure_reason(tmp_path, monkeypatch):
+    repo, source, target = _two_commit_repo(tmp_path)
+    exit_code, terminal_path, _summary = _run_gate(
+        tmp_path, monkeypatch, repo, source, target, quality_result="failure",
+    )
+    terminal = json.loads(terminal_path.read_bytes())
+    assert exit_code == 1
+    assert terminal["carry_blockers"]
+    assert (terminal["gate_result"], terminal["classification"], terminal["reason_code"]) == (
+        "fail", "ci_failure", "quality_failure",
+    )
 
 
 def test_changed_file_blob_releases_carry_without_terminal_field(tmp_path, monkeypatch):
