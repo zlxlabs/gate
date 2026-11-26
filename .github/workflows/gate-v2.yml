@@ -441,6 +441,11 @@ jobs:
     timeout-minutes: 5
     outputs:
       review_expected: ${{ steps.classify.outputs.review_expected }}
+      quality_reusable: ${{ steps.quality-reuse-lookup.outputs.quality_reusable || steps.quality-reuse-defaults.outputs.quality_reusable }}
+      reuse_source_run_id: ${{ steps.quality-reuse-lookup.outputs.reuse_source_run_id || steps.quality-reuse-defaults.outputs.reuse_source_run_id }}
+      reuse_caller_checks: ${{ steps.quality-reuse-lookup.outputs.reuse_caller_checks || steps.quality-reuse-defaults.outputs.reuse_caller_checks }}
+      reuse_preflight_result: ${{ steps.quality-reuse-lookup.outputs.reuse_preflight_result || steps.quality-reuse-defaults.outputs.reuse_preflight_result }}
+      reuse_reason: ${{ steps.quality-reuse-lookup.outputs.reuse_reason || steps.quality-reuse-defaults.outputs.reuse_reason }}
     steps:
       # gate-hub#1724: validate the caller's optional extra runner labels
       # BEFORE anything else runs — this job is the earliest that always runs.
@@ -519,6 +524,47 @@ jobs:
             exit 0
           fi
 
+      - name: Default quality reuse outputs to false
+        id: quality-reuse-defaults
+        if: always()
+        run: printf '%s\n' 'quality_reusable=false' 'reuse_source_run_id=' 'reuse_caller_checks=' 'reuse_preflight_result=' 'reuse_reason=not_eligible' >> "$GITHUB_OUTPUT"
+
+      - name: Lookup reusable quality receipt
+        id: quality-reuse-lookup
+        if: ${{ github.event_name == 'pull_request' && github.event.action == 'ready_for_review' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          RUNNER_MODE: ${{ inputs.runner }}
+          EXTRA_RUNNER_LABEL_CI: ${{ inputs.extra_runner_label_ci }}
+          TIER: ${{ inputs.tier }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          if ! merge_tree="$(timeout -k 5s --foreground 20s gh api "repos/${REPOSITORY}/git/commits/${GITHUB_SHA}" --jq '.tree.sha')"; then
+            echo "::warning::GATE-QUALITY-REUSE-LOOKUP-FAILED reason=merge-tree"
+            exit 1
+          fi
+          python3 "_gate-classify-src/scripts/quality_reuse.py" lookup \
+            --repository "$REPOSITORY" \
+            --repository-id "$REPOSITORY_ID" \
+            --pr-number "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA" \
+            --merge-tree "$merge_tree" \
+            --runner "$RUNNER_MODE" \
+            --extra-runner-label-ci "$EXTRA_RUNNER_LABEL_CI" \
+            --tier "$TIER" \
+            --current-run-id "$CURRENT_RUN_ID" \
+            --event-action "$EVENT_ACTION" \
+            --github-output "$GITHUB_OUTPUT"
+
   # ── quality ──────────────────────────────────────────────────────────────
   # Every legacy gate.yml step EXCEPT the model review chain (see "primary"
   # below). Its ledger inputs are uploaded at the end of this job so the
@@ -531,6 +577,8 @@ jobs:
     # 仅同仓合法人类 PR 可选 ci 标签；Bot、fork、非法作者走 hosted。
     # 标签不证明镜像隔离或应用依赖，部署状态须由平台实测确认。
     # gate-hub#1724/#1819: `extra_runner_label_ci` (default "") REPLACES the lane label "ci" on quality's self-hosted branch only (empty keeps ["self-hosted","linux","ci"]).
+    needs: [classify_pr_paths]
+    if: ${{ !cancelled() && !(github.event_name == 'pull_request' && github.event.action == 'converted_to_draft') && !(github.event_name == 'pull_request' && github.event.action == 'ready_for_review' && needs.classify_pr_paths.outputs.quality_reusable == 'true') }}
     runs-on: ${{ (inputs.runner == 'self' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"'))) && (inputs.extra_runner_label_ci != '' && fromJSON(format('["self-hosted","linux",{0}]', toJSON(inputs.extra_runner_label_ci))) || fromJSON('["self-hosted","linux","ci"]')) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     outputs:
@@ -689,12 +737,14 @@ jobs:
             scripts/gate_source.py
             scripts/scrub_outbound.py
             scripts/install_result_telemetry.py
+            scripts/quality_reuse.py
           GATE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           bash -euo pipefail -c "$GATE_SOURCE_BOOTSTRAP_SCRIPT"
           python3 "${RUNNER_TEMP}/gate_bounded_retry.py" checkout
           cp "$GITHUB_WORKSPACE/_gate-action-src/scripts/install_result_telemetry.py" "$RUNNER_TEMP/install_result_telemetry.py" || echo "::warning::GATE-INSTALL-RESULT-DEGRADED reason=helper-copy-failed"
+          cp "$GITHUB_WORKSPACE/_gate-action-src/scripts/quality_reuse.py" "$RUNNER_TEMP/quality_reuse.py"
 
       - name: PR size preflight
         id: pr-size-preflight
@@ -1384,6 +1434,54 @@ jobs:
           else
             echo "caller_checks=not_started" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Build quality reuse receipt
+        id: build-quality-reuse-receipt
+        if: ${{ github.event_name == 'pull_request' && steps.caller-checks-outcome.outputs.caller_checks == 'passed' && steps.caller-checks-outcome.outputs.preflight_result != 'blocked' }}
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          RUNNER_MODE: ${{ inputs.runner }}
+          EXTRA_RUNNER_LABEL_CI: ${{ inputs.extra_runner_label_ci }}
+          TIER: ${{ inputs.tier }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          CALLER_CHECKS: ${{ steps.caller-checks-outcome.outputs.caller_checks }}
+          PREFLIGHT_RESULT: ${{ steps.caller-checks-outcome.outputs.preflight_result }}
+        run: |
+          set -euo pipefail
+          merge_tree="$(git rev-parse 'HEAD^{tree}')"
+          receipt_dir="$RUNNER_TEMP/gate-quality-reuse"
+          mkdir -p "$receipt_dir"
+          python3 "$RUNNER_TEMP/quality_reuse.py" build-receipt \
+            --repository-id "$REPOSITORY_ID" \
+            --pr-number "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA" \
+            --merge-tree "$merge_tree" \
+            --runner "$RUNNER_MODE" \
+            --extra-runner-label-ci "$EXTRA_RUNNER_LABEL_CI" \
+            --tier "$TIER" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --caller-checks "$CALLER_CHECKS" \
+            --preflight-result "$PREFLIGHT_RESULT" \
+            --out "$receipt_dir/quality-reuse-receipt.json"
+
+      - name: Upload quality reuse receipt
+        id: upload-quality-reuse-receipt
+        if: ${{ always() && github.event_name == 'pull_request' && steps.caller-checks-outcome.outputs.caller_checks == 'passed' && steps.caller-checks-outcome.outputs.preflight_result != 'blocked' && steps.build-quality-reuse-receipt.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-quality-reuse-v1-${{ github.repository_id }}-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/gate-quality-reuse/quality-reuse-receipt.json
+          # retention: 7 — 消费方仅在 ready_for_review 同 merge tree 时查询 quality 收据，过期后重新运行检查即可
+          retention-days: 7
+
+      - name: Warn on quality reuse receipt upload failure
+        if: ${{ always() && steps.upload-quality-reuse-receipt.outcome == 'failure' }}
+        run: echo "::warning::GATE-QUALITY-REUSE-UPLOAD-FAILED"
 
   # ── primary ──────────────────────────────────────────────────────────────
   # Runs review-primary (gate-hub, already merged) and writes+uploads the ONE
@@ -2361,7 +2459,7 @@ jobs:
     # Required Gate section calls out. This job must always run and compute
     # its own verdict from needs.*.result instead of relying on GitHub's
     # default dependency semantics.
-    if: always()
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.action != 'converted_to_draft') }}
     concurrency:
       group: gate-required-v2-panel-${{ github.repository_id }}-${{ github.event.pull_request.number }}
       cancel-in-progress: false
@@ -2477,10 +2575,10 @@ jobs:
       - name: Aggregate required verdict
         id: aggregate-required-verdict
         env:
-          QUALITY_RESULT: ${{ needs.quality.result }}
-          QUALITY_CALLER_CHECKS: ${{ needs.quality.outputs.caller_checks }}
+          QUALITY_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && 'success' || needs.quality.result }}
+          QUALITY_CALLER_CHECKS: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_caller_checks || needs.quality.outputs.caller_checks }}
           QUALITY_CALLER_SIGNAL: ${{ needs.quality.outputs.caller_signal }}
-          QUALITY_PREFLIGHT_RESULT: ${{ needs.quality.outputs.preflight_result }}
+          QUALITY_PREFLIGHT_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_preflight_result || needs.quality.outputs.preflight_result }}
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
           # Forwarded so the aggregator can strictly validate it itself
@@ -2645,10 +2743,10 @@ jobs:
         if: always() && (steps.upload-gate-terminal.outcome == 'success' || steps.retry-upload-gate-terminal.outcome == 'success')
         env:
           GH_TOKEN: ${{ github.token }}
-          QUALITY_RESULT: ${{ needs.quality.result }}
-          QUALITY_CALLER_CHECKS: ${{ needs.quality.outputs.caller_checks }}
+          QUALITY_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && 'success' || needs.quality.result }}
+          QUALITY_CALLER_CHECKS: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_caller_checks || needs.quality.outputs.caller_checks }}
           QUALITY_CALLER_SIGNAL: ${{ needs.quality.outputs.caller_signal }}
-          QUALITY_PREFLIGHT_RESULT: ${{ needs.quality.outputs.preflight_result }}
+          QUALITY_PREFLIGHT_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_preflight_result || needs.quality.outputs.preflight_result }}
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
           RUNNER_MODE: ${{ inputs.runner }}
@@ -2837,7 +2935,9 @@ jobs:
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
           QUALITY_LEDGER_INPUT_UPLOAD: ${{ needs.quality.outputs.ledger_input_upload }}
-          QUALITY_RESULT: ${{ needs.quality.result }}
+          QUALITY_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && 'success' || needs.quality.result }}
+          QUALITY_CALLER_CHECKS: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_caller_checks || needs.quality.outputs.caller_checks }}
+          QUALITY_PREFLIGHT_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_preflight_result || needs.quality.outputs.preflight_result }}
           PRIMARY_RESULT_RAW: ${{ needs.primary.result }}
           PRIMARY_RESULT: ${{ needs.primary.result == 'success' && 'success' || needs.primary.result == 'failure' && 'failure' || needs.primary.result == 'cancelled' && 'cancelled' || needs.primary.result == 'skipped' && 'skipped' || 'cancelled' }}
         run: |
