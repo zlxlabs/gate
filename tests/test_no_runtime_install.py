@@ -52,6 +52,7 @@ ENTRY_FILES = {
     ".github/actions/gate-aggregator/behavior_counterevidence.py": "G1 并行 behavior_replay 句法契约（尚未接入 workflow，被 actions glob 发现）",
     ".github/actions/gate-aggregator/neighbor_evidence.py": "gate#297 邻域证据采集（subprocess/git/silo I/O 槽）",
     ".github/actions/gate-aggregator/inherited_rejection.py": "gate-hub#2677 继承驳回四元组与 blob 判定（纯计算槽，无 I/O）",
+    ".github/actions/gate-aggregator/carry_blockers.py": "gate-hub#2677 未释放 sol must_respond 携带阻断（纯判定槽，无 I/O）",
     # quality 槽：非门禁 advisory（缺包时退化，不取包）。
     ".github/actions/diff-coverage-advisory/advisory.py": "quality 槽 advisory 本体",
     ".github/actions/diff-coverage-advisory/action.yml": "quality 槽 advisory 包装器",
