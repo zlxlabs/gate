@@ -148,6 +148,25 @@ def _run_gate(
     return exit_code, terminal, summary
 
 
+def test_primary_relation_records_previous_context_source_head(tmp_path):
+    source = "a" * 40
+    finding = _finding()
+    previous_path = tmp_path / "previous.json"
+    previous_path.write_text(json.dumps({
+        "available": True, "head_sha": source,
+        "findings": [finding], "open_findings": [finding],
+    }), encoding="utf-8")
+    audit_path = tmp_path / "primary-audit.json"
+    audit_path.write_text(json.dumps({
+        "verdict": "pass", "result": {"findings": []},
+    }), encoding="utf-8")
+    assert AGG._annotate_primary_audit_cli([
+        "--audit-path", str(audit_path), "--previous-findings-path", str(previous_path),
+    ]) == 0
+    relation = json.loads(audit_path.read_text(encoding="utf-8"))["finding_relation"]
+    assert relation["previous_head_sha"] == source
+
+
 def test_unreleased_sol_finding_with_same_blob_fails_and_cross_process_ledger_keeps_payload(
     tmp_path, monkeypatch, capsys,
 ):
