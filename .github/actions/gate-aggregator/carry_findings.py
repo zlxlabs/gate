@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _BLOCKING_GATE_ACTIONS = frozenset({"block", "must_respond"})
 _KNOWN_GATE_ACTIONS = frozenset({"block", "must_respond", "comment"})
@@ -53,14 +53,20 @@ def _rejected_releases(finding: dict[str, Any]) -> bool:
     )
 
 
-def _released_ids(findings: list[Any], dispositions: list[Any]) -> set[str]:
+def _released_ids(
+    findings: list[Any], dispositions: list[Any],
+    rejected_release_keys: set[tuple[str, str]] | None = None,
+    canonical_finding_key: Callable[[dict[str, Any]], str] | None = None,
+) -> set[str]:
     """Finding ids an already-approved receipt releases from the carry.
 
     ``dispositions`` arrives pre-filtered by the projection's validity rules
     (refuted counterevidence for false-positive; a tracking issue for
     deferred; a non-blank reason for rejected), so no receipt re-validation
-    happens here.
+    happens here. Rejected id/key pairs are supplied only after exact-key and
+    same-blob evidence has been verified by inherited_rejection.py.
     """
+    rejected_release_keys = rejected_release_keys or set()
     false_positives = {
         item["finding_id"] for item in dispositions
         if isinstance(item, dict) and item.get("disposition") == "false-positive"
@@ -71,11 +77,6 @@ def _released_ids(findings: list[Any], dispositions: list[Any]) -> set[str]:
         if isinstance(item, dict) and item.get("disposition") == "deferred"
         and isinstance(item.get("finding_id"), str)
     }
-    rejected = {
-        item["finding_id"] for item in dispositions
-        if isinstance(item, dict) and item.get("disposition") == "rejected"
-        and isinstance(item.get("finding_id"), str)
-    }
     released: set[str] = set()
     for finding in findings:
         finding_id = finding.get("id") if isinstance(finding, dict) else None
@@ -83,13 +84,19 @@ def _released_ids(findings: list[Any], dispositions: list[Any]) -> set[str]:
             continue
         if finding_id in false_positives or (
             finding_id in deferred and finding.get("gate_action") == "must_respond"
-        ) or (finding_id in rejected and _rejected_releases(finding)):
+        ) or (
+            canonical_finding_key is not None
+            and (finding_id, canonical_finding_key(finding)) in rejected_release_keys
+            and _rejected_releases(finding)
+        ):
             released.add(finding_id)
     return released
 
 
 def write_previous_context(
     previous: dict[str, Any], dispositions: list[Any], path: str,
+    *, rejected_release_keys: set[tuple[str, str]] | None = None,
+    canonical_finding_key: Callable[[dict[str, Any]], str] | None = None,
 ) -> None:
     """Attach ``open_findings`` and persist the producer bytes.
 
@@ -101,7 +108,9 @@ def write_previous_context(
     findings = payload.get("findings")
     if not isinstance(findings, list):
         findings = []
-    released = _released_ids(findings, dispositions)
+    released = _released_ids(
+        findings, dispositions, rejected_release_keys, canonical_finding_key,
+    )
     payload["open_findings"] = [
         finding for finding in findings
         if isinstance(finding, dict) and _blocks_merge(finding)

@@ -155,6 +155,14 @@ _CARRY_SPEC = importlib.util.spec_from_file_location(
 _CARRY = importlib.util.module_from_spec(_CARRY_SPEC)
 sys.modules[_CARRY_SPEC.name] = _CARRY
 _CARRY_SPEC.loader.exec_module(_CARRY)
+_INHERITED_REJECTION_SPEC = importlib.util.spec_from_file_location(
+    "gate_inherited_rejection_from_aggregate",
+    Path(__file__).with_name("inherited_rejection.py"),
+)
+assert _INHERITED_REJECTION_SPEC and _INHERITED_REJECTION_SPEC.loader
+_INHERITED_REJECTION = importlib.util.module_from_spec(_INHERITED_REJECTION_SPEC)
+sys.modules[_INHERITED_REJECTION_SPEC.name] = _INHERITED_REJECTION
+_INHERITED_REJECTION_SPEC.loader.exec_module(_INHERITED_REJECTION)
 
 
 # The audit schema's complete verdict domain, including states not_expected
@@ -480,7 +488,7 @@ def project_disposition_receipt_audit(audit: Any) -> dict[str, Any]:
         if receipt.finding_key:
             item["finding_key"] = receipt.finding_key
         recorded.append(item)
-        resolved.append({
+        resolved_item = {
             "finding_id": target,
             "receipt": item["receipt"],
             "approver": _CONVERGENCE._bounded_disposition_text(receipt.approver),
@@ -492,7 +500,18 @@ def project_disposition_receipt_audit(audit: Any) -> dict[str, Any]:
             **({"counterevidence_command": command} if command else {}),
             **({"counterevidence_output": output} if output else {}),
             **({"finding_key": receipt.finding_key} if receipt.finding_key else {}),
-        })
+        }
+        inherited_status = next((
+            status for status in getattr(audit, "statuses", ())
+            if status.receipt is receipt and status.matched_by == "inherited_rejected"
+        ), None)
+        if inherited_status is not None:
+            resolved_item.update({
+                "matched_by": "inherited_rejected",
+                "receipt_head_sha": receipt.head_sha,
+                "receipt_finding_id": receipt.finding_id,
+            })
+        resolved.append(resolved_item)
     rejected_reasons: dict[str, int] = {}
     for _receipt, reason in audit.rejected_receipts:
         rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
@@ -608,6 +627,18 @@ def relate_findings(current: list[Any], previous: list[Any]) -> list[dict[str, A
         if projected["id"] and projected["id"] in by_id:
             projected["relation_to_previous"] = "repeat"
             projected["previous_finding_id"] = projected["id"]
+            labeled.append(projected)
+            continue
+        sol_key_matches = [
+            item for item in previous
+            if isinstance(item, dict)
+            and item.get("origin") == "sol_verify"
+            and finding.get("origin") == "sol_verify"
+            and _GATE_ACTION.canonical_finding_key(item) == _GATE_ACTION.canonical_finding_key(finding)
+        ]
+        if len(sol_key_matches) == 1 and isinstance(sol_key_matches[0].get("id"), str) and sol_key_matches[0]["id"]:
+            projected["relation_to_previous"] = "repeat"
+            projected["previous_finding_id"] = sol_key_matches[0]["id"]
             labeled.append(projected)
             continue
         matches = [item for item in previous if isinstance(item, dict) and _is_location_conflict(projected, project_finding(item))]
@@ -879,12 +910,16 @@ def load_previous_round_findings(
             detail = payload.get("detail")
             return _degrade_previous_round(detail if isinstance(detail, str) and detail else "previous-findings-unavailable")
         if isinstance(payload, dict) and payload.get("available") is True and isinstance(payload.get("findings"), list):
+            open_findings = payload.get("open_findings", payload["findings"])
+            if not isinstance(open_findings, list) or any(not isinstance(item, dict) for item in open_findings):
+                return _degrade_previous_round("previous-findings-file-invalid")
             head_sha = payload.get("head_sha")
             return {
                 "available": True,
                 "detail": "",
                 "head_sha": head_sha if isinstance(head_sha, str) and head_sha else None,
                 "findings": payload["findings"],
+                "open_findings": open_findings,
             }
         return _degrade_previous_round("previous-findings-file-invalid")
     if not _silo_configured(): return _degrade_previous_round("silo-not-configured")
@@ -935,6 +970,7 @@ def _project_previous_dispositions(
         approved_at = receipt.approved_at if isinstance(receipt.approved_at, str) else ""
         projected.append((approved_at, {
             "finding_id": _clip_text(receipt.finding_id),
+            "finding_key": receipt.finding_key,
             "disposition": _clip_text(receipt.disposition),
             "head_sha": receipt.head_sha,
             "approved_at": _clip_text(approved_at),
@@ -965,7 +1001,33 @@ def _render_previous_context_cli(argv: list[str]) -> int:
     dispositions = _project_previous_dispositions(
         repository_id=args.repository_id, pr_number=args.pr_number,
     ) if previous["available"] else []
-    _CARRY.write_previous_context(previous, dispositions, args.previous_json)
+    rejected_release_keys: set[tuple[str, str]] = set()
+    target_head_sha = previous.get("head_sha")
+    candidates = _INHERITED_REJECTION.disposition_blob_candidates(
+        findings=previous.get("findings", []), dispositions=dispositions,
+        target_head_sha=target_head_sha or "",
+        canonical_finding_key=_GATE_ACTION.canonical_finding_key,
+        is_rejected_eligible=_CARRY._rejected_releases,
+    ) if previous["available"] else []
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+    repository = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("REPOSITORY", "")
+    if candidates and token and repository and target_head_sha:
+        blob_oids = _NEIGHBOR_EVIDENCE.collect_file_blob_oids(
+            repository=repository,
+            current_head_sha=target_head_sha,
+            head_paths=sorted(_INHERITED_REJECTION.blob_fetch_requests(candidates)),
+            token=token,
+        )
+        rejected_release_keys = _INHERITED_REJECTION.matching_finding_keys(
+            candidates, blob_oids,
+        )
+    elif candidates:
+        print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=environment_missing")
+    _CARRY.write_previous_context(
+        previous, dispositions, args.previous_json,
+        rejected_release_keys=rejected_release_keys,
+        canonical_finding_key=_GATE_ACTION.canonical_finding_key,
+    )
     return 0
 
 
@@ -983,12 +1045,16 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
     result = audit.get("result") if isinstance(audit, dict) else None
     findings = result.get("findings") if isinstance(result, dict) else None
     if isinstance(findings, list):
+        relation_previous = {
+            **previous,
+            "findings": previous.get("open_findings", previous.get("findings", [])),
+        }
         annotation = Outcome(ok=True)
-        apply_finding_relation(annotation, findings, previous)
+        apply_finding_relation(annotation, findings, relation_previous)
         relation = annotation.finding_relation
         assert relation is not None
         relation = _consume_explicit_withdrawals(
-            relation, previous,
+            relation, relation_previous,
             result.get("withdrawals") if isinstance(result, dict) else None,
         )
         if (
@@ -1010,7 +1076,7 @@ def _annotate_primary_audit_cli(argv: list[str]) -> int:
                     print("GATE-ANCHOR-CLOSURE-UNAVAILABLE reason=current_audit_invalid")
                 else:
                     anchor_updates = _NEIGHBOR_EVIDENCE.collect_anchor_updates(
-                        findings=previous["findings"], repository=os.environ.get("GITHUB_REPOSITORY", ""),
+                        findings=relation_previous["findings"], repository=os.environ.get("GITHUB_REPOSITORY", ""),
                         previous_head_sha=previous.get("head_sha") or "",
                         current_head_sha=identity.head_sha,
                         token=os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", ""),
@@ -1445,6 +1511,7 @@ def evaluate(
     prior_eligible_run_ids: Sequence[int] = (),
     convergence_history_status: str = "history_unavailable",
     neighbor_evidence: Optional[dict[str, Any]] = None,
+    inherited_rejection_matches: Optional[dict[tuple[str, str, str], str]] = None,
 ) -> Outcome:
     """The pure decision core — no I/O, no GitHub API, fully unit-testable.
 
@@ -1736,6 +1803,7 @@ def evaluate(
             repository=repository,
             neighbor_evidence=neighbor_evidence,
             gate_actions=gate_actions,
+            inherited_rejection_matches=inherited_rejection_matches,
         )
         outcome.disposition_audit = disposition_audit
         state = convergence_state or _CONVERGENCE.initial_state(scope)
@@ -4068,6 +4136,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         result = audit.get("result")
         if isinstance(result, dict) and isinstance(result.get("findings"), list):
             findings = result["findings"]
+    inherited_rejection_matches: dict[tuple[str, str, str], str] = {}
+    inherited_candidates = _INHERITED_REJECTION.receipt_blob_candidates(
+        receipts=waiver_receipts,
+        findings=findings,
+        current_head_sha=identity.head_sha,
+        canonical_finding_key=_GATE_ACTION.canonical_finding_key,
+        is_rejected_eligible=_CARRY._rejected_releases,
+    )
+    if inherited_candidates and token:
+        blob_oids = _NEIGHBOR_EVIDENCE.collect_file_blob_oids(
+            repository=args.repository,
+            current_head_sha=identity.head_sha,
+            head_paths=sorted(_INHERITED_REJECTION.blob_fetch_requests(inherited_candidates)),
+            token=token,
+        )
+        inherited_rejection_matches = _INHERITED_REJECTION.matching_finding_ids(
+            inherited_candidates, blob_oids,
+        )
+    elif inherited_candidates:
+        print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=environment_missing")
     outcome = evaluate(
         quality_result=args.quality_result,
         caller_checks=args.caller_checks,
@@ -4093,6 +4181,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         prior_eligible_run_ids=prior_eligible_run_ids,
         convergence_history_status=convergence_history_status,
         neighbor_evidence=neighbor_evidence,
+        inherited_rejection_matches=inherited_rejection_matches,
     )
     if isinstance(audit, dict):
         if "finding_relation" in audit:

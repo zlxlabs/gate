@@ -866,6 +866,7 @@ def validate_disposition_receipt(
     repository: str | None = None,
     neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
     gate_actions: Mapping[str, str] | None = None,
+    inherited_rejection_matches: Mapping[tuple[str, str, str], str] | None = None,
 ) -> DispositionStatus:
     """Validate one receipt against the current canonical audit round.
 
@@ -943,8 +944,41 @@ def validate_disposition_receipt(
     evidence = _neighbor_evidence_for(receipt, neighbor_evidence)
     if isinstance(evidence, DispositionStatus):
         return evidence
+    inherited_finding_id = ""
     if head_ok and epoch_ok and digest_ok:
         pass
+    elif (
+        receipt.disposition == "rejected"
+        and isinstance(receipt.finding_key, str)
+        and inherited_rejection_matches is not None
+    ):
+        inherited_finding_id = inherited_rejection_matches.get(
+            (receipt.head_sha, receipt.finding_key, receipt.finding_id), "",
+        )
+        if not inherited_finding_id:
+            if not head_ok:
+                return _disposition_status(
+                    receipt, valid=False, active=False, reason="head_sha_mismatch",
+                    message=_actionable_disposition_reason(
+                        "head_sha_mismatch", receipt, scope=scope, primary=primary,
+                        audit_digest=audit_digest,
+                    ),
+                )
+            if not epoch_ok:
+                return _disposition_status(
+                    receipt, valid=False, active=False, reason="epoch_mismatch_stale",
+                    message=_actionable_disposition_reason(
+                        "epoch_mismatch_stale", receipt, scope=scope, primary=primary,
+                        audit_digest=audit_digest,
+                    ),
+                )
+            return _disposition_status(
+                receipt, valid=False, active=False, reason="audit_digest_mismatch",
+                message=_actionable_disposition_reason(
+                    "audit_digest_mismatch", receipt, scope=scope, primary=primary,
+                    audit_digest=audit_digest,
+                ),
+            )
     elif evidence is not None:
         if _neighbor_epoch_mismatch(receipt, evidence, scope):
             return _disposition_status(
@@ -1064,6 +1098,8 @@ def validate_disposition_receipt(
     return _disposition_status(
         receipt, valid=True, active=True,
         reason=f"active_{receipt.disposition.replace('-', '_')}",
+        matched_by="inherited_rejected" if inherited_finding_id else "",
+        matched_finding_id=inherited_finding_id,
     )
 
 
@@ -1077,6 +1113,7 @@ def disposition_status(
     repository: str | None = None,
     neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
     gate_actions: Mapping[str, str] | None = None,
+    inherited_rejection_matches: Mapping[tuple[str, str, str], str] | None = None,
 ) -> DispositionStatus:
     """Return the observational status view used by ledger/human summaries."""
 
@@ -1089,6 +1126,7 @@ def disposition_status(
         repository=repository,
         neighbor_evidence=neighbor_evidence,
         gate_actions=gate_actions,
+        inherited_rejection_matches=inherited_rejection_matches,
     )
 
 
@@ -1103,6 +1141,7 @@ def record_dispositions(
     repository: str | None = None,
     neighbor_evidence: Mapping[str, NeighborEvidence] | None = None,
     gate_actions: Mapping[str, str] | None = None,
+    inherited_rejection_matches: Mapping[tuple[str, str, str], str] | None = None,
 ) -> DispositionAudit:
     """Validate receipts and return the current P1s they cover exactly."""
 
@@ -1125,6 +1164,7 @@ def record_dispositions(
                 repository=repository,
                 neighbor_evidence=neighbor_evidence,
                 gate_actions=gate_actions,
+                inherited_rejection_matches=inherited_rejection_matches,
             )
             statuses.append(status)
             rejected.append((status.receipt, status.reason_code))
@@ -1138,6 +1178,7 @@ def record_dispositions(
             repository=repository,
             neighbor_evidence=neighbor_evidence,
             gate_actions=gate_actions,
+            inherited_rejection_matches=inherited_rejection_matches,
         )
         if status.active and status.valid:
             payload_signature = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)

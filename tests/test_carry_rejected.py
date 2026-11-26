@@ -103,9 +103,34 @@ def _fp_counterevidence():
 
 
 def _render(tmp_path, monkeypatch, findings, receipts, *, capsys=None):
-    """Run the real --render-previous-context CLI against a fake silo store."""
+    """Run the real previous-context CLI against silo bytes and real Git blobs."""
+    repo = tmp_path / "blob-repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "init", "--quiet"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "sol.py").write_bytes(b"def check():\n    return True\n")
+    subprocess.run(["git", "-C", str(repo), "add", "src/sol.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "old"], check=True)
+    old_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    (repo / "unrelated.txt").write_text("second commit\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "unrelated.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "current"], check=True)
+    current_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    for receipt in receipts:
+        receipt["head_sha"] = old_sha
+        receipt["finding_key"] = AGG._GATE_ACTION.canonical_finding_key(
+            next(finding for finding in findings if finding["id"] == receipt["finding_id"])
+        )
+        if isinstance(receipt.get("counterevidence"), dict):
+            receipt["counterevidence"]["gate_rerun"]["argv"][6] = old_sha
     objects = [(AGG._ledger_latest_key(123, 42), json.dumps({
-        "pr_number": 42, "run_id": 100, "run_attempt": 1, "head_sha": HEAD_SHA,
+        "pr_number": 42, "run_id": 100, "run_attempt": 1, "head_sha": current_sha,
         "review": {"result": {"findings": findings}},
     }).encode("utf-8"))]
     for index, receipt in enumerate(receipts):
@@ -121,6 +146,18 @@ def _render(tmp_path, monkeypatch, findings, receipts, *, capsys=None):
         Path(dest).write_bytes(body)
         return subprocess.CompletedProcess(argv, 0, stdout=dest, stderr="")
 
+    def local_blob_oids(*, repository, current_head_sha, head_paths, token):
+        return {
+            (sha, path): subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--verify", f"{sha}:{path}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            for sha, path in head_paths
+        }
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "zlxlabs/gate")
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setattr(AGG._NEIGHBOR_EVIDENCE, "collect_file_blob_oids", local_blob_oids)
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
     monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
     monkeypatch.setattr(
@@ -154,26 +191,29 @@ def test_compliant_rejected_projects_and_releases(tmp_path, monkeypatch, capsys)
     payload, _, out = _render(tmp_path, monkeypatch, *_ok_pair(), capsys=capsys)
 
     assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=0\n"
-    assert payload["available"] is True and payload["head_sha"] == HEAD_SHA
+    assert payload["available"] is True and payload["head_sha"]
     assert payload["findings"] == [_finding(OK_FINDING_ID)]  # findings stay verbatim
     rejected = payload["dispositions"][0]
     assert set(rejected) == {
-        "finding_id", "disposition", "head_sha", "approved_at", "reason",
+        "finding_id", "finding_key", "disposition", "head_sha", "approved_at", "reason",
         "counterevidence", "tracking_issue",
     }
     assert rejected == {
-        "finding_id": OK_FINDING_ID, "disposition": "rejected", "head_sha": HEAD_SHA,
+        "finding_id": OK_FINDING_ID,
+        "finding_key": AGG._GATE_ACTION.canonical_finding_key(_finding(OK_FINDING_ID)),
+        "disposition": "rejected", "head_sha": rejected["head_sha"],
         "approved_at": "2026-11-25T09:00:00Z", "reason": "sol verifier retracted after re-check",
         "counterevidence": None, "tracking_issue": None,
     }
+    assert len(rejected["head_sha"]) == 40 and rejected["head_sha"] != payload["head_sha"]
     assert payload["open_findings"] == []  # eligible finding released from the carry
 
 
 @pytest.mark.parametrize("origin", ["primary", None])
 def test_rejected_requires_sol_verify_origin(tmp_path, monkeypatch, capsys, origin):
-    guard = _finding("guard-primary", origin=origin)
+    guard = _finding("guard-primary", origin=origin, line=13)
     if origin is None:
-        guard = _finding("guard-primary", drop=("origin",))
+        guard = _finding("guard-primary", drop=("origin",), line=13)
     findings, receipts = _ok_pair()
     findings.append(guard)
     receipts.append(_receipt("guard-primary"))
@@ -187,7 +227,7 @@ def test_rejected_requires_sol_verify_origin(tmp_path, monkeypatch, capsys, orig
 
 def test_rejected_requires_must_respond(tmp_path, monkeypatch, capsys):
     findings, receipts = _ok_pair()
-    findings.append(_finding("guard-block", gate_action="block"))
+    findings.append(_finding("guard-block", gate_action="block", line=13))
     receipts.append(_receipt("guard-block"))
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
@@ -199,7 +239,7 @@ def test_rejected_requires_must_respond(tmp_path, monkeypatch, capsys):
 @pytest.mark.parametrize("category", ["security", "test_integrity"])
 def test_rejected_refuses_owner_protected_categories(tmp_path, monkeypatch, capsys, category):
     findings, receipts = _ok_pair()
-    findings.append(_finding(f"guard-{category}", category=category))
+    findings.append(_finding(f"guard-{category}", category=category, line=13))
     receipts.append(_receipt(f"guard-{category}"))
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
@@ -211,7 +251,7 @@ def test_rejected_refuses_owner_protected_categories(tmp_path, monkeypatch, caps
 @pytest.mark.parametrize("drop", [("origin",), ("gate_action",), ("category",)])
 def test_rejected_missing_field_fails_closed(tmp_path, monkeypatch, capsys, drop):
     findings, receipts = _ok_pair()
-    findings.append(_finding("guard-incomplete", drop=drop))
+    findings.append(_finding("guard-incomplete", drop=drop, line=13))
     receipts.append(_receipt("guard-incomplete"))
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
@@ -222,7 +262,7 @@ def test_rejected_missing_field_fails_closed(tmp_path, monkeypatch, capsys, drop
 
 def test_blank_reason_rejected_stays_dropped(tmp_path, monkeypatch, capsys):
     findings, receipts = _ok_pair()
-    findings.append(_finding("sol-carry-blank"))
+    findings.append(_finding("sol-carry-blank", line=13))
     receipts.append(_receipt("sol-carry-blank", reason="   "))
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
@@ -234,10 +274,10 @@ def test_blank_reason_rejected_stays_dropped(tmp_path, monkeypatch, capsys):
 
 def test_false_positive_and_deferred_behavior_unchanged(tmp_path, monkeypatch, capsys):
     findings, receipts = _ok_pair()
-    findings.append(_finding("fp-carry", origin="primary", category="security"))
+    findings.append(_finding("fp-carry", origin="primary", category="security", line=13))
     receipts.append(_receipt("fp-carry", disposition="false-positive",
                              reason="locked upstream behavior", counterevidence=_fp_counterevidence()))
-    findings.append(_finding("def-carry", origin="primary"))
+    findings.append(_finding("def-carry", origin="primary", line=14))
     receipts.append(_receipt("def-carry", disposition="deferred", reason="follow-up scheduled",
                              tracking_issue="#123"))
 
