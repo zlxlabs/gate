@@ -252,7 +252,7 @@ summary = summary_path.read_bytes()
 expected = agg.scrub_for_publish(
     rendering.render_summary(outcome),
     runtime_values=agg.runtime_values_from_environment(),
-)
+).encode("utf-8")
 verdict = {"v": 1, "gate_result": "pass", "classification": "integration_error",
            "reason_code": "audit_invalid", "primary": "executed", "skip_reason": None, "draft": False}
 expected += "AGENT-GATE-VERDICT-V1 " + json.dumps(verdict, sort_keys=True, separators=(",", ":")) + "\n"
