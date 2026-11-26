@@ -44,6 +44,10 @@ ENTRY_FILES = {
     # gate job：跨 run 消费 Silo（terminal 历史、disposition receipts、
     # previous findings）。本卡主修对象。
     ".github/actions/gate-aggregator/aggregate.py": "gate 槽聚合器",
+    ".github/actions/gate-aggregator/aggregate_models.py": "聚合器共享领域值域与契约常量模块",
+    ".github/actions/gate-aggregator/disposition_projection.py": "纯处置回执审计投影模块",
+    ".github/actions/gate-aggregator/finding_relations.py": "纯跨轮 finding 关系判定模块",
+    ".github/actions/gate-aggregator/decision.py": "纯 gate 裁决与终态信封模块",
     ".github/actions/gate-aggregator/convergence.py": "被聚合器载入的同目录模块",
     ".github/actions/gate-aggregator/convergence_contract.py": "被收敛与处置模块共享的不可变合同和规范化模块",
     ".github/actions/gate-aggregator/disposition_receipts.py": "被处置裁决模块加载的回执句法模块",
@@ -127,6 +131,10 @@ IMPORT_ALLOWLIST_EXTRA = frozenset({
     "gate_convergence_contract",
     "gate_disposition_receipts",
     "gate_dispositions",
+    "gate_aggregate_models",
+    "gate_disposition_projection",
+    "gate_finding_relations",
+    "gate_aggregate_decision",
 })
 
 
