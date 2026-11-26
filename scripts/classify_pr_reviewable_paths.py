@@ -4,9 +4,11 @@
 Single source of truth for `.github/workflows/gate-v2.yml` and
 `.github/workflows/gate-shadow-v2.yml`.
 
-Reads GitHub compare API JSON (`{ "files": [ { "filename": ... }, ... ],
-"truncated": bool }`) or Pull Request Files API JSON (an array of objects
-with `filename`, or a `--paginate --slurp` array of such pages). Writes
+Reads GitHub compare API JSON (`{ "files": [ { "filename": ... }, ... ] }`,
+with an optional `truncated` boolean) or Pull Request Files API JSON (an array
+of objects with `filename`, or a `--paginate --slurp` array of such pages).
+Compare listings at GitHub's 300-file ceiling are treated as truncated
+regardless of whether `truncated` is omitted or false. Writes
 `review_expected=true|false` to stdout and to `--github-output` /
 `$GITHUB_OUTPUT`.
 
@@ -30,6 +32,7 @@ from typing import Any, Sequence
 
 FLEET_DEFAULT_EXEMPT: frozenset[str] = frozenset({"retro/acceptance-log.jsonl"})
 REVIEW_EXEMPT_PATHS_ENV = "REVIEW_EXEMPT_PATHS"
+COMPARE_FILES_LIMIT = 300
 _DIR_PREFIX_SUFFIX = "/**"
 _WILDCARD_CHARS = frozenset("*?[")
 _WARNING_ENTRY_MAX = 200
@@ -57,9 +60,12 @@ def _filenames_from_file_objects(items: list[Any]) -> list[str]:
 def parse_listing(payload: Any) -> tuple[list[str], bool]:
     """Return filenames and truncation from compare or files API JSON.
 
-    Compare objects are `{ "files": [ { "filename": ... }, ... ], "truncated":
-    bool }`. Files API payloads are a JSON array of file objects, or an array
-    of such arrays (gh `--paginate --slurp`). Anything else raises
+    Compare objects are `{ "files": [ { "filename": ... }, ... ] }`, with an
+    optional boolean `truncated`. An explicit true value or 300 or more files
+    means the listing is truncated; the 300-file ceiling catches GitHub's
+    Compare response even though it omits that field. Files API payloads are a
+    JSON array of file objects, or an array of such arrays (gh `--paginate
+    --slurp`); their size does not imply truncation. Anything else raises
     ClassifyError.
     """
     if isinstance(payload, dict):
@@ -67,9 +73,10 @@ def parse_listing(payload: Any) -> tuple[list[str], bool]:
         if not isinstance(files, list):
             raise ClassifyError("compare payload files must be an array")
         truncated_field = payload.get("truncated", False)
-        if truncated_field not in (True, False):
+        if type(truncated_field) is not bool:
             raise ClassifyError("compare payload truncated must be a boolean")
-        return _filenames_from_file_objects(files), bool(truncated_field)
+        filenames = _filenames_from_file_objects(files)
+        return filenames, truncated_field or len(files) >= COMPARE_FILES_LIMIT
     if not isinstance(payload, list):
         raise ClassifyError("files API payload must be a JSON array")
     if payload and all(isinstance(item, list) for item in payload):

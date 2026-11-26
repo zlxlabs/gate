@@ -1,12 +1,12 @@
-"""Table-driven tests for scripts/classify_pr_reviewable_paths.py.
+"""Behavioural tests for scripts/classify_pr_reviewable_paths.py.
 
 The classifier is the single source of truth for "should this PR run a model
-review?". Fixtures use the GitHub Pull Request Files API JSON shape
-(objects with `filename`); see Evidence-Commands on gate-hub#734
-(`gh api .../zlxlabs/AiUsageMonitor/pulls/201/files`).
+review?". Fixtures cover GitHub Compare and Pull Request Files API JSON
+shapes; the PR Files API payload is a sanitized copy of live PR #201 evidence.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -73,6 +73,19 @@ def _file_obj(filename: str, **extra) -> dict:
     }
     payload.update(extra)
     return payload
+
+
+def _compare_response(files: list[dict]) -> dict:
+    """Representative GitHub Compare API response; that API omits truncated."""
+    return {
+        "url": "https://api.github.com/repos/example/repo/compare/base...head",
+        "status": "ahead",
+        "ahead_by": 1,
+        "behind_by": 0,
+        "total_commits": 1,
+        "commits": [{"sha": "0" * 40, "commit": {"message": "Add docs"}}],
+        "files": files,
+    }
 
 
 def _run_cli(
@@ -202,6 +215,8 @@ def test_table_driven_files_api_payloads(tmp_path, name, payload, extra_args, wa
         ("compare_files_missing", json.dumps({"truncated": False, "filename": LEDGER_PATH}), ()),
         ("compare_files_not_array", json.dumps({"files": {"filename": LEDGER_PATH}, "truncated": False}), ()),
         ("compare_truncated_not_bool", json.dumps({"files": PR201_FILES_API, "truncated": "true"}), ()),
+        ("compare_truncated_integer_false", json.dumps({"files": PR201_FILES_API, "truncated": 0}), ()),
+        ("compare_truncated_integer_true", json.dumps({"files": PR201_FILES_API, "truncated": 1}), ()),
     ],
 )
 def test_unusable_payloads_are_not_false(tmp_path, name, payload_text, extra_args):
@@ -212,7 +227,8 @@ def test_unusable_payloads_are_not_false(tmp_path, name, payload_text, extra_arg
         extra_args=extra_args,
         input_text=payload_text,
     )
-    # Failure must not skip review: never write false. Exit may be non-zero.
+    # Invalid input must fail, and must never lead to a false exemption.
+    assert proc.returncode != 0, name
     combined = written + proc.stdout
     assert "review_expected=false" not in combined, name
     if "review_expected=" in combined:
@@ -227,6 +243,112 @@ def test_stdin_json_matches_file_argv(tmp_path):
     assert via_stdin.returncode == 0
     assert _review_expected_from_output(file_out, via_file.stdout) == "false"
     assert _review_expected_from_output(stdin_out, via_stdin.stdout) == "false"
+
+
+def test_compare_api_300_files_without_truncated_fails_closed_through_aggregator(tmp_path):
+    assert classifier.COMPARE_FILES_LIMIT == 300
+    payload = _compare_response(
+        [_file_obj(f"docs/f{index:03}.md") for index in range(300)]
+    )
+    assert "truncated" not in payload
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    classify_review_expected = _review_expected_from_output(written, proc.stdout)
+    assert written == "review_expected=true\n"
+    assert classify_review_expected == "true"
+
+    aggregate_path = REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
+    spec = importlib.util.spec_from_file_location("gate_aggregate_compare_truncation", aggregate_path)
+    assert spec is not None and spec.loader is not None
+    aggregate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = aggregate
+    spec.loader.exec_module(aggregate)
+    identity = aggregate.Identity(
+        repository_id=123,
+        head_sha="a" * 40,
+        run_id=999,
+        run_attempt=1,
+        pr=42,
+    )
+    outcome = aggregate.evaluate(
+        quality_result="success",
+        primary_result="skipped",
+        runner="self",
+        is_draft=False,
+        is_fork=False,
+        review_expected=classify_review_expected == "true",
+        classify_review_expected=classify_review_expected,
+        audit=None,
+        audit_error=None,
+        identity=identity,
+        pr_author="example-user",
+    )
+    assert outcome.skip_reason != "review_exempt"
+    assert outcome.reason_code == "unexpected_primary_skip"
+
+
+def test_compare_api_299_exempt_files_without_truncated_remains_exempt(tmp_path):
+    payload = _compare_response(
+        [_file_obj(f"docs/f{index:03}.md") for index in range(299)]
+    )
+    assert "truncated" not in payload
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert written == "review_expected=false\n"
+    assert _review_expected_from_output(written, proc.stdout) == "false"
+
+
+def test_compare_api_300_exempt_files_with_truncated_false_fails_closed(tmp_path):
+    payload = _compare_response(
+        [_file_obj(f"docs/f{index:03}.md") for index in range(300)]
+    )
+    payload["truncated"] = False
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert written == "review_expected=true\n"
+
+
+def test_compare_api_ledger_only_without_truncated_remains_exempt(tmp_path):
+    payload = _compare_response([_file_obj(LEDGER_PATH)])
+    assert "truncated" not in payload
+    proc, written = _run_cli(tmp_path, payload)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert written == "review_expected=false\n"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [_file_obj(f"docs/f{index:03}.md") for index in range(300)],
+        [
+            [_file_obj(f"docs/f{index:03}.md") for index in range(150)],
+            [_file_obj(f"docs/f{index:03}.md") for index in range(150, 300)],
+        ],
+    ],
+    ids=("files-api-array", "files-api-slurp-pages"),
+)
+def test_files_api_300_exempt_files_are_not_mistaken_for_compare_truncation(
+    tmp_path, payload
+):
+    proc, written = _run_cli(
+        tmp_path,
+        payload,
+        extra_env={REVIEW_EXEMPT_PATHS_ENV: "docs/**"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert written == "review_expected=false\n"
 
 
 def test_github_output_env_is_honored_without_flag(tmp_path):
