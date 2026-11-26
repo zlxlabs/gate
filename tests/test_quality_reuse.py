@@ -193,6 +193,19 @@ def test_build_cli_rejects_invalid_sha_with_nonzero_exit(tmp_path):
     assert not output.exists()
 
 
+@pytest.mark.parametrize("field,value,reason", [
+    ("repository_id", True, "receipt_integer_invalid"),
+    ("runner", 7, "receipt_string_invalid"),
+    ("extra_runner_label_ci", None, "receipt_string_invalid"),
+    ("schema_version", True, "receipt_version_invalid"),
+])
+def test_receipt_json_field_type_errors_fail_closed(tmp_path, field, value, reason):
+    payload = json.loads(_build_receipt(tmp_path))
+    payload[field] = value
+    decision = quality_reuse.lookup_reusable_quality(REQUEST, _api(_zip(json.dumps(payload).encode())))
+    assert not decision.reusable and decision.reason == reason
+
+
 def test_artifact_name_and_receipt_validator_contract():
     assert quality_reuse.RECEIPT_SCHEMA_VERSION == 1
     assert quality_reuse.RECEIPT_KIND == "gate_quality_reuse"
