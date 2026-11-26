@@ -159,10 +159,11 @@ print(json.dumps({"receipt": parsed.as_dict(), "single_class_identity": True}))
     completed = subprocess.run(
         [sys.executable, "-c", script],
         cwd=tmp_path,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
+    assert completed.returncode == 0, completed.stderr
     result = json.loads(completed.stdout)
     assert result["single_class_identity"] is True
     assert result["receipt"]["tracking_issue"] == "#453"

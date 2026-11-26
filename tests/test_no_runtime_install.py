@@ -120,7 +120,13 @@ BANNED_LAUNCHERS = (
 )
 
 # 标准库白名单 = 运行解释器自带的模块名全集 + 仓内包 + __future__。
-IMPORT_ALLOWLIST_EXTRA = frozenset({"__future__", "scripts"})
+IMPORT_ALLOWLIST_EXTRA = frozenset({
+    "__future__",
+    "scripts",
+    "gate_convergence_contract",
+    "gate_disposition_receipts",
+    "gate_dispositions",
+})
 
 
 def _discover_entries() -> set[str]:

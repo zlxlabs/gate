@@ -38,6 +38,9 @@ DISPOSITION_CHECKOUT_SUBDIR = "_gate-disposition-src"
 DISPOSITION_PRODUCER_SPARSE = [
     ".github/actions/gate-disposition/issue_receipt.py",
     ".github/actions/gate-aggregator/convergence.py",
+    ".github/actions/gate-aggregator/convergence_contract.py",
+    ".github/actions/gate-aggregator/disposition_receipts.py",
+    ".github/actions/gate-aggregator/dispositions.py",
     ".github/actions/gate-aggregator/gate_action.py",
     ".github/actions/gate-aggregator/counterevidence_argv.py",
     ".github/actions/gate-aggregator/behavior_counterevidence.py",
@@ -280,7 +283,6 @@ def test_is_workflow_call_named_gate():
     assert "workflow_call" in trigger
     assert raw["name"] == "gate"
 
-
 def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
     raw, trigger = _load_disposition_workflow()
     assert raw["name"] == "gate-v2 disposition control"
@@ -350,7 +352,6 @@ def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
         f"python3 {DISPOSITION_CHECKOUT_SUBDIR}/.github/actions/gate-disposition/issue_receipt.py issue"
         in issue["run"]
     )
-
 
 def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
     raw, _ = _load_disposition_workflow()
@@ -591,7 +592,6 @@ def test_disposition_workflow_call_declares_optional_silo_secret_pair():
     for name in consumed:
         assert declared[name]["required"] is False
     assert "secrets" not in trigger["workflow_dispatch"]
-
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
