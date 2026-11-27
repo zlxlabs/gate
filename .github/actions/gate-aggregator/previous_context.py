@@ -193,12 +193,18 @@ def _project_previous_dispositions(
                 dropped += 1
                 continue
             evidence = receipt.counterevidence
-            counterevidence = {
-                field: _clip_text(evidence[field])
-                for field in ("command", "output", "result", "pointer")
-            }
-            if evidence.get("match_expectation") == "absent":
-                counterevidence["match_expectation"] = "absent"
+            if evidence.get("kind") == "behavior_replay":
+                counterevidence = {
+                    field: _clip_text(evidence[field])
+                    for field in ("kind", "result", "pointer", "runner", "nodeid")
+                }
+            else:
+                counterevidence = {
+                    field: _clip_text(evidence[field])
+                    for field in ("command", "output", "result", "pointer")
+                }
+                if evidence.get("match_expectation") == "absent":
+                    counterevidence["match_expectation"] = "absent"
         elif receipt.disposition == "deferred":
             if not isinstance(receipt.tracking_issue, str) or not receipt.tracking_issue.strip():
                 dropped += 1
