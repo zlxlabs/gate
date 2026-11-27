@@ -36,17 +36,17 @@ ABANDONED_FIXTURE = ROOT / "tests" / "fixtures" / "primary-abandoned-run-3474020
 CONVERGENCE_HISTORY_FIXTURE = ROOT / "tests" / "fixtures" / "convergence_history" / "gate-hub-pr-928.json"
 
 
-def _module():
-    spec = importlib.util.spec_from_file_location("gate_aggregate", MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader
-    # dataclasses (used by aggregate.py) resolves annotation types via
-    # sys.modules[cls.__module__] under `from __future__ import annotations` —
-    # it must be registered before exec_module, or the dataclass decorator
-    # crashes with "'NoneType' object has no attribute '__dict__'".
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+from _gate_aggregator_support import _assert_terminal_classification, _module
+
+
+
+
+
+
+
+
+
+
 
 
 AGG = _module()
@@ -55,6 +55,63 @@ IDENTITY = AGG.Identity(repository_id=123, head_sha="a" * 40, run_id=999, run_at
 # Captured from REST PR #252's real `user.login` field; this is a PR object
 # fixture, not an Actions event or Dependabot run.
 PR_AUTHOR_REST_FIXTURE = {"user": {"login": "zj1123581321"}}
+
+
+def _cli_args(audit_dir, summary_path, **overrides):
+    identity = overrides.pop("identity", IDENTITY)
+    values = dict(
+        quality_result="success",
+        primary_result="success",
+        preflight_result="success",
+        runner="self",
+        is_draft="false",
+        is_fork="false",
+        classify_review_expected="true",
+        review_expected="true",
+        repository_id=str(identity.repository_id),
+        head_sha=identity.head_sha,
+        run_id=str(identity.run_id),
+        run_attempt=str(identity.run_attempt),
+        pr_number=str(identity.pr), repository="zlxlabs/gate",
+        pr_author_json=json.dumps(PR_AUTHOR_REST_FIXTURE["user"]["login"]),
+        audit_source_attempt=str(identity.run_attempt), audit_artifact_name="primary-audit-v2-1", terminal_path=str(Path(summary_path).with_name("gate-terminal.json")),
+    )
+    values.update(overrides)
+    args = [
+        "--quality-result", values["quality_result"],
+        "--primary-result", values["primary_result"],
+        "--runner", values["runner"],
+        "--is-draft", values["is_draft"],
+        "--is-fork", values["is_fork"],
+        "--classify-review-expected", values["classify_review_expected"],
+        "--review-expected", values["review_expected"],
+        "--repository-id", values["repository_id"], "--repository", values["repository"],
+        "--head-sha", values["head_sha"],
+        "--run-id", values["run_id"],
+        "--run-attempt", values["run_attempt"],
+        "--audit-artifact-name", values["audit_artifact_name"], "--terminal-path", values["terminal_path"],
+        "--audit-dir", str(audit_dir),
+        "--summary-path", str(summary_path),
+    ]
+    if values.get("pr_author_json") is not None:
+        args.extend(["--pr-author-json", values["pr_author_json"]])
+    if values.get("pr_number") is not None:
+        args.extend(["--pr-number", values["pr_number"]])
+    if "audit_source_attempt" in values:
+        args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
+    if values.get("panel_delivery_path") is not None:
+        args.extend(["--panel-delivery-path", values["panel_delivery_path"]])
+    if values.get("caller_checks") is not None:
+        args.extend(["--caller-checks", values["caller_checks"]])
+    if values.get("caller_signal") is not None:
+        args.extend(["--caller-signal", values["caller_signal"]])
+    if values.get("preflight_result") is not None:
+        args.extend(["--preflight-result", values["preflight_result"]])
+    if values.get("convergence_receipt_path") is not None:
+        args.extend(["--convergence-receipt-path", values["convergence_receipt_path"]])
+    return args
+
+
 
 
 def test_single_round_gate_outcome_is_not_convergence_state():
@@ -515,85 +572,9 @@ def test_read_audit_file_non_dict_json_roundtrips_as_is(tmp_path):
 
 # ── CLI end-to-end (exit codes + step summary) ───────────────────────────
 
-def _cli_args(audit_dir, summary_path, **overrides):
-    identity = overrides.pop("identity", IDENTITY)
-    values = dict(
-        quality_result="success",
-        primary_result="success",
-        preflight_result="success",
-        runner="self",
-        is_draft="false",
-        is_fork="false",
-        classify_review_expected="true",
-        review_expected="true",
-        repository_id=str(identity.repository_id),
-        head_sha=identity.head_sha,
-        run_id=str(identity.run_id),
-        run_attempt=str(identity.run_attempt),
-        pr_number=str(identity.pr), repository="zlxlabs/gate",
-        pr_author_json=json.dumps(PR_AUTHOR_REST_FIXTURE["user"]["login"]),
-        audit_source_attempt=str(identity.run_attempt), audit_artifact_name="primary-audit-v2-1", terminal_path=str(Path(summary_path).with_name("gate-terminal.json")),
-    )
-    values.update(overrides)
-    args = [
-        "--quality-result", values["quality_result"],
-        "--primary-result", values["primary_result"],
-        "--runner", values["runner"],
-        "--is-draft", values["is_draft"],
-        "--is-fork", values["is_fork"],
-        "--classify-review-expected", values["classify_review_expected"],
-        "--review-expected", values["review_expected"],
-        "--repository-id", values["repository_id"], "--repository", values["repository"],
-        "--head-sha", values["head_sha"],
-        "--run-id", values["run_id"],
-        "--run-attempt", values["run_attempt"],
-        "--audit-artifact-name", values["audit_artifact_name"], "--terminal-path", values["terminal_path"],
-        "--audit-dir", str(audit_dir),
-        "--summary-path", str(summary_path),
-    ]
-    if values.get("pr_author_json") is not None:
-        args.extend(["--pr-author-json", values["pr_author_json"]])
-    if values.get("pr_number") is not None:
-        args.extend(["--pr-number", values["pr_number"]])
-    if "audit_source_attempt" in values:
-        args.extend(["--audit-source-attempt", values["audit_source_attempt"]])
-    if values.get("panel_delivery_path") is not None:
-        args.extend(["--panel-delivery-path", values["panel_delivery_path"]])
-    if values.get("caller_checks") is not None:
-        args.extend(["--caller-checks", values["caller_checks"]])
-    if values.get("caller_signal") is not None:
-        args.extend(["--caller-signal", values["caller_signal"]])
-    if values.get("preflight_result") is not None:
-        args.extend(["--preflight-result", values["preflight_result"]])
-    if values.get("convergence_receipt_path") is not None:
-        args.extend(["--convergence-receipt-path", values["convergence_receipt_path"]])
-    return args
-
-def test_main_exit_code_zero_on_pass(tmp_path):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(audit_dir, summary_path))
-    assert rc == 0
-    assert "pass" in summary_path.read_text() and json.loads(summary_path.with_name("gate-terminal.json").read_text())["kind"] == "gate_terminal"
 
 
-@pytest.mark.parametrize("author_json,expected", [
-    (json.dumps(PR_AUTHOR_REST_FIXTURE["user"]["login"]), "skipped"),
-    (json.dumps("dependabot[bot]"), "unavailable"), (None, "unavailable"),
-    ("not-json", "unavailable"),
-])
-def test_cli_consumes_pr_author_json_instead_of_human_rerun_actor(tmp_path, monkeypatch, author_json, expected):
-    monkeypatch.setenv("GITHUB_ACTOR", "zj1123581321")
-    summary = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(
-        tmp_path / "missing-audit", summary, primary_result="skipped", runner="hosted",
-        review_expected="false", classify_review_expected="false", pr_author_json=author_json,
-    ))
-    terminal = json.loads(summary.with_name("gate-terminal.json").read_text())
-    assert terminal["gate_result"] == expected
-    assert rc == (0 if expected == "skipped" else 1)
+
 
 
 def test_observed_abandoned_fixture_produces_fail_terminal_and_unreviewed_ledger_row(tmp_path, monkeypatch):
@@ -651,274 +632,39 @@ def test_observed_abandoned_fixture_produces_fail_terminal_and_unreviewed_ledger
     assert row["review"]["result"] is None
 
 
-def test_main_writes_one_canonical_receipt_for_scoped_primary(tmp_path):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    audit = _valid_scoped_primary_record()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
-    summary_path = tmp_path / "summary.md"
-    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
-
-    rc = AGG.main(
-        _cli_args(
-            audit_dir,
-            summary_path,
-            convergence_receipt_path=str(receipt_path),
-        )
-    )
-
-    assert rc == 0
-    assert receipt_path.is_file()
-    assert list(receipt_path.parent.iterdir()) == [receipt_path]
-    payload = json.loads(receipt_path.read_text())
-    assert receipt_path.read_bytes() == json.dumps(
-        payload, sort_keys=True, separators=(",", ":")
-    ).encode()
-    assert "Convergence receipt: produced (`convergence-receipt.json`).\n" in summary_path.read_text()
 
 
-def test_cli_missing_one_scope_field_names_it_without_receipt(tmp_path):
-    audit = _valid_scoped_primary_record()
-    del audit["caller_sha"]
-
-    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
-
-    assert rc == 0
-    assert not receipt_path.exists()
-    summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
-    assert (
-        "Convergence receipt: not produced (reason: canonical primary audit is missing "
-        "scope field(s): `caller_sha`)."
-    ) in summary
 
 
-def test_cli_missing_multiple_scope_fields_names_all_in_sorted_order(tmp_path):
-    audit = _valid_scoped_primary_record()
-    for field in ("caller_sha", "reusable_workflow_sha"):
-        del audit[field]
-
-    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
-
-    assert rc == 0
-    assert not receipt_path.exists()
-    summary = receipt_path.parent.parent.joinpath("summary.md").read_text()
-    assert (
-        "Convergence receipt: not produced (reason: canonical primary audit is missing "
-        "scope field(s): `caller_sha, reusable_workflow_sha`)."
-    ) in summary
 
 
-@pytest.mark.parametrize("tier", [None, "unrecognized"])
-def test_cli_missing_or_invalid_tier_defaults_to_internal(tmp_path, tier):
-    audit = _valid_scoped_primary_record()
-    if tier is None:
-        del audit["tier"]
-    else:
-        audit["tier"] = tier
-
-    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
-
-    assert rc == 0
-    payload = json.loads(receipt_path.read_bytes())
-    assert payload["scope"]["tier"] == "internal"
 
 
-@pytest.mark.parametrize(
-    ("verdict", "primary_result", "expected_rc"),
-    [("pass", "success", 0), ("fail", "failure", 1)],
-)
-def test_cli_missing_scope_field_preserves_exit_and_receipt_semantics(
-    tmp_path, verdict, primary_result, expected_rc,
-):
-    audit = _valid_scoped_primary_record(
-        verdict=verdict,
-        result={"findings": []} if verdict == "pass" else {"findings": [{"id": "p1", "severity": "major"}]},
-    )
-    del audit["caller_sha"]
-
-    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result=primary_result)
-
-    assert rc == expected_rc
-    assert not receipt_path.exists()
 
 
-def test_main_skipped_round_does_not_write_receipt_and_explains_reason(tmp_path):
-    summary_path = tmp_path / "summary.md"
-    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
-
-    rc = AGG.main(
-        _cli_args(
-            tmp_path / "missing-audit",
-            summary_path,
-            primary_result="skipped",
-            is_draft="true",
-            review_expected="false",
-            convergence_receipt_path=str(receipt_path),
-        )
-    )
-
-    assert rc == 0
-    assert not receipt_path.exists()
-    summary = summary_path.read_text()
-    assert "Convergence receipt: not produced" in summary
-    assert "review_not_expected" in summary
 
 
-def _run_receipt_cli_case(tmp_path, *, audit, primary_result, is_draft="false", review_expected="true"):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    if audit is not None:
-        (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
-    summary_path = tmp_path / "summary.md"
-    receipt_path = tmp_path / "convergence-receipt" / "convergence-receipt.json"
-    overrides = {
-        "primary_result": primary_result,
-        "is_draft": is_draft,
-        "review_expected": review_expected,
-        "convergence_receipt_path": str(receipt_path),
-    }
-    return AGG.main(_cli_args(audit_dir, summary_path, **overrides)), receipt_path
 
 
-def test_cli_exit_zero_with_receipt_for_clean_round(tmp_path):
-    audit = _valid_scoped_primary_record()
-    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="success")
-
-    assert rc == 0
-    assert receipt_path.is_file()
-    assert json.loads(receipt_path.read_text())["clean_streak"] == 1
 
 
-def test_cli_exit_zero_without_receipt_for_expected_skip(tmp_path):
-    rc, receipt_path = _run_receipt_cli_case(
-        tmp_path, audit=None, primary_result="skipped", is_draft="true", review_expected="false",
-    )
-
-    assert rc == 0
-    assert not receipt_path.exists()
 
 
-def test_cli_draft_payload_skip_uses_event_and_makes_no_github_request(tmp_path, monkeypatch):
-    # A draft event has its own check name, so its verdict describes the draft
-    # stage even when the PR has since been marked ready.
-    requests = []
-    monkeypatch.setenv("GITHUB_TOKEN", "token")
-    monkeypatch.setattr(
-        AGG, "_github_request",
-        lambda **kwargs: (requests.append(kwargs["url"]), b'{"draft": false}')[1],
-    )
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_scoped_primary_record()))
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(
-        _cli_args(
-            audit_dir, summary_path,
-            primary_result="skipped", is_draft="true", review_expected="false",
-            runner="hosted", is_fork="true", classify_review_expected="false",
-        )
-    )
-
-    assert rc == 0
-    assert requests == []
-    text = summary_path.read_text()
-    assert "draft event check records quality for the draft stage" in text
-    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text())
-    assert terminal["classification"] == "expected_skip"
-    assert terminal["reason_code"] == "review_not_expected"
-    assert terminal["gate_result"] == "skipped"
 
 
-@pytest.mark.parametrize(
-    "primary_result,expected_classification,expected_reason",
-    [
-        ("skipped", "integration_error", "unexpected_primary_skip"),
-        ("cancelled", "review_unavailable", "primary_cancelled"),
-    ],
-)
-def test_cli_non_draft_missing_primary_remains_fail_closed(
-    tmp_path, primary_result, expected_classification, expected_reason,
-):
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(
-        _cli_args(
-            tmp_path / "missing-audit", summary_path,
-            primary_result=primary_result, is_draft="false", review_expected="true",
-        )
-    )
-
-    assert rc == 1
-    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text())
-    assert terminal["classification"] == expected_classification
-    assert terminal["reason_code"] == expected_reason
-    assert terminal["gate_result"] == "unavailable"
 
 
-@pytest.mark.parametrize("verdict", ["fail", "unavailable"])
-def test_cli_exit_nonzero_with_zero_streak_receipt_for_red_or_unavailable_round(tmp_path, verdict):
-    audit = _valid_scoped_primary_record(
-        verdict=verdict,
-        result={"findings": [{
-            "id": "p1", "severity": "major", "file": "src/lock.py", "line": 12,
-            "category": "correctness",
-        }]},
-    )
-    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=audit, primary_result="failure")
-
-    assert rc != 0
-    assert receipt_path.is_file()
-    assert json.loads(receipt_path.read_text())["clean_streak"] == 0
 
 
-def test_cli_exit_nonzero_without_receipt_for_fail_closed_audit(tmp_path):
-    rc, receipt_path = _run_receipt_cli_case(tmp_path, audit=None, primary_result="failure")
-
-    assert rc != 0
-    assert not receipt_path.exists()
 
 
-def test_main_summary_and_notice_include_cross_attempt_source(capsys, tmp_path):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    audit = _valid_primary_record(run_attempt=1)
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit))
-    summary_path = tmp_path / "summary.md"
-    args = _cli_args(audit_dir, summary_path, run_attempt="2", audit_source_attempt="1")
-    rc = AGG.main(args)
-    assert rc == 0
-    assert "source run_attempt=1" in summary_path.read_text()
-    assert "source run_attempt=1" in capsys.readouterr().out
 
 
-def test_main_exit_code_nonzero_on_missing_audit(tmp_path):
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(tmp_path / "nope", summary_path))
-    assert rc == 1
-    assert "Synthetic audit generated" in summary_path.read_text()
-    assert json.loads(summary_path.with_name("gate-terminal.json").read_text())["audit"] == {"available": False, "source_attempt": None, "artifact_name": None}
 
 
-def test_main_exit_code_nonzero_on_malformed_boolean_input(tmp_path):
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(tmp_path / "nope", summary_path, is_draft="banana"))
-    assert rc == 1
-    text = summary_path.read_text()
-    assert "malformed boolean input" in text
 
 
-def test_main_exit_code_nonzero_on_unknown_runner(tmp_path):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(_cli_args(audit_dir, summary_path, runner="slef"))
-    assert rc == 1
-    assert "runner input" in summary_path.read_text()
 
-def _assert_terminal_classification(outcome, expected):
-    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == expected
-    if expected[0] == "integration_error":
-        assert (outcome.audit_available, outcome.audit_source_attempt, outcome.audit_artifact_name) == (False, None, None)
 
 @pytest.mark.parametrize("kwargs,expected", [
     ({"quality_result": "failure", "caller_checks": "failed"}, ("ci_failure", "quality_failure", "fail")), ({"quality_result": "cancelled"}, ("ci_failure", "quality_cancelled", "fail")),
@@ -962,48 +708,10 @@ def test_dependabot_draft_skip_is_expected_from_payload():
     )
 
 
-@pytest.mark.parametrize(
-    "facts,expected_reason,expected_draft",
-    [
-        ({"is_draft": True, "is_fork": True, "runner": "hosted", "classify_review_expected": "false"}, "draft", True),
-        ({"is_draft": False, "is_fork": True, "runner": "hosted", "classify_review_expected": "false"}, "fork", False),
-        ({"is_draft": False, "is_fork": False, "runner": "hosted", "classify_review_expected": "false"}, "hosted_runner", False),
-        ({"is_draft": False, "is_fork": False, "runner": "self", "classify_review_expected": "false"}, "review_exempt", False),
-    ],
-)
-def test_primary_skip_reason_uses_locked_precedence(facts, expected_reason, expected_draft):
-    outcome = AGG.evaluate(**_base_kwargs(
-        primary_result="skipped", review_expected=False, audit=None, **facts,
-    ))
-    assert outcome.skip_reason == expected_reason
-    assert facts["is_draft"] is expected_draft
-    if expected_reason == "review_exempt":
-        assert (outcome.classification, outcome.reason_code, outcome.gate_result) == (
-            "expected_skip", "review_not_expected", "skipped",
-        )
 
 
-def test_primary_skip_without_a_matching_reason_fails_closed():
-    outcome = AGG.evaluate(**_base_kwargs(
-        primary_result="skipped", is_draft=False, is_fork=False, runner="self",
-        classify_review_expected="true", review_expected=False, audit=None,
-    ))
-    assert outcome.ok is False
-    assert outcome.skip_reason is None
-    assert (outcome.classification, outcome.reason_code) == (
-        "integration_error", "unexpected_primary_skip",
-    )
-    assert outcome.gate_result != "skipped"
 
 
-def test_primary_skip_with_missing_classify_fact_fails_closed():
-    kwargs = _base_kwargs(
-        primary_result="skipped", is_draft=False, review_expected=False, audit=None,
-    )
-    outcome = AGG.evaluate(**kwargs)
-    assert outcome.ok is False
-    assert outcome.skip_reason is None
-    assert outcome.gate_result != "skipped"
 
 
 @pytest.mark.parametrize(
@@ -1073,16 +781,8 @@ def test_quality_skipped_by_primary_failure_reports_short_circuit_not_quality_pr
     assert not any("quality job result is 'skipped'" in p for p in outcome.problems)
 
 
-def test_terminal_reason_domain_lock():
-    assert AGG.TERMINAL_REASON_DOMAIN == (
-        "primary_pass", "primary_findings", "disposition_resolved", "review_not_expected", "primary_unavailable", "primary_cancelled",
-        "quality_failure", "quality_infra", "quality_cancelled", "quality_skipped", "audit_missing", "audit_invalid",
-        "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip",
-    )
 
 
-def test_primary_skip_reason_domain_lock():
-    assert AGG.PRIMARY_SKIP_REASON_DOMAIN == ("draft", "review_exempt", "fork", "hosted_runner")
 
 
 @pytest.mark.parametrize(
@@ -1110,49 +810,8 @@ def test_draft_skipped_primary_uses_payload_for_all_caller_modes(
     assert any("draft stage" in note for note in outcome.notes)
 
 
-def test_cli_draft_quality_failure_stays_red_without_github_request(tmp_path, monkeypatch):
-    requests = []
-    monkeypatch.setenv("GITHUB_TOKEN", "token")
-    monkeypatch.setattr(
-        AGG, "_github_request",
-        lambda **kwargs: (requests.append(kwargs["url"]), b'{"draft": false}')[1],
-    )
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(
-        _cli_args(
-            tmp_path / "missing-audit", summary_path,
-            quality_result="failure", caller_checks="failed",
-            primary_result="skipped", is_draft="true", review_expected="false",
-        )
-    )
-    assert rc == 1
-    assert requests == []
-    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text())
-    assert terminal["classification"] == "ci_failure"
-    assert terminal["reason_code"] == "quality_failure"
-    assert terminal["gate_result"] == "fail"
 
 
-def test_terminal_publish_barrier_failures(tmp_path, monkeypatch):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    terminal_path = tmp_path / "gate-terminal.json"
-    summary_path = tmp_path / "summary.md"
-    summary_path.mkdir()
-    with pytest.raises(OSError):
-        AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path)))
-    assert not terminal_path.exists()
-    original_write_text = Path.write_text
-    def partial_write_then_fail(path, data, **kwargs):
-        if path.name == ".gate-terminal.json.tmp":
-            path.write_bytes(data.encode())
-            raise OSError("simulated partial terminal write")
-        return original_write_text(path, data, **kwargs)
-    monkeypatch.setattr(Path, "write_text", partial_write_then_fail)
-    with pytest.raises(OSError, match="simulated partial terminal write"):
-        AGG.main(_cli_args(audit_dir, tmp_path / "summary.txt", terminal_path=str(terminal_path)))
-    assert not terminal_path.exists()
 
 
 # ── visible terminal state (issues #32/#43): classification x output slot ──
@@ -1199,18 +858,6 @@ _TERMINAL_GOLDEN = """{
 """
 
 
-def test_terminal_envelope_bytes_unchanged_by_rendering_work():
-    # gate-terminal.json is a cross-job publish boundary. Receipt audit stays
-    # present even when no receipt could be recorded.
-    outcome = AGG.Outcome(
-        ok=True, classification="code_pass", reason_code="primary_pass", gate_result="pass",
-        audit_available=True, audit_source_attempt=1, audit_artifact_name="primary-audit-v2-1",
-    )
-    envelope = AGG.build_terminal_envelope(
-        repository="zlxlabs/gate", identity=IDENTITY, quality_result="success",
-        primary_result="success", review_expected=True, is_draft=False, runner="self", outcome=outcome,
-    )
-    assert json.dumps(envelope, ensure_ascii=False, indent=2) + "\n" == _TERMINAL_GOLDEN
 
 
 @pytest.mark.parametrize(
@@ -1253,32 +900,8 @@ def test_primary_verdict_is_transported_from_validated_audit_to_terminal_history
     assert row["primary_verdict"] == verdict
 
 
-def test_main_terminal_omits_primary_verdict_when_findings_are_malformed(tmp_path):
-    audit = _valid_scoped_primary_record()
-    audit["result"]["findings"] = [{"severity": "unknown"}]
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(audit))
-    summary_path = tmp_path / "summary.md"
-
-    assert AGG.main(_cli_args(audit_dir, summary_path)) == 1
-    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
-
-    assert (terminal["gate_result"], terminal["reason_code"]) == ("unavailable", "audit_invalid")
-    assert "primary_verdict" not in terminal
 
 
-@pytest.mark.parametrize("include_null", [False, True], ids=["legacy-missing", "legacy-null"])
-def test_terminal_history_keeps_missing_or_null_primary_verdict_unknown(include_null):
-    record = json.loads(_canary_terminal_bytes())
-    if include_null:
-        record["primary_verdict"] = None
-
-    row = AGG._terminal_row(
-        record, repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-
-    assert row["primary_verdict"] is None
 
 
 @pytest.mark.parametrize("verdict", ["not-a-primary-verdict", "not_expected", "waived"])
@@ -1304,50 +927,8 @@ def test_invalid_primary_verdict_marks_terminal_history_incomplete(monkeypatch, 
     assert "primary_verdict" in history.incomplete_reasons[0]
 
 
-@pytest.mark.parametrize("verdict", ["not_expected", "waived"])
-def test_terminal_rejects_nonreview_primary_verdicts(verdict):
-    outcome = AGG.Outcome(
-        ok=False, classification="integration_error", reason_code="audit_invalid",
-        gate_result="unavailable", primary_verdict=verdict,
-    )
-    with pytest.raises(ValueError, match="terminal primary_verdict"):
-        _terminal_for(outcome)
 
 
-def test_terminal_envelope_publishes_shadow_budget_bytes_without_changing_gate_result(tmp_path):
-    audit = _valid_scoped_primary_record()
-    terminal_path = tmp_path / "gate-terminal.json"
-    summary_path = tmp_path / "summary.md"
-    outcome = AGG.evaluate(
-        **_base_kwargs(
-            primary_result="success", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A,
-        ),
-        prior_eligible_run_ids=(101, 102, 103, 104),
-        convergence_history_status="available",
-    )
-    assert AGG._finish(
-        outcome, str(summary_path), terminal_path=str(terminal_path),
-        repository="zlxlabs/gate", identity=IDENTITY,
-        quality_result="success", primary_result="success", review_expected=True,
-        is_draft=False, runner="self", primary_audit=audit,
-    ) == 0
-    published = json.loads(terminal_path.read_bytes())
-    assert published["gate_result"] == "pass"
-    assert published["convergence_shadow"] == {
-        "history_status": "available",
-        "eligible_rounds": 5,
-        "limit": 5,
-        "terminal_decision": "arbitration_required",
-        "eligible_this_round": True,
-    }
-    summary = summary_path.read_text()
-    assert "5/5" in summary and "arbitration_required" in summary
-    row = AGG._terminal_row(
-        published, repository="zlxlabs/gate", repository_id=IDENTITY.repository_id,
-        pr_number=IDENTITY.pr,
-    )
-    panel = AGG.render_status_panel([row])
-    assert "5/5 · arbitration_required" in panel
 
 
 def _visible_scenario(tmp_path, overrides, audit_record="__default__"):
@@ -1594,18 +1175,18 @@ def test_primary_fail_summary_no_longer_points_at_problems_for_findings(tmp_path
 
 # ── Status panel sticky delivery and durable-history contract ────────────────
 
-class _FakeResponse:
-    def __init__(self, payload=b""):
-        self.payload = payload
+from _gate_aggregator_support import _FakeResponse
 
-    def __enter__(self):
-        return self
 
-    def __exit__(self, *exc):
-        return False
 
-    def read(self):
-        return self.payload
+
+
+
+
+
+
+
+
 
 
 def _panel_terminal_row(run_id, attempt, gate_result, head_sha=None):
@@ -2820,42 +2401,6 @@ def test_post_self_heal_deletes_duplicate_and_patches_earliest_own_panel(monkeyp
     assert receipt["comment_created"] is True
 
 
-def test_history_loader_skips_other_pr_and_bad_records_individually(monkeypatch):
-    valid = {
-        "schema_version": 1, "kind": "gate_terminal", "repository": "zlxlabs/gate",
-        "repository_id": 123, "pr_number": 42, "run_id": 9, "run_attempt": 1,
-        "head_sha": "a" * 40, "gate_result": "pass", "classification": "code_pass",
-        "reason_code": "primary_pass",
-    }
-    other_pr = dict(valid, pr_number=77, run_id=8)
-    bad_schema = dict(valid, schema_version=True, run_id=7)
-    archives = {
-        "valid": valid,
-        "other": other_pr,
-        "bad": bad_schema,
-    }
-    zipped = {}
-    for name, record in archives.items():
-        archive = io.BytesIO()
-        with zipfile.ZipFile(archive, "w") as bundle:
-            bundle.writestr("gate-terminal.json", json.dumps(record))
-        zipped[name] = archive.getvalue()
-    monkeypatch.setattr(
-        AGG, "_github_json",
-        lambda **kwargs: {"artifacts": [
-            {"name": "gate-terminal-v1-123-valid", "expired": False, "archive_download_url": "valid"},
-            {"name": "gate-terminal-v1-123-other", "expired": False, "archive_download_url": "other"},
-            {"name": "gate-terminal-v1-123-bad", "expired": False, "archive_download_url": "bad"},
-            {"name": "gate-terminal-v1-123-expired", "expired": True, "archive_download_url": "expired"},
-        ]},
-    )
-    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: zipped[kwargs["url"]])
-    result = AGG._fetch_terminal_history(token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42)
-    assert [row["run_id"] for row in result.rows] == [9]
-    assert {entry["name"] for entry in result.skipped_records} == {
-        "gate-terminal-v1-123-other", "gate-terminal-v1-123-bad", "gate-terminal-v1-123-expired",
-    }
-    assert any("expired" in reason for reason in result.incomplete_reasons)
 
 
 def test_existing_panel_cache_is_parsed_and_incomplete_history_is_explicit():
@@ -3448,51 +2993,8 @@ def test_canonical_p1_projection_accepts_null_line():
     )
 
 
-def test_cross_head_shadow_cap_records_arbitration_without_changing_gate_result():
-    audit = _valid_scoped_primary_record(
-        verdict="fail",
-        tier="personal",
-        result={"findings": [{
-            "id": "p1", "severity": "major", "trigger_kind": "inferred",
-            "file": "src/lock.py", "line": 12, "category": "correctness",
-        }]},
-    )
-    kwargs = _base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A)
-    before = AGG.evaluate(**kwargs)
-    after = AGG.evaluate(
-        **kwargs,
-        prior_eligible_run_ids=(101, 102, 103),
-        convergence_history_status="available",
-    )
-    assert (after.ok, after.classification, after.reason_code, after.gate_result) == (
-        before.ok, before.classification, before.reason_code, before.gate_result,
-    ) == (False, "code_fail", "primary_findings", "fail")
-    assert after.convergence_shadow == {
-        "history_status": "available",
-        "eligible_rounds": 4,
-        "limit": 5,
-        "terminal_decision": "collecting",
-        "eligible_this_round": True,
-    }
 
 
-def test_cross_head_shadow_cap_marks_arbitration_for_current_p1_round():
-    audit = _valid_scoped_primary_record(
-        verdict="fail",
-        tier="personal",
-        result={"findings": [{
-            "id": "p1", "severity": "major", "trigger_kind": "inferred",
-            "file": "src/lock.py", "line": 12, "category": "correctness",
-        }]},
-    )
-    outcome = AGG.evaluate(
-        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
-        prior_eligible_run_ids=(101, 102, 103, 104),
-        convergence_history_status="available",
-    )
-    assert outcome.gate_result == "fail"
-    assert outcome.convergence_shadow["eligible_rounds"] == 5
-    assert outcome.convergence_shadow["terminal_decision"] == "arbitration_required"
 
 
 def test_clean_round_at_cross_head_cap_marks_shadow_but_preserves_pass():
@@ -3541,21 +3043,6 @@ def test_unavailable_cross_head_history_has_no_zero_count():
     assert "eligible_rounds" not in outcome.convergence_shadow
 
 
-def test_cross_head_shadow_rerun_same_run_attempt_is_idempotent():
-    audit = _valid_scoped_primary_record(
-        verdict="fail", tier="personal",
-        result={"findings": [{
-            "id": "p1", "severity": "major", "trigger_kind": "inferred",
-            "file": "src/lock.py", "line": 12, "category": "correctness",
-        }]},
-    )
-    outcome = AGG.evaluate(
-        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
-        prior_eligible_run_ids=(101, IDENTITY.run_id),
-        convergence_history_status="available",
-    )
-    assert outcome.convergence_shadow["eligible_rounds"] == 2
-    assert outcome.convergence_shadow["eligible_this_round"] is True
 
 
 def test_aggregate_projection_binds_stable_disposition_and_rejects_line_change():
@@ -3645,88 +3132,14 @@ def _terminal_for(outcome, *, primary_result="failure"):
     )
 
 
-def test_terminal_projects_structured_audit_from_record_dispositions_objects():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope)
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert block["recorded"][0]["finding_id"] == "p1"
-    assert block["recorded"][0]["disposition_claim"] == "false-positive"
-    assert block["recorded"][0]["evidence_pointer"] == "tests/test_regression.py::test_regression"
-    assert block["recorded"][0]["counterevidence_command"] == "pytest -q tests/test_regression.py"
-    assert block["recorded"][0]["counterevidence_output"] == "1 passed"
-    assert block["resolved"][0]["disposition"] == "false-positive"
-    assert block["resolved"][0]["evidence_pointer"] == "tests/test_regression.py::test_regression"
-    assert block["consumed_count"] == 1
-    assert block["remaining_p1_ids"] == []
-    assert outcome.recorded_disposition_claims == [_resolved_line(receipt)]
-    assert "receipt claim" not in json.dumps(block)
 
 
-def test_terminal_structured_block_does_not_parse_g4_display_strings():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope, finding_id="p1")
-    g4 = _resolved_line(receipt)
-    consumption = CONV.DispositionAudit(
-        primary_p1_ids=(),
-        recorded_receipts=(receipt,),
-        rejected_receipts=(),
-        recorded_finding_ids=("p1",),
-    )
-    outcome = AGG.Outcome(
-        ok=False, classification="code_fail", reason_code="primary_findings", gate_result="fail",
-        recorded_disposition_claims=[g4],
-        disposition_audit=consumption,
-    )
-    block = _terminal_for(outcome, primary_result="success")["disposition_receipt_consumption"]
-    assert block["resolved"][0]["evidence_pointer"] == "tests/test_regression.py::test_regression"
-    assert block["recorded"][0]["finding_id"] == "p1"
-    assert isinstance(block["recorded"][0], dict)
-    assert block["recorded"][0]["triggering_actor"] == "octocat"
-    assert g4 != block["recorded"][0]
 
 
-def test_terminal_stable_audit_separates_human_id_and_finding_key():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    stable_key = CONV.canonical_finding_key(audit["result"]["findings"][0])
-    receipt = _false_positive_receipt(
-        scope, finding_id="p1", finding_key=stable_key,
-    )
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    claims = _terminal_for(outcome)["disposition_receipt_consumption"]["recorded"]
-    assert claims[0]["finding_id"] == "p1"
-    assert claims[0]["finding_key"] == stable_key
 
 
-def test_terminal_empty_audit_when_evaluate_sees_no_receipts():
-    audit = _failing_scoped_audit()
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=())
-    block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert {**block, "remaining_p1_ids": []} == AGG.empty_disposition_receipt_audit()
-    assert block["remaining_p1_ids"] == ["p1"]
-    assert outcome.disposition_audit is not None
-    assert outcome.disposition_audit.recorded_receipts == ()
 
 
-def test_terminal_rejected_receipts_project_reason_counts_without_fail_closed():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    mismatched = _false_positive_receipt(scope, audit_digest=_DIGEST_B)
-    unknown = _false_positive_receipt(scope, finding_id="other-finding")
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(mismatched, unknown))
-    block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert block["resolved"] == []
-    assert block["consumed_count"] == 0
-    assert block["rejected_count"] == 2
-    assert block["rejected_reasons"] == {
-        "audit_digest_mismatch": 1,
-        "finding_not_current_p1": 1,
-    }
-    assert block["fail_closed"] is False
-    assert outcome.recorded_disposition_claims == []
 
 
 def test_digest_mismatch_keeps_finding_active_and_gate_fail():
@@ -3877,49 +3290,6 @@ def test_partial_disposition_records_claim_and_keeps_only_uncovered_finding_bloc
     ]
 
 
-def test_main_fail_primary_plus_matching_receipt_resolves_p1(monkeypatch, tmp_path):
-    audit = _failing_scoped_audit()
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    raw = json.dumps(audit, indent=2).encode("utf-8") + b"\n"
-    (audit_dir / "primary-review-audit.json").write_bytes(raw)
-    digest = hashlib.sha256(raw).hexdigest()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope, audit_digest=digest)
-    payload = {**receipt.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
-    artifact_name = CONV.disposition_receipt_artifact_name(receipt)
-    zip_bytes = _zip_receipt_bytes(payload)
-
-    def fake_github_json(*, token, url, **kwargs):
-        assert "actions/artifacts" in url
-        return {
-            "artifacts": [
-                {
-                    "name": artifact_name,
-                    "expired": False,
-                    "archive_download_url": "https://api.github.com/artifacts/1/zip",
-                }
-            ]
-        }
-
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: zip_bytes)
-
-    summary_path = tmp_path / "summary.md"
-    rc = AGG.main(
-        _cli_args(audit_dir, summary_path, primary_result="failure")
-    )
-    text = summary_path.read_text()
-    resolved = _resolved_line(receipt)
-    assert rc == 0
-    assert "**Result: pass**" in text
-    assert "Disposition receipts consumed:" in text
-    assert resolved in text
-    assert "All current P1 findings are covered" in text
-    terminal = json.loads(summary_path.with_name("gate-terminal.json").read_text())
-    assert terminal["gate_result"] == "pass"
-    assert terminal["reason_code"] == "disposition_resolved"
 
 
 def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
@@ -4095,74 +3465,10 @@ def _run_pr_convergence_cli(tmp_path, monkeypatch, *, audit_verdict, primary_res
     return exit_code, json.loads(summary_path.with_name("gate-terminal.json").read_bytes())
 
 
-@pytest.mark.parametrize(
-    "run_501_head,run_504_head",
-    [("c" * 40, "b" * 40), (IDENTITY.head_sha, IDENTITY.head_sha)],
-    ids=["three-distinct-pr-heads", "same-pr-head"],
-)
-def test_cli_convergence_counts_latest_actual_attempt_per_run_and_known_skips(
-    monkeypatch, tmp_path, run_501_head, run_504_head,
-):
-    history = _primary_convergence_history((501, 502, 503, 504, IDENTITY.run_id), [
-        _primary_convergence_row(501, 1, "fail", head_sha=run_501_head),
-        _primary_convergence_row(501, 2, "unavailable", head_sha=run_501_head),
-        _primary_convergence_row(502, 1, "fail"), _primary_convergence_row(502, 2, "pass"),
-        _primary_convergence_row(503, 1, None, primary_result="skipped", skip_reason="draft"),
-        _primary_convergence_row(504, 1, "fail", head_sha=run_504_head),
-    ])
-    exit_code, terminal = _run_pr_convergence_cli(
-        tmp_path, monkeypatch, history=history, audit_verdict="fail", primary_result="failure",
-    )
-    assert exit_code == 1
-    assert terminal.get("convergence") == {"fail_count": 3, "reconsider": True}
 
 
-@pytest.mark.parametrize(
-    "history,audit_verdict,primary_result,expected",
-    [
-        (_primary_convergence_history((501, IDENTITY.run_id), [
-            _primary_convergence_row(501, 1, None, primary_result="failure", audit_available=True),
-        ]), "fail", "failure", {"fail_count": None, "reconsider": None}),
-        (_primary_convergence_history((501, 502, 503, IDENTITY.run_id), [
-            _primary_convergence_row(501, 1, "fail"), _primary_convergence_row(502, 1, "fail"),
-        ]), "fail", "failure", {"fail_count": None, "reconsider": True}),
-        (None, None, "failure", {"fail_count": None, "reconsider": None}),
-    ],
-    ids=["legacy-reviewed-verdict-missing-never-use-gate-result", "target-gap-three-failure-lower-bound", "current-reviewed-verdict-missing"],
-)
-def test_cli_convergence_keeps_unknown_history_and_verified_lower_bound(
-    history, audit_verdict, primary_result, expected, monkeypatch, tmp_path,
-):
-    exit_code, terminal = _run_pr_convergence_cli(
-        tmp_path, monkeypatch, history=history, audit_verdict=audit_verdict, primary_result=primary_result,
-    )
-    assert exit_code == 1
-    assert terminal.get("convergence") == expected
 
 
-def test_main_terminal_convergence_reads_target_run_gap_and_quality_fail_primary_pass(monkeypatch, tmp_path):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [700, IDENTITY.run_id])
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
-    monkeypatch.setattr(AGG, "_fetch_github_terminal_history", lambda **kwargs: AGG.HistoryLoad(
-        incomplete_reasons=[f"no terminal artifact matched run {run_id}" for run_id in (700, IDENTITY.run_id)],
-    ))
-    observed = []
-    load_history = AGG._load_pr_convergence_history
-    def record_loaded_history(**kwargs):
-        result = load_history(**kwargs)
-        observed.append(getattr(result[2], "target_run_ids", None))
-        return result
-    monkeypatch.setattr(AGG, "_load_pr_convergence_history", record_loaded_history)
-
-    exit_code, terminal = _run_pr_convergence_cli(
-        tmp_path, monkeypatch, audit_verdict="pass", primary_result="success",
-        quality_result="failure", caller_checks="failed",
-    )
-    assert (exit_code, terminal["gate_result"], terminal["primary_verdict"]) == (1, "fail", "pass")
-    assert observed == [(700, IDENTITY.run_id)]
-    assert terminal.get("convergence") == {"fail_count": None, "reconsider": False}
 
 
 def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_objects, github_error=None, silo_error=None):
@@ -4202,294 +3508,34 @@ def _install_dual_read(monkeypatch, *, github_artifacts, github_blobs, silo_obje
     monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
 
 
-def test_convergence_history_without_silo_configuration_is_greppable(monkeypatch, capsys):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: False)
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert history.incomplete_reasons == ["Silo terminal history unavailable: not configured"]
-    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=silo_not_configured" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize(
-    "error",
-    [RuntimeError("Silo list denied"), subprocess.TimeoutExpired(["silo_store.py", "list"], 15)],
-    ids=["listing-error", "listing-timeout"],
-)
-def test_convergence_history_silo_failure_is_greppable_and_unavailable(monkeypatch, capsys, error):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
-
-    def fail_listing(**kwargs):
-        raise error
-
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", fail_listing)
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert history.incomplete_reasons == [f"Silo terminal history unavailable: {type(error).__name__}"]
-    assert f"GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason={type(error).__name__}" in capsys.readouterr().out
 
 
-def test_convergence_history_empty_silo_but_github_has_prior_terminal_is_unavailable(monkeypatch, capsys):
-    prior = AGG._terminal_row(
-        json.loads(_canary_terminal_bytes()),
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [_CANARY_RUN_ID])
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
-    monkeypatch.setattr(
-        AGG, "_fetch_github_terminal_history",
-        lambda **kwargs: AGG.HistoryLoad(rows=[prior]),
-    )
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert history.incomplete_reasons == ["Silo empty but GitHub has terminal history"]
-    assert "silo_empty_but_github_has_terminal_history" in capsys.readouterr().out
 
 
-def test_convergence_history_malformed_silo_terminal_is_unavailable(monkeypatch, capsys):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [_CANARY_RUN_ID])
-
-    def fake_silo_cli(argv, timeout_s):
-        if argv[0] == "list":
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{_CANARY_TERMINAL_KEY}\n", stderr="")
-        Path(argv[argv.index("--dest") + 1]).write_bytes(b"{")
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-
-    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert history.incomplete_reasons
-    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=incomplete_terminal_history" in capsys.readouterr().out
 
 
-def test_convergence_history_empty_first_run_is_available_zero(monkeypatch):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
-    monkeypatch.setattr(
-        AGG, "_fetch_github_terminal_history",
-        lambda **kwargs: AGG.HistoryLoad(
-            incomplete_reasons=["no terminal artifact matched run 501"],
-        ),
-    )
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids, history.rows, history.incomplete_reasons) == ("available", (), [], [])
 
 
-def test_history_loader_without_token_fails_fast_before_silo_scan(monkeypatch, capsys):
-    # gate#290 教训：没有 token 就无法按 PR 定向，无定向的 Silo/GitHub 全仓
-    # 下载正是拖垮汇总 job 的路径，必须 fail-fast 而不是退回全仓扫描。
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-
-    def must_not_run(**kwargs):
-        raise AssertionError("untargeted silo scan must not run without a token")
-
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", must_not_run)
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert history.incomplete_reasons == ["history loader needs GITHUB_TOKEN to target this PR's runs"]
-    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=github_token_missing" in capsys.readouterr().out
 
 
-def test_history_loader_run_targeting_failure_is_greppable(monkeypatch, capsys):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-
-    def fail_targeting(**kwargs):
-        raise ValueError("Actions runs response has an invalid shape")
-
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", fail_targeting)
-
-    def must_not_run(**kwargs):
-        raise AssertionError("silo scan must not run when targeting failed")
-
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", must_not_run)
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert history.incomplete_reasons == ["GitHub run targeting unavailable: ValueError"]
-    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=ValueError" in capsys.readouterr().out
 
 
-def test_history_loader_silo_empty_with_no_targeted_runs_skips_github_fallback(monkeypatch):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [])
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
-
-    def must_not_run(**kwargs):
-        raise AssertionError("fallback must not run without targeted runs")
-
-    monkeypatch.setattr(AGG, "_fetch_github_terminal_history", must_not_run)
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids, history.rows, history.incomplete_reasons) == ("available", (), [], [])
 
 
-def test_history_loader_budget_exhaustion_in_github_fallback_is_greppable(monkeypatch, capsys):
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [501])
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", lambda **kwargs: AGG.HistoryLoad())
-    monkeypatch.setattr(
-        AGG, "_fetch_github_terminal_history",
-        lambda **kwargs: AGG.HistoryLoad(
-            incomplete_reasons=["history budget exhausted during targeted scan"],
-        ),
-    )
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert history.incomplete_reasons == ["history budget exhausted"]
-    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_budget_exhausted" in capsys.readouterr().out
 
 
-def test_pr_target_run_ids_narrows_to_pr_branch(monkeypatch):
-    urls = []
-
-    def fake_github_json(*, token, url):
-        urls.append(url)
-        if "/pulls/42" in url:
-            return {"head": {"ref": "feature/分支"}}
-        return {"total_count": 2, "workflow_runs": [{"id": 7}, {"id": 3}, {"id": 7}, {"id": "bad"}, {"id": 0}, {}]}
-
-    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    run_ids = AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42)
-    assert run_ids == [7, 3]
-    assert sum("/pulls/42" in url for url in urls) == 1
-    assert any("branch=feature%2F%E5%88%86%E6%94%AF" in url for url in urls)
-    # terminal 记录只由 pull_request 触发的 gate run 产生（caller 模板 on: 仅
-    # pull_request），过滤掉 push/dispatch 类 run 既降噪又降低截断概率。
-    assert any("event=pull_request" in url for url in urls)
 
 
-def test_pr_target_run_ids_returns_none_when_more_runs_than_one_page(monkeypatch):
-    def fake_github_json(*, token, url):
-        if "/pulls/42" in url:
-            return {"head": {"ref": "main"}}
-        return {
-            "total_count": 150,
-            "workflow_runs": [{"id": run_id} for run_id in range(2000, 2000 + 100)],
-        }
-
-    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
 
 
-def test_pr_target_run_ids_returns_none_when_page_full_without_total_count(monkeypatch):
-    def fake_github_json(*, token, url):
-        if "/pulls/42" in url:
-            return {"head": {"ref": "main"}}
-        return {"workflow_runs": [{"id": run_id} for run_id in range(2000, 2000 + 100)]}
-
-    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
 
 
-def test_pr_target_run_ids_returns_none_when_targeted_cap_reached(monkeypatch):
-    def fake_github_json(*, token, url):
-        if "/pulls/42" in url:
-            return {"head": {"ref": "main"}}
-        return {
-            "total_count": 60,
-            "workflow_runs": [{"id": run_id} for run_id in range(1000, 1000 + 60)],
-        }
-
-    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    assert AGG._pr_target_run_ids(token="tok", repository="zlxlabs/gate", pr_number=42) is None
 
 
-def test_history_loader_run_list_truncation_is_history_unavailable(monkeypatch, capsys):
-    """F1 / INV-A4 锁：runs 列表截断（total_count 超过本页，或超过定向 cap）时
-    不得返回部分列表少算 eligible_rounds，必须整体判 history_unavailable 且打
-    reason=history_truncated。红验：去掉 `_pr_target_run_ids` 的截断判定后，
-    本测试必须以断言失败转红（打桩无 sleep，不存在挂起）。"""
-    def fake_github_json(*, token, url):
-        if "/pulls/42" in url:
-            return {"head": {"ref": "card/long-lived"}}
-        return {
-            "total_count": 150,
-            "workflow_runs": [{"id": run_id} for run_id in range(3000, 3000 + 100)],
-        }
-
-    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    silo_calls = []
-
-    def fake_silo(**kwargs):
-        silo_calls.append(kwargs)
-        return AGG.HistoryLoad()
-
-    monkeypatch.setattr(AGG, "_fetch_silo_terminal_history", fake_silo)
-    monkeypatch.setattr(
-        AGG, "_fetch_github_terminal_history",
-        lambda **kwargs: AGG.HistoryLoad(
-            incomplete_reasons=["no terminal artifact matched run 3000"],
-        ),
-    )
-    status, run_ids, history = AGG._load_pr_convergence_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert (status, run_ids) == ("history_unavailable", ())
-    assert silo_calls == []
-    assert history.incomplete_reasons == [
-        "history truncated: this PR's branch has more pull_request runs than one page or the targeted cap"
-    ]
-    assert "GATE-CONVERGENCE-HISTORY-UNAVAILABLE reason=history_truncated" in capsys.readouterr().out
 
 
-def test_fetch_silo_terminal_history_downloads_only_targeted_runs(monkeypatch):
-    other_run_key = (
-        f"d30/{_CANARY_REPO_ID}/gate-terminal-v1-{_CANARY_REPO_ID}-"
-        f"{'9' * 40}-999-1/gate-terminal.json"
-    )
-    keys = [_CANARY_TERMINAL_KEY, other_run_key]
-    gets = []
-
-    def fake_silo_cli(argv, timeout_s):
-        if argv[0] == "list":
-            return subprocess.CompletedProcess(
-                argv, 0, stdout="".join(f"{key}\n" for key in keys), stderr="",
-            )
-        gets.append(argv[argv.index("--key") + 1])
-        run_id = _CANARY_RUN_ID if len(gets) == 1 else 999
-        Path(argv[argv.index("--dest") + 1]).write_bytes(
-            _canary_terminal_bytes("pass", run_id=run_id)
-        )
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-
-    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
-    result = AGG._fetch_silo_terminal_history(
-        repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-        target_run_ids=[_CANARY_RUN_ID],
-    )
-    assert gets == [_CANARY_TERMINAL_KEY]
-    assert [(row["run_id"], row["gate_result"]) for row in result.rows] == [(_CANARY_RUN_ID, "pass")]
-    assert result.incomplete_reasons == []
 
 
 def _real_convergence_history_silo_objects():
@@ -4501,38 +3547,6 @@ def _real_convergence_history_silo_objects():
     return fixture, objects
 
 
-def test_real_silo_d30_terminal_fixture_drives_terminal_row_and_history_loader(monkeypatch):
-    fixture, objects = _real_convergence_history_silo_objects()
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    targeted_ids = [record["run_id"] for record in fixture["terminal_envelopes"]]
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: targeted_ids)
-
-    def fake_silo_cli(argv, timeout_s):
-        if argv[0] == "list":
-            return subprocess.CompletedProcess(
-                argv, 0, stdout="".join(f"{key}\n" for key, _body in objects), stderr="",
-            )
-        key = argv[argv.index("--key") + 1]
-        Path(argv[argv.index("--dest") + 1]).write_bytes(dict(objects)[key])
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-
-    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
-    rows = [
-        AGG._terminal_row(
-            record, repository=fixture["repository"], repository_id=fixture["repository_id"],
-            pr_number=fixture["pr_number"],
-        )
-        for record in fixture["terminal_envelopes"]
-    ]
-    status, run_ids, _history = AGG._load_pr_convergence_history(
-        repository=fixture["repository"], repository_id=fixture["repository_id"],
-        pr_number=fixture["pr_number"],
-    )
-    assert len(fixture["source_keys"]) >= 2
-    assert all("findings" not in record and "result" not in record for record in fixture["terminal_envelopes"])
-    assert all(row["_eligible_primary_round"] is True for row in rows)
-    assert (status, run_ids) == ("available", (35424466527, 35423752741))
 
 
 def test_mixed_legacy_and_new_terminal_history_prefers_explicit_eligibility(monkeypatch):
@@ -4649,67 +3663,6 @@ def _receipt_key(receipt):
     return f"d30/{_CANARY_REPO_ID}/{name}/{name}"
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["github_only", "silo_only", "both_same", "both_empty", "github_fail", "silo_fail"],
-)
-def test_terminal_history_dual_read_table(monkeypatch, capsys, case):
-    github_zip = _canary_terminal_zip("fail")
-    silo_bytes = _canary_terminal_bytes("pass")
-    github_art = [{
-        "name": _CANARY_TERMINAL_NAME, "expired": False,
-        "archive_download_url": "https://api.github.com/artifacts/canary/zip",
-    }]
-    kwargs = dict(github_artifacts=[], github_blobs={}, silo_objects=[])
-    if case == "github_only":
-        kwargs = dict(github_artifacts=github_art, github_blobs={"https://api.github.com/artifacts/canary/zip": github_zip}, silo_objects=[])
-    elif case == "silo_only":
-        kwargs = dict(github_artifacts=[], github_blobs={}, silo_objects=[(_CANARY_TERMINAL_KEY, silo_bytes)])
-    elif case == "both_same":
-        kwargs = dict(
-            github_artifacts=github_art,
-            github_blobs={"https://api.github.com/artifacts/canary/zip": github_zip},
-            silo_objects=[(_CANARY_TERMINAL_KEY, silo_bytes)],
-        )
-    elif case == "github_fail":
-        kwargs = dict(
-            github_artifacts=[], github_blobs={}, silo_objects=[(_CANARY_TERMINAL_KEY, silo_bytes)],
-            github_error=RuntimeError("github listing down"),
-        )
-    elif case == "silo_fail":
-        kwargs = dict(
-            github_artifacts=github_art,
-            github_blobs={"https://api.github.com/artifacts/canary/zip": github_zip},
-            silo_objects=[],
-            silo_error=RuntimeError("silo listing down"),
-        )
-    _install_dual_read(monkeypatch, **kwargs)
-    result = AGG._fetch_terminal_history(
-        token="tok", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    warning = capsys.readouterr().out
-    rows_by_id = {(row["run_id"], row["run_attempt"]): row["gate_result"] for row in result.rows}
-    if case == "github_only":
-        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "fail"}
-        assert "Silo terminal history unavailable" not in warning
-    elif case == "silo_only":
-        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "pass"}
-        assert not any(reason.startswith("no terminal artifact matched gate-terminal-v1-") for reason in result.incomplete_reasons)
-        assert "Silo terminal history unavailable" not in warning
-    elif case == "both_same":
-        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "pass"}
-        assert "Silo terminal history unavailable" not in warning
-    elif case == "both_empty":
-        assert result.rows == []
-        assert any("no terminal artifact matched" in reason for reason in result.incomplete_reasons)
-        assert "Silo terminal history unavailable" not in warning
-    elif case == "github_fail":
-        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "pass"}
-        assert any("GitHub terminal history unavailable: RuntimeError" in reason for reason in result.incomplete_reasons)
-    elif case == "silo_fail":
-        assert rows_by_id == {(_CANARY_RUN_ID, _CANARY_ATTEMPT): "fail"}
-        assert "Silo terminal history unavailable: RuntimeError" in warning
-        assert any("Silo terminal history unavailable: RuntimeError" in reason for reason in result.incomplete_reasons)
 
 
 @pytest.mark.parametrize(
@@ -5125,17 +4078,6 @@ def test_quality_infra_panel_renders_infra_action():
     assert "要修代码" not in body
 
 
-def test_cli_evidence_reaches_the_verdict(tmp_path):
-    # E2E-Assertion 的消费侧一半：--caller-checks/--preflight-result 经 CLI
-    # 到达判据（生产侧一半由契约测试锁 YAML→env→argv 接线）。
-    _, summary_path, args = _visible_scenario(
-        tmp_path, {"quality_result": "failure", "caller_checks": "", "preflight_result": ""}, "__default__",
-    )
-    rc = AGG.main(args)
-    assert rc == 1
-    summary = summary_path.read_text()
-    assert "quality_infra" in summary
-    assert "review_unavailable" in summary
 
 
 def _relation_audit(**finding):
@@ -5212,73 +4154,8 @@ def test_opposite_same_location_requirement_is_conflict_and_not_pass(tmp_path):
     assert AGG.relate_findings([current], [same])[0]["relation_to_previous"] == "new"
 
 
-@pytest.mark.parametrize("case", ["pass", "fail", "manual_conflict"])
-def test_shadow_budget_preserves_existing_verdict_contract(case):
-    if case == "pass":
-        audit = _valid_scoped_primary_record(verdict="pass", result={"findings": []})
-        primary_result = "success"
-        previous_round = {"available": True, "findings": []}
-    elif case == "fail":
-        audit = _valid_scoped_primary_record(
-            verdict="fail",
-            result={"findings": [{
-                "id": "p1", "severity": "major", "trigger_kind": "inferred",
-                "file": "src/lock.py", "line": 12, "category": "correctness",
-            }]},
-        )
-        primary_result = "failure"
-        previous_round = {"available": True, "findings": []}
-    else:
-        current = {
-            "id": "round-b", "severity": "major", "file": "src/lock.py", "line": 12,
-            "category": "correctness", "issue": "must not advance the lease",
-            "acceptance": "leave the lease at evidence",
-        }
-        previous = {
-            "id": "round-a", "severity": "major", "file": "src/lock.py", "line": 12,
-            "category": "correctness", "issue": "must advance the lease",
-            "acceptance": "advance the lease to closed",
-        }
-        audit = _relation_audit(**current)
-        previous_round = {"available": True, "findings": [previous]}
-        primary_result = "success"
-
-    kwargs = _base_kwargs(
-        primary_result=primary_result,
-        audit=audit,
-        scope=_scope_for(audit),
-        audit_digest=_DIGEST_A,
-    )
-    baseline = AGG.evaluate(**kwargs)
-    shadow = AGG.evaluate(
-        **kwargs,
-        prior_eligible_run_ids=(101, 102, 103, 104),
-        convergence_history_status="available",
-    )
-    for outcome in (baseline, shadow):
-        findings = json.loads(json.dumps(audit["result"]["findings"]))
-        AGG.apply_finding_relation(outcome, findings, previous_round)
-    assert (shadow.ok, shadow.classification, shadow.reason_code, shadow.gate_result) == (
-        baseline.ok, baseline.classification, baseline.reason_code, baseline.gate_result,
-    )
-    assert shadow.convergence_shadow["terminal_decision"] == "arbitration_required"
-    if case == "manual_conflict":
-        assert shadow.finding_relation["review_terminal"] == "manual_required"
 
 
-def test_cli_rejects_present_null_finding_relation(tmp_path):
-    audit_dir = _write_relation_audit(tmp_path, {"id": "a"})
-    audit_path = audit_dir / "primary-review-audit.json"
-    audit = json.loads(audit_path.read_text())
-    audit["finding_relation"] = None
-    audit_path.write_text(json.dumps(audit))
-    result = subprocess.run(
-        [sys.executable, str(MODULE_PATH), *_cli_args(audit_dir, tmp_path / "summary.md")],
-        cwd=ROOT, env={**os.environ, "SILO_ENDPOINT": "", "SILO_STORE": "", "GITHUB_TOKEN": "", "GH_TOKEN": ""},
-        capture_output=True, text=True, check=False,
-    )
-    assert result.returncode == 1
-    assert "GATE-FINDING-RELATION-UNKNOWN: block schema" in result.stderr
 
 
 def test_missing_previous_ledger_marks_new_and_job_succeeds(tmp_path, capsys):
