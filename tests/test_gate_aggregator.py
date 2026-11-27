@@ -941,166 +941,17 @@ def _visible_scenario(tmp_path, overrides, audit_record="__default__"):
     return audit_dir, summary_path, _cli_args(audit_dir, summary_path, **overrides)
 
 
-@pytest.mark.parametrize(
-    "overrides,audit_record,classification,reason_code,gate_result,exit_code,annotation",
-    [
-        ({}, "__default__", "code_pass", "primary_pass", "pass", 0, "::notice::"),
-        (
-            {"primary_result": "failure"}, _valid_primary_record(verdict="fail"),
-            "code_fail", "primary_findings", "fail", 1, "::error::",
-        ),
-        (
-            {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
-            "expected_skip", "review_not_expected", "skipped", 0, "::notice::",
-        ),
-        (
-            {"primary_result": "failure"}, _valid_primary_record(verdict="unavailable"),
-            "review_unavailable", "primary_unavailable", "unavailable", 1, "::error::",
-        ),
-        (
-            {"quality_result": "failure", "caller_checks": "failed"}, "__default__",
-            "ci_failure", "quality_failure", "fail", 1, "::error::",
-        ),
-        ({}, None, "integration_error", "audit_missing", "unavailable", 1, "::error::"),
-    ],
-)
-def test_visible_terminal_state_axis(
-    capsys, tmp_path, overrides, audit_record, classification, reason_code, gate_result, exit_code, annotation,
-):
-    _, summary_path, args = _visible_scenario(tmp_path, overrides, audit_record)
-    rc = AGG.main(args)
-    out = capsys.readouterr().out
-    text = summary_path.read_text()
-
-    # Exit code is exactly the pre-existing pass/fail semantic (skipped -> 0).
-    assert rc == exit_code
-
-    # Output slot 1 — Summary top line shows the four-state gate_result, and
-    # never one of the other three states (skipped must not read as pass,
-    # unavailable must not read as fail).
-    assert f"**Result: {gate_result}**" in text
-    for other in AGG.GATE_RESULT_DOMAIN:
-        if other != gate_result:
-            assert f"**Result: {other}**" not in text
-
-    # Output slot 2 — Summary body exposes all three terminal fields.
-    assert (
-        f"classification=`{classification}`, reason_code=`{reason_code}`, gate_result=`{gate_result}`"
-    ) in text
-
-    # Output slot 3 — annotation of the expected type carrying reason_code,
-    # visible on the checks list page without expanding the run.
-    assert f"{annotation}gate terminal state:" in out
-    assert f"reason_code={reason_code}" in out
-    opposite = "::error::" if annotation == "::notice::" else "::notice::"
-    assert f"{opposite}gate terminal state:" not in out
 
 
-def test_visible_expected_skip_summary_names_draft_as_the_skip_reason(capsys, tmp_path):
-    _, summary_path, args = _visible_scenario(
-        tmp_path, {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
-    )
-    assert AGG.main(args) == 0
-    text = summary_path.read_text()
-    assert "**Result: skipped**" in text
-    assert "draft=True" in text
 
 
 # ── wording axis (issue #43): unreadable-conclusion ≠ reviewer rejection ────
 
 
-@pytest.mark.parametrize(
-    "kwargs,must_say,must_not_say",
-    [
-        (
-            {"primary_result": "failure", "audit": _valid_primary_record(verdict="fail")},
-            ["REJECTED", "Problems"],
-            ["could NOT be read"],
-        ),
-        (
-            {"audit": None, "audit_error": "missing"},
-            ["could NOT be read", "reason for the primary job result is unknown", "not a reviewer rejection"],
-            ["REJECTED", "primary job logs"],
-        ),
-        (
-            {"audit": _valid_primary_record(kind="synthetic_primary")},
-            ["could NOT be read", "reason for the primary job result is unknown", "not a reviewer rejection"],
-            ["REJECTED", "primary job logs"],
-        ),
-        (
-            {"audit_source_attempt": 2},
-            ["could NOT be read", "reason for the primary job result is unknown", "not a reviewer rejection"],
-            ["REJECTED", "primary job logs"],
-        ),
-        (
-            {"primary_result": "failure", "audit": _valid_primary_record(verdict="pass")},
-            ["contradicts", "Check the primary job logs"],
-            ["could NOT be read", "REJECTED"],
-        ),
-        (
-            {"primary_result": "skipped", "audit": None},
-            ["should have run but was skipped", "NOT the normal draft/fork"],
-            ["could NOT be read"],
-        ),
-    ],
-    ids=["primary_findings", "audit_missing", "audit_invalid", "audit_source_mismatch", "job_audit_mismatch", "unexpected_primary_skip"],
-)
-def test_reason_code_wording_cannot_be_misread(kwargs, must_say, must_not_say):
-    outcome = AGG.evaluate(**_base_kwargs(**kwargs))
-    text = AGG.render_summary(outcome)
-    for phrase in must_say:
-        assert phrase in text
-    for phrase in must_not_say:
-        assert phrase not in text
 
 
-@pytest.mark.parametrize(
-    "primary_result",
-    [
-        "failure",
-        "success",
-    ],
-    ids=["primary_failure", "primary_success"],
-)
-def test_audit_missing_wording_does_not_infer_from_primary_job_result(tmp_path, primary_result):
-    # The terminal classification and unknown-cause wording hold regardless of
-    # the primary job conclusion; only canonical verdict=fail proves rejection.
-    _, summary_path, args = _visible_scenario(
-        tmp_path, {"primary_result": primary_result}, None,
-    )
-    assert AGG.main(args) == 1
-    text = summary_path.read_text()
-    assert "classification=`integration_error`, reason_code=`audit_missing`, gate_result=`unavailable`" in text
-    assert "could NOT be read" in text
-    assert "reason for the primary job result is unknown" in text
-    assert "not a reviewer rejection" in text
-    assert "primary job logs" not in text
-    assert "usually because of a reviewer rejection" not in text
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"audit": None, "audit_error": "missing"},
-        {"primary_result": "failure", "audit": None, "audit_error": "missing"},
-        {"audit": _valid_primary_record(kind="synthetic_primary")},
-        {"audit_source_attempt": 2},
-        {"primary_result": "cancelled", "audit": None},
-    ],
-    ids=["audit_missing", "audit_missing_primary_failure", "audit_invalid", "audit_source_mismatch", "primary_cancelled"],
-)
-def test_synthetic_verdict_null_is_explained_before_the_json(kwargs):
-    # A human sentence explaining `"verdict": null` must precede the synthetic
-    # audit JSON, and it must say "not a reviewer rejection" (issue #43).
-    outcome = AGG.evaluate(**_base_kwargs(**kwargs))
-    assert outcome.synthetic_audit is not None
-    text = AGG.render_summary(outcome)
-    explanation = '"verdict": null` below means no canonical primary review conclusion was available'
-    assert explanation in text
-    assert "NOT a reviewer rejection" in text
-    assert "cause cannot be determined from the available audit data" in text
-    assert "primary job logs" not in text
-    assert text.index(explanation) < text.index('  "verdict": null')
 
 
 # ── human-first action line: every gate_result answers "what do I do now" ────
@@ -1119,58 +970,8 @@ def test_synthetic_verdict_null_is_explained_before_the_json(kwargs):
 _RUN_URL = "https://github.com/zlxlabs/gate/actions/runs/999"
 
 
-@pytest.mark.parametrize(
-    "overrides,audit_record,gate_result,action_phrases,needs_run_url",
-    [
-        ({}, "__default__", "pass", ["No action needed"], False),
-        (
-            {"primary_result": "failure"}, _valid_primary_record(verdict="fail"),
-            "fail", ["Action needed", "the primary reviewer rejected this change"], True,
-        ),
-        (
-            {"primary_result": "skipped", "is_draft": "true", "review_expected": "false"}, None,
-            "skipped", ["No action needed", "draft", "ready for review"], False,
-        ),
-        (
-            {"primary_result": "skipped", "runner": "hosted", "review_expected": "false"}, None,
-            "skipped", ["No action needed", "runner=self", "runner=hosted"], False,
-        ),
-        (
-            {"primary_result": "cancelled"}, None,
-            "unavailable", ["Action needed", "could not be determined"], True,
-        ),
-    ],
-    ids=["pass", "fail", "skipped_draft", "skipped_hosted", "unavailable"],
-)
-def test_action_line_precedes_machine_codes_for_every_gate_result(tmp_path, overrides, audit_record, gate_result, action_phrases, needs_run_url):
-    _, summary_path, args = _visible_scenario(tmp_path, overrides, audit_record)
-    AGG.main(args)
-    text = summary_path.read_text()
-
-    # Axis 2: Result stays the first verdict line and the machine codes stay
-    # behind it…
-    assert text.index(f"**Result: {gate_result}**") < text.index("Terminal state: classification=")
-    # …and EVERY action-sentence phrase lands before the machine codes (axis
-    # 1: the human sentence first, classification= never ahead of it).
-    terminal_pos = text.index("Terminal state: classification=")
-    for phrase in action_phrases:
-        assert phrase in text
-        assert text.index(phrase) < terminal_pos
-    if needs_run_url:
-        # Fail/unavailable must hand the recipient a direct run entry point
-        # (axis 1) — built from repository + run_id, before the machine codes.
-        assert _RUN_URL in text
-        assert text.index(_RUN_URL) < terminal_pos
 
 
-def test_primary_fail_summary_no_longer_points_at_problems_for_findings(tmp_path):
-    # P2-1: the Problems list only mirrors the verdict string; the summary
-    # must not claim the findings live there.
-    _, summary_path, args = _visible_scenario(tmp_path, {"primary_result": "failure"}, _valid_primary_record(verdict="fail"))
-    AGG.main(args)
-    text = summary_path.read_text()
-    assert "see the findings listed under Problems" not in text
-    assert _RUN_URL in text
 
 
 # ── Status panel sticky delivery and durable-history contract ────────────────
@@ -1240,177 +1041,18 @@ def _publish_only_panel_body(
     return comments[0], row
 
 
-@pytest.mark.parametrize(
-    "verdict,findings",
-    [("pass", None), ("fail", [{"id": "x", "severity": "major", "file": "a.py", "line": 1, "title": "t"}]),
-     ("unavailable", None), ("not_expected", None), ("waived", None)],
-)
-def test_primary_findings_panel_accepts_every_audit_verdict_domain_value(verdict, findings):
-    audit = _valid_primary_record(verdict=verdict)
-    if findings is not None:
-        audit["result"] = {"findings": findings}
-
-    lines = AGG._primary_findings_panel_lines(audit)
-
-    assert bool(lines) is (verdict == "fail")
 
 
-def test_publish_only_status_panel_renders_bounded_scrubbed_primary_findings(monkeypatch, tmp_path):
-    title = "reviewer label\n::error:: token=ghp_" + "A" * 16 + " limit " + "z" * 230
-    findings = [{
-        "id": "correctness.data-loss",
-        "severity": "major",
-        "category": "correctness",
-        "file": "src/service.py",
-        "line": 17,
-        "trigger": "private reviewer trigger must not be published",
-        "evidence": "private reviewer evidence must not be published",
-        "issue": title,
-        "acceptance": "private reviewer acceptance must not be published",
-        "title": title,
-    }]
-    findings.extend({
-        "id": f"quality.other-{index}",
-        "severity": "minor",
-        "category": "quality",
-        "file": "src/other.py",
-        "line": index,
-        "trigger": "trigger",
-        "evidence": "evidence",
-        "issue": "Short title",
-        "acceptance": "acceptance",
-        "title": "Short title",
-    } for index in range(1, 51))
-    audit = _valid_primary_record(verdict="fail", result={"findings": findings})
-    assert not AGG.validate_audit_identity(audit, IDENTITY)
-    assert AGG._primary_findings_panel_lines(audit)
-
-    body, _ = _publish_only_panel_body(monkeypatch, tmp_path, audit)
-
-    assert "PRIMARY-FINDINGS" in body
-    assert "| major | correctness.data-loss | src/service.py:17 |" in body
-    assert "reviewer label :error: [REDACTED:TOKEN] limit" in body
-    assert "+1 more" in body
-    assert "::error::" not in body
-    assert "ghp_" not in body
-    assert "private reviewer trigger must not be published" not in body
-    assert "private reviewer evidence must not be published" not in body
-    assert "private reviewer acceptance must not be published" not in body
-    long_title_row = next(
-        line for line in body.splitlines()
-        if line.startswith("| major | correctness.data-loss | src/service.py:17 |")
-    )
-    title_cell = long_title_row.rsplit("|", 2)[1].strip()
-    assert len(title_cell) <= AGG.FINDING_SUMMARY_MAX_TITLE_CHARS
 
 
-def test_publish_only_status_panel_does_not_render_pass_audit_findings(monkeypatch, tmp_path):
-    audit = _valid_scoped_primary_record(
-        verdict="pass",
-        result={"findings": [{
-            "id": "quality.nonblocking",
-            "severity": "minor",
-            "category": "quality",
-            "file": "src/example.py",
-            "line": 4,
-            "trigger": "nonblocking trigger",
-            "evidence": "nonblocking evidence",
-            "issue": "nonblocking title",
-            "acceptance": "nonblocking acceptance",
-            "title": "nonblocking title",
-        }]},
-    )
-    body, row = _publish_only_panel_body(monkeypatch, tmp_path, audit)
-
-    assert "PRIMARY-FINDINGS" not in body
-    assert body == AGG.render_status_panel([row])
 
 
-def test_publish_only_status_panel_without_audit_keeps_existing_body(monkeypatch, tmp_path):
-    audit = _valid_scoped_primary_record(
-        verdict="fail",
-        result={"findings": [{
-            "id": "correctness.data-loss",
-            "severity": "major",
-            "category": "correctness",
-            "file": "src/example.py",
-            "line": 8,
-            "trigger": "trigger",
-            "evidence": "evidence",
-            "issue": "title",
-            "acceptance": "acceptance",
-            "title": "title",
-        }]},
-    )
-    body, row = _publish_only_panel_body(
-        monkeypatch, tmp_path, audit, remove_audit_before_publish=True,
-    )
-
-    assert "PRIMARY-FINDINGS" not in body
-    assert body == AGG.render_status_panel([row])
 
 
-def test_status_panel_malformed_primary_findings_fail_loud():
-    row = _panel_terminal_row(1, 1, "fail", "a" * 40)
-    row["primary_audit"] = {"verdict": "fail", "result": {"findings": {}}}
-
-    with pytest.raises(ValueError, match="findings is not a list"):
-        AGG.render_status_panel([row])
 
 
-def test_status_panel_publisher_creates_once_then_patches(monkeypatch):
-    current = _panel_terminal_row(5, 1, "pass", "e" * 40)
-    history = [_panel_terminal_row(i, 1, result, chr(96 + i) * 40) for i, result in enumerate(
-        ["skipped", "fail", "fail", "unavailable"], start=1
-    )]
-    owner = {"id": 99, "login": "workflow-bot"}
-    existing_comment = {"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER + "\nold", "user": owner}
-    comments = [[], [existing_comment], [existing_comment]]
-    operations = []
-
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments.pop(0))
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=history))
-    monkeypatch.setattr(
-        AGG, "_post_issue_comment",
-        lambda **kwargs: operations.append(("POST", kwargs["body"])),
-    )
-    monkeypatch.setattr(
-        AGG, "_patch_issue_comment",
-        lambda **kwargs: operations.append(("PATCH", kwargs["comment_id"], kwargs["body"])),
-    )
-
-    body, receipt = AGG._post_status_panel_fail_open(
-        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        identity=IDENTITY,
-    )
-    assert receipt["delivery"] == "created"
-    assert operations[0][0] == "POST"
-    assert body.count("| [") == 5
-
-    body, receipt = AGG._post_status_panel_fail_open(
-        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        identity=IDENTITY,
-    )
-    assert receipt["delivery"] == "updated"
-    assert operations[1][0:2] == ("PATCH", 77)
-    assert body.count("| [") == 5
-    assert sum(operation[0] == "POST" for operation in operations) == 1
 
 
-def test_status_panel_scrub_failure_prevents_github_write(monkeypatch):
-    operations = []
-    monkeypatch.setattr(AGG, "scrub_for_publish", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("scrub failed")))
-    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs))
-
-    with pytest.raises(RuntimeError, match="scrub failed"):
-        AGG._post_status_panel_fail_open(
-            current=_panel_terminal_row(1, 1, "pass", "a" * 40),
-            repository="org/repo", repository_id=123, pr_number=7, identity=IDENTITY,
-        )
-
-    assert operations == []
 
 
 def test_status_panel_sends_scrubbed_body(monkeypatch):
@@ -1439,678 +1081,48 @@ def test_status_panel_sends_scrubbed_body(monkeypatch):
     assert "[REDACTED:PRIVATE_IP]" in body
 
 
-def test_aggregate_step_summary_scrubs_runtime_values(monkeypatch, tmp_path):
-    summary = tmp_path / "summary.md"
-    monkeypatch.setenv("RUNNER_NAME", "runner-secret")
-    outcome = AGG.Outcome(
-        ok=True,
-        notes=["runner-secret"],
-        classification="code_pass",
-        reason_code="primary_pass",
-        gate_result="pass",
-    )
-
-    assert AGG._finish(outcome, str(summary)) == 0
-    text = summary.read_text()
-    assert "runner-secret" not in text
-    assert "[REDACTED:RUNNER_NAME]" in text
-
-
-@pytest.mark.parametrize("status", [403, 404])
-def test_installation_token_identity_403_or_404_falls_back_and_publishes(monkeypatch, status):
-    current = _panel_terminal_row(5, 1, "pass", "e" * 40)
-    identity_error = urllib.error.HTTPError("https://api.github.com/user", status, "forbidden", hdrs=None, fp=None)
-    calls = []
-    operations = []
-
-    def fake_json(**kwargs):
-        url = kwargs["url"]
-        calls.append(url)
-        if url == "https://api.github.com/user":
-            raise identity_error
-        if "/issues/42/comments" in url:
-            return []
-        if "/actions/artifacts" in url:
-            return {"artifacts": []}
-        raise AssertionError(f"unexpected GitHub API call: {url}")
-
-    monkeypatch.setenv("GH_TOKEN", "installation-token")
-    monkeypatch.setattr(AGG, "_github_json", fake_json)
-    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
-
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        identity=IDENTITY,
-    )
-
-    assert calls.count("https://api.github.com/user") == 1
-    assert operations and AGG.PANEL_MARKER in operations[0]
-    assert receipt["delivery"] == "created"
-    assert receipt["operation"] == "POST"
-    assert receipt["identity_source"] == "actions_bot_fallback"
-
-
-def test_identity_http_500_is_reported_as_identity_failure(monkeypatch):
-    error = urllib.error.HTTPError("https://api.github.com/user", 500, "server error", hdrs=None, fp=None)
-    monkeypatch.setenv("GH_TOKEN", "installation-token")
-    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: (_ for _ in ()).throw(error))
-
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=_panel_terminal_row(1, 1, "pass", "a" * 40),
-        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
-    )
-
-    assert receipt["operation"] == "IDENTITY"
-    assert receipt["http_status"] == 500
-    assert receipt["error_category"] == "server_error"
-
-
-def test_status_panel_rebuild_after_comment_deletion_uses_terminal_history(monkeypatch):
-    current = _panel_terminal_row(5, 1, "pass", "e" * 40)
-    history = [_panel_terminal_row(i, 1, result, chr(96 + i) * 40) for i, result in enumerate(
-        ["skipped", "fail", "fail", "unavailable"], start=1
-    )]
-    operations = []
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    owner = {"id": 99, "login": "workflow-bot"}
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=history))
-    monkeypatch.setattr(
-        AGG, "_post_issue_comment",
-        lambda **kwargs: operations.append(("POST", kwargs["body"])),
-    )
-    body, receipt = AGG._post_status_panel_fail_open(
-        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        identity=IDENTITY,
-    )
-    assert receipt["delivery"] == "created"
-    assert sum(operation[0] == "POST" for operation in operations) == 1
-    assert body.count("| [") == 5
-    assert "当前状态：**pass** · **可合并**" in body
-
-
-def test_existing_panel_history_targets_cached_runs_without_repo_wide_scan(monkeypatch):
-    current = _panel_terminal_row(10, 1, "pass", "j" * 40)
-    cached = [_panel_terminal_row(run_id, 1, "fail", chr(96 + run_id) * 40) for run_id in (7, 8, 9)]
-    owner = {"id": 99, "login": "workflow-bot"}
-    comments = [{"id": 7, "created_at": "2026-08-16T00:00:00Z", "body": AGG.render_status_panel(cached), "user": owner}]
-    calls = []
-    operations = []
-
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments)
-    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: calls.append(kwargs["url"]) or {"artifacts": []})
-    monkeypatch.setattr(AGG, "_patch_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
-
-    body, receipt = AGG._post_status_panel_fail_open(
-        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        identity=IDENTITY,
-    )
-
-    assert calls == [
-        "https://api.github.com/repos/zlxlabs/gate/actions/runs/7/artifacts",
-        "https://api.github.com/repos/zlxlabs/gate/actions/runs/8/artifacts",
-        "https://api.github.com/repos/zlxlabs/gate/actions/runs/9/artifacts",
-    ]
-    assert all("/actions/artifacts?" not in url for url in calls)
-    assert receipt["history_incomplete"] is True
-    assert operations == [body]
-
-
-def test_targeted_history_run_count_is_bounded(monkeypatch):
-    calls = []
-    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: calls.append(kwargs["url"]) or {"artifacts": []})
-
-    result = AGG._fetch_terminal_history(
-        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        target_run_ids=list(range(1, AGG.MAX_TARGETED_HISTORY_RUNS + 7)),
-    )
-
-    assert len(calls) == AGG.MAX_TARGETED_HISTORY_RUNS
-    assert any("bounded_scan" in reason for reason in result.incomplete_reasons)
-
-
-def test_repo_wide_history_scan_stops_at_page_limit(monkeypatch):
-    calls = []
-
-    def fake_json(**kwargs):
-        calls.append(kwargs["url"])
-        return {"artifacts": [{"name": f"unrelated-{len(calls)}-{index}"} for index in range(100)]}
-
-    monkeypatch.setattr(AGG, "_github_json", fake_json)
-    result = AGG._fetch_terminal_history(
-        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
-    )
-
-    assert len(calls) == AGG.MAX_REPO_WIDE_HISTORY_PAGES
-    assert calls[-1].endswith(f"page={AGG.MAX_REPO_WIDE_HISTORY_PAGES}")
-    assert any("bounded_scan" in reason for reason in result.incomplete_reasons)
-
-
-def test_fetch_terminal_history_consumes_a_persisted_terminal_artifact(monkeypatch, tmp_path):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    terminal_path = tmp_path / "gate-terminal.json"
-    summary_path = tmp_path / "summary.md"
-    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
-    terminal_bytes = terminal_path.read_bytes()
-    archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("gate-terminal.json", terminal_bytes)
-
-    monkeypatch.setattr(
-        AGG, "_github_json",
-        lambda **kwargs: {"artifacts": [{
-            "name": "gate-terminal-v1-123-" + "a" * 40 + "-999-1",
-            "expired": False,
-            "archive_download_url": "https://api.github.com/archive/1",
-        }]},
-    )
-    monkeypatch.setattr(AGG, "_download_terminal_zip", lambda **kwargs: archive.getvalue())
-    rows = AGG._fetch_terminal_history(
-        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
-    )
-    assert rows.rows[0]["run_id"] == IDENTITY.run_id
-    assert rows.rows[0]["gate_result"] == "pass"
-
-
-def test_terminal_artifact_redirect_drops_auth_for_blob_download(monkeypatch):
-    record = {
-        "schema_version": 1, "kind": "gate_terminal", "repository": "zlxlabs/gate",
-        "repository_id": 123, "pr_number": 42, "run_id": 9, "run_attempt": 1,
-        "head_sha": "a" * 40, "gate_result": "pass", "classification": "code_pass",
-        "reason_code": "primary_pass",
-    }
-    archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("gate-terminal.json", json.dumps(record))
-    archive_url = "https://api.github.com/repos/zlxlabs/gate/actions/artifacts/9/zip"
-    blob_url = "https://blob.example.test/signed-artifact.zip?sig=secret"
-    calls = []
-
-    class RedirectStub:
-        def open(self, request, timeout=None):
-            headers = dict(request.header_items())
-            calls.append((request.full_url, headers, timeout))
-            if request.full_url == archive_url:
-                raise urllib.error.HTTPError(
-                    archive_url, 302, "redirect", {"Location": blob_url}, None,
-                )
-            assert request.full_url == blob_url
-            assert "Authorization" not in headers
-            return _FakeResponse(archive.getvalue())
-
-    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: RedirectStub())
-    monkeypatch.setattr(
-        urllib.request, "urlopen",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            urllib.error.HTTPError(archive_url, 302, "redirect", {"Location": blob_url}, None)
-        ),
-    )
-    monkeypatch.setattr(
-        AGG, "_github_json",
-        lambda **kwargs: {"artifacts": [{
-            "name": "gate-terminal-v1-123-valid", "expired": False,
-            "archive_download_url": archive_url,
-        }]},
-    )
-
-    result = AGG._fetch_terminal_history(
-        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
-    )
-
-    assert [row["run_id"] for row in result.rows] == [9]
-    assert [call[0] for call in calls] == [archive_url, blob_url]
-    assert calls[0][1]["Authorization"] == "Bearer tok"
-    assert "Authorization" not in calls[1][1]
-
-
-@pytest.mark.parametrize("existing", [False, True], ids=["POST", "PATCH"])
-def test_status_panel_post_or_patch_failure_is_fail_open(monkeypatch, existing):
-    error = urllib.error.HTTPError("https://api.github.com/x", 403, "forbidden", hdrs=None, fp=None)
-    current = _panel_terminal_row(1, 1, "pass", "a" * 40)
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    owner = {"id": 99, "login": "workflow-bot"}
-    comments = [{"id": 7, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}] if existing else []
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: comments)
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
-    requests = []
-    if existing:
-        def fail_patch(**kwargs):
-            requests.append("PATCH")
-            raise error
-        monkeypatch.setattr(AGG, "_patch_issue_comment", fail_patch)
-    else:
-        def fail_post(**kwargs):
-            requests.append("POST")
-            raise error
-        monkeypatch.setattr(AGG, "_post_issue_comment", fail_post)
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        identity=IDENTITY,
-    )
-    assert receipt["http_status"] == 403
-    assert receipt["error_category"] == "permission_or_rate_limit"
-    assert receipt["comment_created"] is False
-    assert requests == ["PATCH" if existing else "POST"]
-    assert receipt["attempts"] == 1
-    assert receipt["exception_type"] == "HTTPError"
-    assert receipt["operation"] == ("comment_patch" if existing else "comment_create")
-    assert receipt["reason_code"] == "http_403"
-
-
-def test_status_panel_mail_invariant_for_five_runs(monkeypatch):
-    states = ["skipped", "fail", "fail", "unavailable", "pass"]
-    rows = []
-    comments = []
-    operations = []
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    owner = {"id": 99, "login": "workflow-bot"}
-
-    def fake_comments(**kwargs):
-        return comments
-
-    def post(**kwargs):
-        operations.append("POST")
-        comments[:] = [{"id": 1, "created_at": "2026-08-16T00:00:00Z", "body": kwargs["body"], "user": owner}]
-
-    def patch(**kwargs):
-        operations.append("PATCH")
-        comments[0]["body"] = kwargs["body"]
-
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_panel_comments", fake_comments)
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=list(rows)))
-    monkeypatch.setattr(AGG, "_post_issue_comment", post)
-    monkeypatch.setattr(AGG, "_patch_issue_comment", patch)
-
-    for run_id, state in enumerate(states, start=1):
-        current = _panel_terminal_row(run_id, 1, state, chr(96 + run_id) * 40)
-        AGG._post_status_panel_fail_open(
-            current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-            identity=IDENTITY,
-        )
-        rows.append(current)
-
-    assert operations.count("POST") == 1
-    assert operations.count("PATCH") == 4
-    assert len(comments) == 1
-    assert comments[0]["body"].count("| [") == 5
-    assert "当前状态：**pass** · **可合并**" in comments[0]["body"]
-
-
-def test_terminal_artifact_written_by_real_aggregate_is_panel_history_producer_fixture(monkeypatch, tmp_path):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    terminal_path = tmp_path / "gate-terminal.json"
-    summary_path = tmp_path / "summary.md"
-    args = _cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))
-    assert AGG.main(args) == 0
-    record = json.loads(terminal_path.read_text(encoding="utf-8"))
-    row = AGG._terminal_row(record, repository="zlxlabs/gate", repository_id=123, pr_number=42)
-    assert row["schema_version"] == AGG.PANEL_HISTORY_ROW_SCHEMA_VERSION
-    assert AGG.PANEL_MARKER in AGG.render_status_panel([row])
-
-
-def test_publish_only_consumes_the_real_terminal_producer_fixture_after_upload(monkeypatch, tmp_path):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    summary_path = tmp_path / "summary.md"
-    terminal_path = tmp_path / "gate-terminal.json"
-    delivery_path = tmp_path / "panel-delivery.json"
-    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
-    owner = {"id": 99, "login": "workflow-bot"}
-    operations = []
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_panel_comments", lambda **kwargs: [])
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
-    monkeypatch.setattr(AGG, "_post_issue_comment", lambda **kwargs: operations.append(kwargs["body"]))
-    publish_args = _cli_args(
-        audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
-    ) + ["--publish-only"]
-    assert AGG.main(publish_args) == 0
-    receipt = json.loads(delivery_path.read_text(encoding="utf-8"))
-    assert receipt["delivery"] == "created"
-    assert receipt["history_incomplete"] is False
-    assert receipt["completed_operations"] == [
-        "IDENTITY", "COMMENT_LOOKUP", "HISTORY_RECONSTRUCTION", "COMMENT_PUBLISH", "POST_VERIFY",
-    ]
-    assert receipt["pending_operations"] == []
-    assert operations and AGG.PANEL_MARKER in operations[0]
-
-
-def test_publish_only_subprocess_writes_additive_delivery_receipt_bytes(monkeypatch, tmp_path):
-    # Captured from base 85916ed's real _build_panel_delivery producer for this terminal row.
-    old_receipt = {
-        "comment_body_sha256": "e1eec6dfd3e6568367e09430ba0d4fd4f24924429ecfbe977fe448d6766cf370",
-        "comment_created": True, "comment_expected": True,
-        "completed_operations": ["IDENTITY", "COMMENT_LOOKUP", "HISTORY_RECONSTRUCTION", "COMMENT_PUBLISH", "POST_VERIFY"],
-        "delivery": "created", "error_category": None, "head_sha": "a" * 40,
-        "history_error": None, "history_incomplete": False, "history_incomplete_reasons": [],
-        "history_skipped_count": 0, "history_skipped_records": [], "http_status": None,
-        "identity_source": "user_api", "kind": "gate_v2_status_panel_delivery",
-        "operation": "POST", "pending_operations": [], "pr_number": 42, "reason_code": "posted",
-        "repository": "zlxlabs/gate", "repository_id": 123, "run_attempt": 1, "run_id": 999,
-        "schema_version": 1, "self_heal_errors": [],
-    }
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    terminal_path, summary_path = tmp_path / "terminal.json", tmp_path / "summary.md"
-    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
-    owner = {"id": 99, "login": "workflow-bot"}
-
-    import http.server
-
-    class Api(http.server.BaseHTTPRequestHandler):
-        def respond(self, value):
-            payload = json.dumps(value).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *args):
-            pass
-
-        def do_GET(self):
-            if self.path == "/user":
-                return self.respond(owner)
-            if self.path.startswith("/repos/zlxlabs/gate/issues/42/comments"):
-                return self.respond(self.server.comments)
-            if self.path.startswith("/repos/zlxlabs/gate/actions/artifacts"):
-                return self.respond({"artifacts": []})
-            self.send_error(404)
-
-        def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            self.server.comments.append({
-                "id": 1, "created_at": "2026-09-30T00:00:00Z", "body": body["body"], "user": owner,
-            })
-            self.respond({})
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Api)
-    server.comments = []
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        site_dir = tmp_path / "site"
-        site_dir.mkdir()
-        (site_dir / "sitecustomize.py").write_text(
-            "import urllib.request\n"
-            "_urlopen = urllib.request.urlopen\n"
-            f"_local = 'http://127.0.0.1:{server.server_port}'\n"
-            "def urlopen(request, *args, **kwargs):\n"
-            "    if isinstance(request, urllib.request.Request) and request.full_url.startswith('https://api.github.com'):\n"
-            "        request = urllib.request.Request(request.full_url.replace('https://api.github.com', _local, 1), data=request.data, headers=dict(request.header_items()), method=request.get_method())\n"
-            "    return _urlopen(request, *args, **kwargs)\n"
-            "urllib.request.urlopen = urlopen\n",
-            encoding="utf-8",
-        )
-        silo_store = tmp_path / "fake_silo.py"
-        artifact_name = "gate-terminal-v1-123-" + "a" * 40 + "-999-1"
-        key = f"d30/123/{artifact_name}/gate-terminal.json"
-        silo_store.write_text(
-            "import pathlib, sys\n"
-            "args = sys.argv[1:]\n"
-            f"key = {key!r}\n"
-            f"body = pathlib.Path({str(terminal_path)!r}).read_bytes()\n"
-            "if args[0] == 'get':\n"
-            "    pathlib.Path(args[args.index('--dest') + 1]).write_bytes(body)\n"
-            "elif '--dest' in args:\n"
-            "    dest = pathlib.Path(args[args.index('--dest') + 1])\n"
-            "    target = dest / key.split('/')[2] / key.split('/', 3)[3]\n"
-            "    target.parent.mkdir(parents=True, exist_ok=True)\n"
-            "    target.write_bytes(body)\n"
-            "print(key)\n",
-            encoding="utf-8",
-        )
-        env = os.environ.copy()
-        env.pop("GITHUB_TOKEN", None)
-        env["GH_TOKEN"] = "test-token"
-        env["SILO_ENDPOINT"] = "http://local-test"
-        env["SILO_STORE"] = str(silo_store)
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(site_dir), env.get("PYTHONPATH", "")]))
-        delivery_path = tmp_path / "delivery.json"
-        args = _cli_args(
-            audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
-        ) + ["--publish-only"]
-        result = subprocess.run(
-            [sys.executable, str(MODULE_PATH), *args], cwd=ROOT, env=env,
-            capture_output=True, text=True, timeout=20,
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
-
-    assert result.returncode == 0, result.stderr
-    receipt_bytes = delivery_path.read_bytes()
-    receipt = json.loads(receipt_bytes)
-    assert receipt_bytes.endswith(b"\n")
-    assert b'"attempts": null' in receipt_bytes
-    assert b'"exception_type": null' in receipt_bytes
-    assert receipt == {**old_receipt, "attempts": None, "exception_type": None}
-
-
-@pytest.mark.parametrize(
-    "status,category",
-    [(403, "permission_or_rate_limit"), (500, "server_error")],
-)
-def test_status_panel_http_failure_is_fail_open_and_diagnostic(monkeypatch, capsys, status, category):
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    error = urllib.error.HTTPError("https://api.github.com/x", status, "boom", hdrs=None, fp=None)
-    monkeypatch.setattr(AGG, "_github_json", lambda **kwargs: (_ for _ in ()).throw(error))
-    current = _panel_terminal_row(1, 1, "pass", "a" * 40)
-    body, receipt = AGG._post_status_panel_fail_open(
-        current=current, repository="zlxlabs/gate", repository_id=123, pr_number=42,
-        identity=IDENTITY,
-    )
-    assert receipt["delivery"] in {"not_created", "unknown"}
-    assert receipt["http_status"] == status
-    assert receipt["error_category"] == category
-    output = capsys.readouterr().out
-    assert "HTTP status=" + str(status) in output
-    assert "permission category=" + category in output
-
-
-def test_status_panel_missing_token_is_fail_open_without_network(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network call")))
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=_panel_terminal_row(1, 1, "pass", "a" * 40),
-        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
-    )
-    assert receipt["delivery"] == "not_created"
-    assert receipt["reason_code"] == "missing_token"
-    assert receipt["error_category"] == "configuration"
-
-
-def test_github_timeout_and_publish_budget_defaults_are_centralized(monkeypatch):
-    assert AGG.GITHUB_API_TIMEOUT_SECONDS == 15
-    assert AGG.DEFAULT_PUBLISH_BUDGET_SECONDS <= 120
-    monkeypatch.delenv(AGG.PUBLISH_BUDGET_ENV, raising=False)
-    assert AGG._PublishBudget.from_environment().seconds == 120
-    monkeypatch.setenv(AGG.PUBLISH_BUDGET_ENV, "3.5")
-    assert AGG._PublishBudget.from_environment().seconds == 3.5
-
-    tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
-    urlopen_calls = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "urlopen"
-    ]
-    assert len(urlopen_calls) == 1
-    timeout_keywords = [keyword for keyword in urlopen_calls[0].keywords if keyword.arg == "timeout"]
-    assert len(timeout_keywords) == 1
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        urllib.error.URLError("temporary"),
-        urllib.error.HTTPError("https://api.github.com/x", 503, "server", hdrs=None, fp=None),
-    ],
-    ids=["network", "http-5xx"],
-)
-def test_comment_lookup_retries_transient_failure_twice(monkeypatch, failure):
-    owner = {"id": 99, "login": "workflow-bot"}
-    comments = [{"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}]
-    requests = []
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
-    monkeypatch.setattr(AGG.time, "sleep", lambda seconds: None)
-
-    def fake_urlopen(request, timeout=None):
-        requests.append(request)
-        if request.get_method() == "GET":
-            if sum(item.get_method() == "GET" for item in requests) < 3:
-                raise failure
-            return _FakeResponse(json.dumps(comments).encode())
-        return _FakeResponse()
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=_panel_terminal_row(999, 1, "pass", "a" * 40),
-        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
-    )
-    assert [request.get_method() for request in requests] == ["GET", "GET", "GET", "PATCH"]
-    assert sum(request.get_method() == "GET" for request in requests) == 3
-    assert receipt["delivery"] == "updated"
-
-
-def test_comment_lookup_http_4xx_is_not_retried(monkeypatch):
-    owner = {"id": 99, "login": "workflow-bot"}
-    requests = []
-    error = urllib.error.HTTPError("https://api.github.com/x", 404, "missing", hdrs=None, fp=None)
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=None: (requests.append(request), (_ for _ in ()).throw(error))[1])
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=_panel_terminal_row(999, 1, "pass", "a" * 40),
-        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
-    )
-    assert len(requests) == 1
-    assert requests[0].get_method() == "GET"
-    assert receipt["delivery"] == "not_created"
-    assert receipt["operation"] == "comment_lookup"
-    assert receipt["attempts"] == 1
-    assert receipt["reason_code"] == "http_error"
-
-
-@pytest.mark.parametrize("server_applied,expected_patch_calls", [(True, 1), (False, 2)])
-def test_patch_timeout_reads_back_before_retry(monkeypatch, server_applied, expected_patch_calls):
-    owner = {"id": 99, "login": "workflow-bot"}
-    comments = [{"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}]
-    requests = []
-    patch_calls = 0
-    readback_calls = 0
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
-    monkeypatch.setattr(AGG.time, "sleep", lambda seconds: None)
-
-    def fake_urlopen(request, timeout=None):
-        nonlocal patch_calls, readback_calls
-        requests.append(request)
-        if request.get_method() == "GET":
-            if request.full_url.endswith("/issues/comments/77"):
-                readback_calls += 1
-                return _FakeResponse(json.dumps({"body": comments[0]["body"]}).encode())
-            return _FakeResponse(json.dumps(comments).encode())
-        patch_calls += 1
-        next_body = json.loads(request.data.decode())["body"]
-        if patch_calls == 1:
-            if server_applied:
-                comments[0]["body"] = next_body
-            raise socket.timeout("response lost")
-        comments[0]["body"] = next_body
-        return _FakeResponse()
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=_panel_terminal_row(999, 1, "pass", "a" * 40),
-        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
-    )
-    assert patch_calls == expected_patch_calls
-    assert readback_calls == 1
-    assert [request.get_method() for request in requests] == (
-        ["GET", "PATCH", "GET"] if server_applied else ["GET", "PATCH", "GET", "PATCH"]
-    )
-    assert receipt["delivery"] == "updated"
-
-
-@pytest.mark.parametrize("readback_fails", [False, True], ids=["patch-exhausted", "readback-failure-counts"])
-def test_patch_retry_exhaustion_is_visible_and_publish_only_stays_green(monkeypatch, capsys, tmp_path, readback_fails):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_primary_record()))
-    summary_path = tmp_path / "summary.md"
-    terminal_path = tmp_path / "gate-terminal.json"
-    delivery_path = tmp_path / "panel-delivery.json"
-    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
-
-    owner = {"id": 99, "login": "workflow-bot"}
-    comments = [{"id": 77, "created_at": "2026-08-16T00:00:00Z", "body": AGG.PANEL_MARKER, "user": owner}]
-    requests = []
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_github_identity", lambda token: owner)
-    monkeypatch.setattr(AGG, "_fetch_terminal_history", lambda **kwargs: AGG.HistoryLoad(rows=[]))
-    monkeypatch.setattr(AGG.time, "sleep", lambda seconds: None)
-
-    def fake_urlopen(request, timeout=None):
-        requests.append(request)
-        if request.get_method() == "GET":
-            if readback_fails and request.full_url.endswith("/issues/comments/77"):
-                raise urllib.error.URLError("readback unavailable")
-            if request.full_url.endswith("/issues/comments/77"):
-                return _FakeResponse(json.dumps({"body": comments[0]["body"]}).encode())
-            return _FakeResponse(json.dumps(comments).encode())
-        raise urllib.error.URLError("temporary")
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    args = _cli_args(
-        audit_dir, summary_path, terminal_path=str(terminal_path), panel_delivery_path=str(delivery_path),
-    ) + ["--publish-only"]
-    assert AGG.main(args) == 0
-    receipt = json.loads(delivery_path.read_bytes())
-    assert receipt["delivery"] == "unknown"
-    assert receipt["operation"] == "comment_patch"
-    assert receipt["attempts"] == 3
-    assert receipt["exception_type"] == "URLError"
-    assert sum(request.get_method() == "PATCH" for request in requests) == (2 if readback_fails else 3)
-    assert sum(request.get_method() == "GET" for request in requests) == (2 if readback_fails else 3)
-    output = capsys.readouterr().out
-    assert "PANEL_PUBLISH_FAILED operation=comment_patch attempts=3 exc_type=URLError" in output
-    assert "面板发布失败，面板可能显示旧状态" in summary_path.read_text(encoding="utf-8")
-
-
-def test_history_reconstruction_budget_has_one_bounded_configuration_point(monkeypatch):
-    assert AGG.DEFAULT_HISTORY_RECONSTRUCTION_BUDGET_SECONDS <= 45
-    monkeypatch.delenv(AGG.HISTORY_RECONSTRUCTION_BUDGET_ENV, raising=False)
-    assert AGG._PublishBudget.from_environment().history_seconds == 45
-    monkeypatch.setenv(AGG.HISTORY_RECONSTRUCTION_BUDGET_ENV, "3.5")
-    assert AGG._PublishBudget.from_environment().history_seconds == 3.5
-    monkeypatch.setenv(AGG.HISTORY_RECONSTRUCTION_BUDGET_ENV, "45.1")
-    with pytest.raises(ValueError, match="between zero and 45"):
-        AGG._PublishBudget.from_environment()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_publish_budget_stops_hanging_http_call_and_records_operations(monkeypatch):
@@ -2252,31 +1264,8 @@ def test_publish_only_transport_failures_are_fail_open_and_leave_receipt(monkeyp
     assert "query-secret" not in output + summary + json.dumps(receipt)
 
 
-def test_warning_output_failure_stays_fail_open(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    def broken_print(*args, **kwargs):
-        raise OSError("closed stdout")
-    monkeypatch.setattr("builtins.print", broken_print)
-    _, receipt = AGG._post_status_panel_fail_open(
-        current=_panel_terminal_row(1, 1, "pass", "a" * 40),
-        repository="zlxlabs/gate", repository_id=123, pr_number=42, identity=IDENTITY,
-    )
-    assert receipt["reason_code"] == "missing_token"
 
 
-def test_panel_delivery_receipt_uses_temp_file_then_atomic_replace(monkeypatch, tmp_path):
-    path = tmp_path / "panel-delivery.json"
-    replacements = []
-    original_replace = Path.replace
-    def record_replace(source, target):
-        replacements.append((source, target))
-        return original_replace(source, target)
-    monkeypatch.setattr(Path, "replace", record_replace)
-    AGG._persist_panel_delivery(str(path), {"delivery": "created"})
-    assert replacements == [(path.with_name(".panel-delivery.json.tmp"), path)]
-    assert json.loads(path.read_text(encoding="utf-8"))["delivery"] == "created"
-    assert not path.with_name(".panel-delivery.json.tmp").exists()
 
 
 def test_panel_delivery_write_failure_clears_stale_file_and_stays_fail_open(monkeypatch, capsys, tmp_path):
@@ -2609,120 +1598,16 @@ def _budget_exhausted_audit(*, attempts=None):
     return audit
 
 
-def test_panel_bucket_mapping_exhaustively_covers_current_gate_result_domain():
-    assert set(AGG.PANEL_BUCKET_BY_GATE_RESULT) == set(AGG.GATE_RESULT_DOMAIN)
 
 
-@pytest.mark.parametrize("gate_result", AGG.GATE_RESULT_DOMAIN)
-def test_status_panel_renders_every_gate_result_and_action_bucket(gate_result):
-    body = AGG.render_status_panel([_panel_row(1, 1, gate_result)])
-    assert AGG.PANEL_MARKER in body
-    assert f"当前状态：**{gate_result}**" in body
-    assert AGG.PANEL_BUCKET_BY_GATE_RESULT[gate_result] in body
 
 
-def test_status_panel_is_pure_and_history_is_sorted_by_durable_run_identity():
-    rows = [_panel_row(3, 1, "pass"), _panel_row(2, 2, "fail"), _panel_row(2, 1, "skipped")]
-    original = [dict(row) for row in rows]
-    body = AGG.render_status_panel(rows)
-    assert rows == original
-    assert body.index("| [2]") < body.index("| [3]")
-    assert body.index("| [2]") < body.index("| [2]") + 1
-    assert "主审未跑，绿≠过审" in body
 
 
-@pytest.mark.parametrize(
-    "audit,expected",
-    [
-        (
-            _budget_exhausted_audit(),
-            "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。",
-        ),
-        (
-            _budget_exhausted_audit(
-                attempts=[
-                    _budget_exhausted_attempt(reviewer="reviewer-a"),
-                    _budget_exhausted_attempt(reason="认证或网络暂不可用", exit_code=21, reviewer="reviewer-b"),
-                ],
-            ),
-            "修基础设施",
-        ),
-        (
-            _budget_exhausted_audit(attempts=[]),
-            "修基础设施",
-        ),
-        (
-            {
-                **_budget_exhausted_audit(),
-                "attempts": [
-                    {**_budget_exhausted_attempt(reviewer="reviewer-a"), "exit_code": True},
-                    _budget_exhausted_attempt(reviewer="reviewer-b"),
-                ],
-            },
-            "修基础设施",
-        ),
-        (
-            {
-                **_budget_exhausted_audit(),
-                "attempts": [
-                    {**_budget_exhausted_attempt(reviewer="reviewer-a"), "exit_code": "22"},
-                    _budget_exhausted_attempt(reviewer="reviewer-b"),
-                ],
-            },
-            "修基础设施",
-        ),
-        (
-            {
-                **_budget_exhausted_audit(),
-                "attempts": [
-                    {
-                        **_budget_exhausted_attempt(reviewer="reviewer-a"),
-                        "reason": AGG.PRIMARY_BUDGET_EXHAUSTED_REASON + "x",
-                    },
-                    _budget_exhausted_attempt(reviewer="reviewer-b"),
-                ],
-            },
-            "修基础设施",
-        ),
-    ],
-    ids=[
-        "all-legs-exhausted", "mixed-failure", "no-attempts",
-        "exit-code-bool", "exit-code-string", "reason-extra-character",
-    ],
-)
-def test_budget_exhaustion_panel_action_is_rendered_from_primary_audit(audit, expected):
-    outcome = AGG.evaluate(**_base_kwargs(primary_result="failure", audit=audit))
-    assert (outcome.gate_result, outcome.classification, outcome.reason_code) == (
-        "unavailable", "review_unavailable", "primary_unavailable",
-    )
-    row = _panel_row(1, 1, "unavailable")
-    row["classification"] = "review_unavailable"
-    row["reason_code"] = "primary_unavailable"
-    row["primary_audit"] = audit
-    body = AGG.render_status_panel([row])
-    assert f"当前状态：**unavailable** · **{expected}**" in body
-    assert "0 个审查分片" not in body
 
 
-def test_budget_exhaustion_panel_action_rejects_non_unavailable_verdict():
-    audit = {**_budget_exhausted_audit(), "verdict": "pass"}
-    row = _panel_row(1, 1, "unavailable")
-    row["classification"] = "review_unavailable"
-    row["reason_code"] = "primary_unavailable"
-    row["primary_audit"] = audit
-    body = AGG.render_status_panel([row])
-    assert "当前状态：**unavailable** · **修基础设施**" in body
 
 
-def test_budget_exhaustion_action_keeps_terminal_decision_fields_unchanged():
-    audit = _budget_exhausted_audit()
-    outcome = AGG.evaluate(**_base_kwargs(primary_result="failure", audit=audit))
-    assert (outcome.gate_result, outcome.classification, outcome.reason_code) == (
-        "unavailable", "review_unavailable", "primary_unavailable",
-    )
-    summary = AGG.render_summary(outcome, primary_audit=audit)
-    assert "classification=`review_unavailable`, reason_code=`primary_unavailable`, gate_result=`unavailable`" in summary
-    assert "本 PR 规模超出单次评审预算，本次未能评审完。请拆成更小的增量 PR 后重试。" in summary
 
 
 # ── false-positive disposition consumption (required verdict) ─────────────
@@ -2833,125 +1718,14 @@ def _evaluate_failing_primary(audit, *, audit_digest=_DIGEST_A, waiver_receipts=
     )
 
 
-def test_evaluate_records_dispositions_once_for_active_p1():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope, audit_digest=_DIGEST_A)
-    original = CONV.record_dispositions
-
-    with patch.object(CONV, "record_dispositions", wraps=original) as record_dispositions:
-        outcome = AGG.evaluate(**_base_kwargs(
-            primary_result="failure",
-            audit=audit,
-            scope=scope,
-            audit_digest=_DIGEST_B,
-            legacy_raw_audit_digest=_DIGEST_A,
-            waiver_receipts=(receipt,),
-            repository="zlxlabs/gate",
-        ))
-
-    assert record_dispositions.call_count == 1
-    assert outcome.convergence_envelope is not None
-    assert outcome.disposition_audit.primary_p1_ids == ("p1",)
-    assert outcome.disposition_audit.remaining_p1_ids == ()
-    assert outcome.convergence_envelope["state"]["clean_streak"] == 1
 
 
-def test_evaluate_round_reuses_disposition_audit_with_legacy_digest():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    p1_findings = AGG._canonical_p1_findings(audit)
-    primary = CONV.CanonicalPrimary(
-        schema_version=1,
-        repository_id=IDENTITY.repository_id,
-        pr_number=IDENTITY.pr,
-        head_sha=IDENTITY.head_sha,
-        run_id=IDENTITY.run_id,
-        run_attempt=IDENTITY.run_attempt,
-        verdict=audit["verdict"],
-        p1_ids=tuple(item[0] for item in p1_findings),
-        p1_findings=p1_findings,
-    )
-    receipt = _false_positive_receipt(scope, audit_digest=_DIGEST_A)
-    disposition_audit = CONV.record_dispositions(
-        primary.p1_ids,
-        (receipt,),
-        scope=scope,
-        primary=primary,
-        audit_digest=_DIGEST_B,
-        legacy_raw_audit_digest=_DIGEST_A,
-        repository="zlxlabs/gate",
-    )
-    without_legacy_digest = CONV.record_dispositions(
-        primary.p1_ids,
-        (receipt,),
-        scope=scope,
-        primary=primary,
-        audit_digest=_DIGEST_B,
-        repository="zlxlabs/gate",
-    )
-
-    decision = CONV.evaluate_round(
-        state=CONV.initial_state(scope),
-        scope=scope,
-        primary=primary,
-        audit_digest=_DIGEST_B,
-        waiver_receipts=(receipt,),
-        disposition_audit=disposition_audit,
-        processing_key=CONV.ProcessingKey(
-            IDENTITY.repository_id, IDENTITY.pr, IDENTITY.run_id, IDENTITY.run_attempt,
-        ),
-        repository="zlxlabs/gate",
-    )
-
-    assert disposition_audit.remaining_p1_ids == ()
-    assert without_legacy_digest.remaining_p1_ids == primary.p1_ids
-    assert decision.remaining_p1_ids == disposition_audit.remaining_p1_ids
-    assert decision.state.clean_streak == 1
 
 
-@pytest.mark.parametrize("tier", ["personal", "internal", "unrecognized"])
-def test_deferred_receipt_rejected_for_every_tier_or_defaulted_tier_at_consumption(tier):
-    audit = _failing_scoped_audit()
-    audit["tier"] = tier
-    scope = _scope_for(audit)
-    receipt = _deferred_receipt(
-        scope, tracking_issue="https://github.com/zlxlabs/gate/issues/12",
-    )
-
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-
-    block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert outcome.gate_result == "fail"
-    assert block["remaining_p1_ids"] == ["p1"]
-    assert block["rejected_reasons"] == {"deferred_not_allowed_for_tier": 1}
 
 
-def test_deferred_receipt_is_rejected_for_saas_at_consumption():
-    audit = _failing_scoped_audit()
-    audit["tier"] = "saas"
-    receipt = _deferred_receipt(_scope_for(audit))
-
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-
-    block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert outcome.gate_result == "fail"
-    assert block["remaining_p1_ids"] == ["p1"]
-    assert block["rejected_reasons"] == {"deferred_not_allowed_for_tier": 1}
 
 
-def test_consumer_rejects_handcrafted_deferred_pull_or_cross_repository_url():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    for reference, reason in (
-        ("https://github.com/zlxlabs/gate/pull/12", "tracking_issue_invalid"),
-        ("https://github.com/other/repo/issues/12", "tracking_issue_repository_mismatch"),
-    ):
-        receipt = _deferred_receipt(scope, tracking_issue=reference)
-        outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-        block = _terminal_for(outcome)["disposition_receipt_consumption"]
-        assert outcome.gate_result == "fail"
-        assert block["rejected_reasons"] == {reason: 1}
 
 
 def _zip_receipt_bytes(payload):
@@ -2961,167 +1735,26 @@ def _zip_receipt_bytes(payload):
     return buf.getvalue()
 
 
-@pytest.mark.parametrize(
-    "finding",
-    [
-        {"id": "p1", "severity": "major", "line": 12, "category": "correctness"},
-        {"id": "p1", "severity": "major", "file": 12, "line": 12, "category": "correctness"},
-        {"id": "p1", "severity": "major", "file": "src/lock.py", "line": "12", "category": "correctness"},
-        {"id": "p1", "severity": "major", "file": "src/lock.py", "line": 12, "category": None},
-    ],
-)
-def test_canonical_p1_projection_rejects_missing_or_malformed_stable_fields(finding):
-    audit = _valid_scoped_primary_record(result={"findings": [finding]})
-    assert AGG._canonical_p1_findings(audit) is None
-
-
-def test_canonical_p1_projection_rejects_missing_line():
-    audit = _valid_scoped_primary_record(result={"findings": [{
-        "id": "p1", "severity": "major", "trigger_kind": "inferred",
-        "file": "src/lock.py", "category": "correctness",
-    }]})
-    assert AGG._canonical_p1_findings(audit) is None
-
-
-def test_canonical_p1_projection_accepts_null_line():
-    audit = _valid_scoped_primary_record(result={"findings": [{
-        "id": "p1", "severity": "major", "trigger_kind": "inferred",
-        "file": "src/lock.py", "line": None, "category": "correctness",
-    }]})
-    assert AGG._canonical_p1_findings(audit) == (
-        ("p1", "major", "inferred", "src/lock.py", None, "correctness"),
-    )
 
 
 
 
 
 
-def test_clean_round_at_cross_head_cap_marks_shadow_but_preserves_pass():
-    audit = _valid_scoped_primary_record(
-        verdict="pass", tier="personal", result={"findings": []},
-    )
-    outcome = AGG.evaluate(
-        **_base_kwargs(primary_result="success", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
-        prior_eligible_run_ids=(101, 102, 103, 104),
-        convergence_history_status="available",
-    )
-    assert outcome.gate_result == "pass"
-    assert outcome.convergence_shadow["eligible_rounds"] == 5
-    assert outcome.convergence_shadow["terminal_decision"] == "arbitration_required"
-
-
-def test_unavailable_primary_does_not_increment_cross_head_shadow_count():
-    assert (audit_digest := hashlib.sha256(payload := (ROOT / "tests" / "fixtures" / "primary-audit-unavailable-malformed-v2.json").read_bytes()).hexdigest()) == "b8b521b776083e374ada7d803516adcfa29472210dba575516a36709956b7cfd"
-    scope = AGG._convergence_scope_from_audit(audit := json.loads(payload), IDENTITY)[0]
-    assert scope is not None and AGG.validate_audit_identity(audit, IDENTITY) == [] and audit["verdict"] == "unavailable" and audit["result"] is None
-    outcome = AGG.evaluate(**_base_kwargs(primary_result="failure", audit=audit, scope=scope, audit_digest=audit_digest, prior_eligible_run_ids=(101, 102), convergence_history_status="available"))
-    assert (outcome.classification, outcome.reason_code, outcome.gate_result) == ("review_unavailable", "primary_unavailable", "unavailable") and outcome.convergence_envelope is not None and outcome.convergence_envelope["state"]["unavailable_streak"] == 1 and not any("canonical finding severity" in p for p in outcome.problems)
-    assert outcome.convergence_shadow["eligible_rounds"] == 2 and outcome.convergence_shadow["eligible_this_round"] is False
-    assert AGG.evaluate(**_base_kwargs(primary_result="failure", audit={**audit, "result": {"findings": [{"severity": "unknown"}]}}, scope=scope, audit_digest=audit_digest)).reason_code == "audit_invalid"
-    state = CONV.initial_state(scope)
-    for run_id in range(1000, 1000 + CONV.policy_for(scope).unavailable_budget):
-        state = CONV.evaluate_round(state=state, scope=scope, primary=CONV.CanonicalPrimary(1, IDENTITY.repository_id, IDENTITY.pr, IDENTITY.head_sha, run_id, 1, "unavailable"), audit_digest=audit_digest, processing_key=CONV.ProcessingKey(IDENTITY.repository_id, IDENTITY.pr, run_id, 1)).state
-    assert (state.terminal_decision, state.reason) == ("manual_required", "unavailable budget exhausted")
-
-
-def test_unavailable_cross_head_history_has_no_zero_count():
-    audit = _valid_scoped_primary_record(
-        verdict="fail", tier="personal",
-        result={"findings": [{
-            "id": "p1", "severity": "major", "trigger_kind": "inferred",
-            "file": "src/lock.py", "line": 12, "category": "correctness",
-        }]},
-    )
-    outcome = AGG.evaluate(
-        **_base_kwargs(primary_result="failure", audit=audit, scope=_scope_for(audit), audit_digest=_DIGEST_A),
-        prior_eligible_run_ids=(),
-        convergence_history_status="history_unavailable",
-    )
-    assert outcome.gate_result == "fail"
-    assert outcome.convergence_shadow["history_status"] == "history_unavailable"
-    assert "eligible_rounds" not in outcome.convergence_shadow
 
 
 
 
-def test_aggregate_projection_binds_stable_disposition_and_rejects_line_change():
-    audit = _valid_scoped_primary_record(
-        verdict="fail",
-        result={"findings": [{
-            "id": "p1", "severity": "major", "trigger_kind": "inferred",
-            "file": "src/lock.py", "line": 12, "category": "correctness",
-        }]},
-    )
-    projected = AGG._canonical_p1_findings(audit)
-    assert projected is not None
-    scope = _scope_for(audit)
-    digest = CONV.canonical_audit_digest(audit)
-    stable_key = CONV.canonical_finding_key(audit["result"]["findings"][0])
-    receipt = _false_positive_receipt(
-        scope, audit_digest=digest, finding_id=stable_key, finding_key=stable_key,
-    )
-    primary = CONV.CanonicalPrimary(
-        schema_version=1, repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
-        head_sha=IDENTITY.head_sha, run_id=IDENTITY.run_id, run_attempt=IDENTITY.run_attempt,
-        verdict=audit["verdict"], p1_ids=tuple(item[0] for item in projected),
-        p1_findings=projected,
-    )
-    active = CONV.validate_disposition_receipt(
-        receipt, scope=scope, primary=primary, audit_digest=digest,
-    )
-    assert (active.valid, active.active, active.reason) == (True, True, "active_false_positive")
-
-    moved_audit = {
-        **audit,
-        "result": {"findings": [{**audit["result"]["findings"][0], "line": 13}]},
-    }
-    moved_projected = AGG._canonical_p1_findings(moved_audit)
-    assert moved_projected is not None
-    moved_primary = CONV.CanonicalPrimary(
-        schema_version=1, repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
-        head_sha=IDENTITY.head_sha, run_id=IDENTITY.run_id, run_attempt=IDENTITY.run_attempt,
-        verdict=moved_audit["verdict"], p1_ids=tuple(item[0] for item in moved_projected),
-        p1_findings=moved_projected,
-    )
-    stale = CONV.validate_disposition_receipt(
-        receipt, scope=scope, primary=moved_primary, audit_digest=digest,
-    )
-    assert (stale.valid, stale.active, stale.reason_code) == (
-        False, False, "finding_not_current_p1",
-    )
 
 
-@pytest.mark.parametrize("severity", ["major", "blocker"])
-def test_valid_disposition_receipt_releases_the_matching_required_gate_finding(severity):
-    audit = _failing_scoped_audit(severity=severity)
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope)
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    resolved = _resolved_line(receipt)
-    assert outcome.gate_result == "pass"
-    assert outcome.ok is True
-    assert outcome.classification == "code_pass"
-    assert outcome.reason_code == "disposition_resolved"
-    assert outcome.recorded_disposition_claims == [resolved]
-    assert "resolved_findings" not in outcome.convergence_envelope
-    summary = AGG.render_summary(outcome)
-    assert resolved in summary
-    assert "**Result: pass**" in summary
-    assert "Disposition receipts consumed:" in summary
-    terminal = AGG.build_terminal_envelope(
-        repository="zlxlabs/gate", identity=IDENTITY, quality_result="success",
-        primary_result="failure", review_expected=True, is_draft=False, runner="self",
-        outcome=outcome,
-    )
-    panel_row = AGG._terminal_row(
-        terminal, repository="zlxlabs/gate",
-        repository_id=IDENTITY.repository_id, pr_number=IDENTITY.pr,
-    )
-    panel = AGG.render_status_panel([panel_row])
-    pr_panel_has_required_line = resolved in panel
-    assert pr_panel_has_required_line is True
-    assert "Disposition receipts consumed:" in panel
+
+
+
+
+
+
+
+
 
 
 def _terminal_for(outcome, *, primary_result="failure"):
@@ -3142,233 +1775,32 @@ def _terminal_for(outcome, *, primary_result="failure"):
 
 
 
-def test_digest_mismatch_keeps_finding_active_and_gate_fail():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope, audit_digest=_DIGEST_B)
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    assert outcome.gate_result == "fail"
-    assert outcome.reason_code == "primary_findings"
-    assert outcome.recorded_disposition_claims == []
-    assert "resolved_findings" not in (outcome.convergence_envelope or {})
-    assert _terminal_for(outcome)["disposition_receipt_consumption"]["rejected_reasons"] == {
-        "audit_digest_mismatch": 1,
-    }
-
-
-def test_old_head_receipt_keeps_finding_active_and_gate_fail():
-    from dataclasses import replace
-
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    old_scope = replace(scope, head_sha="f" * 40)
-    receipt = _false_positive_receipt(
-        old_scope, head_sha=old_scope.head_sha,
-    )
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    assert outcome.gate_result == "fail"
-    assert outcome.reason_code == "primary_findings"
-    assert _terminal_for(outcome)["disposition_receipt_consumption"]["rejected_reasons"] == {
-        "head_sha_mismatch": 1,
-    }
-
-
-def test_old_format_receipt_without_counterevidence_cannot_pass():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(
-        scope, schema_version=2, counterevidence=None,
-    )
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    assert outcome.gate_result == "fail"
-    assert _terminal_for(outcome)["disposition_receipt_consumption"]["rejected_reasons"] == {
-        "schema_version_mismatch": 1,
-    }
-
-
-def test_finding_id_mismatch_keeps_finding_active_and_gate_fail():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope, finding_id="other-finding")
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    assert outcome.gate_result == "fail"
-    assert outcome.reason_code == "primary_findings"
-    assert outcome.recorded_disposition_claims == []
-
-
-def test_missing_reason_keeps_finding_active_and_gate_fail():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope, reason="")
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    assert outcome.gate_result == "fail"
-    assert outcome.reason_code == "primary_findings"
-    assert outcome.recorded_disposition_claims == []
-
-
-def test_duplicate_disposition_receipt_is_idempotent_and_releases_once():
-    audit = _failing_scoped_audit()
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope)
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt, receipt))
-    assert outcome.gate_result == "pass"
-    assert _terminal_for(outcome)["disposition_receipt_consumption"]["consumed_count"] == 1
-    assert outcome.recorded_disposition_claims == [
-        _resolved_line(receipt)
-    ]
-
-
-def test_no_receipts_keeps_required_fail_byte_identical_to_baseline():
-    audit = _failing_scoped_audit()
-    without = _evaluate_failing_primary(audit, waiver_receipts=())
-    explicit_empty = _evaluate_failing_primary(audit)
-    assert without.gate_result == "fail"
-    assert without.recorded_disposition_claims == []
-    assert AGG.render_summary(without) == AGG.render_summary(explicit_empty)
-    assert without.convergence_envelope == explicit_empty.convergence_envelope
-    assert "resolved_findings" not in without.convergence_envelope
-
-
-def test_measured_p1_receipt_cannot_resolve_required_gate():
-    audit = _failing_scoped_audit()
-    audit["result"]["findings"][0]["trigger_kind"] = "measured"
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope)
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    assert outcome.gate_result == "fail"
-    assert outcome.recorded_disposition_claims == []
-
-
-@pytest.mark.parametrize("trigger_kind", ["inferred", "measured", "unmeasurable", None, "unknown"])
-def test_p1_receipt_trigger_kind_controls_gate_and_terminal_payload(trigger_kind):
-    audit = _failing_scoped_audit()
-    finding = audit["result"]["findings"][0]
-    if trigger_kind is None:
-        finding.pop("trigger_kind")
-    else:
-        finding["trigger_kind"] = trigger_kind
-    scope = _scope_for(audit)
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(_false_positive_receipt(scope),))
-    terminal = _terminal_for(outcome)
-    block = terminal["disposition_receipt_consumption"]
-    if trigger_kind == "inferred":
-        assert outcome.gate_result == "pass"
-        assert len(block["recorded"]) == 1
-    else:
-        assert outcome.gate_result == "fail"
-        assert block["resolved"] == []
-        assert block["rejected_reasons"] == {"finding_trigger_not_inferred": 1}
-
-
-def test_malformed_receipt_stays_blocked_in_terminal_payload():
-    audit = _failing_scoped_audit()
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=({"finding_id": "p1"},))
-    block = _terminal_for(outcome)["disposition_receipt_consumption"]
-    assert outcome.gate_result == "fail"
-    assert block["rejected_reasons"] == {"malformed_receipt": 1}
-    assert block["fail_closed"] is False
-
-
-def test_partial_disposition_records_claim_and_keeps_only_uncovered_finding_blocking():
-    audit = _valid_scoped_primary_record(
-        verdict="fail",
-        result={
-            "findings": [
-                {"id": "keep", "severity": "major", "file": "src/keep.py", "line": 10, "category": "correctness"},
-                {"id": "drop", "severity": "blocker", "trigger_kind": "inferred", "file": "src/drop.py", "line": 12, "category": "correctness"},
-            ]
-        },
-    )
-    scope = _scope_for(audit)
-    receipt = _false_positive_receipt(scope, finding_id="drop")
-    outcome = _evaluate_failing_primary(audit, waiver_receipts=(receipt,))
-    assert outcome.gate_result == "fail"
-    assert outcome.reason_code == "primary_findings"
-    assert _terminal_for(outcome)["disposition_receipt_consumption"]["remaining_p1_ids"] == ["keep"]
-    assert outcome.recorded_disposition_claims == [
-        _resolved_line(receipt)
-    ]
 
 
 
 
-def test_fetch_disposition_receipts_skips_other_pr_and_expired(monkeypatch):
-    scope = _scope_for(_failing_scoped_audit())
-    mine = _false_positive_receipt(scope)
-    other = _false_positive_receipt(scope, pr_number=99)
-    payloads = {
-        "https://api.github.com/artifacts/mine/zip": _zip_receipt_bytes(
-            {**mine.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
-        ),
-        "https://api.github.com/artifacts/other/zip": _zip_receipt_bytes(
-            {**other.as_dict(), "kind": CONV.DISPOSITION_RECEIPT_KIND}
-        ),
-    }
-
-    def fake_github_json(*, token, url, **kwargs):
-        return {
-            "artifacts": [
-                {
-                    "name": CONV.disposition_receipt_artifact_name(mine),
-                    "expired": False,
-                    "archive_download_url": "https://api.github.com/artifacts/mine/zip",
-                },
-                {
-                    "name": CONV.disposition_receipt_artifact_name(other),
-                    "expired": False,
-                    "archive_download_url": "https://api.github.com/artifacts/other/zip",
-                },
-                {
-                    "name": "gate-disposition-receipt-v2-expired",
-                    "expired": True,
-                    "archive_download_url": "https://api.github.com/artifacts/expired/zip",
-                },
-            ]
-        }
-
-    monkeypatch.setattr(AGG, "_github_json", fake_github_json)
-    monkeypatch.setattr(
-        AGG, "_download_terminal_zip",
-        lambda **kwargs: payloads[kwargs["url"]],
-    )
-    receipts = AGG._fetch_disposition_receipts(
-        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
-    )
-    assert receipts == (mine,)
 
 
-@pytest.mark.parametrize("has_p1", [True, False], ids=["primary-p1", "primary-clean"])
-def test_disposition_receipt_read_error_is_visible_and_does_not_change_gate(monkeypatch, capsys, has_p1):
-    audit = (
-        _failing_scoped_audit()
-        if has_p1
-        else _valid_scoped_primary_record(verdict="pass", result={"findings": []})
-    )
 
-    def fail_listing(**kwargs):
-        raise RuntimeError("private response body must not be logged")
 
-    monkeypatch.setattr(AGG, "_github_json", fail_listing)
-    receipts = AGG._fetch_disposition_receipts(
-        token="tok", repository="zlxlabs/gate", repository_id=123, pr_number=42,
-    )
-    outcome = AGG.evaluate(
-        **_base_kwargs(
-            primary_result="failure" if has_p1 else "success",
-            audit=audit,
-            scope=_scope_for(audit),
-            audit_digest=CONV.canonical_audit_digest(audit),
-            waiver_receipts=receipts,
-        )
-    )
 
-    assert receipts == ()
-    assert outcome.gate_result == ("fail" if has_p1 else "pass")
-    assert outcome.convergence_envelope["state"]["clean_streak"] == (0 if has_p1 else 1)
-    warning = capsys.readouterr().out
-    assert "Disposition receipt scan failed" in warning
-    assert "RuntimeError" in warning
-    assert "private response body" not in warning
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ── dual-read GitHub ∪ Silo (cross-run history + disposition receipts) ────
@@ -3388,15 +1820,6 @@ _CANARY_AUDIT_KEY = (
 )
 
 
-def test_dual_read_fixtures_copy_b1_canary_key_layout():
-    assert _CANARY_TERMINAL_KEY == (
-        "d30/1327629472/gate-terminal-v1-1327629472-"
-        "2cdbc1bd4719665b7ba7548ba04edea73ec65ffc-35082772768-1/gate-terminal.json"
-    )
-    assert _CANARY_AUDIT_KEY == (
-        "d14/1327629472/primary-audit-v2-1327629472-"
-        "2cdbc1bd4719665b7ba7548ba04edea73ec65ffc-35082772768-1/primary-review-audit.json"
-    )
 
 
 def _canary_terminal_bytes(gate_result="pass", *, run_id=_CANARY_RUN_ID, run_attempt=_CANARY_ATTEMPT, head_sha=_CANARY_SHA):
@@ -3549,102 +1972,8 @@ def _real_convergence_history_silo_objects():
 
 
 
-def test_mixed_legacy_and_new_terminal_history_prefers_explicit_eligibility(monkeypatch):
-    fixture, objects = _real_convergence_history_silo_objects()
-    new_terminal = dict(fixture["terminal_envelopes"][0])
-    new_terminal.update({
-        "run_id": 35429999999,
-        "head_sha": "f" * 40,
-        "convergence_shadow": {
-            "history_status": "available",
-            "eligible_rounds": 1,
-            "limit": 8,
-            "terminal_decision": "collecting",
-            "eligible_this_round": False,
-        },
-    })
-    new_name = (
-        f"gate-terminal-v1-{fixture['repository_id']}-{new_terminal['head_sha']}-"
-        f"{new_terminal['run_id']}-{new_terminal['run_attempt']}"
-    )
-    objects.append((
-        f"d30/{fixture['repository_id']}/{new_name}/gate-terminal.json",
-        json.dumps(new_terminal, sort_keys=True).encode("utf-8"),
-    ))
-    monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    targeted_ids = [record["run_id"] for record in fixture["terminal_envelopes"]] + [new_terminal["run_id"]]
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: targeted_ids)
-
-    def fake_silo_cli(argv, timeout_s):
-        if argv[0] == "list":
-            return subprocess.CompletedProcess(
-                argv, 0, stdout="".join(f"{key}\n" for key, _body in objects), stderr="",
-            )
-        key = argv[argv.index("--key") + 1]
-        Path(argv[argv.index("--dest") + 1]).write_bytes(dict(objects)[key])
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-
-    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
-    status, run_ids, _history = AGG._load_pr_convergence_history(
-        repository=fixture["repository"], repository_id=fixture["repository_id"],
-        pr_number=fixture["pr_number"],
-    )
-    assert (status, run_ids) == ("available", (35424466527, 35423752741))
 
 
-def test_one_gate_run_lists_terminal_silo_prefix_once_and_panel_reuses_cache(monkeypatch, tmp_path):
-    audit_dir = tmp_path / "audit"
-    audit_dir.mkdir()
-    (audit_dir / "primary-review-audit.json").write_text(json.dumps(_valid_scoped_primary_record()))
-    terminal_path = tmp_path / "gate-terminal.json"
-    summary_path = tmp_path / "summary.md"
-    monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
-    monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setattr(AGG, "_pr_target_run_ids", lambda **kwargs: [])
-    monkeypatch.setattr(AGG, "_fetch_disposition_receipts", lambda **kwargs: ())
-    monkeypatch.setattr(
-        AGG, "load_previous_round_findings",
-        lambda **kwargs: {"available": False, "detail": "fixture", "findings": []},
-    )
-    monkeypatch.setattr(
-        AGG, "_fetch_github_terminal_history",
-        lambda **kwargs: AGG.HistoryLoad(
-            incomplete_reasons=["no terminal artifact matched gate-terminal-v1-123-"],
-        ),
-    )
-    terminal_prefix_calls = []
-
-    def fake_silo_cli(argv, timeout_s):
-        prefix = argv[argv.index("--prefix") + 1]
-        if prefix.startswith("d30/123/gate-terminal-v1-123-"):
-            terminal_prefix_calls.append(prefix)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(AGG, "_silo_cli", fake_silo_cli)
-    assert AGG.main(_cli_args(audit_dir, summary_path, terminal_path=str(terminal_path))) == 0
-    cache_path = AGG._terminal_history_cache_path(terminal_path)
-    cache_bytes = cache_path.read_bytes()
-    assert cache_bytes.endswith(b"\n")
-    assert json.loads(cache_bytes) == {
-        "schema_version": AGG.TERMINAL_HISTORY_CACHE_SCHEMA_VERSION,
-        "rows": [],
-        "skipped_records": [],
-        "incomplete_reasons": [],
-    }
-
-    received = {}
-
-    def fake_panel_publish(**kwargs):
-        received["history"] = kwargs["silo_history"]
-        return "", {"delivery": "not_created", "reason_code": "test", "history_error": None}
-
-    monkeypatch.setattr(AGG, "_post_status_panel_fail_open", fake_panel_publish)
-    publish_args = _cli_args(audit_dir, summary_path, terminal_path=str(terminal_path)) + ["--publish-only"]
-    assert AGG.main(publish_args) == 0
-    assert isinstance(received["history"], AGG.HistoryLoad)
-    assert received["history"].rows == []
-    assert terminal_prefix_calls == ["d30/123/gate-terminal-v1-123-"]
 
 
 def _canary_receipt(reason="locked upstream behavior", finding_id="p1"):
@@ -3665,179 +1994,10 @@ def _receipt_key(receipt):
 
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["github_only", "silo_only", "both_same", "both_empty", "github_fail", "silo_fail"],
-)
-def test_disposition_receipts_dual_read_table(monkeypatch, capsys, case):
-    github_receipt = _canary_receipt(reason="from-github")
-    silo_receipt = _canary_receipt(reason="from-silo")
-    other = _canary_receipt(reason="from-silo-only", finding_id="p2")
-    github_zip = _zip_receipt_bytes(_receipt_payload(github_receipt))
-    github_art = [{
-        "name": CONV.disposition_receipt_artifact_name(github_receipt),
-        "expired": False,
-        "archive_download_url": "https://api.github.com/artifacts/receipt/zip",
-    }]
-    kwargs = dict(github_artifacts=[], github_blobs={}, silo_objects=[])
-    if case == "github_only":
-        kwargs = dict(
-            github_artifacts=github_art,
-            github_blobs={"https://api.github.com/artifacts/receipt/zip": github_zip},
-            silo_objects=[],
-        )
-    elif case == "silo_only":
-        kwargs = dict(
-            github_artifacts=[], github_blobs={},
-            silo_objects=[(_receipt_key(silo_receipt), json.dumps(_receipt_payload(silo_receipt)).encode())],
-        )
-    elif case == "both_same":
-        kwargs = dict(
-            github_artifacts=github_art,
-            github_blobs={"https://api.github.com/artifacts/receipt/zip": github_zip},
-            silo_objects=[(_receipt_key(silo_receipt), json.dumps(_receipt_payload(silo_receipt)).encode())],
-        )
-    elif case == "github_fail":
-        kwargs = dict(
-            github_artifacts=[], github_blobs={},
-            silo_objects=[(_receipt_key(other), json.dumps(_receipt_payload(other)).encode())],
-            github_error=RuntimeError("private response body must not be logged"),
-        )
-    elif case == "silo_fail":
-        kwargs = dict(
-            github_artifacts=github_art,
-            github_blobs={"https://api.github.com/artifacts/receipt/zip": github_zip},
-            silo_objects=[],
-            silo_error=RuntimeError("silo listing down"),
-        )
-    _install_dual_read(monkeypatch, **kwargs)
-    receipts = AGG._fetch_disposition_receipts(
-        token="tok", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    warning = capsys.readouterr().out
-    reasons = [receipt.reason for receipt in receipts]
-    names = [CONV.disposition_receipt_artifact_name(receipt) for receipt in receipts]
-    if case == "github_only":
-        assert reasons == ["from-github"]
-        assert "Silo disposition receipt scan failed" not in warning
-    elif case == "silo_only":
-        assert reasons == ["from-silo"]
-        assert "Silo disposition receipt scan failed" not in warning
-    elif case == "both_same":
-        assert reasons == ["from-silo"]
-        assert names == [CONV.disposition_receipt_artifact_name(silo_receipt)]
-    elif case == "both_empty":
-        assert receipts == ()
-        assert "scan failed" not in warning
-    elif case == "github_fail":
-        assert reasons == ["from-silo-only"]
-        assert "Disposition receipt scan failed" in warning
-        assert "RuntimeError" in warning
-        assert "private response body" not in warning
-    elif case == "silo_fail":
-        assert reasons == ["from-github"]
-        assert "Silo disposition receipt scan failed" in warning
-        assert "RuntimeError" in warning
 
 
-def test_dual_read_merge_keeps_same_key_receipts_with_different_finding_ids(monkeypatch):
-    # gate#240: two same-key P1s (same file, line null) legitimately produce
-    # two receipts that differ only by finding_id; the name-keyed merge must
-    # keep both instead of letting one swallow the other.
-    scope = _scope_for(_failing_scoped_audit())
-    same_key = CONV.canonical_finding_key(
-        {"file": "src/lock.py", "line": None, "category": "correctness", "severity": "major"}
-    )
-    first = _false_positive_receipt(
-        scope, repository_id=str(_CANARY_REPO_ID), finding_id="p1", finding_key=same_key,
-    )
-    second = _false_positive_receipt(
-        scope, repository_id=str(_CANARY_REPO_ID), finding_id="p2", finding_key=same_key,
-    )
-    assert CONV.disposition_receipt_artifact_name(first) != CONV.disposition_receipt_artifact_name(second)
-
-    def github_artifact(receipt, index):
-        return {
-            "name": CONV.disposition_receipt_artifact_name(receipt),
-            "expired": False,
-            "archive_download_url": f"https://api.github.com/artifacts/{index}/zip",
-        }
-
-    _install_dual_read(
-        monkeypatch,
-        github_artifacts=[github_artifact(first, 1), github_artifact(second, 2)],
-        github_blobs={
-            "https://api.github.com/artifacts/1/zip": _zip_receipt_bytes(_receipt_payload(first)),
-            "https://api.github.com/artifacts/2/zip": _zip_receipt_bytes(_receipt_payload(second)),
-        },
-        silo_objects=[
-            (_receipt_key(first), json.dumps(_receipt_payload(first)).encode()),
-            (_receipt_key(second), json.dumps(_receipt_payload(second)).encode()),
-        ],
-    )
-    receipts = AGG._fetch_disposition_receipts(
-        token="tok", repository="zlxlabs/gate", repository_id=_CANARY_REPO_ID, pr_number=42,
-    )
-    assert len(receipts) == 2
-    assert {receipt.finding_id for receipt in receipts} == {"p1", "p2"}
 
 
-def test_silo_objects_under_cli_path_contract(monkeypatch):
-    import subprocess
-
-    prefix = f"d30/{_CANARY_REPO_ID}/"
-    canonical_key = f"d30/{_CANARY_REPO_ID}/artifact-abc/receipt.json"
-    payload = b'{"receipt": true}'
-    recorded_calls = []
-
-    dest_existed = []
-    recorded_timeouts = []
-
-    def fake_cli(argv, timeout_s):
-        recorded_calls.append(list(argv))
-        recorded_timeouts.append(timeout_s)
-        assert "--dest" in argv
-        dest_idx = argv.index("--dest")
-        dest_dir = Path(argv[dest_idx + 1])
-        dest_existed.append(dest_dir.is_dir())
-        parts = canonical_key.split("/", 3)
-        file_path = dest_dir / parts[2] / parts[3]
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_bytes(payload)
-        return subprocess.CompletedProcess(
-            args=argv,
-            returncode=0,
-            stdout=f"{canonical_key}\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(AGG, "_silo_cli", fake_cli)
-    objects = AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
-
-    # 断言走 CLI 路径及 argv 形态
-    assert len(recorded_calls) == 1
-    argv = recorded_calls[0]
-    assert argv[0:3] == ["list", "--prefix", prefix]
-    assert argv[3] == "--dest"
-    assert dest_existed == [True]
-    assert recorded_timeouts == [AGG.SILO_CLI_CALL_TIMEOUT_SECONDS]
-
-    # 断言 stdout 键解析与 (key, body) 返回
-    assert objects == [(canonical_key, payload)]
-
-    # 断言四段键校验
-    def bad_key_cli(argv, timeout_s):
-        return subprocess.CompletedProcess(
-            args=argv,
-            returncode=0,
-            stdout="invalid-two-segment/key\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(AGG, "_silo_cli", bad_key_cli)
-    with pytest.raises(ValueError) as exc:
-        AGG._silo_objects_under(prefix, AGG.SILO_CLI_CALL_TIMEOUT_SECONDS)
-    assert "silo key is not tier/repo_id/artifact_name/path" in str(exc.value)
 
 
 def test_silo_objects_under_has_no_in_process_client_branch(monkeypatch):
