@@ -83,7 +83,6 @@ def test_exceptions_are_test_only_and_nine_split_modules_form_a_dag():
     assert ".github/actions/gate-aggregator/convergence.py" not in exception_paths
     assert exception_paths == {
         "tests/test_gate_aggregator.py",
-        "tests/test_gate_v2_contract.py",
     }
 
     paths = {name: AGGREGATOR / name for name in SPLIT_MODULES}

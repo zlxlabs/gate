@@ -1,4 +1,3 @@
 [
-    {"path": "tests/test_gate_v2_contract.py", "ceiling": 4067, "reason": "存量基线 2026-11-25；锁现值不放大（gate-hub#2579 L3 需触碰）"},
     {"path": "tests/test_gate_aggregator.py", "ceiling": 6065, "reason": "存量基线 2026-11-26；锁现值不放大（gate-hub#2677 跟随断言需触碰）"}
 ]
