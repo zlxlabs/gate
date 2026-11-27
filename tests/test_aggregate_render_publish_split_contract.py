@@ -81,9 +81,7 @@ def test_exceptions_are_test_only_and_nine_split_modules_form_a_dag():
     exception_paths = {item["path"] for item in exceptions}
     assert ".github/actions/gate-aggregator/aggregate.py" not in exception_paths
     assert ".github/actions/gate-aggregator/convergence.py" not in exception_paths
-    assert exception_paths == {
-        "tests/test_gate_aggregator.py",
-    }
+    assert exception_paths == set()
 
     paths = {name: AGGREGATOR / name for name in SPLIT_MODULES}
     graph = {name: _local_dependencies(path) & SPLIT_MODULES for name, path in paths.items()}

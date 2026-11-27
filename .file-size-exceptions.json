@@ -1,3 +1,1 @@
-[
-    {"path": "tests/test_gate_aggregator.py", "ceiling": 6065, "reason": "存量基线 2026-11-26；锁现值不放大（gate-hub#2677 跟随断言需触碰）"}
-]
+[]
