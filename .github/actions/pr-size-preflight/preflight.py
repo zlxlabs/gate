@@ -18,6 +18,7 @@ GATE_ROOT = Path(__file__).resolve().parents[3]
 if str(GATE_ROOT) not in sys.path:
     sys.path.insert(0, str(GATE_ROOT))
 
+from scripts import gate_source
 from scripts.gate_source import SourceError, declared_mode, ensure_commits
 from scripts.scrub_outbound import runtime_values_from_environment, scrub_for_publish
 
@@ -453,11 +454,25 @@ def main() -> int:
     merge_base_sha: str | None = None
     try:
         repository = os.environ.get("GITHUB_REPOSITORY", "")
-        merge_base_sha = compare_merge_base_sha(
-            args.base_sha, args.head_sha,
-            token=os.environ.get("GH_TOKEN", ""),
-            repository=repository,
-        )
+        try:
+            mode = gate_source.declared_mode()
+        except gate_source.SourceError as error:
+            raise MergeBaseUnavailableError(
+                f"merge-base-unavailable: source mode unavailable: {error}"
+            ) from error
+        if mode == "service":
+            try:
+                merge_base_sha = gate_source.merge_base(repository, args.base_sha, args.head_sha)
+            except gate_source.SourceError as error:
+                raise MergeBaseUnavailableError(
+                    f"merge-base-unavailable: source service failed: {error}"
+                ) from error
+        else:
+            merge_base_sha = compare_merge_base_sha(
+                args.base_sha, args.head_sha,
+                token=os.environ.get("GH_TOKEN", ""),
+                repository=repository,
+            )
         ensure_review_commits(Path.cwd(), args.head_sha, merge_base_sha)
         result = measure(
             Path.cwd(), args.base_sha, args.head_sha,

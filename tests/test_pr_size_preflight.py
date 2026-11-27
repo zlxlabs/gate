@@ -74,6 +74,71 @@ def _fixture_repo(tmp_path: Path) -> tuple[Path, str, str]:
     return repo, base, head
 
 
+def test_main_service_mode_computes_merge_base_without_network(tmp_path, monkeypatch):
+    module = _module()
+    repo, base, head = _repo(tmp_path, 3)
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "SOURCE-MODE").write_text("service\n")
+    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(mirror))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "zlxlabs/repo")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(module.gate_source, "merge_base", lambda *args: base)
+    monkeypatch.setattr(module, "compare_merge_base_sha", lambda *args, **kwargs: pytest.fail("compare API called"))
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: pytest.fail("network called"))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["preflight.py", "--base-sha", base, "--head-sha", head,
+        "--max-diff-lines", "20", "--warn-lines", "40", "--max-review-shards", "3", "--output", str(output)])
+
+    assert module.main() == 0
+    result = json.loads(output.read_text())
+    assert result["merge_base_sha"] == base
+    assert result["preflight_result"] == "success"
+
+
+def test_main_service_failure_never_falls_back_to_compare(tmp_path, monkeypatch):
+    from scripts.gate_source import SourceError
+
+    module = _module()
+    repo, base, head = _repo(tmp_path, 3)
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "SOURCE-MODE").write_text("service\n")
+    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(mirror))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "zlxlabs/repo")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(module.gate_source, "merge_base", lambda *args: (_ for _ in ()).throw(SourceError("SOURCE-MERGE-BASE-FAILED", "fixture")))
+    monkeypatch.setattr(module, "compare_merge_base_sha", lambda *args, **kwargs: pytest.fail("compare fallback"))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["preflight.py", "--base-sha", base, "--head-sha", head,
+        "--max-diff-lines", "20", "--warn-lines", "40", "--max-review-shards", "3", "--output", str(output)])
+
+    assert module.main() == 1
+    result = json.loads(output.read_text())
+    assert result["preflight_result"] == "unavailable"
+    assert "merge-base-unavailable: source service failed: SOURCE-MERGE-BASE-FAILED: fixture" in result["measurement_error"]
+
+
+def test_main_source_mode_error_is_explicit_unavailable(tmp_path, monkeypatch):
+    from scripts.gate_source import SourceError
+
+    module = _module()
+    repo, base, head = _repo(tmp_path, 1)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("GATE_HUB_GIT_MIRROR_DIR", str(tmp_path / "bad-mirror"))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "zlxlabs/repo")
+    monkeypatch.setattr(module, "compare_merge_base_sha", lambda *args, **kwargs: pytest.fail("compare fallback"))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["preflight.py", "--base-sha", base, "--head-sha", head,
+        "--max-diff-lines", "20", "--warn-lines", "40", "--max-review-shards", "3", "--output", str(output)])
+
+    assert module.main() == 1
+    result = json.loads(output.read_text())
+    assert result["preflight_result"] == "unavailable"
+    assert "merge-base-unavailable: source mode unavailable:" in result["measurement_error"]
+
+
 def test_classifies_single_sharded_warning_and_blocked():
     module = _module()
     assert module.classify(3000, 4000, 8000, 8) == ("single", True)
