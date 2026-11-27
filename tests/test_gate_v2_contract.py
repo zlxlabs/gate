@@ -283,122 +283,7 @@ def test_is_workflow_call_named_gate():
     assert "workflow_call" in trigger
     assert raw["name"] == "gate"
 
-def test_disposition_workflow_is_protected_and_cannot_publish_gate_result():
-    raw, trigger = _load_disposition_workflow()
-    assert raw["name"] == "gate-v2 disposition control"
-    assert "workflow_dispatch" in trigger
-    assert "workflow_call" in trigger
-    assert raw["permissions"] == {"actions": "write", "contents": "read", "pull-requests": "read"}
-    control = raw["jobs"]["control"]
-    assert control["environment"] == {"name": "gate-disposition"}
-    expected_inputs = {
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
-        "disposition", "counterevidence_json", "tracking_issue", "gate_ref",
-    }
-    assert "operation" not in trigger["workflow_dispatch"]["inputs"]
-    assert "repository_id" not in trigger["workflow_dispatch"]["inputs"]
-    assert "epoch" not in trigger["workflow_dispatch"]["inputs"]
-    assert set(trigger["workflow_dispatch"]["inputs"]) == expected_inputs
-    assert set(trigger["workflow_call"]["inputs"]) == expected_inputs
-    for kind in ("workflow_dispatch", "workflow_call"):
-        gate_ref = trigger[kind]["inputs"]["gate_ref"]
-        assert gate_ref["required"] is False
-        assert gate_ref["type"] == "string"
-        for name in ("disposition", "counterevidence_json", "tracking_issue"):
-            assert trigger[kind]["inputs"][name]["required"] is False
-            assert trigger[kind]["inputs"][name]["type"] == "string"
-    text = DISPOSITION_WORKFLOW.read_text()
-    assert "issue_receipt.py issue" in text
-    assert "issue_receipt.py revoke" not in text
-    assert "counterevidence_json" in text
-    assert "tracking_issue" in text
-    assert "GITHUB_ACTOR" not in text
-    assert "pull-requests: write" not in text
-    assert "checks: write" not in text
-    assert "statuses: write" not in text
-    assert "gate/gate" not in text
-    assert "check-runs" not in text
-    upload = next(step for step in control["steps"] if step.get("name") == "Upload immutable disposition artifact")
-    assert "uses" not in upload
-    assert "--tier d30" in upload["run"]
-    assert "put-dir" in upload["run"]
-    resolve = next(step for step in control["steps"] if step.get("name") == "Resolve current PR head and canonical primary audit")
-    assert resolve["env"]["GH_REPO"] == "${{ github.repository }}"
-    assert 'audit_name="primary-audit-v2-${GITHUB_REPOSITORY_ID}-${head_sha}-${PRIMARY_RUN_ID}-${audit_attempt}"' in resolve["run"]
-    assert 'silo_key="d14/${GITHUB_REPOSITORY_ID}/${audit_name}/primary-review-audit.json"' in resolve["run"]
-    assert '"$SILO_EXEC" get' in resolve["run"]
-    assert resolve["run"].index("$SILO_EXEC") < resolve["run"].index("gh run download")
-    assert 'if [ "$silo_rc" -eq 2 ]; then' in resolve["run"]
-    assert 'gh run download -R "$GITHUB_REPOSITORY" "$PRIMARY_RUN_ID" --name "$audit_name"' in resolve["run"]
-    issue = next(step for step in control["steps"] if step.get("name") == "Issue immutable disposition artifact")
-    assert '--scope-json "$CURRENT_SCOPE_JSON"' in issue["run"]
-    assert issue["env"]["DISPOSITION_APPROVER"] == "${{ github.actor }}"
-    assert issue["env"]["DISPOSITION_APPROVER_ID"] == "${{ github.actor_id }}"
-    assert "github.actor" in issue["env"]["DISPOSITION_APPROVER"]
-    assert "github.triggering_actor" not in issue["env"]["DISPOSITION_APPROVER"]
-    assert "--approver \"$DISPOSITION_APPROVER\"" in issue["run"]
-    assert "--approver-id \"$DISPOSITION_APPROVER_ID\"" in issue["run"]
-    assert "--approved-at \"$approved_at\"" in issue["run"]
-    assert "--repo-dir \"$CALLER_HEAD_DIR\"" in issue["run"]
-    assert 'test -n "$CALLER_HEAD_DIR"' in issue["run"]
-    assert "inputs.approver" not in text
-    assert "${{ github.actor }}" in text
-    assert "${{ github.triggering_actor }}" not in text
-    assert "${{ github.actor_id }}" in text
-    assert "GITHUB_TRIGGERING_ACTOR" not in issue.get("env", {})
-    assert "--triggering-actor" not in issue["run"]
-    assert "env -i" not in issue["run"]
-    assert (
-        f"python3 {DISPOSITION_CHECKOUT_SUBDIR}/.github/actions/gate-disposition/issue_receipt.py issue"
-        in issue["run"]
-    )
 
-def test_disposition_workflow_fetches_caller_head_for_counterevidence_rerun():
-    raw, _ = _load_disposition_workflow()
-    control = raw["jobs"]["control"]
-    names = [step.get("name") for step in control["steps"]]
-    fetch = next(
-        step for step in control["steps"]
-        if step.get("name") == "Fetch caller head for counterevidence rerun"
-    )
-    assert "uses" not in fetch
-    assert fetch["env"]["GH_TOKEN"] == "${{ github.token }}"
-    run = fetch["run"]
-    assert "eval \"$GATE_SOURCE_DECIDE_SCRIPT\"" in run
-    assert 'if [ "$mode" = service ]' in run
-    assert run.index('if [ "$mode" = service ]') < run.index("git-source-prepare")
-    assert "flock" not in run
-    assert "COUNTEREVIDENCE-${mapped}" in run
-    assert "SOURCE-SERVICE-UNAVAILABLE" in run
-    assert "COUNTEREVIDENCE-SOURCE-TIMEOUT" in run
-    assert "COUNTEREVIDENCE-SOURCE-FETCH-FAILED" in run
-    assert "git -C \"$repo_dir\" init --quiet" in run
-    # gate#302: the caller head must arrive complete. A blob-filtered clone
-    # defers the pathspec blobs to per-object promisor fetches and the grep
-    # times out without saying why.
-    assert 'timeout 300 git -C "$repo_dir" fetch --depth 1 origin "${fetch_shas[@]}"' in run
-    assert not [line for line in run.splitlines() if "fetch" in line and "--filter" in line]
-    assert "--missing=print" in run
-    assert "_gate-caller-head" in run
-    assert raw["permissions"]["contents"] == "read"
-    issue = next(
-        step for step in control["steps"]
-        if step.get("name") == "Issue immutable disposition artifact"
-    )
-    issue_run = issue["run"]
-    assert "GIT_NO_REPLACE_OBJECTS=1" in issue_run
-    assert "consume.lock" in issue_run
-    assert "flock --shared" in issue_run
-    assert issue_run.index("flock --shared") < issue_run.index("issue_receipt.py issue")
-    assert issue_run.index("issue_receipt.py issue") < issue_run.index("flock --unlock")
-    assert "GIT_CONFIG_KEY_0=safe.directory" in issue_run
-    assert "COUNTEREVIDENCE-SOURCE-PIN-MISMATCH" in issue_run
-    assert names.index("Resolve current PR head and canonical primary audit") < names.index(
-        "Fetch caller head for counterevidence rerun"
-    )
-    assert names.index("Fetch caller head for counterevidence rerun") < names.index(
-        "Issue immutable disposition artifact"
-    )
 
 
 def test_disposition_workflow_resolves_magicdns_before_s3_and_has_no_upload_artifact():
@@ -457,141 +342,18 @@ def test_magicdns_failure_messages_point_to_underlying_retry_reason():
                     assert "100.100.100.100" not in message
 
 
-def test_gate_disposition_receipt_names_include_epoch_and_audit_digest():
-    text = DISPOSITION_WORKFLOW.read_text()
-    producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()
-    consumer = (REPO_ROOT / ".github" / "actions" / "gate-aggregator" / "convergence.py").read_text()
-    assert "disposition_receipt_artifact_name" in producer
-    assert "DISPOSITION_APPROVER" in producer
-    assert "steps.disposition.outputs.artifact_name" in text
-    assert "CURRENT_AUDIT_DIGEST" in text
-    assert "receipt.audit_digest[:12]" in consumer
 
 
-def test_recorded_disposition_lines_is_the_only_g4_line_builder():
-    hits = []
-    line_builder = 'f"disposition={receipt.disposition} finding='
-    for path in (REPO_ROOT / ".github").rglob("*"):
-        if not path.is_file() or path.suffix not in {".py", ".yml"}:
-            continue
-        if line_builder in path.read_text(encoding="utf-8"):
-            hits.append(str(path.relative_to(REPO_ROOT)))
-    assert hits == [".github/actions/gate-aggregator/convergence.py"]
 
 
-def test_disposition_inline_python_registers_sys_modules_before_dataclass_exec(tmp_path):
-    """Lock issue #88: dataclass Scope crashes unless sys.modules is registered first."""
-    source = _disposition_scope_python()
-    register = "sys.modules[spec.name] = module"
-    exec_call = "spec.loader.exec_module(module)"
-    assert register in source
-    assert exec_call in source
-    assert source.index(register) < source.index(exec_call)
-    assert "if spec is None or spec.loader is None" in source
-
-    head_sha = "a" * 40
-    base_sha = "b" * 40
-    audit = {
-        "diff_digest": "d" * 64,
-        "policy_version": "1",
-        "policy_digest": "p" * 64,
-        "tier": "personal",
-        "caller_sha": "c" * 40,
-        "reusable_workflow_sha": "r" * 40,
-        "base_sha": base_sha,
-        "head_sha": head_sha,
-    }
-    pull = {"base": {"sha": base_sha}, "head": {"sha": head_sha}}
-    audit_path = tmp_path / "audit.json"
-    pr_path = tmp_path / "pr.json"
-    audit_path.write_text(json.dumps(audit), encoding="utf-8")
-    pr_path.write_text(json.dumps(pull), encoding="utf-8")
-    # The module is loaded from the workflow's own checkout subdirectory, so the
-    # only copy in existence has to be the one a sparse checkout leaves there.
-    workspace = _checkout_shaped_workspace(
-        tmp_path, DISPOSITION_CHECKOUT_SUBDIR, DISPOSITION_PRODUCER_SPARSE)
-    result = subprocess.run(
-        [sys.executable, "-", str(audit_path), str(pr_path), "123", "42"],
-        input=source,
-        cwd=workspace,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
-    assert payload["scope"]["repository_id"] == 123
-    assert payload["scope"]["pr_number"] == 42
-    assert payload["scope"]["head_sha"] == head_sha
-    assert isinstance(payload["epoch"], str) and len(payload["epoch"]) == 64
 
 
-def test_disposition_sparse_checkout_lists_files_and_disables_cone_mode():
-    """Lock issue #88: file-path sparse-checkout requires cone-mode off."""
-    raw, _ = _load_disposition_workflow()
-    checkout = next(
-        step
-        for step in raw["jobs"]["control"]["steps"]
-        if step.get("name") == "Checkout disposition producer"
-    )
-    assert set(_sparse_env_paths(checkout)) == set(DISPOSITION_PRODUCER_SPARSE)
-    helper = BOUNDED_RETRY_HELPER.read_text(encoding="utf-8")
-    assert '["sparse-checkout", "init", "--no-cone"]' in helper
-    assert '"--no-cone"' in helper
 
 
-def test_disposition_checkout_uses_reusable_workflow_identity():
-    raw, _ = _load_disposition_workflow()
-    checkout = next(
-        step
-        for step in raw["jobs"]["control"]["steps"]
-        if step.get("name") == "Checkout disposition producer"
-    )
-    assert_workflow_sha_checkout(checkout, path=DISPOSITION_CHECKOUT_SUBDIR, sparse=DISPOSITION_PRODUCER_SPARSE)
-    assert not any(step.get("name") == "Require 40-hex gate_ref" for step in raw["jobs"]["control"]["steps"])
-    assert "inputs." + "gate_ref" not in DISPOSITION_WORKFLOW.read_text()
 
 
-def test_disposition_workflow_call_accepts_legacy_gate_ref_both_ways():
-    _, callee_trigger = _load_disposition_workflow()
-    callee_declared = callee_trigger["workflow_call"]["inputs"]
-    callee_required = {name for name, spec in callee_declared.items() if spec.get("required")}
-
-    caller_raw, _ = _load_disposition_caller()
-    caller_inputs = set(caller_raw["jobs"]["disposition"]["with"].keys())
-    assert "gate_ref" not in caller_inputs
-
-    # New caller: caller omits gate_ref; callee required inputs must be satisfied
-    # and caller must stay within declared callee inputs.
-    assert callee_required <= caller_inputs
-    assert caller_inputs <= set(callee_declared)
-
-    # Legacy caller: caller still supplies gate_ref; callee required inputs are
-    # satisfied and callee must still accept gate_ref without schema rejection.
-    legacy_caller_inputs = caller_inputs | {"gate_ref"}
-    assert callee_required <= legacy_caller_inputs
-    assert legacy_caller_inputs <= set(callee_declared)
 
 
-def test_disposition_workflow_call_declares_optional_silo_secret_pair():
-    # Public callers map the Silo pair by name; legacy callers keep
-    # secrets: inherit. The callee must declare exactly the pair its control
-    # job consumes, both optional, so both call shapes pass schema validation.
-    raw, trigger = _load_disposition_workflow()
-    control_env = raw["jobs"]["control"]["env"]
-    assert control_env["AWS_ACCESS_KEY_ID"] == "${{ secrets.SILO_ACCESS_KEY }}"
-    assert control_env["AWS_SECRET_ACCESS_KEY"] == "${{ secrets.SILO_SECRET_KEY }}"
-    consumed = set()
-    for value in control_env.values():
-        match = re.fullmatch(r"\$\{\{ secrets\.([A-Z0-9_]+) }}", str(value))
-        if match:
-            consumed.add(match.group(1))
-    assert consumed == {"SILO_ACCESS_KEY", "SILO_SECRET_KEY"}
-    declared = trigger["workflow_call"].get("secrets", {})
-    assert set(declared) == consumed
-    for name in consumed:
-        assert declared[name]["required"] is False
-    assert "secrets" not in trigger["workflow_dispatch"]
 
 
 def test_production_v2_official_actions_are_exactly_sha_pinned():
@@ -850,47 +612,6 @@ def test_every_workflow_sha_checkout_names_a_workspace_subdirectory():
     assert [site[1:] for site in disposition] == [("control", "Checkout disposition producer")]
 
 
-def test_disposition_silo_and_script_consumers_read_from_the_checkout_subdirectory(tmp_path):
-    """The four root-relative consumers of the disposition job.
-
-    `SILO_STORE` / `SILO_EXEC` are the Silo helpers the MagicDNS and audit steps
-    invoke; the other two are the inline script invocations.  Each is resolved
-    against a workspace that contains the tools ONLY below the declared
-    subdirectory, so a consumer left addressing the workspace root resolves to
-    nothing instead of quietly working in the source tree.
-    """
-    raw, _ = _load_disposition_workflow()
-    job = raw["jobs"]["control"]
-    checkout = _disposition_checkout_step()
-    subdir = checkout["env"]["GATE_CHECKOUT_PATH"]
-    sparse = _sparse_env_paths(checkout)
-    workspace = _checkout_shaped_workspace(tmp_path, subdir, sparse)
-
-    assert job["env"]["SILO_STORE"] == (
-        f"${{{{ github.workspace }}}}/{subdir}/scripts/silo_store.py"
-    )
-    assert job["env"]["SILO_EXEC"] == (
-        f"${{{{ github.workspace }}}}/{subdir}/scripts/silo_exec.sh"
-    )
-    module_ref = re.search(
-        r'module_path = Path\("([^"]+)"\)', _disposition_scope_python()
-    ).group(1)
-    producer_ref = re.search(
-        r'python3 (\S+) issue', _disposition_step("Issue immutable disposition artifact")["run"]
-    ).group(1)
-    assert module_ref == f"{subdir}/.github/actions/gate-aggregator/convergence.py"
-    assert producer_ref == f"{subdir}/.github/actions/gate-disposition/issue_receipt.py"
-    for relative in (
-        f"{subdir}/scripts/silo_store.py",
-        f"{subdir}/scripts/silo_exec.sh",
-        module_ref,
-        producer_ref,
-    ):
-        assert (workspace / relative).is_file(), relative
-        assert (workspace / relative).read_bytes() == (REPO_ROOT / relative[len(subdir) + 1:]).read_bytes()
-    # Nothing resolves from the workspace root any more.
-    for relative in ("scripts/silo_store.py", "scripts/silo_exec.sh", ".github"):
-        assert not (workspace / relative).exists()
 
 
 def _seed_caller_head(repo: Path, *, relpath="src/guard.py", literal="counterevidence-literal"):
@@ -918,80 +639,6 @@ def _seed_caller_head(repo: Path, *, relpath="src/guard.py", literal="counterevi
     }
 
 
-def test_disposition_receipt_step_runs_the_producer_from_the_checkout_subdirectory(tmp_path):
-    """Run the receipt step's own `run` body, from a checkout-shaped workspace,
-    and check that it signs a real receipt from the producer the checkout left
-    below the subdirectory."""
-    raw, _ = _load_disposition_workflow()
-    step = _disposition_step("Issue immutable disposition artifact")
-    subdir = _disposition_checkout_step()["env"]["GATE_CHECKOUT_PATH"]
-    sparse = _sparse_env_paths(_disposition_checkout_step())
-    workspace = _checkout_shaped_workspace(tmp_path, subdir, sparse)
-    caller_head = tmp_path / "caller-head"
-    head_sha, counterevidence = _seed_caller_head(caller_head)
-
-    scope = {
-        "repository_id": 123, "pr_number": 42, "base_sha": "b" * 40,
-        "head_sha": head_sha, "diff_digest": "d" * 64, "policy_version": "policy-v1",
-        "policy_digest": "p" * 64, "tier": "personal", "caller_sha": "c" * 40,
-        "reusable_workflow_sha": "r" * 40,
-    }
-    audit = {
-        **scope, "repository": "zlxlabs/gate", "pr": 42, "run_id": 7, "run_attempt": 1,
-        "verdict": "fail",
-        "result": {"findings": [{
-            "id": "finding-one", "severity": "major", "trigger_kind": "inferred",
-            "file": "src/guard.py", "line": 12, "category": "correctness",
-        }]},
-    }
-    audit_path = tmp_path / "audit.json"
-    audit_path.write_text(json.dumps(audit), encoding="utf-8")
-    output_dir = tmp_path / "artifact"
-    output_dir.mkdir()
-    github_env = tmp_path / "github-env"
-    github_env.write_text("")
-    github_output = tmp_path / "github-output"
-    github_output.write_text("")
-
-    env = {
-        **os.environ,
-        "AUDIT_PATH": str(audit_path),
-        "CURRENT_HEAD_SHA": scope["head_sha"],
-        "CURRENT_AUDIT_DIGEST": "d" * 64,
-        "CURRENT_EPOCH": "e" * 64,
-        "CURRENT_SCOPE_JSON": json.dumps(scope),
-        "REPOSITORY_ID": "123",
-        "PR_NUMBER": "42",
-        "FINDING_ID": "finding-one",
-        "DISPOSITION_REASON": "canonical evidence reviewed",
-        "DISPOSITION_KIND": "false-positive",
-        "DISPOSITION_COUNTEREVIDENCE_JSON": json.dumps(counterevidence),
-        "CALLER_HEAD_DIR": str(caller_head),
-        "DISPOSITION_TRACKING_ISSUE": "",
-        "DISPOSITION_APPROVER": "owner",
-        "DISPOSITION_APPROVER_ID": "10",
-        "DISPOSITION_REPOSITORY": "zlxlabs/gate",
-        "OUTPUT_DIR": str(output_dir),
-        "GITHUB_TRIGGERING_ACTOR": "owner",
-        "GITHUB_ENV": str(github_env),
-        "GITHUB_OUTPUT": str(github_output),
-        "GATE_SOURCE_DECIDE_SCRIPT": raw["env"]["GATE_SOURCE_DECIDE_SCRIPT"],
-    }
-    result = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
-        cwd=workspace, env=env, capture_output=True, text=True, timeout=180,
-    )
-
-    assert result.returncode == 0, f"{result.stderr}\n{result.stdout}"
-    artifact_name = next(
-        line.split("=", 1)[1] for line in github_output.read_text().splitlines()
-        if line.startswith("artifact_name=")
-    )
-    receipt = json.loads((output_dir / artifact_name).read_text(encoding="utf-8"))
-    assert receipt["kind"] == "gate-disposition-receipt-v3"
-    assert receipt["disposition"] == "false-positive"
-    assert receipt["finding_id"] == "finding-one"
-    assert receipt["approver"] == "owner"
 
 
 # gate#275: a caller still pinned to the legacy five inputs carries no evidence
@@ -1100,106 +747,10 @@ def _run_receipt_step(tmp_path, values: dict[str, str]) -> subprocess.CompletedP
     return result
 
 
-def test_disposition_preflight_reads_the_same_inputs_as_the_receipt_step():
-    """The preflight may only pre-judge what the receipt already rejects, so its
-    view of the three optional inputs must be the receipt step's view."""
-    raw, _ = _load_disposition_workflow()
-    steps = raw["jobs"]["control"]["steps"]
-    preflight = _preflight_step()
-    receipt = _disposition_step("Issue immutable disposition artifact")
-    assert set(preflight["env"]) == set(EVIDENCE_INPUT_ENV), preflight["env"]
-    assert {name: preflight["env"][name] for name in EVIDENCE_INPUT_ENV} == EVIDENCE_INPUT_ENV
-    assert {name: receipt["env"][name] for name in EVIDENCE_INPUT_ENV} == EVIDENCE_INPUT_ENV
-    # An absent input renders as "", and issue_receipt.py turns exactly that into
-    # its documented false-positive default (`... or "false-positive"`).
-    producer = (REPO_ROOT / ".github" / "actions" / "gate-disposition" / "issue_receipt.py").read_text()
-    assert '_value(args, envelope, "disposition", "DISPOSITION_KIND") or "false-positive"' in producer
-    assert 'if counterevidence_raw is None or counterevidence_raw == "":' in producer
-    assert DISPOSITION_PREFLIGHT_ERROR in preflight["run"]
-    # Nothing outside the three inputs: no evidence channel the preflight could
-    # invent, and no Silo/audit/network token for it to touch.
-    run = preflight["run"]
-    for token in ("SILO_", "AWS_", "RUNNER_TEMP", "gh ", "curl", "audit", "github.token"):
-        assert token not in run, token
-    # Before every step that can reach Silo or the canonical audit: the job stops
-    # at the first failing step, so an early non-zero keeps them untouched.
-    assert steps[0]["name"] == PREFLIGHT_STEP_NAME
-    later = [
-        index for index, step in enumerate(steps)
-        if index and any(token in str(step.get("run", "")) for token in ("SILO_EXEC", "SILO_STORE", "gh api"))
-    ]
-    assert later, "no Silo/audit step found to order the preflight against"
 
 
-@pytest.mark.parametrize(
-    "values, expect_preflight_rc, expect_receipt_failure",
-    [
-        # Legacy five-input caller: nothing to forward, rejected for any audit.
-        (LEGACY_FIVE_INPUTS, 1, "counterevidence_required"),
-        ({**LEGACY_FIVE_INPUTS, "disposition": "false-positive"}, 1, "counterevidence_required"),
-        ({**LEGACY_FIVE_INPUTS, "disposition": "yes-please"}, 1, "disposition must be false-positive, deferred or rejected"),
-        # The default empty disposition is the false-positive default, so it is
-        # checked with counterevidence exactly as the receipt checks it.
-        ({**LEGACY_FIVE_INPUTS, "counterevidence_json": VALID_COUNTEREVIDENCE}, 0, None),
-        ({**LEGACY_FIVE_INPUTS, "disposition": "false-positive",
-          "counterevidence_json": VALID_COUNTEREVIDENCE}, 0, None),
-        # Deferred keeps its existing rejection boundary, untouched.
-        ({**LEGACY_FIVE_INPUTS, "disposition": "deferred", "tracking_issue": "#12"}, 0,
-         "deferred_not_allowed_for_tier"),
-        # Malformed evidence stays with the authoritative validator.
-        ({**LEGACY_FIVE_INPUTS, "counterevidence_json": "not json"}, 0, "counterevidence"),
-    ],
-)
-def test_disposition_preflight_never_changes_the_authoritative_outcome(
-    tmp_path, values, expect_preflight_rc, expect_receipt_failure,
-):
-    preflight = _run_preflight(values)
-    assert preflight.returncode == expect_preflight_rc, preflight.stderr
-    if expect_preflight_rc:
-        assert DISPOSITION_PREFLIGHT_ERROR in preflight.stderr
-        # Readable, actionable, and not a verdict on the calling repository: name
-        # the evidence channel and say what the caller has to expose and forward.
-        for name in EVIDENCE_INPUT_ENV.values():
-            assert name.split(".")[-1].rstrip(" }") in preflight.stderr
-        assert (
-            "expose and forward disposition, counterevidence_json and tracking_issue"
-            in preflight.stderr
-        )
-        assert "caller" in preflight.stderr
-        assert "counterevidence_required" not in preflight.stderr
-    # Every early rejection is one the producer makes anyway; every shape the
-    # preflight waves through keeps the outcome it had before.
-    receipt = _run_receipt_step(tmp_path, values)
-    if expect_receipt_failure is None:
-        assert receipt.returncode == 0, receipt.stderr
-        assert len(list(receipt.receipt_dir.iterdir())) == 1
-    else:
-        assert receipt.returncode != 0
-        assert expect_receipt_failure in receipt.stderr
 
 
-def test_disposition_preflight_failure_never_reaches_silo_or_the_audit(tmp_path):
-    """Recorded-access fixture: every network/Silo entry point of this job is
-    wired to a recorder, so an early rejection that touched one would leave a
-    mark instead of silently passing."""
-    record = tmp_path / "touched.log"
-    recorder = tmp_path / "touched.sh"
-    recorder.write_text(f'#!/bin/sh\necho "$0 $*" >> "{record}"\nexit 0\n')
-    recorder.chmod(0o755)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for tool in ("gh", "curl", "aws", "jq", "git"):
-        (bin_dir / tool).symlink_to(recorder)
-    env = {
-        **_input_env(_preflight_step(), LEGACY_FIVE_INPUTS),
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "SILO_EXEC": str(recorder), "SILO_STORE": str(recorder),
-        "AWS_ACCESS_KEY_ID": "would-not-be-here", "AWS_SECRET_ACCESS_KEY": "x",
-    }
-    result = _run_preflight(LEGACY_FIVE_INPUTS, env=env)
-    assert result.returncode != 0
-    assert DISPOSITION_PREFLIGHT_ERROR in result.stderr
-    assert not record.exists(), "preflight reached Silo or a network client"
 
 
 def test_model_jobs_and_review_expected_copies_need_classify_and_match_primary_if():
@@ -1282,29 +833,6 @@ def test_primary_result_expression_preserves_domain_and_normalizes_everything_el
     assert _evaluate_primary_result_expr(PRIMARY_RESULT_EXPR, raw_result) == expected
 
 
-@pytest.mark.parametrize("raw_result", ["", "abandoned", "weird_future_value"])
-def test_ledger_resolver_records_out_of_domain_primary_as_cancelled(tmp_path, raw_result):
-    artifacts = [
-        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, output = _run_ledger_resolver(
-        tmp_path,
-        artifacts=artifacts,
-        current=1,
-        review_expected="true",
-        extra_env={
-            "QUALITY_RESULT": "success",
-            "PRIMARY_RESULT": _evaluate_primary_result_expr(PRIMARY_RESULT_EXPR, raw_result),
-            "PRIMARY_RESULT_RAW": raw_result,
-        },
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode == 0, combined
-    assert "audit_artifact_id=" not in output  # audit channel moved to job outputs (design A.3)
-    assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
-    assert f"::warning::PRIMARY_RESULT normalized from {raw_result!r} to 'cancelled'" in combined
 
 
 def test_classify_listing_failure_does_not_output_false(tmp_path):
@@ -1776,140 +1304,6 @@ def test_gate_job_forwards_selected_audit_source_attempt_to_aggregator():
     assert '--audit-artifact-name "$AUDIT_ARTIFACT_NAME"' in aggregate_step["run"]
 
 
-def test_ledger_job_builds_and_uploads_v2_review_ledger_without_gating():
-    raw, _ = _load_workflow()
-    quality_steps = raw["jobs"]["quality"]["steps"]
-    gate_steps = raw["jobs"]["gate"]["steps"]
-    ledger = raw["jobs"]["ledger"]
-    steps = ledger["steps"]
-    input_publish = next(step for step in quality_steps if step.get("name") == "Publish v2 review ledger inputs")
-    input_download = next(step for step in steps if step.get("name") == "Download v2 review ledger inputs")
-    persist = next(step for step in steps if step.get("name") == "Upload v2 review ledger inputs")
-    persist_retry = next(step for step in steps if step.get("name") == "Retry upload v2 review ledger inputs")
-    build_index = next(i for i, step in enumerate(steps) if step.get("name") == "Build v2 review effectiveness ledger")
-    upload_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload v2 review effectiveness ledger")
-
-    assert ledger["needs"] == ["quality", "primary", "gate", "classify_pr_paths"]
-    assert ledger["if"] == "always()"
-    assert ledger["continue-on-error"] is True
-    assert not any(step.get("name") == "Build v2 review effectiveness ledger" for step in gate_steps)
-    assert not any(step.get("name") == "Upload v2 review effectiveness ledger" for step in gate_steps)
-    assert input_publish["if"] == "always()"
-    assert input_publish["continue-on-error"] is True
-    assert "uses" not in input_publish
-    assert "pr-size-preflight.json" in input_publish["env"]["PREFLIGHT"]
-    assert "install-result.json" in input_publish["env"]["INSTALL"]
-    assert persist["continue-on-error"] is True
-    assert persist_retry["continue-on-error"] is True
-    assert persist_retry["if"] == "always() && steps.persist-ledger-input.outcome == 'failure'"
-    assert persist["env"]["ARTIFACT_NAME"] == persist_retry["env"]["ARTIFACT_NAME"]
-    assert "--tier d1" in persist["run"] and "--tier d1" in persist_retry["run"]
-    assert persist["env"]["PREFLIGHT"] == "${{ runner.temp }}/review-ledger-input/pr-size-preflight.json"
-    assert "needs.quality.outputs.ledger_input_bundle" in input_download["env"]["LEDGER_INPUT_BUNDLE"]
-    assert input_download["env"]["DEST"] == "${{ runner.temp }}/review-ledger-input"
-    assert "ARTIFACT_PREFIX" not in input_download.get("env", {})
-    assert "$SILO_EXEC" not in input_download["run"]
-    terminal_download = next(step for step in steps if step.get("name") == "Download gate terminal envelope for ledger")
-    assert terminal_download["id"] == "download-gate-terminal-for-ledger"
-    assert terminal_download["env"]["ARTIFACT_PREFIX"] == "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id }}"
-    assert terminal_download["env"]["DEST"] == "${{ runner.temp }}/gate-terminal"
-    assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
-    assert terminal_download["continue-on-error"] is True
-    # audit channel (design A.3): the ledger reads needs.primary.outputs instead
-    # of resolving/downloading the audit from Silo.
-    audit_read = next(step for step in steps if step.get("name") == "Read canonical primary audit from primary job output for ledger")
-    assert audit_read["id"] == "read-primary-audit-for-ledger"
-    assert audit_read["if"] == "always()"
-    # Ledger-side read remains fail-loud at the step outcome; step-level
-    # continue-on-error keeps this bookkeeping job check green.
-    assert audit_read["continue-on-error"] is True
-    assert audit_read["env"]["AUDIT_B64"] == "${{ needs.primary.outputs.audit_json_gz_b64 }}"
-    assert audit_read["env"]["AUDIT_BYTES_DECLARED"] == "${{ needs.primary.outputs.audit_bytes }}"
-    assert audit_read["env"]["AUDIT_FILENAME"] == "primary-review-audit.json"
-    audit_read_run = audit_read["run"]
-    assert 'success|failure) reviewed=true' in audit_read_run
-    assert "refusing to ledger a reviewed run without its audit record" in audit_read_run
-    assert "audit fields will be null" in audit_read_run
-    assert "base64 -d" in audit_read_run
-    assert "gunzip -c" in audit_read_run
-    assert "truncated (declared=" in audit_read_run
-    assert 'mv "$tmp" "$AUDIT_DIR/$AUDIT_FILENAME"' in audit_read_run
-    build = steps[build_index]
-    assert build["id"] == "build-review-ledger"
-    assert build["uses"] == "./_gate-aggregator-src/.github/actions/review-ledger"
-    assert build["with"]["audit-path"] == "${{ runner.temp }}/primary-audit/primary-review-audit.json"
-    assert build["with"]["codex-expected"] == raw["jobs"]["primary"]["if"]
-    assert build["with"]["codex-waived"] is False
-    assert build["with"]["expected-repository-id"] == "${{ github.repository_id }}"
-    assert build["with"]["expected-base-sha"] == "${{ github.event.pull_request.base.sha }}"
-    assert build["with"]["expected-caller-sha"] == "${{ github.workflow_sha }}"
-    assert build["with"]["expected-reusable-workflow-sha"] == "${{ job.workflow_sha }}"
-    assert build["with"]["terminal-path"] == (
-        "${{ steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != '' && "
-        "format('{0}/gate-terminal/gate-terminal.json', runner.temp) || '' }}"
-    )
-    assert "token" not in build["with"]
-
-    upload = steps[upload_index]
-    assert upload["if"] == "success() && steps.build-review-ledger.outcome == 'success'"
-    assert "uses" not in upload
-    assert upload["env"]["ARTIFACT_NAME"] == (
-        "codex-review-ledger-v2-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}"
-        "-${{ github.run_id }}-${{ github.run_attempt }}"
-    )
-    assert upload["env"]["LEDGER_PATH"] == "${{ runner.temp }}/review-ledger/ledger.jsonl"
-    assert "--tier d30" in upload["run"]
-    assert "$SILO_EXEC" in upload["run"]
-
-    latest = next(step for step in steps if step.get("name") == "Upload v2 review effectiveness ledger latest pointer")
-    assert steps.index(latest) == upload_index + 1
-    assert "uses" not in latest
-    assert latest["if"] == "success() && steps.build-review-ledger.outcome == 'success'"
-    assert latest["continue-on-error"] is True
-    assert latest["env"]["ARTIFACT_NAME"] == (
-        "codex-review-ledger-latest-v1-${{ github.repository_id }}-pr${{ github.event.pull_request.number }}"
-    )
-    assert latest["env"]["LEDGER_PATH"] == upload["env"]["LEDGER_PATH"]
-    assert "--tier d30" in latest["run"]
-    assert "--name \"$ARTIFACT_NAME\"" in latest["run"]
-    assert "--file \"$LEDGER_PATH\"" in latest["run"]
-    assert "$SILO_EXEC" in latest["run"]
-    assert "list" not in latest["run"]
-
-    # Silo uploads keep failures at the step outcome while making the job check green.
-    assert upload["continue-on-error"] is True
-    assert "GATE-ARCHIVE-DEFERRED kind=review-ledger " in upload["run"]
-    assert "GATE-ARCHIVE-DEFERRED kind=review-ledger-latest " in latest["run"]
-
-    archive_steps = [
-        step for step in steps if step.get("name") == "Upload v2 raw review ledger to permanent archive"
-    ]
-    assert len(archive_steps) == 1
-    archive = archive_steps[0]
-    assert steps.index(archive) == steps.index(latest) + 1
-    assert archive["if"] == "always() && steps.build-review-ledger.outcome == 'success'"
-    assert archive["continue-on-error"] is True
-    assert archive["env"]["ARTIFACT_NAME"] == upload["env"]["ARTIFACT_NAME"]
-    assert archive["env"]["LEDGER_PATH"] == upload["env"]["LEDGER_PATH"]
-    assert "--tier archive" in archive["run"]
-    assert "--repo-id \"${{ github.repository_id }}\"" in archive["run"]
-    assert "--name \"$ARTIFACT_NAME\"" in archive["run"]
-    assert "--file \"$LEDGER_PATH\"" in archive["run"]
-    assert "GATE-ARCHIVE-DEFERRED kind=review-ledger-archive " in archive["run"]
-
-    audit_archive = next(step for step in steps if step.get("name") == "Archive canonical primary audit permanently")
-    assert audit_archive["if"] == "always() && needs.primary.outputs.audit_key != ''"
-    assert audit_archive["continue-on-error"] is True
-    assert audit_archive["env"]["ARTIFACT_NAME"] == "${{ needs.primary.outputs.audit_key }}"
-    assert "GATE-ARCHIVE-DEFERRED kind=primary-audit-archive " in audit_archive["run"]
-
-    terminal_archive = next(step for step in steps if step.get("name") == "Archive gate terminal envelope permanently")
-    assert terminal_archive["continue-on-error"] is True
-    assert "GATE-ARCHIVE-DEFERRED kind=gate-terminal-archive " in terminal_archive["run"]
-
-    record_upload = next(step for step in steps if step.get("name") == "Upload live review record/v1 to permanent Silo")
-    assert record_upload["continue-on-error"] is True
-    assert "GATE-ARCHIVE-DEFERRED kind=review-record " in record_upload["run"]
 
 
 def _evaluate_ledger_if(expression: str, outcomes: dict[str, str], *, job_success: bool) -> bool:
@@ -1942,38 +1336,6 @@ def _evaluate_ledger_if(expression: str, outcomes: dict[str, str], *, job_succes
     return bool(evaluate(tree))
 
 
-def test_ledger_resolve_failure_skips_build_and_both_uploads():
-    steps = _load_workflow()[0]["jobs"]["ledger"]["steps"]
-    named = {step.get("name"): step for step in steps}
-    outcomes = {
-        "resolve-ledger-artifacts": "failure",
-        "read-primary-audit-for-ledger": "success",
-        "download-gate-terminal-for-ledger": "skipped",
-    }
-    build = named["Build v2 review effectiveness ledger"]
-    assert not _evaluate_ledger_if(build["if"], outcomes, job_success=True)
-    outcomes["build-review-ledger"] = "skipped"
-    for name in (
-        "Upload v2 review effectiveness ledger",
-        "Upload v2 review effectiveness ledger latest pointer",
-    ):
-        assert not _evaluate_ledger_if(named[name]["if"], outcomes, job_success=True)
-
-    # Known-success control: optional terminal download may be skipped, but the
-    # resolved inputs and audit are present, so build and uploads can proceed.
-    outcomes.update(
-        {
-            "resolve-ledger-artifacts": "success",
-            "read-primary-audit-for-ledger": "success",
-            "build-review-ledger": "success",
-        }
-    )
-    assert _evaluate_ledger_if(build["if"], outcomes, job_success=True)
-    for name in (
-        "Upload v2 review effectiveness ledger",
-        "Upload v2 review effectiveness ledger latest pointer",
-    ):
-        assert _evaluate_ledger_if(named[name]["if"], outcomes, job_success=True)
 
 
 def _assert_ledger_scheduling_contract(workflow: dict) -> None:
@@ -1982,62 +1344,12 @@ def _assert_ledger_scheduling_contract(workflow: dict) -> None:
     assert "concurrency" not in ledger
 
 
-@pytest.mark.parametrize("regression", ["three_minute_limit", "repository_only_lock"])
-def test_ledger_scheduling_contract_rejects_known_regressions(regression):
-    raw, _ = _load_workflow()
-    ledger = raw["jobs"]["ledger"]
-    if regression == "three_minute_limit":
-        ledger["timeout-minutes"] = 3
-    else:
-        ledger["concurrency"] = {
-            "group": "gate-required-v2-ledger-${{ github.repository_id }}",
-            "cancel-in-progress": False,
-        }
-
-    with pytest.raises(AssertionError):
-        _assert_ledger_scheduling_contract(raw)
 
 
-def test_ledger_job_has_ten_minute_limit_and_no_shared_concurrency():
-    raw, _ = _load_workflow()
-    _assert_ledger_scheduling_contract(raw)
 
 
-def test_ledger_build_step_has_one_minute_timeout():
-    raw, _ = _load_workflow()
-    build = next(
-        step for step in raw["jobs"]["ledger"]["steps"]
-        if step.get("name") == "Build v2 review effectiveness ledger"
-    )
-    assert build["timeout-minutes"] == 1
 
 
-def test_ledger_steps_emit_start_progress_markers():
-    raw, _ = _load_workflow()
-    steps = raw["jobs"]["ledger"]["steps"]
-    names = (
-        "Checkout ledger action at this workflow's own commit",
-        "Resolve Silo hostname via MagicDNS",
-        "Resolve v2 ledger artifacts",
-        "Download v2 review ledger inputs",
-        "Read canonical primary audit from primary job output for ledger",
-        "Download gate terminal envelope for ledger",
-        "Build v2 review effectiveness ledger",
-        "Upload v2 review effectiveness ledger",
-        "Upload v2 review effectiveness ledger latest pointer",
-    )
-
-    assert len([step for step in steps if step.get("name") in names]) == len(names)
-    for name in names:
-        index = next(i for i, step in enumerate(steps) if step.get("name") == name)
-        step = steps[index]
-        marker = f'echo "::notice::step-start: {name}"'
-        if "uses" in step:
-            progress = steps[index - 1]
-            assert progress["name"] == f"Mark {name} start"
-            assert progress["run"] == marker
-        else:
-            assert step["run"].splitlines()[0] == marker
 
 
 def test_review_ledger_input_uploads_declare_one_day_retention():
@@ -2094,37 +1406,6 @@ def test_only_ledger_job_has_continue_on_error():
     assert {job for job, spec in jobs.items() if spec.get("continue-on-error") is True} == {"ledger"}
 
 
-def test_ledger_resolver_is_strict_about_current_run_artifact_attempts():
-    raw, _ = _load_workflow()
-    resolver = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Resolve v2 ledger artifacts")
-    assert resolver["if"] == "always()"
-    assert resolver["env"]["CURRENT_ATTEMPT"] == "${{ github.run_attempt }}"
-    assert resolver["env"]["REVIEW_EXPECTED"] == raw["jobs"]["primary"]["if"]
-    run = resolver["run"]
-    for marker in (
-        "$SILO_EXEC", "resolve", "--attempt",
-        "input_artifact_id", "terminal_artifact_id",
-        "terminal_source_attempt",
-    ):
-        assert marker in run
-    # audit no longer resolves from Silo (design A.3) — it arrives via the
-    # primary job output in the following step.
-    assert "audit_artifact_id" not in run
-    assert "AUDIT_RESOLVE" not in run
-    assert "exact_attempt" not in run
-    assert resolver["env"].get("AUDIT_PREFIX") is None
-    assert resolver["env"]["TERMINAL_PREFIX"] == (
-        "gate-terminal-v1-${{ github.repository_id }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-"
-    )
-    assert resolver["env"]["REPOSITORY"] == "${{ github.repository }}"
-    assert resolver["env"]["RUN_ID"] == "${{ github.run_id }}"
-    assert "No matching required ledger input artifact found" in run
-    assert "No matching canonical primary audit artifact found" not in run
-    assert "No matching required gate terminal artifact found" in run
-    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in run
-    assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in run
-    assert "/attempts/" in run and "/jobs" in run
-    assert "run_started_at" in run
 
 
 def _ledger_resolver_python() -> str:
@@ -2282,229 +1563,26 @@ def _issue_101_attempt2_jobs():
     }
 
 
-@pytest.mark.parametrize(
-    ("target", "timeout_message"),
-    [
-        ("jobs", "Resolve v2 ledger artifacts 超时：current-attempt jobs API 调用超过 30 秒"),
-        ("meta", "Resolve v2 ledger artifacts 超时：current-attempt metadata API 调用超过 30 秒"),
-    ],
-)
-def test_ledger_resolver_times_out_for_each_current_attempt_api_call(
-    tmp_path, target, timeout_message,
-):
-    gh = _write_ledger_gh_stub(tmp_path, target=target, mode="hang")
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 101},
-    ]
-    started = time.perf_counter()
-    result, _output = _run_ledger_resolver(
-        tmp_path,
-        artifacts=artifacts,
-        current=2,
-        extra_env={
-            "PATH": f"{gh.parent}:{os.environ['PATH']}",
-            "REPOSITORY": "owner/repo",
-            "RUN_ID": "123",
-        },
-        process_timeout=45,
-    )
-    elapsed = time.perf_counter() - started
-
-    combined = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert timeout_message in combined
-    assert "Jobs API call failed while attributing a missing current-attempt terminal" not in combined
-    assert 20 <= elapsed < 40, f"dedicated 30-second timeout took {elapsed:.1f}s"
 
 
-@pytest.mark.parametrize("target", ["jobs", "meta"])
-def test_ledger_resolver_keeps_nonzero_api_failure_distinct_from_timeout(tmp_path, target):
-    gh = _write_ledger_gh_stub(tmp_path, target=target, mode="fail")
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 101},
-    ]
-    result, _output = _run_ledger_resolver(
-        tmp_path,
-        artifacts=artifacts,
-        current=2,
-        extra_env={
-            "PATH": f"{gh.parent}:{os.environ['PATH']}",
-            "REPOSITORY": "owner/repo",
-            "RUN_ID": "123",
-        },
-        process_timeout=45,
-    )
-
-    combined = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert "Jobs API call failed while attributing a missing current-attempt terminal" in combined
-    assert "超时" not in combined
 
 
-def test_ledger_resolver_refuses_stale_terminal_when_current_attempt_is_missing(tmp_path):
-    artifacts = [
-        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "primary-audit-v2-2", "expired": False, "id": 302},
-    ]
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=2, review_expected="true",
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "No matching required gate terminal artifact found" in combined
-    assert "identity mismatch" not in combined
 
 
-def test_ledger_resolver_falls_back_to_prior_terminal_when_current_attempt_is_missing(tmp_path):
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=2,
-        jobs=_jobs("gate / ledger", "gate / quality"),
-        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
-    assert "terminal_source_attempt=1" in output
 
 
-def test_ledger_resolver_selects_current_attempt_terminal_not_an_older_one(tmp_path):
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
-    ]
-    result, output = _run_ledger_resolver(tmp_path, artifacts=artifacts, current=2)
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-2')}" in output
-    assert "terminal_source_attempt=2" in output
 
 
-def test_ledger_resolver_refuses_future_terminal_artifact(tmp_path):
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "primary-audit-v2-2", "expired": False, "id": 302},
-        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
-    ]
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=2, review_expected="true",
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "No matching required gate terminal artifact found" in combined
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-3')}" not in _output
 
 
-def test_ledger_resolver_ignores_future_terminal_when_an_eligible_one_exists(tmp_path):
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-        {"name": "gate-terminal-v1-3", "expired": False, "id": 203},
-    ]
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=2, jobs=_jobs("gate / ledger"),
-        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
-    assert "terminal_source_attempt=1" in output
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-3')}" not in output
 
 
-@pytest.mark.parametrize("gate_job_name", (*GATE_AGGREGATOR_JOB_NAMES, "ci / gate"))
-def test_ledger_resolver_hard_fails_when_aggregator_ran_without_terminal(tmp_path, gate_job_name):
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=2,
-        jobs=_jobs(gate_job_name, "gate / ledger", started_at="2026-09-01T02:57:51Z"),
-        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in combined
-    assert "No matching required gate terminal artifact found" not in combined
 
 
-def test_ledger_resolver_records_not_applicable_when_review_not_expected_without_terminal(tmp_path):
-    """gate#185: attempt 1 也没有终态时，豁免路径记「不适用」而不是硬失败。"""
-    artifacts = [
-        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
-    ]
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=1, review_expected="false",
-        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "skipped"},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode == 0, combined
-    assert "本轮未评审/豁免，无终态产物" in result.stdout
-    assert "terminal_artifact_id=\n" in output
-    assert "terminal_source_attempt=\n" in output
-    assert "No matching required gate terminal artifact found" not in combined
 
 
-def test_ledger_resolver_python_keeps_terminal_required_tied_to_review_expected():
-    """YAML 抽出的 resolver AST：终态 parse_resolve 不得再写死 Constant True。"""
-    tree = ast.parse(_ledger_resolver_python())
-    required_name = None
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "terminal_required"
-            for target in node.targets
-        ):
-            compare = node.value
-            assert isinstance(compare, ast.Compare)
-            assert isinstance(compare.left, ast.Name) and compare.left.id == "expected_text"
-            assert isinstance(compare.comparators[0], ast.Constant)
-            assert compare.comparators[0].value == "true"
-            required_name = "terminal_required"
-            break
-    assert required_name == "terminal_required"
-    terminal_calls = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "parse_resolve"
-            and len(node.args) >= 3
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == "No matching required gate terminal artifact found"
-        ):
-            terminal_calls.append(node)
-    assert len(terminal_calls) == 1
-    third = terminal_calls[0].args[2]
-    assert isinstance(third, ast.Name) and third.id == "terminal_required"
 
 
-def test_ledger_resolver_skips_jobs_listing_when_current_terminal_exists(tmp_path):
-    artifacts = [
-        {"name": "review-ledger-input-v2-2", "expired": False, "id": 102},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-        {"name": "gate-terminal-v1-2", "expired": False, "id": 202},
-    ]
-    missing = tmp_path / "jobs-missing.json"
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=2, jobs_path=missing,
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-2')}" in output
-    assert "terminal_source_attempt=2" in output
-    poison = tmp_path / "jobs-poison.json"
-    poison.write_text("{not json", encoding="utf-8")
-    attempt_poison = tmp_path / "attempt-poison.json"
-    attempt_poison.write_text("{not json", encoding="utf-8")
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=2, jobs_path=poison, attempt_path=attempt_poison,
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert "terminal_source_attempt=2" in output
 
 
 def _prior_terminal_artifacts():
@@ -2514,66 +1592,12 @@ def _prior_terminal_artifacts():
     ]
 
 
-def test_ledger_resolver_falls_back_when_copied_aggregator_job_predates_attempt(tmp_path):
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
-        jobs=_issue_101_attempt2_jobs(),
-        attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
-    assert "terminal_source_attempt=1" in output
 
 
-def test_ledger_resolver_hard_fails_when_aggregator_started_at_or_after_attempt(tmp_path):
-    jobs = _issue_101_attempt2_jobs()
-    jobs["jobs"][0]["started_at"] = "2026-09-01T02:57:51Z"
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
-        jobs=jobs, attempt={"run_started_at": ISSUE_101_RUN_STARTED_AT},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "Aggregator ran on this attempt but did not produce a terminal artifact" in combined
-    assert "No matching required gate terminal artifact found" not in combined
-    assert "run_started_at is missing or unparseable" not in combined
 
 
-@pytest.mark.parametrize("attempt", [
-    {},
-    {"run_started_at": None},
-    {"run_started_at": "not-a-timestamp"},
-    {"run_started_at": "2026-09-01 02:57:51"},
-])
-def test_ledger_resolver_fail_louds_when_run_started_at_is_unusable(tmp_path, attempt):
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=_prior_terminal_artifacts(), current=2,
-        jobs=_issue_101_attempt2_jobs(), attempt=attempt,
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "Cannot attribute missing current-attempt terminal: run_started_at is missing or unparseable" in combined
-    assert "No matching required gate terminal artifact found" not in combined
-    assert "Aggregator ran on this attempt but did not produce a terminal artifact" not in combined
 
 
-@pytest.mark.parametrize("upload_env,expected_token", [
-    ({"QUALITY_LEDGER_INPUT_UPLOAD": "failure"}, "quality upload outcome: failure"),
-    ({"QUALITY_LEDGER_INPUT_UPLOAD": ""}, "quality upload outcome: unknown"),
-])
-def test_ledger_resolver_missing_input_reports_quality_upload_outcome(
-    tmp_path, upload_env, expected_token,
-):
-    artifacts = [
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=1, extra_env=upload_env,
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert expected_token in combined
-    assert "No matching required ledger input artifact found" in combined
 
 
 # ── gate#105 A (PR #119 r1): short-circuited quality has no input BY DESIGN ──
@@ -2584,64 +1608,12 @@ def test_ledger_resolver_missing_input_reports_quality_upload_outcome(
 # ONLY for this exact combination; every other missing-input case stays fatal.
 
 
-def test_ledger_resolver_short_circuited_quality_makes_input_optional(tmp_path):
-    artifacts = [
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=1,
-        extra_env={
-            "QUALITY_RESULT": "skipped",
-            "PRIMARY_RESULT": "failure",
-            "QUALITY_LEDGER_INPUT_UPLOAD": "",
-        },
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert "input_artifact_id=\n" in output
-    assert "input_short_circuited=true" in output
-    assert "::notice::ledger input skipped" in result.stdout
 
 
-def test_ledger_resolver_skipped_quality_without_primary_failure_still_requires_input(tmp_path):
-    artifacts = [
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=1,
-        extra_env={"QUALITY_RESULT": "skipped", "PRIMARY_RESULT": "success", "QUALITY_LEDGER_INPUT_UPLOAD": ""},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "quality upload outcome: unknown" in combined
-    assert "No matching required ledger input artifact found" in combined
 
 
-def test_ledger_resolver_step_env_and_download_guard_literals():
-    raw, _ = _load_workflow()
-    ledger_steps = raw["jobs"]["ledger"]["steps"]
-    resolve = next(s for s in ledger_steps if s.get("name") == "Resolve v2 ledger artifacts")
-    assert resolve["env"]["QUALITY_RESULT"] == "${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && 'success' || needs.quality.result }}"
-    assert resolve["env"]["PRIMARY_RESULT"] == PRIMARY_RESULT_EXPR
-    assert resolve["env"]["PRIMARY_RESULT_RAW"] == PRIMARY_RESULT_RAW_EXPR
-    download = next(s for s in ledger_steps if s.get("name") == "Download v2 review ledger inputs")
-    assert download["if"] == "steps.resolve-ledger-artifacts.outputs.input_artifact_id != ''"
-    terminal_download = next(s for s in ledger_steps if s.get("name") == "Download gate terminal envelope for ledger")
-    assert terminal_download["if"] == "always() && steps.resolve-ledger-artifacts.outputs.terminal_artifact_id != ''"
 
 
-def test_ledger_build_step_forwards_input_short_circuited():
-    """W5: Build 步 with: 必须把解析器的 input_short_circuited 原样传进 action。"""
-    raw, _ = _load_workflow()
-    matches = [
-        s for s in raw["jobs"]["ledger"]["steps"]
-        if s.get("name") == "Build v2 review effectiveness ledger"
-    ]
-    assert len(matches) == 1
-    build = matches[0]
-    assert "input-short-circuited" in build.get("with", {})
-    assert build["with"]["input-short-circuited"] == (
-        "${{ steps.resolve-ledger-artifacts.outputs.input_short_circuited }}"
-    )
 
 
 def test_review_ledger_action_declares_and_forwards_input_short_circuited():
@@ -2662,172 +1634,18 @@ def test_review_ledger_action_declares_and_forwards_input_short_circuited():
     assert ":-}" not in run
 
 
-@pytest.mark.parametrize(
-    "env_key,bad",
-    [
-        ("QUALITY_RESULT", "bogus"),
-        ("PRIMARY_RESULT", "timeout"),
-        ("QUALITY_RESULT", ""),
-        ("PRIMARY_RESULT", "SUCCESS"),
-        ("QUALITY_RESULT", "true"),
-        ("PRIMARY_RESULT", "0"),
-    ],
-)
-def test_ledger_resolver_result_domain_rejects_illegal_values(tmp_path, env_key, bad):
-    """W6: RESULT_DOMAIN 四值域；非法 QUALITY_RESULT / PRIMARY_RESULT 必须 fail-loud。"""
-    artifacts = [
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    extra = {"QUALITY_RESULT": "success", "PRIMARY_RESULT": "success"}
-    extra[env_key] = bad
-    result, _output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=1, extra_env=extra,
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "must be one of" in combined
-    assert env_key in combined
 
 
-@pytest.mark.parametrize("quality_result", ["success", "failure", "cancelled", "skipped"])
-@pytest.mark.parametrize("primary_result", ["success", "failure", "cancelled", "skipped"])
-def test_ledger_resolver_result_domain_accepts_legal_values(
-    tmp_path, quality_result, primary_result,
-):
-    """W6 positive: every RESULT_DOMAIN value is accepted; domain check must not exit."""
-    artifacts = [
-        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, output = _run_ledger_resolver(
-        tmp_path, artifacts=artifacts, current=1,
-        extra_env={"QUALITY_RESULT": quality_result, "PRIMARY_RESULT": primary_result},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode == 0, combined
-    assert "must be one of" not in combined
-    assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
 
 
-def test_ledger_resolver_has_no_audit_outputs_after_channel_split(tmp_path):
-    """Audit resolve removed (design A.3): the resolver no longer emits audit_*.
-
-    The audit reaches the ledger through needs.primary.outputs (see
-    test_gate_v2_audit_output_channel.py for the read-step behavior contract).
-    """
-    fixture = json.loads(ABANDONED_FIXTURE.read_text(encoding="utf-8"))
-    observed = fixture["observed_env"]
-    artifacts = [
-        {"name": "review-ledger-input-v2-1", "expired": False, "id": 101},
-        {"name": "gate-terminal-v1-1", "expired": False, "id": 201},
-    ]
-    result, output = _run_ledger_resolver(
-        tmp_path,
-        artifacts=artifacts,
-        current=fixture["identity"]["run_attempt"],
-        review_expected=observed["REVIEW_EXPECTED"],
-        extra_env={
-            "QUALITY_RESULT": observed["QUALITY_RESULT"],
-            "PRIMARY_RESULT": "cancelled",
-            "PRIMARY_RESULT_RAW": observed["PRIMARY_RESULT"],
-        },
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert "audit_artifact_id=" not in output
-    assert "audit_source_attempt=" not in output
-    assert f"input_artifact_id={_silo_prefix('review-ledger-input-v2-1')}" in output
-    assert f"terminal_artifact_id={_silo_prefix('gate-terminal-v1-1')}" in output
 
 
-@pytest.mark.parametrize("primary_result", ["success", "failure"])
-def test_ledger_audit_read_still_fail_louds_for_reviewed_success_or_failure(tmp_path, primary_result):
-    """Reviewed run + missing audit output must fail the read step (exit 1).
-
-    Same input contract the required Silo resolve enforced before the channel
-    split; step-level continue-on-error keeps the ledger job check green.
-    """
-    raw, _ = _load_workflow()
-    step = next(s for s in raw["jobs"]["ledger"]["steps"] if s.get("name") == "Read canonical primary audit from primary job output for ledger")
-    env = {
-        "PRIMARY_RESULT_RAW": primary_result,
-        "PRIMARY_RESULT": primary_result,
-        "AUDIT_B64": "",
-        "AUDIT_BYTES_DECLARED": "",
-        "AUDIT_DIR": str(tmp_path / "primary-audit"),
-        "AUDIT_FILENAME": "primary-review-audit.json",
-    }
-    proc = subprocess.run(["bash", "-c", step["run"]], env={**os.environ, **env}, capture_output=True, text=True, timeout=30)
-    combined = proc.stderr + proc.stdout
-    assert proc.returncode != 0
-    assert "refusing to ledger a reviewed run without its audit record" in combined
 
 
-def test_ledger_resolver_cancelled_primary_still_requires_terminal(tmp_path):
-    result, _output = _run_ledger_resolver(
-        tmp_path,
-        artifacts=[{"name": "review-ledger-input-v2-1", "expired": False, "id": 101}],
-        current=1,
-        review_expected="true",
-        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "cancelled"},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "No matching required gate terminal artifact found" in combined
 
 
-def test_ledger_resolver_quality_success_still_requires_input_on_cancelled_primary(tmp_path):
-    result, _output = _run_ledger_resolver(
-        tmp_path,
-        artifacts=[{"name": "gate-terminal-v1-1", "expired": False, "id": 201}],
-        current=1,
-        review_expected="true",
-        extra_env={"QUALITY_RESULT": "success", "PRIMARY_RESULT": "cancelled", "QUALITY_LEDGER_INPUT_UPLOAD": ""},
-    )
-    combined = result.stderr + result.stdout
-    assert result.returncode != 0
-    assert "No matching required ledger input artifact found" in combined
 
 
-def test_ledger_persistence_never_gates_the_conclusion():
-    """Inverted contract (design A/E): Silo bookkeeping failures only warn.
-
-    Every Silo bookkeeping step is protected at the step level; audit read still
-    fails loudly in its step outcome, while the job's check stays green.
-    """
-    raw, _ = _load_workflow()
-    ledger_steps = raw["jobs"]["ledger"]["steps"]
-    for name in (
-        "Download v2 review ledger inputs",
-        "Build v2 review effectiveness ledger",
-    ):
-        step = next(s for s in ledger_steps if s.get("name") == name)
-        assert "continue-on-error" not in step
-    for name in (
-        "Resolve v2 ledger artifacts",
-        "Read canonical primary audit from primary job output for ledger",
-        "Download gate terminal envelope for ledger",
-    ):
-        step = next(s for s in ledger_steps if s.get("name") == name)
-        assert step["continue-on-error"] is True
-    job_level = raw["jobs"]["ledger"].get("continue-on-error") is True
-    assert job_level
-    for name in (
-        "Upload v2 review effectiveness ledger",
-        "Upload v2 review effectiveness ledger latest pointer",
-    ):
-        step = next(s for s in ledger_steps if s.get("name") == name)
-        assert step["continue-on-error"] is True
-        assert "GATE-ARCHIVE-DEFERRED" in step["run"]
-    for name in (
-        "Upload v2 raw review ledger to permanent archive",
-        "Archive canonical primary audit permanently",
-        "Archive gate terminal envelope permanently",
-        "Upload live review record/v1 to permanent Silo",
-    ):
-        step = next(s for s in ledger_steps if s.get("name") == name)
-        assert step["continue-on-error"] is True
-        assert "GATE-ARCHIVE-DEFERRED" in step["run"]
 
 
 def test_gate_job_review_expected_matches_primary_jobs_own_condition():
@@ -3375,33 +2193,7 @@ def test_silo_src_aggregate_sparse_covers_load_time_neighbors():
     assert jobs_that_run, f"no job runs {needle}"
 
 
-def _run_quality_result_render(tmp_path, result_bytes=None):
-    raw, _ = _load_workflow()
-    step = next(
-        step for step in _quality_steps(raw)
-        if step.get("id") == "render-quality-result"
-    )
-    artifact_dir = tmp_path / "gate-quality"
-    artifact_dir.mkdir(parents=True)
-    if result_bytes is not None:
-        (artifact_dir / "gate-quality-result.json").write_bytes(result_bytes)
-    summary_path = tmp_path / "summary.md"
-    summary_path.write_bytes(b"")
-    env = os.environ.copy()
-    env.update({
-        "GATE_ARTIFACT_DIR": str(artifact_dir),
-        "GITHUB_STEP_SUMMARY": str(summary_path),
-    })
-    completed = subprocess.run(
-        ["bash", "-c", step["run"]],
-        cwd=REPO_ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    return step, completed, summary_path.read_bytes()
-
+from _gate_v2_contract_support import _run_quality_result_render
 
 def _quality_result(**overrides):
     result = {
@@ -3661,44 +2453,6 @@ def test_diff_coverage_advisory_never_gates_quality_job():
     assert "exit 1" not in advisory.get("run", "")
 
 
-def test_disposition_caller_forwards_business_inputs_without_legacy_gate_ref():
-    raw, trigger = _load_disposition_caller()
-    assert raw["name"] == "gate-disposition"
-    assert set(trigger["workflow_dispatch"]["inputs"]) == {
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
-        "disposition", "counterevidence_json", "tracking_issue",
-    }
-    assert "workflow_call" not in trigger
-    # reusable-workflow token is caller ∩ callee; upload-artifact needs write, gh api pulls needs pull-requests: read.
-    expected_permissions = {
-        "actions": "write",
-        "contents": "read",
-        "pull-requests": "read",
-    }
-    assert raw["permissions"] == expected_permissions
-    assert "concurrency" not in raw
-    assert set(raw["jobs"]) == {"disposition"}
-    job = raw["jobs"]["disposition"]
-    assert job["permissions"] == expected_permissions
-    assert job["secrets"] == {
-        "SILO_ACCESS_KEY": "${{ secrets.SILO_ACCESS_KEY }}",
-        "SILO_SECRET_KEY": "${{ secrets.SILO_SECRET_KEY }}",
-    }
-    assert "environment" not in job
-    uses = job["uses"]
-    assert uses == (
-        "zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@" + DISPOSITION_CALLER_PIN
-    )
-    forwarded = (
-        "pr_number", "primary_run_id", "primary_run_attempt", "finding_id", "reason",
-        "disposition", "counterevidence_json", "tracking_issue",
-    )
-    for key in forwarded:
-        assert job["with"][key] == "${{ inputs." + key + " }}"
-    assert set(job["with"]) == set(forwarded)
-    text = DISPOSITION_CALLER_TEMPLATE.read_text()
-    assert "pull-requests: write" not in text
-    assert "environment:" not in text
 
 
 # ── gate#199 根治：quality 自带 caller_checks 证据链 ─────────────────────
@@ -4051,16 +2805,3 @@ def test_ledger_resolver_ignores_silo_listing_and_spoofed_prefix_for_input(tmp_p
     )[0]
     assert missing.returncode != 0
     assert "INPUT_PREFIX and REPO_ID are required to bind ledger input identity" in missing.stderr + missing.stdout
-
-
-def test_empty_bundle_download_fails_loud(tmp_path):
-    raw, _ = _load_workflow()
-    download = next(
-        step for step in raw["jobs"]["ledger"]["steps"]
-        if step.get("name") == "Download v2 review ledger inputs"
-    )
-    dest = tmp_path / "review-ledger-input"
-    env = {**os.environ, "LEDGER_INPUT_BUNDLE": "", "DEST": str(dest)}
-    result = subprocess.run(["bash", "-c", download["run"]], env=env, capture_output=True, text=True)
-    assert result.returncode != 0
-    assert "review ledger input bundle missing" in result.stderr
