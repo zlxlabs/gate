@@ -81,6 +81,7 @@ DEMAND_REF_MISSING = "SOURCE-DEMAND-REF-MISSING"
 FETCH_FAILED = "SOURCE-FETCH-FAILED"
 CHECKOUT_FAILED = "SOURCE-CHECKOUT-FAILED"
 PIN_MISMATCH = "SOURCE-PIN-MISMATCH"
+MERGE_BASE_FAILED = "SOURCE-MERGE-BASE-FAILED"
 PATH_MISSING = "SOURCE-PATH-MISSING"
 
 
@@ -174,6 +175,8 @@ def _git(args: Sequence[str], *, cwd: Path | None = None, code: str, timeout: in
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or error.stdout or "").strip().splitlines()
         fail(code, f"git {' '.join(args)}: {detail[-1] if detail else error.returncode}")
+    except OSError as error:
+        fail(code, f"git {' '.join(args)}: {error}")
     return completed.stdout.strip()
 
 
@@ -405,6 +408,41 @@ def _borrow_mirror_objects(repo: Path, mirror_repo: Path) -> None:
             handle.write(f"{separator}{line}\n")
     except OSError as error:
         fail(FETCH_FAILED, f"borrow {mirror_repo} objects into {alternates}: {error}")
+
+
+def merge_base(
+    repository: str, base_sha: str, head_sha: str, *, timeout: int | None = None
+) -> str:
+    """Prepare both commits then compute their merge base from the locked mirror."""
+    require_service_mode()
+    check_repository(repository)
+    check_commit(base_sha)
+    check_commit(head_sha)
+    budget = budget_secs() if timeout is None else timeout
+    deadline = int(time.time()) + budget
+    base_repo, _ = prepare(repository, base_sha, deadline)
+    head_repo, _ = prepare(repository, head_sha, deadline)
+    if base_repo != head_repo:
+        fail(MIRROR_UNREADABLE, f"prepared commits resolved to different mirrors: {base_repo}, {head_repo}")
+    mirror_repo = base_repo
+    with shared_consume_lock(mirror_repo, deadline):
+        for sha in (base_sha, head_sha):
+            demand_ref = DEMAND_REF.format(sha=sha)
+            resolved = _git(
+                ["--git-dir", str(mirror_repo), "rev-parse", "--verify", "--quiet", f"{demand_ref}^{{commit}}"],
+                code=DEMAND_REF_MISSING,
+                timeout=remaining(deadline),
+            )
+            if resolved != sha:
+                fail(PIN_MISMATCH, f"{mirror_repo}:{demand_ref} resolves to {resolved}, expected {sha}")
+        result = _git(
+            ["--git-dir", str(mirror_repo), "merge-base", base_sha, head_sha],
+            code=MERGE_BASE_FAILED,
+            timeout=remaining(deadline),
+        )
+        if not SHA_RE.fullmatch(result):
+            fail(MERGE_BASE_FAILED, f"git merge-base returned invalid SHA {result!r}")
+        return result
 
 
 def ensure_commits(
