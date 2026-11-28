@@ -360,9 +360,7 @@ def _terminal_history_ports() -> SimpleNamespace:
 def _previous_context_ports() -> SimpleNamespace:
     return SimpleNamespace(
         _ledger_latest_key=_ledger_latest_key,
-        _previous_findings_from_silo=_previous_findings_from_silo,
         load_previous_round_findings=load_previous_round_findings,
-        _project_previous_dispositions=_project_previous_dispositions,
         _render_previous_context_cli=_render_previous_context_cli,
         _annotate_primary_audit_cli=_annotate_primary_audit_cli,
         _silo_configured=_silo_configured,
@@ -382,22 +380,10 @@ def _ledger_latest_key(repository_id: int, pr_number: int) -> str:
     return _PREVIOUS_CONTEXT._ledger_latest_key(repository_id=repository_id, pr_number=pr_number, _ports=_previous_context_ports())
 
 
-def _previous_findings_from_silo(
-    *, repository_id: int, pr_number: int, run_id: int, run_attempt: int,
-) -> tuple[Optional[str], list[Any]]:
-    return _PREVIOUS_CONTEXT._previous_findings_from_silo(repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt, _ports=_previous_context_ports())
-
-
 def load_previous_round_findings(
     *, path: Optional[str], repository_id: int, pr_number: int, run_id: int, run_attempt: int,
 ) -> dict[str, Any]:
     return _PREVIOUS_CONTEXT.load_previous_round_findings(path=path, repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt, _ports=_previous_context_ports())
-
-
-def _project_previous_dispositions(
-    *, repository_id: int, pr_number: int,
-) -> list[dict[str, Any]]:
-    return _PREVIOUS_CONTEXT._project_previous_dispositions(repository_id=repository_id, pr_number=pr_number, _ports=_previous_context_ports())
 
 
 def _render_previous_context_cli(argv: list[str]) -> int:
