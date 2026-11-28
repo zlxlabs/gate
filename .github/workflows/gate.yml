@@ -1,0 +1,20 @@
+# Review this repository's PRs with the released @v2 workflow, not a relative
+# reference: changes to gate-v2.yml in a PR must not change the gate that reviews it.
+name: gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    uses: zlxlabs/gate/.github/workflows/gate-v2.yml@v2
+    with:
+      tier: personal
+      runner: self
+    secrets: inherit

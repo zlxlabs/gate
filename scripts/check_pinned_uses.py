@@ -65,7 +65,7 @@ def parse_internal_use_value(line: str) -> tuple[str, str] | None:
 def find_pinned_use_violations(
     repo_root: Path, include_templates: bool = False
 ) -> list[InternalUseViolation]:
-    """Return all absolute internal uses; live self-references must be relative."""
+    """Return absolute internal uses other than the released gate self-caller."""
 
     violations: list[InternalUseViolation] = []
     for file_path in discover_use_files(repo_root, include_templates):
@@ -76,7 +76,14 @@ def find_pinned_use_violations(
             parsed = parse_internal_use_value(line)
             if parsed is None:
                 continue
-            _, ref = parsed
+            value, ref = parsed
+            # The gate PR caller must use the released workflow, not the PR's
+            # own version of the code that reviews it.
+            if (
+                relative_path == ".github/workflows/gate.yml"
+                and value == "zlxlabs/gate/.github/workflows/gate-v2.yml@v2"
+            ):
+                continue
             violations.append(InternalUseViolation(relative_path, line_number, ref))
     return violations
 
@@ -130,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"OK: checked {len(files)} live workflow/action metadata file(s); "
-        "all internal uses are workspace-relative"
+        "no disallowed independent internal uses"
     )
     return 0
 
