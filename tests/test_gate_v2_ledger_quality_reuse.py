@@ -150,7 +150,10 @@ def test_verified_reuse_writes_current_ledger_bytes(ledger_replay, tmp_path, pri
     built = _bash(action_step, env, values | inputs)
     assert built.returncode == 0, built.stderr
     payload = (tmp_path / "review-ledger/ledger.jsonl").read_bytes()
-    assert payload == built.stdout and payload.count(b"\n") == 1 and payload.endswith(b"\n")
+    # The CLI prints the row unsorted; the on-disk protocol sorts its keys.
+    expected_payload = (json.dumps(json.loads(built.stdout), ensure_ascii=False, sort_keys=True) + "\n").encode()
+    assert payload == expected_payload
+    assert payload.count(b"\n") == 1 and payload.endswith(b"\n")
     row = json.loads(payload)
     assert {key: row[key] for key in identity} == identity
     assert row["pr_number"] == PR
