@@ -6,9 +6,11 @@ import importlib.util
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
+from gate_aggregate_decision import _convergence_scope_from_audit
 from gate_aggregate_models import Identity, Outcome, SILO_CLI_CALL_TIMEOUT_SECONDS, SILO_TERMINAL_TIER
 from gate_finding_relations import (
     PREVIOUS_FINDING_LIMIT, _LATEST_LEDGER_DEGRADE, _LEDGER_LATEST_OBJECT,
@@ -100,10 +102,10 @@ def _ledger_latest_key(repository_id: int, pr_number: int, _ports: Any = None) -
         f"{_LEDGER_LATEST_OBJECT}"
     )
 
-def _previous_findings_from_silo(
+def _read_previous_round_from_silo(
     *, repository_id: int, pr_number: int, run_id: int, run_attempt: int,
-    _ports: Any = None) -> tuple[Optional[str], list[Any]]:
-    """Return carried open facts (legacy latest findings when absent); a missing head stays unknown."""
+    _ports: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Read both the carry and its authoritative audit binding in one latest GET."""
     import tempfile
 
     key = _ports._ledger_latest_key(repository_id, pr_number)
@@ -138,9 +140,38 @@ def _previous_findings_from_silo(
     else:
         carried = findings
     head_sha = entry.get("head_sha")
-    return head_sha if isinstance(head_sha, str) and head_sha else None, [
-        item for item in carried if isinstance(item, dict)
-    ]
+    head_sha = head_sha if isinstance(head_sha, str) and head_sha else None
+    primary_identity = entry.get("primary_identity")
+    audit = None
+    if isinstance(primary_identity, dict) and head_sha and type(primary_identity.get("run_attempt")) is int and all(
+        primary_identity.get(key) == expected for key, expected in (
+            ("repository_id", repository_id), ("pr", pr_number),
+            ("head_sha", head_sha), ("run_id", parsed[0]),
+        )
+    ):
+        # The ledger keeps the original result and primary identity verbatim.
+        # Never hash the carried findings: they can come from older audits.
+        audit = {**primary_identity, "verdict": review.get("verdict"), "result": result}
+    return {
+        "available": True, "detail": "", "head_sha": head_sha,
+        "findings": [item for item in carried if isinstance(item, dict)],
+    }, audit
+
+
+def _load_previous_round_from_silo(
+    *, repository_id: int, pr_number: int, run_id: int, run_attempt: int, _ports: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if not _ports._silo_configured():
+        return _degrade_previous_round("silo-not-configured"), None
+    try:
+        return _read_previous_round_from_silo(
+            repository_id=repository_id, pr_number=pr_number, run_id=run_id,
+            run_attempt=run_attempt, _ports=_ports,
+        )
+    except Exception as exc:
+        detail = str(exc)
+        if detail in _LATEST_LEDGER_DEGRADE: return _degrade_previous_round(detail), None
+        return _degrade_previous_round(f"silo-ledger-unreadable:{type(exc).__name__}"), None
 
 def load_previous_round_findings(
     *, path: Optional[str], repository_id: int, pr_number: int, run_id: int, run_attempt: int,
@@ -169,29 +200,107 @@ def load_previous_round_findings(
                 "open_findings": open_findings,
             }
         return _degrade_previous_round("previous-findings-file-invalid")
-    if not _ports._silo_configured(): return _degrade_previous_round("silo-not-configured")
-    try:
-        head_sha, findings = _ports._previous_findings_from_silo(
-            repository_id=repository_id, pr_number=pr_number, run_id=run_id, run_attempt=run_attempt,
-        )
-    except Exception as exc:
-        detail = str(exc)
-        if detail in _LATEST_LEDGER_DEGRADE: return _degrade_previous_round(detail)
-        return _degrade_previous_round(f"silo-ledger-unreadable:{type(exc).__name__}")
-    return {"available": True, "detail": "", "head_sha": head_sha, "findings": findings}
+    previous, _ = _load_previous_round_from_silo(
+        repository_id=repository_id, pr_number=pr_number, run_id=run_id,
+        run_attempt=run_attempt, _ports=_ports,
+    )
+    return previous
+
 
 def _project_previous_dispositions(
-    *, repository_id: int, pr_number: int,
-    _ports: Any = None) -> list[dict[str, Any]]:
+    *, repository_id: int, pr_number: int, audit: dict[str, Any] | None,
+    carried: list[dict[str, Any]], _ports: Any,
+) -> list[dict[str, Any]]:
+    receipts = _ports._fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number)
+    if not receipts:
+        print("GATE-PREVIOUS-DISPOSITIONS: kept=0 dropped=0")
+        return []
+    if audit is None or audit["verdict"] not in ("pass", "fail"):
+        print(f"GATE-PREVIOUS-DISPOSITIONS: kept=0 dropped={len(receipts)} reason=audit_binding_missing")
+        return []
+
+    head_sha = audit["head_sha"]
+    identity = Identity(repository_id, head_sha, audit["run_id"], audit["run_attempt"], pr_number)
+    scope, _ = _convergence_scope_from_audit(audit, identity)
+    findings = audit["result"].get("findings", [])
+    if scope is None or not isinstance(findings, list):
+        print(f"GATE-PREVIOUS-DISPOSITIONS: kept=0 dropped={len(receipts)} reason=audit_binding_invalid")
+        return []
+    # The ledger doesn't retain the top-level matrix marker, but its result
+    # retains the producer's finding-level actions. These aren't digest inputs.
+    if any(isinstance(item, dict) and "gate_action" in item for item in findings):
+        audit = {**audit, "blocking_matrix": {"version": 1, "tier": scope.tier}}
+    finding_tuples = _ports._GATE_ACTION.p1_findings(audit)
+    if finding_tuples is None:
+        print(f"GATE-PREVIOUS-DISPOSITIONS: kept=0 dropped={len(receipts)} reason=audit_binding_invalid")
+        return []
+    ids = tuple(item[0] for item in finding_tuples)
+    primary = _CONVERGENCE.CanonicalPrimary(
+        schema_version=1, repository_id=repository_id, pr_number=pr_number,
+        head_sha=head_sha, run_id=identity.run_id, run_attempt=identity.run_attempt,
+        verdict=audit["verdict"], p1_ids=ids, p1_findings=finding_tuples,
+    )
+    projection = _ports._GATE_ACTION.disposition_projection(audit, primary)
+    _, primary, gate_actions, _ = projection if projection is not None else (ids, primary, None, None)
+
+    key_for = _ports._GATE_ACTION.canonical_finding_key
+    current_keys = {key_for(finding) for finding in findings}
+    carry_only = [finding for finding in carried if key_for(finding) not in current_keys]
+    candidates = _ports._INHERITED_REJECTION.receipt_blob_candidates(
+        receipts=receipts, findings=[*findings, *carry_only], current_head_sha=head_sha,
+        canonical_finding_key=key_for,
+        is_rejected_eligible=_ports._CARRY._rejected_releases,
+    )
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+    repository = audit.get("repository")
+    inherited_matches = {}
+    if candidates and token and repository:
+        blob_oids = _ports._NEIGHBOR_EVIDENCE.collect_file_blob_oids(
+            repository=repository, current_head_sha=head_sha,
+            head_paths=sorted(_ports._INHERITED_REJECTION.blob_fetch_requests(candidates)),
+            token=token,
+        )
+        inherited_matches = _ports._INHERITED_REJECTION.matching_finding_ids(candidates, blob_oids)
+    elif candidates:
+        print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=environment_missing")
+
+    # Give only blob-verified rejected receipts a separate target view. Carry
+    # cannot widen the latest audit's receipt targets or enter its digest.
+    verified_carry = {key for _, key, _ in inherited_matches if key not in current_keys}
+    carry_targets = tuple(
+        target for finding in carry_only if key_for(finding) in verified_carry
+        for target in (_ports._GATE_ACTION.validated_canonical_findings(
+            {"result": {"findings": [finding]}}, full=True,
+        ) or ())
+    )
+    carry_actions = {item[0]: "must_respond" for item in carry_targets}
+    audit_digest = _CONVERGENCE.canonical_audit_digest(audit)
+    current_receipts, inherited_receipts = [], []
+    for receipt in receipts:
+        if receipt.disposition == "rejected" and receipt.finding_key in verified_carry:
+            inherited_receipts.append(receipt)
+        else:
+            current_receipts.append(receipt)
+    contexts = [(primary, gate_actions, current_receipts)]
+    if inherited_receipts:
+        contexts.append((replace(primary, p1_ids=tuple(carry_actions), p1_findings=carry_targets),
+                         carry_actions, inherited_receipts))
+    disposition_audits = [
+        _CONVERGENCE.record_dispositions(
+            target.p1_ids, batch, scope=scope, primary=target,
+            audit_digest=audit_digest, repository=repository,
+            gate_actions=actions, inherited_rejection_matches=inherited_matches,
+        ) for target, actions, batch in contexts
+    ]
+    for reason in sorted({reason for result in disposition_audits for _, reason in result.rejected_receipts}):
+        print(f"GATE-PREVIOUS-DISPOSITION-DROPPED reason={reason}", file=sys.stderr)
+    findings_by_id = {finding["id"]: finding for finding in findings}
     projected: list[tuple[str, dict[str, Any]]] = []
-    dropped = 0
-    for receipt in _ports._fetch_silo_disposition_receipts(repository_id=repository_id, pr_number=pr_number):
+    recorded = (pair for result in disposition_audits for pair in zip(result.recorded_receipts, result.recorded_finding_ids))
+    for receipt, finding_id in recorded:
         counterevidence = None
         tracking_issue = None
         if receipt.disposition == "false-positive":
-            if _CONVERGENCE._counterevidence_reason(receipt) is not None:
-                dropped += 1
-                continue
             evidence = receipt.counterevidence
             if evidence.get("kind") == "behavior_replay":
                 counterevidence = {
@@ -206,23 +315,17 @@ def _project_previous_dispositions(
                 if evidence.get("match_expectation") == "absent":
                     counterevidence["match_expectation"] = "absent"
         elif receipt.disposition == "deferred":
-            if not isinstance(receipt.tracking_issue, str) or not receipt.tracking_issue.strip():
-                dropped += 1
-                continue
             tracking_issue = _clip_text(receipt.tracking_issue)
-        elif receipt.disposition == "rejected":
-            # gate-hub#2644: rejected projects evidence-free; blank reason stays dropped.
-            if not receipt.reason.strip():
-                dropped += 1
-                continue
-        else:
-            dropped += 1
+        elif not receipt.reason.strip() or (
+            receipt.head_sha, receipt.finding_key, receipt.finding_id
+        ) not in inherited_matches:
+            # Keep the non-blank reason and same-blob requirements for carry.
             continue
 
-        approved_at = receipt.approved_at if isinstance(receipt.approved_at, str) else ""
+        approved_at = receipt.approved_at
         projected.append((approved_at, {
-            "finding_id": _clip_text(receipt.finding_id),
-            "finding_key": receipt.finding_key,
+            "finding_id": _clip_text(finding_id),
+            "finding_key": receipt.finding_key or _ports._GATE_ACTION.canonical_finding_key(findings_by_id[finding_id]),
             "disposition": _clip_text(receipt.disposition),
             "head_sha": receipt.head_sha,
             "approved_at": _clip_text(approved_at),
@@ -232,11 +335,8 @@ def _project_previous_dispositions(
         }))
 
     projected.sort(key=lambda item: item[0], reverse=True)
-    if len(projected) > PREVIOUS_FINDING_LIMIT:
-        dropped += len(projected) - PREVIOUS_FINDING_LIMIT
-        projected = projected[:PREVIOUS_FINDING_LIMIT]
-    result = [item for _approved_at, item in projected]
-    print(f"GATE-PREVIOUS-DISPOSITIONS: kept={len(result)} dropped={dropped}")
+    result = [item for _approved_at, item in projected[:PREVIOUS_FINDING_LIMIT]]
+    print(f"GATE-PREVIOUS-DISPOSITIONS: kept={len(result)} dropped={len(receipts) - len(result)}")
     return result
 
 def _render_previous_context_cli(argv: list[str], _ports: Any = None) -> int:
@@ -245,35 +345,18 @@ def _render_previous_context_cli(argv: list[str], _ports: Any = None) -> int:
         parser.add_argument(name, required=True, type=int)
     parser.add_argument("--previous-json", required=True)
     args = parser.parse_args(argv)
-    previous = _ports.load_previous_round_findings(
-        path=None, repository_id=args.repository_id, pr_number=args.pr_number,
-        run_id=args.run_id, run_attempt=args.run_attempt,
-    )
-    dispositions = _ports._project_previous_dispositions(
+    previous, audit = _load_previous_round_from_silo(
         repository_id=args.repository_id, pr_number=args.pr_number,
+        run_id=args.run_id, run_attempt=args.run_attempt, _ports=_ports,
+    )
+    dispositions = _project_previous_dispositions(
+        repository_id=args.repository_id, pr_number=args.pr_number,
+        audit=audit, carried=previous["findings"], _ports=_ports,
     ) if previous["available"] else []
-    rejected_release_keys: set[tuple[str, str]] = set()
-    target_head_sha = previous.get("head_sha")
-    candidates = _ports._INHERITED_REJECTION.disposition_blob_candidates(
-        findings=previous.get("findings", []), dispositions=dispositions,
-        target_head_sha=target_head_sha or "",
-        canonical_finding_key=_ports._GATE_ACTION.canonical_finding_key,
-        is_rejected_eligible=_ports._CARRY._rejected_releases,
-    ) if previous["available"] else []
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
-    repository = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("REPOSITORY", "")
-    if candidates and token and repository and target_head_sha:
-        blob_oids = _ports._NEIGHBOR_EVIDENCE.collect_file_blob_oids(
-            repository=repository,
-            current_head_sha=target_head_sha,
-            head_paths=sorted(_ports._INHERITED_REJECTION.blob_fetch_requests(candidates)),
-            token=token,
-        )
-        rejected_release_keys = _ports._INHERITED_REJECTION.matching_finding_keys(
-            candidates, blob_oids,
-        )
-    elif candidates:
-        print("GATE-INHERITED-REJECTION-EVIDENCE-UNAVAILABLE reason=environment_missing")
+    rejected_release_keys = {
+        (item["finding_id"], item["finding_key"])
+        for item in dispositions if item["disposition"] == "rejected"
+    }
     _ports._CARRY.write_previous_context(
         previous, dispositions, args.previous_json,
         rejected_release_keys=rejected_release_keys,

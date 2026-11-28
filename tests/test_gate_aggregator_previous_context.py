@@ -167,7 +167,7 @@ def _render_previous_round_fixture(
     ])
     return rc, json.loads(output.read_text(encoding="utf-8"))
 
-def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp_path, monkeypatch, capsys):
+def test_render_previous_context_keeps_legacy_digest_finding_open(tmp_path, monkeypatch, capsys):
     ledger, _, objects = _previous_round_fixture_objects()
     assert "open_findings" not in ledger["finding_relation"]
     rc, payload = _render_previous_round_fixture(tmp_path, monkeypatch, objects)
@@ -183,17 +183,9 @@ def test_render_previous_context_projects_real_pr1063_ledger_and_disposition(tmp
         finding.get("id") == "reliability_alternates_survive_hard_kill"
         for finding in payload["findings"]
     )
-    assert len(payload["dispositions"]) == 1
-    disposition = payload["dispositions"][0]
-    assert disposition["finding_id"] == "reliability_alternates_survive_hard_kill"
-    assert disposition["disposition"] == "false-positive"
-    assert disposition["counterevidence"]["result"] == "refuted"
-    assert all(disposition["counterevidence"][field] for field in ("command", "output", "result", "pointer"))
-    assert disposition["head_sha"] == ledger["head_sha"]
-    assert set(disposition) == {
-        "finding_id", "disposition", "head_sha", "approved_at", "reason", "counterevidence", "tracking_issue",
-    }
-    assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=0" in out
+    assert payload["dispositions"] == []  # cannot verify a raw-audit digest from ledger bytes
+    assert "reliability_alternates_survive_hard_kill" in {finding["id"] for finding in payload["open_findings"]}
+    assert "GATE-PREVIOUS-DISPOSITIONS: kept=0 dropped=1" in out
 
 def test_render_previous_context_preserves_full_findings_and_prior_head(tmp_path, monkeypatch):
     ledger, _, objects = _previous_round_fixture_objects()
@@ -298,10 +290,10 @@ def _anchor_git_heads(root: Path, mode: str) -> tuple[Path, str, str, str | None
 @pytest.mark.parametrize(
     "case",
     [
-        ("primary_review_v2_with_tier.json", "none", "new", ["open-with-evidence", "new-current"], "pass"),
+        ("primary_review_v2_with_tier.json", "none", "new", ["open-with-evidence", "new-current"], "fail"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass"),
         ("primary_review_v2_with_withdrawal.json", "actual", "silent", [], "pass"),
-        ("primary_review_v2_with_withdrawal.json", "actual", "same", ["reliability_alternates_survive_hard_kill"], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "actual", "same", ["reliability_alternates_survive_hard_kill"], "fail"),
         ("primary_review_v2_with_withdrawal.json", "actual", "mapped", ["reliability_alternates_survive_hard_kill", "mapped-current"], "fail"),
         ("primary_review_v2_with_withdrawal.json", "blank", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
         ("primary_review_v2_with_withdrawal.json", "unknown", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
@@ -310,7 +302,7 @@ def _anchor_git_heads(root: Path, mode: str) -> tuple[Path, str, str, str | None
         ("primary_review_v2_with_tier.json", "none", "new", ["new-current"], "fail", "changed"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass", "adjacent"),
         ("primary_review_v2_with_tier.json", "none", "new", ["open-with-evidence", "new-current"], "fail", "shift-delete"),
-        ("primary_review_v2_with_tier.json", "none", "same", ["open-with-evidence"], "pass", "changed"),
+        ("primary_review_v2_with_tier.json", "none", "same", ["open-with-evidence"], "fail", "changed"),
         ("primary_review_v2_with_tier.json", "none", "mapped", ["open-with-evidence", "mapped-current"], "fail", "changed"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass", "unavailable"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass", "missing-quote"),
@@ -504,8 +496,9 @@ def test_silent_round_carries_open_finding_through_ledger_jsonl(
                 primary_result="failure" if anchor_case in {"changed", "shift-delete"} and report_case == "new" else "success")],
             cwd=ROOT, env=clean_env, capture_output=True, text=True, check=False,
         )
-        assert legacy_gate.returncode == (1 if anchor_case in {"changed", "shift-delete"} and report_case == "new" else 0), legacy_gate.stderr
+        assert legacy_gate.returncode == 1, legacy_gate.stderr
         legacy_terminal = json.loads(legacy_summary.with_name("gate-terminal.json").read_bytes())
+        assert legacy_terminal["gate_result"] == "fail"  # current P1 blocks without relation metadata too
         assert legacy_terminal["finding_relation"]["history_status"] == "unknown"
         assert [item["id"] for item in legacy_terminal["finding_relation"]["open_findings"]] == [
             item["id"] for item in current_findings
@@ -659,10 +652,11 @@ def test_render_previous_context_keeps_missing_prior_head_unknown(tmp_path, monk
     assert loaded["findings"] == ledger["review"]["result"]["findings"]
 
 def test_render_previous_context_drops_invalid_dispositions_and_reports_count(tmp_path, monkeypatch, capsys):
-    _, valid, objects = _previous_round_fixture_objects()
-    repo_objects = list(objects)
-    base_key, base_raw = repo_objects[-1]
-    base = json.loads(base_raw)
+    ledger, valid, objects = _previous_round_fixture_objects()
+    base_key, _ = objects[-1]
+    audit = {**ledger["primary_identity"], **ledger["review"]}
+    base = {**valid, "audit_digest": CONV.canonical_audit_digest(audit)}
+    repo_objects = [*objects[:-1], (base_key, json.dumps(base).encode())]
     for suffix, mutate in (
         ("missing-pointer", lambda item: item["counterevidence"].pop("pointer")),
         ("confirmed", lambda item: item["counterevidence"].update(result="confirmed")),
@@ -713,9 +707,14 @@ def test_previous_findings_context_renderer_removed():
 def test_render_previous_context_limits_dispositions_and_projects_deferred(tmp_path, monkeypatch, capsys):
     from datetime import datetime, timedelta, timezone
 
-    _, base, objects = _previous_round_fixture_objects()
-    _, receipt_raw = objects[-1]
-    template = json.loads(receipt_raw)
+    ledger, template, _ = _previous_round_fixture_objects()
+    audit = {**ledger["primary_identity"], **ledger["review"]}
+    finding = ledger["review"]["result"]["findings"][-1]
+    ledger["review"]["result"]["findings"] = [
+        {**finding, "id": f"finding-{i:02}", "line": i + 1, "gate_action": "must_respond"}
+        for i in range(35)
+    ]
+    template.update(audit_digest=CONV.canonical_audit_digest(audit), finding_key="")
     repo_id = template["repository_id"]
     receipts = []
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -732,9 +731,10 @@ def test_render_previous_context_limits_dispositions_and_projects_deferred(tmp_p
             item.pop("counterevidence")
             item["tracking_issue"] = "#123"
         receipts.append((f"d30/{repo_id}/gate-disposition-receipt-v3-test-{index}/receipt.json", json.dumps(item).encode()))
-    ledger_objects = [pair for pair in objects if "codex-review-ledger-" in pair[0]]
-
-    _, payload = _render_previous_round_fixture(tmp_path, monkeypatch, ledger_objects + receipts)
+    latest_key = AGG._ledger_latest_key(int(repo_id), ledger["pr_number"])
+    _, payload = _render_previous_round_fixture(
+        tmp_path, monkeypatch, [(latest_key, json.dumps(ledger).encode()), *receipts],
+    )
     out = capsys.readouterr().out
 
     assert len(payload["dispositions"]) == 30

@@ -552,11 +552,12 @@ def test_previous_findings_get_latest_once_without_list(tmp_path, monkeypatch):
     monkeypatch.setenv("SILO_STORE", str(store))
     monkeypatch.setenv("SILO_ENDPOINT", "https://silo.example.test:9000")
     monkeypatch.setattr(AGG, "_silo_configured", lambda: True)
-    head_sha, findings = AGG._previous_findings_from_silo(
-        repository_id=repo_id, pr_number=ledger["pr_number"], run_id=35989919390, run_attempt=1,
+    previous = AGG.load_previous_round_findings(
+        path=None, repository_id=repo_id, pr_number=ledger["pr_number"], run_id=35989919390, run_attempt=1,
     )
-    assert head_sha == ledger["head_sha"]
-    assert any(item.get("id") == "reliability_alternates_survive_hard_kill" for item in findings)
+    assert set(previous) == {"available", "detail", "head_sha", "findings"}
+    assert previous["available"] is True and previous["head_sha"] == ledger["head_sha"]
+    assert any(item.get("id") == "reliability_alternates_survive_hard_kill" for item in previous["findings"])
     _assert_single_latest_get(argv_log, key)
 
 def test_previous_findings_absent_latest_degrades_without_list(tmp_path, monkeypatch, capsys):

@@ -169,7 +169,7 @@ def test_card3_modules_form_downward_acyclic_dag_and_pure_modules_do_not_import_
     }
     assert all_dependencies["previous_context.py"] == {
         "aggregate_models.py", "finding_relations.py", "convergence.py", "gate_io.py",
-        "terminal_history.py", "carry_findings.py", "neighbor_evidence.py",
+        "terminal_history.py", "carry_findings.py", "neighbor_evidence.py", "decision.py",
     }
     edges = {name: _module_edges(name) for name in names}
     assert edges["aggregate_models.py"] == set()
@@ -181,7 +181,7 @@ def test_card3_modules_form_downward_acyclic_dag_and_pure_modules_do_not_import_
         "aggregate_models.py", "decision.py", "gate_io.py",
     }
     assert edges["previous_context.py"] == {
-        "aggregate_models.py", "finding_relations.py", "gate_io.py", "terminal_history.py",
+        "aggregate_models.py", "finding_relations.py", "gate_io.py", "terminal_history.py", "decision.py",
     }
     for pure in PURE:
         assert not edges[pure] & CARD3, f"card-2 pure module imports a card-3 module: {pure}"
