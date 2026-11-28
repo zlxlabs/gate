@@ -2935,6 +2935,9 @@ jobs:
           CURRENT_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_EXPECTED: ${{ github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository && inputs.runner == 'self' && needs.classify_pr_paths.outputs.review_expected != 'false' && startsWith(toJSON(github.event.pull_request.user.login), '"') && endsWith(toJSON(github.event.pull_request.user.login), '"') && toJSON(github.event.pull_request.user.login) != '""' && toJSON(github.event.pull_request.user.login) != '"dependabot[bot]"' }}
           QUALITY_LEDGER_INPUT_UPLOAD: ${{ needs.quality.outputs.ledger_input_upload }}
+          QUALITY_JOB_RESULT: ${{ needs.quality.result }}
+          QUALITY_REUSABLE: ${{ needs.classify_pr_paths.outputs.quality_reusable }}
+          REUSE_SOURCE_RUN_ID: ${{ needs.classify_pr_paths.outputs.reuse_source_run_id }}
           QUALITY_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && 'success' || needs.quality.result }}
           QUALITY_CALLER_CHECKS: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_caller_checks || needs.quality.outputs.caller_checks }}
           QUALITY_PREFLIGHT_RESULT: ${{ needs.classify_pr_paths.outputs.quality_reusable == 'true' && needs.quality.result == 'skipped' && needs.classify_pr_paths.outputs.reuse_preflight_result || needs.quality.outputs.preflight_result }}
@@ -3014,11 +3017,18 @@ jobs:
           # gate-hub#2498: quality's upstream checkout failed before any
           # ledger input producer ran; the missing input artifact is expected.
           quality_upstream_skipped = quality_upload == "upstream_skipped" and quality_result == "failure"
+          # gate#486: verified reuse skips this run's producer; the source
+          # run proves quality passed, but supplies no ledger inputs here.
+          quality_reused_without_input = (
+              quality_upload == "unknown"
+              and os.environ.get("QUALITY_REUSABLE") == "true"
+              and bool(os.environ.get("REUSE_SOURCE_RUN_ID", "").strip())
+              and os.environ.get("QUALITY_JOB_RESULT") == "skipped"
+          )
+          quality_input_optional = quality_short_circuited or quality_upstream_skipped or quality_reused_without_input
           if quality_upload == "success":
               input_artifact = github_fact_input_artifact()
-          elif quality_short_circuited:
-              input_artifact = None
-          elif quality_upstream_skipped:
+          elif quality_input_optional:
               input_artifact = None
           else:
               raise SystemExit(
@@ -3028,6 +3038,8 @@ jobs:
               print("::notice::ledger input skipped: quality was short-circuited by primary failure (gate#105 A); preflight/install fields will be null")
           if quality_upstream_skipped and input_artifact is None:
               print("::notice::ledger input skipped: quality failed upstream before ledger input producers ran; preflight/install fields will be null")
+          if quality_reused_without_input:
+              print("::notice::ledger input skipped: verified quality reuse (gate#486); preflight/install fields will be null")
 
           def parse_resolve(raw, missing_message, required):
               text = (raw or "").strip()
@@ -3172,7 +3184,7 @@ jobs:
           with open(output_path, "a", encoding="utf-8") as output:
               output.write(f"input_artifact_id={input_artifact[1] if input_artifact else ''}\n")
               output.write(f"input_source_attempt={input_artifact[0] if input_artifact else ''}\n")
-              output.write(f"input_short_circuited={'true' if (quality_short_circuited or quality_upstream_skipped) and input_artifact is None else 'false'}\n")
+              output.write(f"input_short_circuited={'true' if quality_input_optional and input_artifact is None else 'false'}\n")
               output.write(f"terminal_artifact_id={terminal_artifact[1] if terminal_artifact else ''}\n")
               output.write(f"terminal_source_attempt={terminal_artifact[0] if terminal_artifact else ''}\n")
               output.write(f"review_expected={expected_text}\n")
