@@ -53,43 +53,40 @@ def _rejected_releases(finding: dict[str, Any]) -> bool:
     )
 
 
-def _released_ids(
+def _released_targets(
     findings: list[Any], dispositions: list[Any],
     rejected_release_keys: set[tuple[str, str]] | None = None,
     canonical_finding_key: Callable[[dict[str, Any]], str] | None = None,
-) -> set[str]:
-    """Finding ids an already-approved receipt releases from the carry.
+    *, head_sha: str | None = None,
+) -> set[tuple[str, str]]:
+    """Release only exact targets already validated by the projection.
 
-    ``dispositions`` arrives pre-filtered by the projection's validity rules
-    (refuted counterevidence for false-positive; a tracking issue for
-    deferred; a non-blank reason for rejected), so no receipt re-validation
-    happens here. Rejected id/key pairs are supplied only after exact-key and
-    same-blob evidence has been verified by inherited_rejection.py.
+    False-positive and deferred targets are bound to the carry head. Rejected
+    id/key pairs have separately verified same-blob evidence across heads.
     """
+    if canonical_finding_key is None:
+        return set()
     rejected_release_keys = rejected_release_keys or set()
-    false_positives = {
-        item["finding_id"] for item in dispositions
-        if isinstance(item, dict) and item.get("disposition") == "false-positive"
-        and isinstance(item.get("finding_id"), str)
+    same_head = {
+        (item["finding_id"], item["finding_key"], item["disposition"])
+        for item in dispositions
+        if isinstance(head_sha, str) and head_sha and isinstance(item, dict)
+        and item.get("head_sha") == head_sha
+        and item.get("disposition") in ("false-positive", "deferred")
+        and isinstance(item.get("finding_id"), str) and isinstance(item.get("finding_key"), str)
     }
-    deferred = {
-        item["finding_id"] for item in dispositions
-        if isinstance(item, dict) and item.get("disposition") == "deferred"
-        and isinstance(item.get("finding_id"), str)
-    }
-    released: set[str] = set()
+    released: set[tuple[str, str]] = set()
     for finding in findings:
         finding_id = finding.get("id") if isinstance(finding, dict) else None
         if not isinstance(finding_id, str):
             continue
-        if finding_id in false_positives or (
-            finding_id in deferred and finding.get("gate_action") == "must_respond"
+        key = canonical_finding_key(finding)
+        if (finding_id, key, "false-positive") in same_head or (
+            (finding_id, key, "deferred") in same_head and finding.get("gate_action") == "must_respond"
         ) or (
-            canonical_finding_key is not None
-            and (finding_id, canonical_finding_key(finding)) in rejected_release_keys
-            and _rejected_releases(finding)
+            (finding_id, key) in rejected_release_keys and _rejected_releases(finding)
         ):
-            released.add(finding_id)
+            released.add((finding_id, key))
     return released
 
 
@@ -114,12 +111,13 @@ def write_previous_context(
     findings = payload.get("findings")
     if not isinstance(findings, list):
         findings = []
-    released = _released_ids(
+    released = _released_targets(
         findings, dispositions, rejected_release_keys, canonical_finding_key,
+        head_sha=previous.get("head_sha"),
     )
     payload["open_findings"] = [
         finding for finding in findings
         if isinstance(finding, dict) and _blocks_merge(finding)
-        and finding.get("id") not in released
+        and (not released or (finding.get("id"), canonical_finding_key(finding)) not in released)
     ]
     Path(path).write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")

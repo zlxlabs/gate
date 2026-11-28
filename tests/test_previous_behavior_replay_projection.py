@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from test_review_ledger import _live_record_audit
+
 ROOT = Path(__file__).resolve().parents[1]
 AGGREGATE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 HEAD_SHA = "a" * 40
@@ -134,10 +136,15 @@ def _render(tmp_path: Path, monkeypatch, findings: list[dict[str, Any]], receipt
         "run_id": 100,
         "run_attempt": 1,
         "head_sha": HEAD_SHA,
-        "review": {"result": {"findings": findings}},
+        "primary_identity": {**_live_record_audit(), "run_id": 100},
+        "review": {"verdict": "fail", "result": {"findings": findings}},
     }
+    identity = AGG.Identity(REPOSITORY_ID, HEAD_SHA, 100, 1, PR_NUMBER)
+    audit = {**ledger["primary_identity"], **ledger["review"]}
+    scope, _ = AGG._convergence_scope_from_audit(audit, identity)
     objects = [(AGG._ledger_latest_key(REPOSITORY_ID, PR_NUMBER), json.dumps(ledger).encode("utf-8"))]
     for payload in receipts:
+        payload.update(epoch=CONV.derive_epoch(scope), audit_digest=CONV.canonical_audit_digest(audit))
         receipt = CONV.parse_disposition_receipt(payload)
         name = CONV.disposition_receipt_artifact_name(receipt)
         objects.append((f"{AGG.SILO_DISPOSITION_TIER}/{REPOSITORY_ID}/{name}/{name}.json", json.dumps(payload).encode("utf-8")))
@@ -192,6 +199,9 @@ def test_previous_context_projects_behavior_replay_and_preserves_literal_contrac
         "quote": "unicode stays: 反证\nand a second line",
     }
     findings = [behavior_finding, literal_finding, absent_finding, unrelated_finding]
+    for finding in findings[:3]:
+        finding.update(trigger_kind="inferred", gate_action="must_respond")
+    unrelated_finding["gate_action"] = "comment"
 
     behavior_receipt, behavior_payload = _receipt(
         behavior_finding["id"], _behavior_evidence(behavior_finding["id"]),

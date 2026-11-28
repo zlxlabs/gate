@@ -508,10 +508,9 @@ def evaluate(
             "treated as an infrastructure problem, not a size decision"
         )
         classification, reason_code = "review_unavailable", "quality_infra"
-    gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[classification]
     outcome = Outcome(
-        ok=gate_result in ("pass", "skipped"), notes=notes, problems=problems, synthetic_audit=synthetic,
-        classification=classification, reason_code=reason_code, gate_result=gate_result,
+        ok=False, notes=notes, problems=problems, synthetic_audit=synthetic,
+        classification=classification, reason_code=reason_code,
         skip_reason=skip_reason,
         audit_available=audit_available, primary_verdict=primary_verdict,
         audit_source_attempt=audit_source, audit_artifact_name=artifact_name,
@@ -604,10 +603,8 @@ def evaluate(
             and disposition_audit.recorded_receipts
             and not disposition_audit.remaining_p1_ids
         ):
-            outcome.ok = True
             outcome.classification = "code_pass"
             outcome.reason_code = "disposition_resolved"
-            outcome.gate_result = "pass"
             outcome.problems = [problem for problem in outcome.problems if problem != "primary review verdict is 'fail'"]
             outcome.notes.append("all current P1 findings are covered by active evidence-bound gate-disposition receipts")
     if scope is not None:
@@ -627,4 +624,12 @@ def evaluate(
             ),
             "eligible_this_round": eligible_this_round,
         }
+    # No classification path can publish pass while a blocking finding remains.
+    gate_result = {"code_pass": "pass", "code_fail": "fail", "expected_skip": "skipped", "ci_failure": "fail", "review_unavailable": "unavailable", "integration_error": "unavailable"}[outcome.classification]
+    if gate_result == "pass" and outcome.disposition_audit and outcome.disposition_audit.remaining_p1_ids:
+        gate_result = "fail"
+        outcome.classification, outcome.reason_code = "code_fail", "primary_findings"
+        outcome.problems.append("primary review still has unresolved blocking findings")
+    outcome.gate_result = gate_result
+    outcome.ok = gate_result in ("pass", "skipped")
     return outcome

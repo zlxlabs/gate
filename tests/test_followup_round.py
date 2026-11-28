@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from test_review_ledger import _live_record_audit
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -217,10 +219,9 @@ def _carry_gate_rerun(head_sha):
 
 def _carry_receipt(repository_id, pr_number, head_sha, disposition, finding_id, **extra):
     payload = {
-        "schema_version": 1, "kind": CONV.DISPOSITION_RECEIPT_KIND,
-        "disposition": disposition, "repository_id": repository_id, "pr_number": pr_number,
-        "epoch": "2026-11-01", "head_sha": head_sha, "audit_digest": "0" * 64,
-        "finding_id": finding_id, "finding_key": f"key-{finding_id}",
+        "schema_version": CONV.DISPOSITION_RECEIPT_SCHEMA_VERSION, "kind": CONV.DISPOSITION_RECEIPT_KIND,
+        "disposition": disposition, "repository_id": str(repository_id), "pr_number": pr_number,
+        "head_sha": head_sha, "finding_id": finding_id,
         "reason": "carry fixture", "approver": "owner", "approver_id": 1,
         "approved_at": "2026-11-01T00:00:00Z", "triggering_actor": "owner",
         "triggering_actor_source": "session",
@@ -236,11 +237,19 @@ def _carry_producer_output(ledger, receipts, tmp_path, monkeypatch):
     variant). Returns (returncode, parsed payload)."""
     aggregate = FUP._load_aggregate()
     repository_id = ledger["primary_identity"]["repository_id"]
+    identity = aggregate.Identity(repository_id, ledger["head_sha"], ledger["run_id"], ledger["run_attempt"], ledger["pr_number"])
+    ledger["primary_identity"] = {
+        **_live_record_audit(), **ledger["primary_identity"], "pr": identity.pr, "tier": "saas",
+    }
+    ledger["primary_identity"].pop("pr_number")
+    audit = {**ledger["primary_identity"], **ledger["review"]}
+    scope, _ = aggregate._convergence_scope_from_audit(audit, identity)
     objects = [
         (aggregate._ledger_latest_key(repository_id, ledger["pr_number"]),
          json.dumps(ledger, ensure_ascii=False).encode("utf-8")),
     ]
     for receipt in receipts:
+        receipt.update(epoch=CONV.derive_epoch(scope), audit_digest=CONV.canonical_audit_digest(audit))
         name = CONV.disposition_receipt_artifact_name(CONV.parse_disposition_receipt(receipt))
         objects.append((
             f"{aggregate.SILO_DISPOSITION_TIER}/{repository_id}/{name}/{name}.json",
@@ -292,7 +301,7 @@ def test_render_previous_context_blocking_matrix_carry_semantics(tmp_path, monke
          "gate_action": "comment"},
         {"id": "carry-fp-block", "severity": "major", "file": "src/lock.py", "line": 30,
          "category": "correctness", "issue": "released by false-positive receipt",
-         "acceptance": "n/a", "gate_action": "block"},
+         "acceptance": "n/a", "gate_action": "block", "trigger_kind": "inferred"},
         {"id": "carry-deferred-mr", "severity": "minor", "file": "src/queue.py", "line": 40,
          "category": "reliability", "issue": "released by deferred receipt",
          "acceptance": "n/a", "gate_action": "must_respond"},
@@ -370,7 +379,7 @@ def test_render_previous_context_legacy_carry_deferred_does_not_release(tmp_path
         "carry-legacy-blocker-open", "carry-legacy-blocker-deferred",
     }
     assert all("gate_action" not in finding for finding in payload["open_findings"])
-    assert "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=0" in out
+    assert "GATE-PREVIOUS-DISPOSITIONS: kept=0 dropped=1" in out
 
 
 def test_inject_step_wires_followup_env_and_skipped_line():

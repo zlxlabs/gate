@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from test_review_ledger import _live_record_audit
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".github" / "actions" / "gate-aggregator" / "aggregate.py"
 HEAD_SHA = "h" * 40
@@ -129,9 +131,11 @@ def _render(tmp_path, monkeypatch, findings, receipts, *, capsys=None):
         )
         if isinstance(receipt.get("counterevidence"), dict):
             receipt["counterevidence"]["gate_rerun"]["argv"][6] = old_sha
+    audit = {**_live_record_audit(), "head_sha": current_sha, "run_id": 100, "tier": "personal"}
     objects = [(AGG._ledger_latest_key(123, 42), json.dumps({
         "pr_number": 42, "run_id": 100, "run_attempt": 1, "head_sha": current_sha,
-        "review": {"result": {"findings": findings}},
+        "primary_identity": audit,
+        "review": {"verdict": "fail", "result": {"findings": findings}},
     }).encode("utf-8"))]
     for index, receipt in enumerate(receipts):
         key = f"{AGG.SILO_DISPOSITION_TIER}/123/{AGG.DISPOSITION_ARTIFACT_PREFIX}case-{index}/r.json"
@@ -219,8 +223,8 @@ def test_rejected_requires_sol_verify_origin(tmp_path, monkeypatch, capsys, orig
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
 
-    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=2 dropped=0\n"  # projection is origin-agnostic
-    assert {item["finding_id"] for item in payload["dispositions"]} == {OK_FINDING_ID, "guard-primary"}
+    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=1\n"
+    assert {item["finding_id"] for item in payload["dispositions"]} == {OK_FINDING_ID}
     assert [item["id"] for item in payload["open_findings"]] == ["guard-primary"]
 
 
@@ -231,7 +235,7 @@ def test_rejected_requires_must_respond(tmp_path, monkeypatch, capsys):
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
 
-    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=2 dropped=0\n"
+    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=1\n"
     assert [item["id"] for item in payload["open_findings"]] == ["guard-block"]
 
 
@@ -243,7 +247,7 @@ def test_rejected_refuses_owner_protected_categories(tmp_path, monkeypatch, caps
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
 
-    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=2 dropped=0\n"
+    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=1\n"
     assert [item["id"] for item in payload["open_findings"]] == [f"guard-{category}"]
 
 
@@ -255,8 +259,12 @@ def test_rejected_missing_field_fails_closed(tmp_path, monkeypatch, capsys, drop
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
 
-    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=2 dropped=0\n"
-    assert [item["id"] for item in payload["open_findings"]] == ["guard-incomplete"]
+    if drop == ("category",):
+        assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=0 dropped=2 reason=audit_binding_invalid\n"
+        assert [item["id"] for item in payload["open_findings"]] == [OK_FINDING_ID, "guard-incomplete"]
+    else:
+        assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=1\n"
+        assert [item["id"] for item in payload["open_findings"]] == ["guard-incomplete"]
 
 
 def test_blank_reason_rejected_stays_dropped(tmp_path, monkeypatch, capsys):
@@ -303,7 +311,7 @@ def test_write_previous_context_omits_finding_key_and_preserves_rejected_release
     assert payload["open_findings"] == []  # rejected-release eligibility still uses the in-memory disposition
 
 
-def test_false_positive_and_deferred_behavior_unchanged(tmp_path, monkeypatch, capsys):
+def test_only_rejected_can_release_with_cross_head_blob_evidence(tmp_path, monkeypatch, capsys):
     findings, receipts = _ok_pair()
     findings.append(_finding("fp-carry", origin="primary", category="security", line=13))
     receipts.append(_receipt("fp-carry", disposition="false-positive",
@@ -314,11 +322,6 @@ def test_false_positive_and_deferred_behavior_unchanged(tmp_path, monkeypatch, c
 
     payload, _, out = _render(tmp_path, monkeypatch, findings, receipts, capsys=capsys)
 
-    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=3 dropped=0\n"
-    fp = next(item for item in payload["dispositions"] if item["disposition"] == "false-positive")
-    assert fp["counterevidence"]["result"] == "refuted" and fp["tracking_issue"] is None
-    deferred = next(item for item in payload["dispositions"] if item["disposition"] == "deferred")
-    assert deferred["tracking_issue"] == "#123" and deferred["counterevidence"] is None
-    # false-positive releases the covered finding regardless of origin/category;
-    # deferred releases the must_respond finding; rejected releases the sol one.
-    assert payload["open_findings"] == []
+    assert out == "GATE-PREVIOUS-DISPOSITIONS: kept=1 dropped=2\n"
+    assert [item["disposition"] for item in payload["dispositions"]] == ["rejected"]
+    assert [item["id"] for item in payload["open_findings"]] == ["fp-carry", "def-carry"]
