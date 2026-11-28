@@ -290,10 +290,10 @@ def _anchor_git_heads(root: Path, mode: str) -> tuple[Path, str, str, str | None
 @pytest.mark.parametrize(
     "case",
     [
-        ("primary_review_v2_with_tier.json", "none", "new", ["open-with-evidence", "new-current"], "pass"),
+        ("primary_review_v2_with_tier.json", "none", "new", ["open-with-evidence", "new-current"], "fail"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass"),
         ("primary_review_v2_with_withdrawal.json", "actual", "silent", [], "pass"),
-        ("primary_review_v2_with_withdrawal.json", "actual", "same", ["reliability_alternates_survive_hard_kill"], "pass"),
+        ("primary_review_v2_with_withdrawal.json", "actual", "same", ["reliability_alternates_survive_hard_kill"], "fail"),
         ("primary_review_v2_with_withdrawal.json", "actual", "mapped", ["reliability_alternates_survive_hard_kill", "mapped-current"], "fail"),
         ("primary_review_v2_with_withdrawal.json", "blank", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
         ("primary_review_v2_with_withdrawal.json", "unknown", "silent", ["reliability_alternates_survive_hard_kill"], "pass"),
@@ -302,7 +302,7 @@ def _anchor_git_heads(root: Path, mode: str) -> tuple[Path, str, str, str | None
         ("primary_review_v2_with_tier.json", "none", "new", ["new-current"], "fail", "changed"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass", "adjacent"),
         ("primary_review_v2_with_tier.json", "none", "new", ["open-with-evidence", "new-current"], "fail", "shift-delete"),
-        ("primary_review_v2_with_tier.json", "none", "same", ["open-with-evidence"], "pass", "changed"),
+        ("primary_review_v2_with_tier.json", "none", "same", ["open-with-evidence"], "fail", "changed"),
         ("primary_review_v2_with_tier.json", "none", "mapped", ["open-with-evidence", "mapped-current"], "fail", "changed"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass", "unavailable"),
         ("primary_review_v2_with_tier.json", "none", "silent", ["open-with-evidence"], "pass", "missing-quote"),
@@ -496,8 +496,9 @@ def test_silent_round_carries_open_finding_through_ledger_jsonl(
                 primary_result="failure" if anchor_case in {"changed", "shift-delete"} and report_case == "new" else "success")],
             cwd=ROOT, env=clean_env, capture_output=True, text=True, check=False,
         )
-        assert legacy_gate.returncode == (1 if anchor_case in {"changed", "shift-delete"} and report_case == "new" else 0), legacy_gate.stderr
+        assert legacy_gate.returncode == 1, legacy_gate.stderr
         legacy_terminal = json.loads(legacy_summary.with_name("gate-terminal.json").read_bytes())
+        assert legacy_terminal["gate_result"] == "fail"  # current P1 blocks without relation metadata too
         assert legacy_terminal["finding_relation"]["history_status"] == "unknown"
         assert [item["id"] for item in legacy_terminal["finding_relation"]["open_findings"]] == [
             item["id"] for item in current_findings

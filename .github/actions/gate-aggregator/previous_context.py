@@ -287,8 +287,10 @@ def _project_previous_dispositions(
                     counterevidence["match_expectation"] = "absent"
         elif receipt.disposition == "deferred":
             tracking_issue = _clip_text(receipt.tracking_issue)
-        elif (receipt.head_sha, receipt.finding_key, receipt.finding_id) not in inherited_matches:
-            # A rejected receipt only releases carry with same-blob evidence.
+        elif not receipt.reason.strip() or (
+            receipt.head_sha, receipt.finding_key, receipt.finding_id
+        ) not in inherited_matches:
+            # Keep the non-blank reason and same-blob requirements for carry.
             continue
 
         approved_at = receipt.approved_at
